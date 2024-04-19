@@ -1,0 +1,298 @@
+dwarf4
+[src/bin/dwarf_exploration.rs:682] units = 5815
+[src/bin/dwarf_exploration.rs:683] dies = 98656533
+[src/bin/dwarf_exploration.rs:684] attrs = 323283313
+[src/bin/dwarf_exploration.rs:685] funcs_including_decls_and_inline = 13391865
+[src/bin/dwarf_exploration.rs:686] funcs = 579365
+[src/bin/dwarf_exploration.rs:687] deduped_funcs = 355413
+[src/bin/dwarf_exploration.rs:688] template_funcs as f64 / funcs as f64 = 0.18408775124489743
+[src/bin/dwarf_exploration.rs:689] funcs_without_name as f64 / funcs as f64 = 0.008288384697038999
+[src/bin/dwarf_exploration.rs:690] funcs_without_link_name as f64 / funcs as f64 = 0.0454463075953846
+[src/bin/dwarf_exploration.rs:691] funcs_with_multiple_ranges = 0
+[src/bin/dwarf_exploration.rs:692] func_ranges = 579365
+[src/bin/dwarf_exploration.rs:693] vars = 23414680
+[src/bin/dwarf_exploration.rs:694] locs = 30913530
+[src/bin/dwarf_exploration.rs:695] types = 2150699
+[src/bin/dwarf_exploration.rs:696] template_types as f64 / types as f64 = 0.644047818871911
+[src/bin/dwarf_exploration.rs:697] fields = 2118337
+[src/bin/dwarf_exploration.rs:698] inlined_funcs = 12812233
+[src/bin/dwarf_exploration.rs:699] inlined_func_ranges = 16413872
+[src/bin/dwarf_exploration.rs:700] inlined_funcs_without_ranges = 0
+[src/bin/dwarf_exploration.rs:701] total_func_link_name_len = 73269012
+[src/bin/dwarf_exploration.rs:702] total_func_full_name_len = 25915453
+[src/bin/dwarf_exploration.rs:703] total_func_local_name_len = 24997566
+[src/bin/dwarf_exploration.rs:704] total_var_name_len = 127335519
+[src/bin/dwarf_exploration.rs:705] total_type_full_name_len = 278636616
+[src/bin/dwarf_exploration.rs:706] longest_origin_chain = 4
+[src/bin/dwarf_exploration.rs:707] vars_without_loc = 3384588
+[src/bin/dwarf_exploration.rs:708] func_instr_len = 175790195
+
+dwarf4-debug
+.debug_info pre-pass took 2.159s
+[src/bin/dwarf_exploration.rs:152] units_vec.len() = 8790
+[src/bin/dwarf_exploration.rs:153] line_programs.len() = 8790
+-----
+.debug_info took 135.569s
+[src/bin/dwarf_exploration.rs:801] dies = 137053555
+[src/bin/dwarf_exploration.rs:802] attrs = 466609646
+[src/bin/dwarf_exploration.rs:803] funcs_including_decls_and_inline = 28778326
+[src/bin/dwarf_exploration.rs:804] funcs = 7491180
+[src/bin/dwarf_exploration.rs:805] deduped_funcs = 2656256
+[src/bin/dwarf_exploration.rs:806] template_funcs as f64 / funcs as f64 = 0.3600713105278474
+[src/bin/dwarf_exploration.rs:807] funcs_without_name as f64 / funcs as f64 = 0.00149509156100908
+[src/bin/dwarf_exploration.rs:808] funcs_without_link_name as f64 / funcs as f64 = 0.008073761410084927
+[src/bin/dwarf_exploration.rs:809] funcs_with_multiple_ranges = 0
+[src/bin/dwarf_exploration.rs:810] func_ranges = 7491180
+[src/bin/dwarf_exploration.rs:811] vars = 21505169
+[src/bin/dwarf_exploration.rs:812] locs = 21792346
+[src/bin/dwarf_exploration.rs:813] types = 4134047
+[src/bin/dwarf_exploration.rs:814] template_types as f64 / types as f64 = 0.6572588555476027
+[src/bin/dwarf_exploration.rs:815] fields = 3818290
+[src/bin/dwarf_exploration.rs:816] inlined_funcs = 1010871
+[src/bin/dwarf_exploration.rs:817] inlined_func_ranges = 1189096
+[src/bin/dwarf_exploration.rs:818] inlined_funcs_without_ranges = 0
+[src/bin/dwarf_exploration.rs:819] total_func_link_name_len = 1001318382
+[src/bin/dwarf_exploration.rs:820] total_func_full_name_len = 537511322
+[src/bin/dwarf_exploration.rs:821] total_func_local_name_len = 522763395
+[src/bin/dwarf_exploration.rs:822] total_var_name_len = 134760343
+[src/bin/dwarf_exploration.rs:823] total_type_full_name_len = 573185069
+[src/bin/dwarf_exploration.rs:824] longest_origin_chain = 4
+[src/bin/dwarf_exploration.rs:825] vars_without_loc = 224791
+[src/bin/dwarf_exploration.rs:826] func_instr_len = 892392252
+
+[src/bin/dwarf_exploration.rs:828] cross_unit_type_refs = 0
+[src/bin/dwarf_exploration.rs:829] forward_type_refs = 58683619
+[src/bin/dwarf_exploration.rs:830] forward_base_type_refs = 4611213
+[src/bin/dwarf_exploration.rs:831] forward_simple_type_refs = 49687503
+[src/bin/dwarf_exploration.rs:832] forward_composite_type_refs = 4380330
+[src/bin/dwarf_exploration.rs:833] base_type_refs = 11608859
+[src/bin/dwarf_exploration.rs:834] simple_type_refs = 75833405
+[src/bin/dwarf_exploration.rs:835] composite_type_refs = 19570815
+[src/bin/dwarf_exploration.rs:836] ptr_to_member_type_refs = 5773
+[src/bin/dwarf_exploration.rs:837] subrange_type_refs = 0
+[src/bin/dwarf_exploration.rs:838] unrecognized_type_refs = 0
+[src/bin/dwarf_exploration.rs:839] type_refs = 107018852
+[src/bin/dwarf_exploration.rs:840] type_refs_with_specification = 0
+[src/bin/dwarf_exploration.rs:841] type_refs_with_abstract_origin = 0
+[src/bin/dwarf_exploration.rs:842] data_member_loc_simple = 3818462
+[src/bin/dwarf_exploration.rs:843] data_member_loc_expr = 610
+[src/bin/dwarf_exploration.rs:844] nontrivial_inheritance_loc = 610
+[src/bin/dwarf_exploration.rs:845] data_member_loc_list = 0
+-----
+[src/bin/dwarf_exploration.rs:1095] all_anchors.len() = 17451800
+[src/bin/dwarf_exploration.rs:1098] all_anchors.len() = 4505190
+[src/bin/dwarf_exploration.rs:1115] longest_run_without_anchors = 314536
+sorting anchors took 0.234s
+
+
+dwarf4-official-release
+.eh_frame took 2.939s
+[src/bin/dwarf_exploration.rs:108] cies.len() = 4
+[src/bin/dwarf_exploration.rs:109] fde_count = 532671
+[src/bin/dwarf_exploration.rs:110] row_count = 4639889
+[src/bin/dwarf_exploration.rs:111] bytes_covered_by_fdes = 293714860
+[src/bin/dwarf_exploration.rs:112] bytes_covered_by_rows = 293714860
+[src/bin/dwarf_exploration.rs:113] register_rules = 17476464
+[src/bin/dwarf_exploration.rs:114] max_rows_per_fde = 2501
+-----
+.debug_info pre-pass took 4.765s
+[src/bin/dwarf_exploration.rs:150] units_vec.len() = 33109
+[src/bin/dwarf_exploration.rs:151] line_programs.len() = 33109
+-----
+.debug_info took 39.317s
+[src/bin/dwarf_exploration.rs:730] dies = 83018884
+[src/bin/dwarf_exploration.rs:731] attrs = 274861560
+[src/bin/dwarf_exploration.rs:732] funcs_including_decls_and_inline = 12236632
+[src/bin/dwarf_exploration.rs:733] funcs = 316368
+[src/bin/dwarf_exploration.rs:734] deduped_funcs = 316355
+[src/bin/dwarf_exploration.rs:735] template_funcs as f64 / funcs as f64 = 0.08716115409902392
+[src/bin/dwarf_exploration.rs:736] funcs_without_name as f64 / funcs as f64 = 0.010901861123754615
+[src/bin/dwarf_exploration.rs:737] funcs_without_link_name as f64 / funcs as f64 = 0.06794935012390634
+[src/bin/dwarf_exploration.rs:738] funcs_with_multiple_ranges = 0
+[src/bin/dwarf_exploration.rs:739] func_ranges = 316368
+[src/bin/dwarf_exploration.rs:740] vars = 16778955
+[src/bin/dwarf_exploration.rs:741] locs = 21236601
+[src/bin/dwarf_exploration.rs:742] types = 2302458
+[src/bin/dwarf_exploration.rs:743] template_types as f64 / types as f64 = 0.5687130883603523
+[src/bin/dwarf_exploration.rs:744] fields = 3062095
+[src/bin/dwarf_exploration.rs:745] inlined_funcs = 9474795
+[src/bin/dwarf_exploration.rs:746] inlined_func_ranges = 12344834
+[src/bin/dwarf_exploration.rs:747] inlined_funcs_without_ranges = 0
+[src/bin/dwarf_exploration.rs:748] total_func_link_name_len = 40081317
+[src/bin/dwarf_exploration.rs:749] total_func_full_name_len = 12118588
+[src/bin/dwarf_exploration.rs:750] total_func_local_name_len = 11534211
+[src/bin/dwarf_exploration.rs:751] total_var_name_len = 110086268
+[src/bin/dwarf_exploration.rs:752] total_type_full_name_len = 274056042
+[src/bin/dwarf_exploration.rs:753] longest_origin_chain = 4
+[src/bin/dwarf_exploration.rs:754] vars_without_loc = 3123063
+[src/bin/dwarf_exploration.rs:755] func_instr_len = 133758066
+-----
+.debug_line took 1.297s
+[src/bin/dwarf_exploration.rs:972] num_empty_sequences = 0
+[src/bin/dwarf_exploration.rs:973] num_sequences_starting_at_zero = 17
+[src/bin/dwarf_exploration.rs:974] max_address_in_sequences_starting_at_zero = 75
+[src/bin/dwarf_exploration.rs:975] num_sequences = 316316
+[src/bin/dwarf_exploration.rs:976] num_all_rows = 18388458
+[src/bin/dwarf_exploration.rs:977] num_rows = 18388399
+[src/bin/dwarf_exploration.rs:978] num_include_directories = 225159
+[src/bin/dwarf_exploration.rs:979] num_files = 777839
+[src/bin/dwarf_exploration.rs:980] file_to_idx.len() = 13378
+[src/bin/dwarf_exploration.rs:981] kinda_num_statements = 11788032
+[src/bin/dwarf_exploration.rs:982] kinda_num_basic_blocks = 0
+[src/bin/dwarf_exploration.rs:983] kinda_num_prologues = 315641
+[src/bin/dwarf_exploration.rs:984] kinda_num_epilogues = 211680
+[src/bin/dwarf_exploration.rs:985] num_programs_where_files_have_md5 = 0
+[src/bin/dwarf_exploration.rs:986] addr_bytes_covered = 133989751
+[src/bin/dwarf_exploration.rs:987] total_program_header_bytes = 21784689
+[src/bin/dwarf_exploration.rs:988] total_program_bytes = 110081149
+[src/bin/dwarf_exploration.rs:989] max_program_header_bytes = 17139
+[src/bin/dwarf_exploration.rs:990] max_program_bytes = 3713091
+[src/bin/dwarf_exploration.rs:991] max_include_directories = 122
+[src/bin/dwarf_exploration.rs:992] max_files = 703
+[src/bin/dwarf_exploration.rs:993] max_rows_per_program = 588310
+[src/bin/dwarf_exploration.rs:994] max_rows_per_sequence = 29046
+[src/bin/dwarf_exploration.rs:995] duplicate_sequences = 0
+[src/bin/dwarf_exploration.rs:996] overlapping_sequences = 0
+[src/bin/dwarf_exploration.rs:997] deduped_addr_bytes_covered = 133989751
+[src/bin/dwarf_exploration.rs:998] mem::size_of::<LineRow>() = 64
+[src/bin/dwarf_exploration.rs:999] max_line = 239378
+[src/bin/dwarf_exploration.rs:1000] max_column = 368
+[src/bin/dwarf_exploration.rs:1005] all_anchors.len() = 38042814
+[src/bin/dwarf_exploration.rs:1008] all_anchors.len() = 23140727
+[src/bin/dwarf_exploration.rs:1025] longest_run_without_anchors = 222016
+sorting anchors took 1.431s
+
+dwarf5
+[src/bin/dwarf_exploration.rs:682] units = 5815
+[src/bin/dwarf_exploration.rs:683] dies = 98669598
+[src/bin/dwarf_exploration.rs:684] attrs = 323438477
+[src/bin/dwarf_exploration.rs:685] funcs_including_decls_and_inline = 13391865
+[src/bin/dwarf_exploration.rs:686] funcs = 579365
+[src/bin/dwarf_exploration.rs:687] deduped_funcs = 355413
+[src/bin/dwarf_exploration.rs:688] template_funcs as f64 / funcs as f64 = 0.18408775124489743
+[src/bin/dwarf_exploration.rs:689] funcs_without_name as f64 / funcs as f64 = 0.008288384697038999
+[src/bin/dwarf_exploration.rs:690] funcs_without_link_name as f64 / funcs as f64 = 0.0454463075953846
+[src/bin/dwarf_exploration.rs:691] funcs_with_multiple_ranges = 0
+[src/bin/dwarf_exploration.rs:692] func_ranges = 579365
+[src/bin/dwarf_exploration.rs:693] vars = 23414680
+[src/bin/dwarf_exploration.rs:694] locs = 30913530
+[src/bin/dwarf_exploration.rs:695] types = 2150699
+[src/bin/dwarf_exploration.rs:696] template_types as f64 / types as f64 = 0.644047818871911
+[src/bin/dwarf_exploration.rs:697] fields = 2118337
+[src/bin/dwarf_exploration.rs:698] inlined_funcs = 12812233
+[src/bin/dwarf_exploration.rs:699] inlined_func_ranges = 16413872
+[src/bin/dwarf_exploration.rs:700] inlined_funcs_without_ranges = 0
+[src/bin/dwarf_exploration.rs:701] total_func_link_name_len = 73269012
+[src/bin/dwarf_exploration.rs:702] total_func_full_name_len = 25915453
+[src/bin/dwarf_exploration.rs:703] total_func_local_name_len = 24997566
+[src/bin/dwarf_exploration.rs:704] total_var_name_len = 127335519
+[src/bin/dwarf_exploration.rs:705] total_type_full_name_len = 278636616
+[src/bin/dwarf_exploration.rs:706] longest_origin_chain = 4
+[src/bin/dwarf_exploration.rs:707] vars_without_loc = 3384588
+[src/bin/dwarf_exploration.rs:708] func_instr_len = 175790195
+
+dwarf5-debug
+.eh_frame took 5.161s
+[src/bin/dwarf_exploration.rs:108] cies.len() = 3
+[src/bin/dwarf_exploration.rs:109] fde_count = 2653469
+[src/bin/dwarf_exploration.rs:110] row_count = 10931015
+[src/bin/dwarf_exploration.rs:111] bytes_covered_by_fdes = 452438729
+[src/bin/dwarf_exploration.rs:112] bytes_covered_by_rows = 452438729
+[src/bin/dwarf_exploration.rs:113] register_rules = 19295924
+[src/bin/dwarf_exploration.rs:114] max_rows_per_fde = 924
+-----
+.debug_info pre-pass took 0.541s
+[src/bin/dwarf_exploration.rs:150] units_vec.len() = 8720
+[src/bin/dwarf_exploration.rs:151] line_programs.len() = 8720
+-----
+.debug_info took 49.173s
+[src/bin/dwarf_exploration.rs:730] dies = 129375765
+[src/bin/dwarf_exploration.rs:731] attrs = 441002637
+[src/bin/dwarf_exploration.rs:732] funcs_including_decls_and_inline = 27152480
+[src/bin/dwarf_exploration.rs:733] funcs = 7175532
+[src/bin/dwarf_exploration.rs:734] deduped_funcs = 2654177
+[src/bin/dwarf_exploration.rs:735] template_funcs as f64 / funcs as f64 = 0.3630610246041687
+[src/bin/dwarf_exploration.rs:736] funcs_without_name as f64 / funcs as f64 = 0.0015041393446506824
+[src/bin/dwarf_exploration.rs:737] funcs_without_link_name as f64 / funcs as f64 = 0.00800219412302809
+[src/bin/dwarf_exploration.rs:738] funcs_with_multiple_ranges = 0
+[src/bin/dwarf_exploration.rs:739] func_ranges = 7175532
+[src/bin/dwarf_exploration.rs:740] vars = 20578836
+[src/bin/dwarf_exploration.rs:741] locs = 20828691
+[src/bin/dwarf_exploration.rs:742] types = 3800629
+[src/bin/dwarf_exploration.rs:743] template_types as f64 / types as f64 = 0.6688858607351572
+[src/bin/dwarf_exploration.rs:744] fields = 3374186
+[src/bin/dwarf_exploration.rs:745] inlined_funcs = 865915
+[src/bin/dwarf_exploration.rs:746] inlined_func_ranges = 1020198
+[src/bin/dwarf_exploration.rs:747] inlined_funcs_without_ranges = 0
+[src/bin/dwarf_exploration.rs:748] total_func_link_name_len = 970940656
+[src/bin/dwarf_exploration.rs:749] total_func_full_name_len = 473425651
+[src/bin/dwarf_exploration.rs:750] total_func_local_name_len = 459483480
+[src/bin/dwarf_exploration.rs:751] total_var_name_len = 126784836
+[src/bin/dwarf_exploration.rs:752] total_type_full_name_len = 499787777
+[src/bin/dwarf_exploration.rs:753] longest_origin_chain = 3
+[src/bin/dwarf_exploration.rs:754] vars_without_loc = 250023
+[src/bin/dwarf_exploration.rs:755] func_instr_len = 855639507
+-----
+.debug_line took 4.499s
+[src/bin/dwarf_exploration.rs:972] num_empty_sequences = 0
+[src/bin/dwarf_exploration.rs:973] num_sequences_starting_at_zero = 4522910
+[src/bin/dwarf_exploration.rs:974] max_address_in_sequences_starting_at_zero = 52455
+[src/bin/dwarf_exploration.rs:975] num_sequences = 2090403
+[src/bin/dwarf_exploration.rs:976] num_all_rows = 84872875
+[src/bin/dwarf_exploration.rs:977] num_rows = 45021504
+[src/bin/dwarf_exploration.rs:978] num_include_directories = 29961
+[src/bin/dwarf_exploration.rs:979] num_files = 929705
+[src/bin/dwarf_exploration.rs:980] file_to_idx.len() = 27170
+[src/bin/dwarf_exploration.rs:981] kinda_num_statements = 34033305
+[src/bin/dwarf_exploration.rs:982] kinda_num_basic_blocks = 0
+[src/bin/dwarf_exploration.rs:983] kinda_num_prologues = 7162965
+[src/bin/dwarf_exploration.rs:984] kinda_num_epilogues = 7027519
+[src/bin/dwarf_exploration.rs:985] num_programs_where_files_have_md5 = 2096
+[src/bin/dwarf_exploration.rs:986] addr_bytes_covered = 460979119
+[src/bin/dwarf_exploration.rs:987] total_program_header_bytes = 5931269
+[src/bin/dwarf_exploration.rs:988] total_program_bytes = 465423316
+[src/bin/dwarf_exploration.rs:989] max_program_header_bytes = 7540
+[src/bin/dwarf_exploration.rs:990] max_program_bytes = 8293728
+[src/bin/dwarf_exploration.rs:991] max_include_directories = 71
+[src/bin/dwarf_exploration.rs:992] max_files = 623
+[src/bin/dwarf_exploration.rs:993] max_rows_per_program = 1651641
+[src/bin/dwarf_exploration.rs:994] max_rows_per_sequence = 146011
+[src/bin/dwarf_exploration.rs:995] duplicate_sequences = 0
+[src/bin/dwarf_exploration.rs:996] overlapping_sequences = 0
+[src/bin/dwarf_exploration.rs:997] deduped_addr_bytes_covered = 460979119
+[src/bin/dwarf_exploration.rs:998] mem::size_of::<LineRow>() = 64
+[src/bin/dwarf_exploration.rs:999] max_line = 333055
+[src/bin/dwarf_exploration.rs:1000] max_column = 408
+[src/bin/dwarf_exploration.rs:1005] all_anchors.len() = 74567209
+[src/bin/dwarf_exploration.rs:1008] all_anchors.len() = 55052832
+[src/bin/dwarf_exploration.rs:1025] longest_run_without_anchors = 30779
+sorting anchors took 2.879s
+
+dwz-dwarf4-official-release
+[src/bin/dwarf_exploration.rs:684] units = 92605
+[src/bin/dwarf_exploration.rs:685] dies = 59109648
+[src/bin/dwarf_exploration.rs:686] attrs = 197105241
+[src/bin/dwarf_exploration.rs:687] funcs_including_decls_and_inline = 7129631
+[src/bin/dwarf_exploration.rs:688] funcs = 316368
+[src/bin/dwarf_exploration.rs:689] deduped_funcs = 316355
+[src/bin/dwarf_exploration.rs:690] template_funcs as f64 / funcs as f64 = 0.08716115409902392
+[src/bin/dwarf_exploration.rs:691] funcs_without_name as f64 / funcs as f64 = 0.010901861123754615
+[src/bin/dwarf_exploration.rs:692] funcs_without_link_name as f64 / funcs as f64 = 0.06794935012390634
+[src/bin/dwarf_exploration.rs:693] funcs_with_multiple_ranges = 0
+[src/bin/dwarf_exploration.rs:694] func_ranges = 316368
+[src/bin/dwarf_exploration.rs:695] vars = 16021617
+[src/bin/dwarf_exploration.rs:696] locs = 21227504
+[src/bin/dwarf_exploration.rs:697] types = 1153774
+[src/bin/dwarf_exploration.rs:698] template_types as f64 / types as f64 = 0.6476155642266163
+[src/bin/dwarf_exploration.rs:699] fields = 1747701
+[src/bin/dwarf_exploration.rs:700] inlined_funcs = 9474795
+[src/bin/dwarf_exploration.rs:701] inlined_func_ranges = 12344834
+[src/bin/dwarf_exploration.rs:702] inlined_funcs_without_ranges = 0
+[src/bin/dwarf_exploration.rs:703] total_func_link_name_len = 40081317
+[src/bin/dwarf_exploration.rs:704] total_func_full_name_len = 12118588
+[src/bin/dwarf_exploration.rs:705] total_func_local_name_len = 11534211
+[src/bin/dwarf_exploration.rs:706] total_var_name_len = 97429214
+[src/bin/dwarf_exploration.rs:707] total_type_full_name_len = 168595996
+[src/bin/dwarf_exploration.rs:708] longest_origin_chain = 4
+[src/bin/dwarf_exploration.rs:709] vars_without_loc = 2374822
+[src/bin/dwarf_exploration.rs:710] func_instr_len = 133758066

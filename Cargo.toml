@@ -1,0 +1,29 @@
+[package]
+name = "nnd"
+version = "0.1.0"
+edition = "2021"
+
+[profile.dev]
+panic = 'abort'
+
+[profile.release]
+debug = true
+panic = 'abort'
+
+[dependencies]
+memmap2 = "0.7" # for mmapping ELF files
+libc = "0.2.146" # syscall wrappers
+iced-x86 = {version = "1.19", default-features = false, features = ["std", "decoder", "instr_info", "nasm"]} # disassember
+termion = "2.0.1" # for interacting with terminal (both input and output)
+tui = {version = "0.19", features = ["termion"]} # for immediate mode GUI; maybe we should roll our own instead, seems simple
+bitflags = "^1.3" # old major version to match tui's dependency to avoid pulling two versions
+gimli = {version = "^0.28.1", default-features = false, features = ["std", "read"]} # for parsing DWARF; takes forever to compile, maybe we should roll our own parsing
+#gimli = {path = "/home/al13n/Dropbox/coding/gimli"}
+crc32fast = "^1.3.2" # a few things in ELF and DWARF use crc32
+flate2 = "^1.0.26" # for decompressing ELF sections
+md5 = "^0.7" # for checking source file hashes against debug symbols
+cpp_demangle = "^0.4.3" # for demangling function names (unavoidable in .symtab, convenient in .debug_info)
+rand = "^0.8.5" # used for some benchmark, not the main program
+unicode-segmentation = "^1.10"
+unicode-width = "^0.1"
+rustc-demangle = "^0.1"

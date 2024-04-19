@@ -1,0 +1,2 @@
+How's the 'breakpoint vs jump' distinguishing problem usually solved? Guesswork, or is there a reliably way? Spurious post-singlestep SIGTRAPs don't help.
+What's up with 70% of line program sequences starting at address 0 (DW_LNE_set_address 0)? Missing relocations? Intentional or compiler bug? See unrelocated_line_number_program_sequences.txt for examples. (Mostly in debug build, clang-16.)
