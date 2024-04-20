@@ -336,7 +336,11 @@ impl Debugger {
                     continue;
                 }
                 found_new_threads = true;
-                unsafe {ptrace(libc::PTRACE_SEIZE, tid, 0, (libc::PTRACE_O_TRACECLONE | libc::PTRACE_O_TRACEEXEC | libc::PTRACE_O_TRACEEXIT | libc::PTRACE_O_TRACESYSGOOD) as u64, Some(&mut r.log.prof))?};
+                match unsafe {ptrace(libc::PTRACE_SEIZE, tid, 0, (libc::PTRACE_O_TRACECLONE | libc::PTRACE_O_TRACEEXEC | libc::PTRACE_O_TRACEEXIT | libc::PTRACE_O_TRACESYSGOOD) as u64, Some(&mut r.log.prof))} {
+                    Ok(_) => (),
+                    Err(e) if e.is_io_permission_denied() => return err!(Usage, "ptrace({}) failed: operation not permitted - missing sudo?", tid),
+                    Err(e) => return Err(e),
+                }
                 let mut thread = Thread::new(r.next_thread_idx, tid, ThreadState::Running);
                 r.next_thread_idx += 1;
 

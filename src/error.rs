@@ -48,11 +48,11 @@ impl<T> ResultWithClonableError<T> for Result<T> { fn as_ref_clone_error(&self) 
 
 impl Error {
     pub fn new(code: ErrorCode, message: String) -> Error {
-        Error {error: ErrorEnum::Code(code), message: message}
+        Error {error: ErrorEnum::Code(code), message}
     }
 
     pub fn from_io_error(e: io::Error, message: String) -> Error {
-        Error {error: ErrorEnum::IO(e), message: message}
+        Error {error: ErrorEnum::IO(e), message}
     }
 
     pub fn is_no_section(&self) -> bool { match self.error { ErrorEnum::Code(ErrorCode::NoSection) => true, _ => false, } }
@@ -63,6 +63,7 @@ impl Error {
     pub fn is_value_tree_placeholder(&self) -> bool { match self.error { ErrorEnum::Code(ErrorCode::ValueTreePlaceholder) => true, _ => false, } }
     pub fn is_too_long(&self) -> bool { match self.error { ErrorEnum::Code(ErrorCode::TooLong) => true, _ => false, } }
     pub fn is_io_not_found(&self) -> bool { match &self.error { ErrorEnum::IO(e) if e.kind() == io::ErrorKind::NotFound => true, _ => false, } }
+    pub fn is_io_permission_denied(&self) -> bool { match &self.error { ErrorEnum::IO(e) if e.kind() == io::ErrorKind::PermissionDenied => true, _ => false, } }
     pub fn is_not_calculated(&self) -> bool { match &self.error { ErrorEnum::Code(ErrorCode::NotCalculated) => true, _ => false, } }
 }
 

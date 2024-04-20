@@ -338,7 +338,8 @@ pub fn restore_terminal_mode() {
         }
         let s = TERMINAL_STATE_TO_RESTORE.get();
         assert!((*s).is_some());
-        let _ = write!(io::stdout(), "{}{}{}", termion::cursor::BlinkingBlock, termion::cursor::Show, ToMainScreen).unwrap_or(());
+        // (Why is "\n" needed here? Without it the original_stderr_fd in panic handler doesn't work for some reason - writing to the original stderr doesn't do anything until \n is printed to stdout, idk why.)
+        let _ = write!(io::stdout(), "{}{}{}\n", termion::cursor::BlinkingBlock, termion::cursor::Show, ToMainScreen).unwrap_or(());
         *s = None; // calls tcsetattr()
     }
 }

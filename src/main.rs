@@ -2,7 +2,7 @@
 #![allow(unused_variables)]
 #![allow(unused_imports)]
 use nnd::{*, elf::*, error::*, debugger::*, util::*, ui::*, log::*, process_info::*, symbols::*, symbols_registry::*, procfs::*, unwind::*, range_index::*, settings::*, context::*, executor::*, persistent::*};
-use std::{rc::Rc, mem, fs, os::fd::{AsRawFd}, io::Read, io, io::Write, panic, process, thread, thread::ThreadId, cell::UnsafeCell, ptr, pin::Pin, sync::Arc, str::FromStr};
+use std::{rc::Rc, mem, fs, os::fd::{FromRawFd}, io::Read, io, io::Write, panic, process, thread, thread::ThreadId, cell::UnsafeCell, ptr, pin::Pin, sync::Arc, str::FromStr};
 use libc::{self, STDIN_FILENO, pid_t};
 
 // Pipes written from corresponding signal handlers, read from main loop. We could use one pipe and write signal number to it, but it would break in the unlikely case when one signal fills up the whole pipe before the main loop drains it - then other signals would get lost. Probably not actually important.
@@ -24,7 +24,7 @@ fn drain_signal_pipe(fd: i32) {
     }
 }
 
-fn main() -> Result<()> {
+fn main() {
     std::env::set_var("RUST_BACKTRACE", "full"); // (short stack traces don't work with custom panic handlers for some reason - the __rust_begin_short_backtrace/__rust_end_short_backtrace are missing)
 
     let mut settings = Settings::default();
@@ -101,6 +101,7 @@ fn main() -> Result<()> {
     //  E.g. maybe some destructor anywhere in the code base inadvertently expects the struct to be in certain clean state -
     //  usually no one will ever notice that until it happens in practice. Or maybe some destructor does something unnecessary and slow,
     //  e.g. wait for background work to complete. In contrast, the panic handler is small and doesn't make many assumptions.)
+    let (log_file_path, original_stderr_fd) = (persistent.log_file_path.clone(), persistent.original_stderr_fd);
     unsafe {*MAIN_THREAD_ID.get() = Some(thread::current().id())}; // assign before spawning any threads
     {
         let default_hook = panic::take_hook();
@@ -123,10 +124,35 @@ fn main() -> Result<()> {
             // To minimize this, we put this at the end of the hook, importantly after the slow default hook.
             restore_terminal_mode();
 
+            // Print something to the console, otherwise it'll be left confusingly empty, like the debugger just quit silently (with nonzero exit code).
+            if let &Some(fd) = &original_stderr_fd {
+                let mut original_stderr = std::mem::ManuallyDrop::new(unsafe {std::fs::File::from_raw_fd(fd)});
+                let _ = writeln!(original_stderr, "panic! this usually indicates a bug, please report (to #debugger in slack, or to mk.al13n@gmail.com)");
+                if let Some(p) = &log_file_path {
+                    let _ = writeln!(original_stderr, "there should be an error message and stack trace at the end of {} - please include them in the report", p.display());
+                }
+                let _ = original_stderr.flush();
+            }
+
             process::exit(2); // this is redundant with panic='abort', but why not
         }));
     }
 
+    match run(settings, attach_pid, command_line, persistent) {
+        Ok(()) => (),
+        Err(e) => {
+            eprintln!("fatal: {}", e);
+            if let &Some(fd) = &original_stderr_fd {
+                let mut original_stderr = std::mem::ManuallyDrop::new(unsafe {std::fs::File::from_raw_fd(fd)});
+                let _ = writeln!(original_stderr, "error: {}", e);
+                let _ = original_stderr.flush();
+            }
+            process::exit(1);
+        }
+    }
+}
+
+fn run(settings: Settings, attach_pid: Option<pid_t>, command_line: Option<Vec<String>>, persistent: PersistentState) -> Result<()> {
     let num_threads = thread::available_parallelism().map_or(8, |n| n.get()).min(settings.max_threads).max(1);
     let context = Arc::new(Context {settings, executor: Executor::new(num_threads)});
 

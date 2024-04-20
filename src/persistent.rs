@@ -1,5 +1,5 @@
 use crate::{*, error::*, debugger::*, ui::*, util::*};
-use std::{fs, os::fd::{OwnedFd, AsRawFd, FromRawFd}, os::unix::ffi::OsStrExt, ffi::CString, io, io::{Read, Write}, path::{Path, PathBuf}, collections::hash_map::DefaultHasher, hash::{Hash, Hasher}};
+use std::{fs, os::fd::{OwnedFd, RawFd, AsRawFd, FromRawFd}, os::unix::ffi::OsStrExt, ffi::CString, io, io::{Read, Write}, path::{Path, PathBuf}, collections::hash_map::DefaultHasher, hash::{Hash, Hasher}};
 
 pub struct PersistentState {
     pub path: Result<PathBuf>,
@@ -8,6 +8,9 @@ pub struct PersistentState {
     
     state_hash: u64,
     save_failures: usize,
+
+    pub log_file_path: Option<PathBuf>,
+    pub original_stderr_fd: Option<RawFd>,
 }
 impl PersistentState {
     // Finds/creates a directory ~/.nnd/0, and flock()s ~/.nnd/0/lock to prevent other debugger processes from using this directory.
@@ -22,7 +25,7 @@ impl PersistentState {
     }
 
     pub fn empty() -> Self {
-        Self {path: err!(Internal, "state is empty"), dir: None, lock: None, state_hash: 0, save_failures: 0}
+        Self {path: err!(Internal, "state is empty"), dir: None, lock: None, state_hash: 0, save_failures: 0, log_file_path: None, original_stderr_fd: None}
     }
 
     pub fn open_or_create_file(&self, name: &str) -> fs::File {
@@ -48,9 +51,11 @@ impl PersistentState {
             loop {
                 let r = unsafe {libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)};
                 if r == 0 {
-                    let log = dir.open_or_create_file(Path::new("log"))?;
-                    redirect_stderr(&log)?;
-                    return Ok(Self {path: Ok(path), dir: Some(dir), lock: Some(lock), state_hash: 0, save_failures: 0});
+                    let log_file_name = "log";
+                    let log = dir.open_or_create_file(Path::new(log_file_name))?;
+                    let original_stderr_fd = redirect_stderr(&log)?;
+                    let log_file_path = Some(path.join(log_file_name));
+                    return Ok(Self {path: Ok(path), dir: Some(dir), lock: Some(lock), state_hash: 0, save_failures: 0, log_file_path, original_stderr_fd});
                 }
                 let e = io::Error::last_os_error();
                 match e.kind() {
@@ -64,8 +69,8 @@ impl PersistentState {
     }
 
     fn fallback_init(err: Error) -> Self {
-        redirect_stderr(&open_dev_null().unwrap()).unwrap();
-        Self {path: Err(err), dir: None, lock: None, state_hash: 0, save_failures: 0}
+        let original_stderr_fd = redirect_stderr(&open_dev_null().unwrap()).unwrap();
+        Self {path: Err(err), dir: None, lock: None, state_hash: 0, save_failures: 0, log_file_path: None, original_stderr_fd}
     }
 
     pub fn try_to_save_state_if_changed(debugger: &mut Debugger, ui: &mut UI) {
@@ -158,12 +163,16 @@ pub fn open_dev_null() -> Result<fs::File> {
     Ok(unsafe {fs::File::from_raw_fd(fd)})
 }
 
-fn redirect_stderr(file: &fs::File) -> Result<()> {
+fn redirect_stderr(file: &fs::File) -> Result<Option<RawFd>> {
+    let original_stderr_fd = match unsafe {libc::dup(2)} {
+        -1 => None,
+        x => Some(x),
+    };
     let r = unsafe {libc::dup2(file.as_raw_fd(), 2)};
     if r < 0 {
         return errno_err!("failed to redirect stderr");
     }
-    Ok(())
+    Ok(original_stderr_fd)
 }
 
 struct DirFd {
