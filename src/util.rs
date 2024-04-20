@@ -24,7 +24,7 @@ pub fn tgkill(pid: pid_t, tid: pid_t, sig: i32) -> Result<i32> {
     Ok(ret)
 }
 
-pub unsafe fn ptrace(request: u32, pid: pid_t, addr: u64, data: u64, prof: Option<&mut Profiling>) -> Result<i64> {
+pub unsafe fn ptrace(request: i32, pid: pid_t, addr: u64, data: u64, prof: Option<&mut Profiling>) -> Result<i64> {
     let timer = TscScope::new();
     (*libc::__errno_location()) = 0;
     let r = libc::ptrace(request, pid, addr, data);
@@ -33,7 +33,7 @@ pub unsafe fn ptrace(request: u32, pid: pid_t, addr: u64, data: u64, prof: Optio
         if (*libc::__errno_location()) != 0 {
             return errno_err!("ptrace({}) failed", request);
         }
-        assert!([libc::PTRACE_PEEKDATA, libc::PTRACE_PEEKSIGINFO, libc::PTRACE_PEEKSIGINFO_SHARED, libc::PTRACE_PEEKTEXT, libc::PTRACE_PEEKUSER].contains(&request));
+        assert!([libc::PTRACE_PEEKDATA, libc::PTRACE_PEEKSIGINFO, libc::PTRACE_PEEKTEXT, libc::PTRACE_PEEKUSER].contains(&request));
     }
     if let Some(p) = prof {
         p.syscall_count += 1;
@@ -275,9 +275,9 @@ pub fn cld_code_name(code: i32) -> &'static str {
     }
 }
 
-pub fn ptrace_request_name(c: u32) -> &'static str {
+pub fn ptrace_request_name(c: i32) -> &'static str {
     match c {
-        libc::PTRACE_TRACEME => "PTRACE_TRACEME", libc::PTRACE_PEEKTEXT => "PTRACE_PEEKTEXT", libc::PTRACE_PEEKDATA => "PTRACE_PEEKDATA", libc::PTRACE_PEEKUSER => "PTRACE_PEEKUSER", libc::PTRACE_POKETEXT => "PTRACE_POKETEXT", libc::PTRACE_POKEDATA => "PTRACE_POKEDATA", libc::PTRACE_POKEUSER => "PTRACE_POKEUSER", libc::PTRACE_CONT => "PTRACE_CONT", libc::PTRACE_KILL => "PTRACE_KILL", libc::PTRACE_SINGLESTEP => "PTRACE_SINGLESTEP", libc::PTRACE_GETREGS => "PTRACE_GETREGS", libc::PTRACE_SETREGS => "PTRACE_SETREGS", libc::PTRACE_GETFPREGS => "PTRACE_GETFPREGS", libc::PTRACE_SETFPREGS => "PTRACE_SETFPREGS", libc::PTRACE_ATTACH => "PTRACE_ATTACH", libc::PTRACE_DETACH => "PTRACE_DETACH", libc::PTRACE_GETFPXREGS => "PTRACE_GETFPXREGS", libc::PTRACE_SETFPXREGS => "PTRACE_SETFPXREGS", libc::PTRACE_SYSCALL => "PTRACE_SYSCALL", libc::PTRACE_SYSEMU => "PTRACE_SYSEMU", libc::PTRACE_SYSEMU_SINGLESTEP => "PTRACE_SYSEMU_SINGLESTEP", libc::PTRACE_SETOPTIONS => "PTRACE_SETOPTIONS", libc::PTRACE_GETEVENTMSG => "PTRACE_GETEVENTMSG", libc::PTRACE_GETSIGINFO => "PTRACE_GETSIGINFO", libc::PTRACE_SETSIGINFO => "PTRACE_SETSIGINFO", libc::PTRACE_GETREGSET => "PTRACE_GETREGSET", libc::PTRACE_SETREGSET => "PTRACE_SETREGSET", libc::PTRACE_SEIZE => "PTRACE_SEIZE", libc::PTRACE_INTERRUPT => "PTRACE_INTERRUPT", libc::PTRACE_LISTEN => "PTRACE_LISTEN", libc::PTRACE_PEEKSIGINFO => "PTRACE_PEEKSIGINFO", libc::PTRACE_GET_SYSCALL_INFO => "PTRACE_GET_SYSCALL_INFO", libc::PTRACE_GET_RSEQ_CONFIGURATION => "PTRACE_GET_RSEQ_CONFIGURATION",
+        libc::PTRACE_TRACEME => "PTRACE_TRACEME", libc::PTRACE_PEEKTEXT => "PTRACE_PEEKTEXT", libc::PTRACE_PEEKDATA => "PTRACE_PEEKDATA", libc::PTRACE_PEEKUSER => "PTRACE_PEEKUSER", libc::PTRACE_POKETEXT => "PTRACE_POKETEXT", libc::PTRACE_POKEDATA => "PTRACE_POKEDATA", libc::PTRACE_POKEUSER => "PTRACE_POKEUSER", libc::PTRACE_CONT => "PTRACE_CONT", libc::PTRACE_KILL => "PTRACE_KILL", libc::PTRACE_SINGLESTEP => "PTRACE_SINGLESTEP", libc::PTRACE_GETREGS => "PTRACE_GETREGS", libc::PTRACE_SETREGS => "PTRACE_SETREGS", libc::PTRACE_GETFPREGS => "PTRACE_GETFPREGS", libc::PTRACE_SETFPREGS => "PTRACE_SETFPREGS", libc::PTRACE_ATTACH => "PTRACE_ATTACH", libc::PTRACE_DETACH => "PTRACE_DETACH", libc::PTRACE_GETFPXREGS => "PTRACE_GETFPXREGS", libc::PTRACE_SETFPXREGS => "PTRACE_SETFPXREGS", libc::PTRACE_SYSCALL => "PTRACE_SYSCALL", libc::PTRACE_SYSEMU => "PTRACE_SYSEMU", libc::PTRACE_SYSEMU_SINGLESTEP => "PTRACE_SYSEMU_SINGLESTEP", libc::PTRACE_SETOPTIONS => "PTRACE_SETOPTIONS", libc::PTRACE_GETEVENTMSG => "PTRACE_GETEVENTMSG", libc::PTRACE_GETSIGINFO => "PTRACE_GETSIGINFO", libc::PTRACE_SETSIGINFO => "PTRACE_SETSIGINFO", libc::PTRACE_GETREGSET => "PTRACE_GETREGSET", libc::PTRACE_SETREGSET => "PTRACE_SETREGSET", libc::PTRACE_SEIZE => "PTRACE_SEIZE", libc::PTRACE_INTERRUPT => "PTRACE_INTERRUPT", libc::PTRACE_LISTEN => "PTRACE_LISTEN", libc::PTRACE_PEEKSIGINFO => "PTRACE_PEEKSIGINFO", /*libc::PTRACE_GET_SYSCALL_INFO => "PTRACE_GET_SYSCALL_INFO", libc::PTRACE_GET_RSEQ_CONFIGURATION => "PTRACE_GET_RSEQ_CONFIGURATION",*/
         _ => "[unknown request]",
     }
 }

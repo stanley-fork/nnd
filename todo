@@ -1,6 +1,9 @@
-investigate rendering issue on mac (ssh-d to linux)
-add --help
-avoid using C-a because it's used by tmux by default
+fix things from slack:
+  rendering issue on mac (ssh-d to linux)
+  add --help
+  key remapping
+  color palette with Rgb for everything (including default bg), maybe configurable
+  print something to console on error or panic, custom message for missing sudo
 fix picking up updated binary unnecessarily
 fix float/float=int in expressions
 parallelize function search
