@@ -261,7 +261,6 @@ impl Layout {
     }
 
     pub fn switch_to_adjacent_window(&mut self, dx: isize, dy: isize) {
-
         if !self.activate_any_visible_window_if_none_active() {
             return;
         }
@@ -278,6 +277,10 @@ impl Layout {
         if let Some(id) = self.window_at_point(point) {
             self.active_window = Some(id);
         }
+    }
+
+    pub fn switch_to_numbered_window(&mut self, idx: usize) {
+        //asdqwe
     }
 
     pub fn switch_tab_in_active_window(&mut self, delta: isize) {

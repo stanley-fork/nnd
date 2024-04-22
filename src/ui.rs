@@ -242,56 +242,56 @@ impl UI {
 
         let mut remaining_keys: Vec<Key> = Vec::new();
         let mut additional_keys_for_window: HashMap<WindowType, Vec<Key>> = HashMap::new();
-        let mut deferred_step_keys: Vec<char> = Vec::new();
+        let mut deferred_step_keys: Vec<KeyAction> = Vec::new();
         for key in keys {
-            match key {
-                Key::Char('q') => return Ok(UIUpdateResult {quit: true, ..Default::default()}),
-
-                Key::Char('r') => {
+            match debugger.context.settings.keys.map.get(&key) {
+                Some(KeyAction::Quit) => return Ok(UIUpdateResult {quit: true, ..Default::default()}),
+                Some(KeyAction::Run) => {
                     let r = debugger.start_child();
                     report_result(&mut self.state, &r);
                 }
-                Key::Char('c') => {
+                Some(KeyAction::Continue) => {
                     let r = debugger.resume();
                     report_result(&mut self.state, &r);
                 }
-                Key::Ctrl('c') => {
+                Some(KeyAction::Suspend) => {
                     let r = debugger.suspend();
                     report_result(&mut self.state, &r);
                 }
-                Key::Char('k') => {
+                Some(KeyAction::Kill) => {
                     let r = debugger.murder();
                     report_result(&mut self.state, &r);
                 }
-                Key::Char(x) if ['s', 'S', 'n', 'N', 'f', 'F', 'm'].contains(&x) => {
+                Some(x) if [KeyAction::StepIntoLine, KeyAction::StepIntoInstruction, KeyAction::StepOverLine, KeyAction::StepOverColumn, KeyAction::StepOverInstruction, KeyAction::StepOut, KeyAction::StepOutNoInline].contains(x) => {
                     // Initiate step later, after StackWindow updates selected_subframe.
                     // Otherwise rapid repeated step-over can effectively step-into instead of -over because selected_subframe is 0 and not assigned yet.
                     // This is kind of a hack, maybe there's a better way to think about input handling in general (separate update from render again?),
                     // but this is working fine for now.
-                    deferred_step_keys.push(x);
+                    deferred_step_keys.push(*x);
                 }
 
-                Key::Ctrl('l') => {
+                Some(KeyAction::DropCaches) => {
                     self.terminal.clear()?;
                     res.drop_caches = true;
                 }
 
-                Key::Ctrl('a') => self.layout.switch_to_adjacent_window(-1, 0),
-                Key::Ctrl('w') => self.layout.switch_to_adjacent_window(0, -1),
-                Key::Ctrl('s') => self.layout.switch_to_adjacent_window(0, 1),
-                Key::Ctrl('d') => self.layout.switch_to_adjacent_window(1, 0),
+                Some(KeyAction::WindowLeft) => self.layout.switch_to_adjacent_window(-1, 0),
+                Some(KeyAction::WindowUp) => self.layout.switch_to_adjacent_window(0, -1),
+                Some(KeyAction::WindowDown) => self.layout.switch_to_adjacent_window(0, 1),
+                Some(KeyAction::WindowRight) => self.layout.switch_to_adjacent_window(1, 0),
+                Some(KeyAction::Window(idx)) => self.layout.switch_to_numbered_window(*idx),
 
-                Key::Ctrl('t') => self.layout.switch_tab_in_active_window(1),
-                Key::Ctrl('b') => self.layout.switch_tab_in_active_window(-1),
+                Some(KeyAction::NextTab) => self.layout.switch_tab_in_active_window(1),
+                Some(KeyAction::PreviousTab) => self.layout.switch_tab_in_active_window(-1),
 
-                Key::Char('[') => additional_keys_for_window.entry(WindowType::Stack).or_default().push(Key::Up),
-                Key::Char(']') => additional_keys_for_window.entry(WindowType::Stack).or_default().push(Key::Down),
-                Key::Char('{') => additional_keys_for_window.entry(WindowType::Threads).or_default().push(Key::Up),
-                Key::Char('}') => additional_keys_for_window.entry(WindowType::Threads).or_default().push(Key::Down),
+                Some(KeyAction::PreviousStackFrame) => additional_keys_for_window.entry(WindowType::Stack).or_default().push(Key::Up),
+                Some(KeyAction::NextStackFrame) => additional_keys_for_window.entry(WindowType::Stack).or_default().push(Key::Down),
+                Some(KeyAction::PreviousThread) => additional_keys_for_window.entry(WindowType::Threads).or_default().push(Key::Up),
+                Some(KeyAction::NextThread) => additional_keys_for_window.entry(WindowType::Threads).or_default().push(Key::Down),
 
-                Key::Ctrl('p') => self.state.profiler_enabled ^= true,
+                Some(KeyAction::ToggleProfiler) => self.state.profiler_enabled ^= true,
 
-                key => remaining_keys.push(key),
+                _ => remaining_keys.push(key),
             }
         }
 
@@ -373,13 +373,14 @@ impl UI {
         debugger.log.prof.terminal_tsc += terminal_prof.finish();
 
         for x in deferred_step_keys {
-            let by_instructions = !x.is_lowercase();
-            let mut use_line_number_with_column = false;
-            let kind = match x.to_ascii_lowercase() {
-                's' => StepKind::Into,
-                'n' => StepKind::Over,
-                'f' => StepKind::Out,
-                'm' => {use_line_number_with_column = true; StepKind::Over}
+            let (kind, by_instructions, use_line_number_with_column) = match x {
+                KeyAction::StepIntoLine => (StepKind::Into, false, false),
+                KeyAction::StepIntoInstruction => (StepKind::Into, true, false),
+                KeyAction::StepOverLine => (StepKind::Over, false, false),
+                KeyAction::StepOverColumn => (StepKind::Over, false, true),
+                KeyAction::StepOverInstruction => (StepKind::Over, true, false),
+                KeyAction::StepOut => (StepKind::Out, false, false),
+                KeyAction::StepOutNoInline => (StepKind::Out, true, false),
                 _ => panic!("huh"),
             };
             let r = debugger.step(self.state.selected_thread, self.state.selected_subframe, kind, by_instructions, use_line_number_with_column);

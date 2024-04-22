@@ -1,9 +1,11 @@
 fix things from slack:
-  rendering issue on mac (ssh-d to linux)
-  add --help
-  key remapping
+  key remapping, maybe change default mapping to avoid C-a (or provide alternative)
   color palette with Rgb for everything (including default bg), maybe configurable
-  print something to console on error or panic, custom message for missing sudo
+  add --help, move doc.txt into sections of it: --help-features, --help-watches, --help-tty
+  rendering issue on mac (ssh-d to linux)
+switching to window by number, show numbers in titles
+-v for build datetime and maybe bug reporting channel name
+parse flags better: accept both --flag=value and --flag value
 fix picking up updated binary unnecessarily
 fix float/float=int in expressions
 parallelize function search
