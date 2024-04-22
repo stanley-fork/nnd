@@ -5,6 +5,7 @@ fix things from slack:
   rendering issue on mac (ssh-d to linux)
 switching to window by number, show numbers in titles
 -v for build datetime and maybe bug reporting channel name
+-c to continue on startup
 parse flags better: accept both --flag=value and --flag value
 fix picking up updated binary unnecessarily
 fix float/float=int in expressions

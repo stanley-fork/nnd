@@ -1,4 +1,4 @@
-use crate::{*, error::{*, Result, Error}, util::*, registers::*, types::*, procfs::*, symbols_registry::*, process_info::*, unwind::*, symbols::*, arena::*, pretty::*};
+use crate::{*, error::{*, Result, Error}, util::*, registers::*, types::*, procfs::*, symbols_registry::*, process_info::*, unwind::*, symbols::*, arena::*, pretty::*, settings::*};
 use std::{fmt, fmt::Write, mem, collections::{HashMap, HashSet}, io::Write as ioWrite};
 use tui::{style::{Style, Modifier, Color}};
 use gimli::{Operation, EndianSlice, LittleEndian, Expression, Encoding, EvaluationResult, ValueType, DieReference, DW_AT_location, Location, DebugInfoOffset};
@@ -470,8 +470,8 @@ pub struct Value {
 
 // Appends to out.chars. Doesn't close the line, the caller should do it after the call.
 // If expanded is true, the returned Vec is populated, and field names and array elements are not included in `out`.
-pub fn format_value(v: &Value, expanded: bool, state: &mut EvalState, context: &EvalContext, arena: &mut Arena, out: &mut StyledText) -> (/*has_children*/ bool, /*children*/ Vec<(/*name*/ &'static str, /*child_id*/ usize, Result<Value>)>) {
-    format_value_recurse(v, expanded, state, context, arena, out, (out.lines.len(), out.chars.len()), false)
+pub fn format_value(v: &Value, expanded: bool, state: &mut EvalState, context: &EvalContext, arena: &mut Arena, out: &mut StyledText, palette: &Palette) -> (/*has_children*/ bool, /*children*/ Vec<(/*name*/ &'static str, /*child_id*/ usize, Result<Value>)>) {
+    format_value_recurse(v, expanded, state, context, arena, out, palette, (out.lines.len(), out.chars.len()), false)
 }
 
 fn over_output_limit(out: &StyledText, text_start: (/*lines*/ usize, /*chars*/ usize)) -> bool {
@@ -479,15 +479,15 @@ fn over_output_limit(out: &StyledText, text_start: (/*lines*/ usize, /*chars*/ u
     out.chars.len() - text_start.1 > 100000 || out.lines.len() - text_start.0 > 1000 || (out.lines.len() == text_start.0 && out.chars.len() - text_start.1 > 1000)
 }
 
-pub fn format_value_recurse(v: &Value, expanded: bool, state: &mut EvalState, context: &EvalContext, arena: &mut Arena, out: &mut StyledText, text_start: (/*lines*/ usize, /*chars*/ usize), address_already_shown: bool) -> (/*has_children*/ bool, /*children*/ Vec<(/*name*/ &'static str, /*child_id*/ usize, Result<Value>)>) {
+pub fn format_value_recurse(v: &Value, expanded: bool, state: &mut EvalState, context: &EvalContext, arena: &mut Arena, out: &mut StyledText, palette: &Palette, text_start: (/*lines*/ usize, /*chars*/ usize), address_already_shown: bool) -> (/*has_children*/ bool, /*children*/ Vec<(/*name*/ &'static str, /*child_id*/ usize, Result<Value>)>) {
     // Output length limit. Also acts as recursion depth limit.
     if over_output_limit(out, text_start) {
-        styled_write!(out, Style::default().fg(Color::Yellow), "…");
+        styled_write!(out, palette.value_warning, "…");
         return (false, Vec::new());
     }
 
     let write_address = |addr: usize, out: &mut StyledText| {
-        styled_write!(out, Style::default(), "&0x{:x} ", addr);
+        styled_write!(out, palette.value_misc, "&0x{:x} ", addr);
     };
     let write_val_address_if_needed = |v: &AddrOrValueBlob, out: &mut StyledText| {
         if let AddrOrValueBlob::Addr(a) = v {
@@ -520,13 +520,13 @@ pub fn format_value_recurse(v: &Value, expanded: bool, state: &mut EvalState, co
         prettified_value = match prettify_value(v, state, context) {
             Ok((x, warning)) => {
                 if let Some(w) = warning {
-                    styled_write!(out, Style::default().fg(Color::Red), "<{}> ", w);
+                    styled_write!(out, palette.value_error, "<{}> ", w);
                 }
                 x
             }
             Err(e) => {
                 write_val_address_if_needed(&v.val, out);
-                styled_write!(out, Style::default().fg(Color::Red), "<{}>", e);
+                styled_write!(out, palette.value_error, "<{}>", e);
                 return (false, Vec::new());
             }
         };
@@ -544,7 +544,7 @@ pub fn format_value_recurse(v: &Value, expanded: bool, state: &mut EvalState, co
         Ok(v) => v,
         Err(e) => {
             write_val_address_if_needed(&v.val, out);
-            styled_write!(out, Style::default().fg(Color::Red), "<{}>", e);
+            styled_write!(out, palette.value_error, "<{}>", e);
             return (false, children);
         }
     };
@@ -552,35 +552,35 @@ pub fn format_value_recurse(v: &Value, expanded: bool, state: &mut EvalState, co
     match &t.t {
         Type::Unknown => {
             write_val_address_if_needed(&v.val, out);
-            styled_write!(out, Style::default(), "0x{:x} ", value.get_usize_prefix());
-            styled_write!(out, Style::default().fg(Color::Red), "<unknown type>");
+            styled_write!(out, palette.value_misc, "0x{:x} ", value.get_usize_prefix());
+            styled_write!(out, palette.value_error, "<unknown type>");
         }
         Type::Primitive(p) => match value.get_usize() {
-            Ok(_) if size == 0 => styled_write!(out, Style::default(), "()"), // covers things like void, decltype(nullptr), rust empty tuple, rust `!` type
+            Ok(_) if size == 0 => styled_write!(out, palette.value_misc, "()"), // covers things like void, decltype(nullptr), rust empty tuple, rust `!` type
             Ok(mut x) if size <= 8 => {
                 let as_number = v.flags.intersects(ValueFlags::RAW | ValueFlags::HEX | ValueFlags::BIN);
                 if p.contains(PrimitiveFlags::FLOAT) {
                     match size {
-                        4 => styled_write!(out, Style::default(), "{}", unsafe {mem::transmute::<u32, f32>(x as u32)}),
-                        8 => styled_write!(out, Style::default(), "{}", unsafe {mem::transmute::<usize, f64>(x)}),
-                        _ => styled_write!(out, Style::default().fg(Color::Red), "<bad size: {}>", size),
+                        4 => styled_write!(out, palette.value, "{}", unsafe {mem::transmute::<u32, f32>(x as u32)}),
+                        8 => styled_write!(out, palette.value, "{}", unsafe {mem::transmute::<usize, f64>(x)}),
+                        _ => styled_write!(out, palette.value_error, "<bad size: {}>", size),
                     }
                 } else if p.contains(PrimitiveFlags::UNSPECIFIED) {
                     write_val_address_if_needed(&v.val, out);
-                    styled_write!(out, Style::default(), "<unspecified type> 0x{:x}", x);
+                    styled_write!(out, palette.value_misc, "<unspecified type> 0x{:x}", x);
                 } else if p.contains(PrimitiveFlags::CHAR) && !as_number {
                     if size > 4 {
-                        styled_write!(out, Style::default().fg(Color::Red), "<bad char size: {}>", size);
+                        styled_write!(out, palette.value_error, "<bad char size: {}>", size);
                     } else if let Some(c) = char::from_u32(x as u32) {
-                        styled_write!(out, Style::default(), "{} '{}'", c as u32, c);
+                        styled_write!(out, palette.value, "{} '{}'", c as u32, c);
                     } else {
-                        styled_write!(out, Style::default().fg(Color::Red), "<bad char: {}>", x);
+                        styled_write!(out, palette.value_error, "<bad char: {}>", x);
                     }
                 } else if p.contains(PrimitiveFlags::BOOL) && !as_number {
                     match x {
-                        0 => styled_write!(out, Style::default(), "false"),
-                        1 => styled_write!(out, Style::default(), "true"),
-                        _ => styled_write!(out, Style::default().fg(Color::Yellow), "{}", x),
+                        0 => styled_write!(out, palette.value, "false"),
+                        1 => styled_write!(out, palette.value, "true"),
+                        _ => styled_write!(out, palette.value_warning, "{}", x),
                     }
                 } else {
                     // Sign-extend.
@@ -588,31 +588,31 @@ pub fn format_value_recurse(v: &Value, expanded: bool, state: &mut EvalState, co
                     if signed && size < 8 && x & 1 << (size*8-1) as u32 != 0 {
                         x |= !((1usize << size*8)-1);
                     }
-                    format_integer(x, size, signed, v.flags, out);
+                    format_integer(x, size, signed, v.flags, out, palette);
                 }
             }
-            Ok(_) => styled_write!(out, Style::default().fg(Color::Red), "<bad size: {}>", size),
-            Err(e) => styled_write!(out, Style::default().fg(Color::Red), "<{}>", e),
+            Ok(_) => styled_write!(out, palette.value_error, "<bad size: {}>", size),
+            Err(e) => styled_write!(out, palette.value_error, "<{}>", e),
         }
         Type::Pointer(p) => match value.get_usize() {
             Ok(x) => if p.flags.contains(PointerFlags::REFERENCE) {
                 write_address(x, out);
-                return format_value_recurse(&Value {val: AddrOrValueBlob::Addr(x), type_: p.type_, flags: v.flags.inherit()}, expanded, state, context, arena, out, text_start, true);
+                return format_value_recurse(&Value {val: AddrOrValueBlob::Addr(x), type_: p.type_, flags: v.flags.inherit()}, expanded, state, context, arena, out, palette, text_start, true);
             } else {
-                styled_write!(out, Style::default(), "*0x{:x} ", x);
+                styled_write!(out, palette.value, "*0x{:x} ", x);
                 if x == 0 {
                     return (false, children);
                 }
                 if !expanded {
                     return (true, children);
                 }
-                if !try_format_as_string(Some(x), None, p.type_, None, false, v.flags, context.memory, "", out) {
+                if !try_format_as_string(Some(x), None, p.type_, None, false, v.flags, context.memory, "", out, palette) {
                     // If expanded, act like a reference, i.e. expand the pointee.
-                    (_, children) = format_value_recurse(&Value {val: AddrOrValueBlob::Addr(x), type_: p.type_, flags: v.flags.inherit()}, true, state, context, arena, out, text_start, true);
+                    (_, children) = format_value_recurse(&Value {val: AddrOrValueBlob::Addr(x), type_: p.type_, flags: v.flags.inherit()}, true, state, context, arena, out, palette, text_start, true);
                 }
                 return (true, children);
             }
-            Err(e) => styled_write!(out, Style::default().fg(Color::Red), "<{}>", e),
+            Err(e) => styled_write!(out, palette.value_error, "<{}>", e),
         }
         Type::Array(a) => {
             // TODO: Print as string if element is char. Hexdump (0x"1a74673bc67f") if element is 1-byte and HEX value flag is set.
@@ -649,38 +649,38 @@ pub fn format_value_recurse(v: &Value, expanded: bool, state: &mut EvalState, co
                     }
                 }
                 if a.flags.contains(ArrayFlags::LEN_KNOWN) {
-                    styled_write!(out, Style::default().add_modifier(Modifier::DIM), "length ");
-                    styled_write!(out, Style::default(), "{}", len);
+                    styled_write!(out, palette.value_misc_dim, "length ");
+                    styled_write!(out, palette.value_misc, "{}", len);
                 } else {
-                    styled_write!(out, Style::default(), "length unknown");
+                    styled_write!(out, palette.value_misc, "length unknown");
                 }
-                try_format_as_string(v.val.addr(), Some(&value), a.type_, if a.flags.contains(ArrayFlags::LEN_KNOWN) {Some(len)} else {None}, a.flags.contains(ArrayFlags::UTF_STRING), v.flags, context.memory, ", ", out);
+                try_format_as_string(v.val.addr(), Some(&value), a.type_, if a.flags.contains(ArrayFlags::LEN_KNOWN) {Some(len)} else {None}, a.flags.contains(ArrayFlags::UTF_STRING), v.flags, context.memory, ", ", out, palette);
             } else {
-                if !try_format_as_string(v.val.addr(), Some(&value), a.type_, if a.flags.contains(ArrayFlags::LEN_KNOWN) {Some(len)} else {None}, a.flags.contains(ArrayFlags::UTF_STRING), v.flags, context.memory, "", out) {
-                    styled_write!(out, Style::default().add_modifier(Modifier::DIM), "[");
+                if !try_format_as_string(v.val.addr(), Some(&value), a.type_, if a.flags.contains(ArrayFlags::LEN_KNOWN) {Some(len)} else {None}, a.flags.contains(ArrayFlags::UTF_STRING), v.flags, context.memory, "", out, palette) {
+                    styled_write!(out, palette.value_misc_dim, "[");
                     for i in 0..len {
                         if i != 0 {
-                            styled_write!(out, Style::default().add_modifier(Modifier::DIM), ", ");
+                            styled_write!(out, palette.value_misc_dim, ", ");
                         }
                         if over_output_limit(out, text_start) {
-                            styled_write!(out, Style::default(), "…");
+                            styled_write!(out, palette.value_warning, "…");
                             break;
                         }
                         match get_val(i) {
                             Ok(v) => {
-                                format_value_recurse(&v, false, state, context, arena, out, text_start, false);
+                                format_value_recurse(&v, false, state, context, arena, out, palette, text_start, false);
                             }
-                            Err(e) if e.is_too_long() => styled_write!(out, Style::default(), "…"),
+                            Err(e) if e.is_too_long() => styled_write!(out, palette.value_warning, "…"),
                             Err(e) => {
-                                styled_write!(out, Style::default().fg(Color::Red), "<{}>", e);
+                                styled_write!(out, palette.value_error, "<{}>", e);
                                 break;
                             }
                         }
                     }
                     if !a.flags.contains(ArrayFlags::LEN_KNOWN) {
-                        styled_write!(out, Style::default().add_modifier(Modifier::DIM), ", <length unknown>");
+                        styled_write!(out, palette.value_misc_dim, ", <length unknown>");
                     }
-                    styled_write!(out, Style::default().add_modifier(Modifier::DIM), "]");
+                    styled_write!(out, palette.value_misc_dim, "]");
                 }
                 return (len != 0, children);
             }
@@ -696,34 +696,34 @@ pub fn format_value_recurse(v: &Value, expanded: bool, state: &mut EvalState, co
             if v.flags.contains(ValueFlags::SHOW_TYPE_NAME) || (expanded && (!t.name.is_empty() || t.die.0 != 0)) {
                 if t.name.is_empty() {
                     // TODO: Print file+line instead of DIE offset.
-                    styled_write!(out, Style::default(), "<{} @{:x}> ", t.t.kind_name(), t.die.0);
+                    styled_write!(out, palette.type_name, "<{} @{:x}> ", t.t.kind_name(), t.die.0);
                 } else {
-                    styled_write!(out, Style::default(), "{} ", t.name);
+                    styled_write!(out, palette.type_name, "{} ", t.name);
                 }
             }
             if !expanded {
-                styled_write!(out, Style::default().add_modifier(Modifier::DIM), "{{");
+                styled_write!(out, palette.value_misc_dim, "{{");
                 for (idx, (name, _, value)) in children.iter().enumerate() {
                     if idx != 0 {
-                        styled_write!(out, Style::default().add_modifier(Modifier::DIM), ", ");
+                        styled_write!(out, palette.value_misc_dim, ", ");
                     }
 
-                    let style = if name.starts_with('#') {Style::default().add_modifier(Modifier::DIM)} else {Style::default().fg(Color::Green)};
+                    let style = if name.starts_with('#') {palette.value_misc_dim} else {palette.value_field_name};
                     styled_write!(out, style, "{}", name);
-                    styled_write!(out, Style::default().add_modifier(Modifier::DIM), ": ");
+                    styled_write!(out, palette.value_misc_dim, ": ");
 
                     match value {
                         Ok(v) => {
-                            format_value_recurse(v, false, state, context, arena, out, text_start, false);
+                            format_value_recurse(v, false, state, context, arena, out, palette, text_start, false);
                         }
-                        Err(e) => styled_write!(out, Style::default().bg(Color::Red).fg(Color::Black), "<{}>", e),
+                        Err(e) => styled_write!(out, palette.value_error, "<{}>", e),
                     }
                 }
                 if children.is_empty() && t.flags.contains(TypeFlags::DECLARATION) {
                     // This can happen e.g. if the file with definition was compiled without debug symbols.
-                    styled_write!(out, Style::default().fg(Color::Red), "<missing type definition>");
+                    styled_write!(out, palette.value_error, "<missing type definition>");
                 }
-                styled_write!(out, Style::default().add_modifier(Modifier::DIM), "}}");
+                styled_write!(out, palette.value_misc_dim, "}}");
             }
         }
         Type::Enum(e) => match value.get_usize() {
@@ -740,27 +740,27 @@ pub fn format_value_recurse(v: &Value, expanded: bool, state: &mut EvalState, co
                 if signed && size < 8 && x & 1 << (size*8-1) as u32 != 0 {
                     x |= !((1usize << size*8)-1);
                 }
-                format_integer(x, size, signed, v.flags, out);
+                format_integer(x, size, signed, v.flags, out, palette);
                 if !v.flags.intersects(ValueFlags::RAW | ValueFlags::HEX | ValueFlags::BIN) {
-                    styled_write!(out, Style::default(), " (");
+                    styled_write!(out, palette.value_misc_dim, " (");
                     let mut found = false;
                     for enumerand in e.enumerands {
                         if enumerand.value == x && !enumerand.name.is_empty() {
-                            styled_write!(out, Style::default().fg(Color::Green), "{}", enumerand.name);
+                            styled_write!(out, palette.value_field_name, "{}", enumerand.name);
                             found = true;
                             break;
                         }
                     }
                     if !found {
-                        styled_write!(out, Style::default().fg(Color::Red), "?");
+                        styled_write!(out, palette.value_error, "?");
                     }
-                    styled_write!(out, Style::default(), ")");
+                    styled_write!(out, palette.value_misc_dim, ")");
                 }
             }
-            Err(e) => styled_write!(out, Style::default().fg(Color::Red), "<{}>", e),
+            Err(e) => styled_write!(out, palette.value_error, "<{}>", e),
         }
         Type::MetaType | Type::MetaField => {
-            let val = reflect_meta_value(v, state, context, Some(out));
+            let val = reflect_meta_value(v, state, context, Some((out, palette)));
             children = list_struct_children(&val.val, unsafe {(*val.type_).t.as_struct().unwrap()}, val.flags, state, context);
         }
     }
@@ -768,25 +768,25 @@ pub fn format_value_recurse(v: &Value, expanded: bool, state: &mut EvalState, co
 }
 
 // x0 must be already sign-extended to 8 bytes if signed.
-fn format_integer(x0: usize, size: usize, signed: bool, flags: ValueFlags, out: &mut StyledText) {
+fn format_integer(x0: usize, size: usize, signed: bool, flags: ValueFlags, out: &mut StyledText, palette: &Palette) {
     assert!(size > 0 && size <= 8);
     let mut x = x0;
     if size < 8 {
         x &= (1 << (size*8) as usize) - 1;
     }
     if flags.contains(ValueFlags::HEX) {
-        styled_write!(out, Style::default(), "0x{:x}", x);
+        styled_write!(out, palette.value, "0x{:x}", x);
     } else if flags.contains(ValueFlags::BIN) {
-        styled_write!(out, Style::default(), "0b{:b}", x);
+        styled_write!(out, palette.value, "0b{:b}", x);
     } else if !signed {
-        styled_write!(out, Style::default(), "{}", x);
+        styled_write!(out, palette.value, "{}", x);
     } else {
         let x: isize = unsafe {mem::transmute(x0)};
-        styled_write!(out, Style::default(), "{}", x);
+        styled_write!(out, palette.value, "{}", x);
     }
 }
 
-fn try_format_as_string(addr: Option<usize>, preread_blob: Option<&ValueBlob>, element_type: *const TypeInfo, len: Option<usize>, marked_as_string: bool, flags: ValueFlags, memory: &MemReader, prefix: &str, out: &mut StyledText) -> bool {
+fn try_format_as_string(addr: Option<usize>, preread_blob: Option<&ValueBlob>, element_type: *const TypeInfo, len: Option<usize>, marked_as_string: bool, flags: ValueFlags, memory: &MemReader, prefix: &str, out: &mut StyledText, palette: &Palette) -> bool {
     if flags.contains(ValueFlags::RAW) {
         return false;
     }
@@ -816,7 +816,7 @@ fn try_format_as_string(addr: Option<usize>, preread_blob: Option<&ValueBlob>, e
                 match memory.read(addr.unwrap(), &mut temp_storage) {
                     Ok(()) => (),
                     Err(e) => {
-                        styled_write!(out, Style::default().fg(Color::Red), "<{}>", e);
+                        styled_write!(out, palette.value_error, "<{}>", e);
                         return true;
                     }
                 }
@@ -840,8 +840,8 @@ fn try_format_as_string(addr: Option<usize>, preread_blob: Option<&ValueBlob>, e
                 match memory.read(addr, &mut res[start..]) {
                     Ok(()) => (),
                     Err(e) => {
-                        styled_write!(out, Style::default().add_modifier(Modifier::DIM), "{}", prefix);
-                        styled_write!(out, Style::default().fg(Color::Red), "bad C string: <{}>", e);
+                        styled_write!(out, palette.value_misc_dim, "{}", prefix);
+                        styled_write!(out, palette.value_error, "bad C string: <{}>", e);
                         return true;
                     }
                 }
@@ -860,17 +860,17 @@ fn try_format_as_string(addr: Option<usize>, preread_blob: Option<&ValueBlob>, e
         }
     };
     let slice = &slice[..slice.len().min(len).min(limit)];
-    styled_write!(out, Style::default().add_modifier(Modifier::DIM), "{}", prefix);
+    styled_write!(out, palette.value_misc_dim, "{}", prefix);
     if flags.contains(ValueFlags::HEX) {
-        styled_write!(out, Style::default().add_modifier(Modifier::DIM), "0x\"");
+        styled_write!(out, palette.value_misc_dim, "0x\"");
         for x in slice {
             write!(out.chars, "{:02x}", x).unwrap();
         }
-        out.close_span(Style::default());
+        out.close_span(palette.value);
     } else {
-        styled_write!(out, Style::default().add_modifier(Modifier::DIM), "\"");
+        styled_write!(out, palette.value_misc_dim, "\"");
         if let Ok(s) = std::str::from_utf8(slice) {
-            styled_write!(out, Style::default(), "{}", s);
+            styled_write!(out, palette.value, "{}", s);
         } else {
             for &x in slice {
                 if x >= 32 && x <= 126 {
@@ -879,14 +879,14 @@ fn try_format_as_string(addr: Option<usize>, preread_blob: Option<&ValueBlob>, e
                     write!(out.chars, "\\x{:02x}", x).unwrap();
                 }
             }
-            out.close_span(Style::default());
+            out.close_span(palette.value);
         }
     }
-    styled_write!(out, Style::default().add_modifier(Modifier::DIM), "\"");
+    styled_write!(out, palette.value_misc_dim, "\"");
     if !terminated {
-        styled_write!(out, Style::default(), "...");
+        styled_write!(out, palette.value_warning, "…");
     } else if slice.len() != len {
-        styled_write!(out, Style::default(), "... {} more bytes", len - slice.len());
+        styled_write!(out, palette.value_warning, "… {} more bytes", len - slice.len());
     }
     true
 }

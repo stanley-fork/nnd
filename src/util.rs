@@ -473,16 +473,6 @@ macro_rules! styled_write {
     );
 }
 
-// Append a span to Option<&mut StyledText> if it's Some. The Option must be mut.
-#[macro_export]
-macro_rules! styled_write_maybe {
-    ($out:expr, $style:expr, $($arg:tt)*) => (
-        if let Some(out) = &mut ($out) {
-            styled_write!(out, $style, $($arg)*);
-        }
-    );
-}
-
 #[repr(align(128))]
 pub struct CachePadded<T> {
     pub t: T,

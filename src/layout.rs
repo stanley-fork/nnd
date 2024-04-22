@@ -1,4 +1,4 @@
-use crate::{ui::*, widgets::*, pool::*};
+use crate::{ui::*, widgets::*, pool::*, settings::*};
 use tui::{self, widgets::{Block, Borders, Tabs, BorderType}, layout::{self, Constraint, Direction, Rect, Alignment}, style::{Style, Color, Modifier}, text::{Span, Spans, Text}};
 use std::{mem::take, collections::HashSet, hash::{Hash, Hasher}, ops::Range};
 
@@ -42,6 +42,7 @@ pub struct RegionSplit {
 pub struct RegionLeaf {
     pub tabs: Vec<WindowId>,
     pub active_tab: usize,
+    pub hotkey_number: Option<usize>,
 }
 
 pub enum RegionContent {
@@ -111,7 +112,7 @@ impl RegionSplit {
 impl Layout {
     pub fn new() -> Layout {
         let mut regions: Pool<Region> = Pool::new();
-        let root = regions.add(Region {parent: None, area: Rect::default(), rigid_size: None, content: RegionContent::Leaf(RegionLeaf {tabs: Vec::new(), active_tab: 0})}).0;
+        let root = regions.add(Region {parent: None, area: Rect::default(), rigid_size: None, content: RegionContent::Leaf(RegionLeaf {tabs: Vec::new(), active_tab: 0, hotkey_number: None})}).0;
         Layout {windows: Pool::new(), active_window: None, regions: regions, root: root}
     }
 
@@ -133,7 +134,7 @@ impl Layout {
 
         let mut children = vec![region_id];
         for i in 0..walls.len() {
-            children.push(self.regions.add(Region {parent: None, area: Rect::default(), rigid_size: None, content: RegionContent::Leaf(RegionLeaf {tabs: Vec::new(), active_tab: 0})}).0);
+            children.push(self.regions.add(Region {parent: None, area: Rect::default(), rigid_size: None, content: RegionContent::Leaf(RegionLeaf {tabs: Vec::new(), active_tab: 0, hotkey_number: None})}).0);
         }
 
         let new_region = self.regions.add(Region {parent: parent.clone(), area: Rect::default(), rigid_size: None, content: RegionContent::Split(RegionSplit {direction: direction, walls: walls, children: children.clone()})}).0;
@@ -158,6 +159,10 @@ impl Layout {
 
     pub fn rigidify(&mut self, region_id: RegionId, size: usize) {
         self.regions.get_mut(region_id).rigid_size = Some(size);
+    }
+
+    pub fn set_hotkey_number(&mut self, region_id: RegionId, number: usize) {
+        self.regions.get_mut(region_id).content.as_leaf_mut().hotkey_number = Some(number);
     }
 
     // Collapses splits that have only one child. Collapses nested splits with the same direction.
@@ -279,8 +284,16 @@ impl Layout {
         }
     }
 
-    pub fn switch_to_numbered_window(&mut self, idx: usize) {
-        //asdqwe
+    pub fn switch_to_window_with_hotkey_number(&mut self, number: usize) {
+        for (id, region) in self.regions.iter() {
+            match &region.content {
+                RegionContent::Leaf(leaf) if leaf.hotkey_number == Some(number) && !leaf.tabs.is_empty() => {
+                    self.active_window = Some(leaf.tabs[leaf.active_tab]);
+                    return;
+                }
+                _ => (),
+            }
+        }
     }
 
     pub fn switch_tab_in_active_window(&mut self, delta: isize) {
@@ -296,7 +309,7 @@ impl Layout {
         self.active_window = Some(leaf.tabs[leaf.active_tab]);
     }
 
-    pub fn layout_and_render_peripherals(&mut self, f: &mut Frame, area: Rect) {
+    pub fn layout_and_render_peripherals(&mut self, f: &mut Frame, area: Rect, palette: &Palette) {
         let mut reachable_regions: HashSet<RegionId> = HashSet::new();
         let mut stack = vec![(area, self.root, None)];
         while let Some((area, region_id, parent_id)) = stack.pop() {
@@ -318,6 +331,7 @@ impl Layout {
 
                     let mut is_active = false;
                     let mut tabs: Vec<Spans> = Vec::new();
+                    let mut block_title: Vec<Span> = Vec::new();
                     for i in 0..leaf.tabs.len() {
                         let win_id = leaf.tabs[i];
                         let win = self.windows.get_mut(win_id);
@@ -328,29 +342,32 @@ impl Layout {
                             win.outer_area = None;
                             win.area = None;
                         }
-                        let mut style = Style::default();
-                        if self.active_window == Some(win_id) {
-                            is_active = true;
-                        } else {
-                            style = style.add_modifier(Modifier::DIM);
-                        }
-                        let spans = Spans::from(Span::styled(win.title.clone(), style));
+                        let tab_active = self.active_window == Some(win_id);
+                        is_active |= tab_active;
                         if leaf.tabs.len() == 1 {
-                            block = block.title(spans);
+                            block_title.push(Span::styled(win.title.clone(), if tab_active {palette.window_border_active} else {palette.window_border}));
                         } else {
-                            tabs.push(spans);
+                            tabs.push(Spans::from(Span::styled(win.title.clone(), if tab_active {palette.tab_title_active} else {palette.tab_title})));
                         }
                     }
+
+                    if let &Some(number) = &leaf.hotkey_number {
+                        block_title.push(Span::raw(" "));
+                        block_title.push(Span::styled(format!("{}", number), palette.window_hotkey));
+                    }
+                    
+                    block = block.title(Spans::from(block_title));
 
                     let style;
                     let border_type;
                     if is_active {
-                        style = Style::default().add_modifier(Modifier::BOLD);
+                        style = palette.window_border_active;
                         border_type = BorderType::Thick;
                     } else {
-                        style = Style::default().add_modifier(Modifier::DIM);
+                        style = palette.window_border;
                         border_type = BorderType::Rounded;
                     }
+                    block = block.style(palette.default);
                     block = block.border_style(style);
                     block = block.border_type(border_type);
 
@@ -358,7 +375,7 @@ impl Layout {
                     if show_tabs {
                         let mut a = area.clone();
                         if a.height > 0 {
-                            let tabs = Tabs::new(tabs).select(leaf.active_tab).highlight_style(style.bg(Color::White).fg(Color::Black));
+                            let tabs = Tabs::new(tabs).select(leaf.active_tab).highlight_style(palette.tab_title_selected);
                             a.height = 1;
                             f.render_widget(tabs, a);
                         }

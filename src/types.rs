@@ -1,4 +1,4 @@
-use crate::{util::*, arena::*, log::*, *};
+use crate::{util::*, arena::*, log::*, *, settings::*};
 use std::{hint, collections::{HashMap, hash_map::{DefaultHasher, Entry}}, hash::{Hash, Hasher}, sync::{Mutex, atomic::{AtomicUsize, Ordering}}, ptr, mem, result, io::Write, slice, ops::Range, fmt, fmt::Write as fmtWrite};
 use bitflags::*;
 use tui::style::{Style, Color, Modifier};
@@ -396,38 +396,38 @@ impl fmt::Debug for DumpType {
     }
 }
 
-pub fn print_type_name(t: *const TypeInfo, out: &mut StyledText, recursion_depth: usize) {
+pub fn print_type_name(t: *const TypeInfo, out: &mut StyledText, palette: &Palette, recursion_depth: usize) {
     if recursion_depth > 100 {
-        styled_write!(out, Style::default().fg(Color::Yellow), "…");
+        styled_write!(out, palette.value_warning, "…");
         return;
     }
     unsafe {
         let t: &TypeInfo = &*t;
         match &t.t {
             Type::Pointer(p) => {
-                styled_write!(out, Style::default(), "{} ", if p.flags.contains(PointerFlags::REFERENCE) {'&'} else {'*'});
-                print_type_name((*p).type_, out, recursion_depth + 1);
+                styled_write!(out, palette.value_misc, "{} ", if p.flags.contains(PointerFlags::REFERENCE) {'&'} else {'*'});
+                print_type_name((*p).type_, out, palette, recursion_depth + 1);
                 return;
             }
             Type::Array(a) => {
                 // Print length before name (instead of e.g. Rust syntax [type; len]) because name may be long and cut off.
-                styled_write!(out, Style::default(), "[");
+                styled_write!(out, palette.value_misc, "[");
                 if a.flags.contains(ArrayFlags::LEN_KNOWN) {
-                    styled_write!(out, Style::default(), "{}", a.len);
+                    styled_write!(out, palette.value_misc, "{}", a.len);
                 } else {
-                    styled_write!(out, Style::default().add_modifier(Modifier::DIM), "<length unknown>");
+                    styled_write!(out, palette.value_misc_dim, "<length unknown>");
                 }
-                styled_write!(out, Style::default(), "] ");
-                print_type_name((*a).type_, out, recursion_depth + 1);
+                styled_write!(out, palette.value_misc, "] ");
+                print_type_name((*a).type_, out, palette, recursion_depth + 1);
                 return;
             }
             _ => (),
         }
         if t.name.is_empty() {
             // TODO: Print file+line instead of DIE offset.
-            styled_write!(out, Style::default(), "<{} @{:x}>", t.t.kind_name(), t.die.0);
+            styled_write!(out, palette.type_name, "<{} @{:x}>", t.t.kind_name(), t.die.0);
         } else {
-            styled_write!(out, Style::default(), "{}", t.name);
+            styled_write!(out, palette.type_name, "{}", t.name);
         }
     }
 }

@@ -1,4 +1,4 @@
-use crate::{*, types::*, error::*, expr::*, util::*};
+use crate::{*, types::*, error::*, expr::*, util::*, settings::*};
 use std::{mem, fmt::Write};
 use tui::style::{Style, Modifier, Color};
 
@@ -119,11 +119,20 @@ pub fn prettify_value(val: &Value, state: &mut EvalState, context: &EvalContext)
     }
 }
 
+// Append a span to Option<&mut StyledText> if it's Some. The Option must be mut.
+macro_rules! styled_write_maybe {
+    ($out:expr, $style:expr, $($arg:tt)*) => (
+        if let Some((out, palette)) = &mut ($out) {
+            styled_write!(out, $style, $($arg)*);
+        }
+    );
+}
+
 // For a *TypeInfo or a *StructField, tells how to show this type or field in watches window.
-// Not a value of this type, the type itself, e.g. when using typeof().
+// (Not a value of this type. The type itself. E.g. when using typeof().)
 // The returned value is a struct that the user can explore using field access in watch expressions or by expanding the line in the watches window.
 // E.g. if the *TypeInfo describes a struct, we'll return something like {name: "foo", size: 24, fields: {f1: <MetaField>, f2: <MetaField>}}.
-pub fn reflect_meta_value(val: &Value, state: &mut EvalState, context: &EvalContext, mut out: Option<&mut StyledText>) -> Value {
+pub fn reflect_meta_value(val: &Value, state: &mut EvalState, context: &EvalContext, mut out: Option<(&mut StyledText, &Palette)>) -> Value {
     let meta_t = unsafe {&*val.type_};
     let mut builder = StructBuilder::default();
     match meta_t.t {
@@ -149,11 +158,11 @@ pub fn reflect_meta_value(val: &Value, state: &mut EvalState, context: &EvalCont
                     show_size = true;
                 }
                 Type::Pointer(p) => {
-                    if let Some(out) = &mut out {print_type_name(t, *out, 0);}
+                    if let Some((text, palette)) = &mut out {print_type_name(t, *text, *palette, 0);}
                     builder.add_usize_field("type", unsafe {mem::transmute(p.type_)}, state.builtin_types.meta_type);
                 }
                 Type::Array(a) => {
-                    if let Some(out) = &mut out {print_type_name(t, *out, 0);}
+                    if let Some((text, palette)) = &mut out {print_type_name(t, *text, *palette, 0);}
                     builder.add_usize_field("type", unsafe {mem::transmute(a.type_)}, state.builtin_types.meta_type);
                 }
                 Type::Struct(s) => {
@@ -213,7 +222,7 @@ pub fn reflect_meta_value(val: &Value, state: &mut EvalState, context: &EvalCont
                 styled_write_maybe!(out, Style::default(), "bit_offset {}: ", f.bit_offset);
                 builder.add_usize_field("bit_offset", f.bit_offset, state.builtin_types.u64_);
             }
-            if let Some(out) = &mut out {print_type_name(f.type_, *out, 0);}
+            if let Some((text, palette)) = &mut out {print_type_name(f.type_, *text, *palette, 0);}
             if f.flags.contains(FieldFlags::SIZE_KNOWN) && f.bit_size != unsafe {(*f.type_).calculate_size() * 8} {
                 builder.add_usize_field("bit_size", f.bit_size, state.builtin_types.u64_);
             }

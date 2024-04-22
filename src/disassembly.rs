@@ -1,4 +1,4 @@
-use crate::{*, symbols::*, error::*, symbols_registry::*, util::*, procfs::*};
+use crate::{*, symbols::*, error::*, symbols_registry::*, util::*, procfs::*, settings::*};
 use std::{fmt::Write, ops::Range};
 use tui::{text::{Span, Spans, Text}, style::{Style, Color, Modifier}};
 use iced_x86::*;
@@ -85,9 +85,9 @@ impl Disassembly {
         }
     }
 
-    pub fn with_error(mut self, e: Error) -> Self {
+    pub fn with_error(mut self, e: Error, palette: &Palette) -> Self {
         assert!(self.error.is_none());
-        styled_write!(self.text, Style::default().bg(Color::Red).fg(Color::Black), "{}", e);
+        styled_write!(self.text, palette.error, "{}", e);
         self.text.close_line();
         self.lines.push(DisassemblyLineInfo {kind: DisassemblyLineKind::Error, addr: usize::MAX, leaf_line: None, subfunction: None, indent_span_idx: 0});
         self.error = Some(e);
@@ -101,17 +101,21 @@ impl Disassembly {
     }
 }
 
-impl FormatterOutput for Disassembly {
+struct StyledFormatter<'a> {
+    palette: &'a Palette,
+    text: &'a mut StyledText,
+}
+
+impl<'a> FormatterOutput for StyledFormatter<'a> {
     fn write(&mut self, text: &str, kind: FormatterTextKind) {
-        let s = Style::default();
         use FormatterTextKind::*;
         let s = match kind {
-            Directive | Keyword => s.add_modifier(Modifier::DIM),
-            Prefix | Mnemonic => s.fg(Color::Green).add_modifier(Modifier::BOLD),
-            Register => s.fg(Color::Blue),
-            Number => s.fg(Color::Cyan),
-            Function => s.fg(Color::Magenta),
-            _ => s,
+            Directive | Keyword => self.palette.disas_keyword,
+            Prefix | Mnemonic => self.palette.disas_mnemonic,
+            Register => self.palette.disas_register,
+            Number => self.palette.disas_number,
+            Function => self.palette.disas_function,
+            _ => self.palette.disas_default,
         };
 
         self.text.chars.push_str(text);
@@ -145,7 +149,7 @@ impl<'a> SymbolResolver for Resolver<'a> {
     }
 }
 
-pub fn disassemble_function(function_idx: usize, mut static_addr_ranges: Vec<Range<usize>>, symbols: Option<&Symbols>, addr_map: &AddrMap, memory: &MemReader, intro: StyledText) -> Disassembly {
+pub fn disassemble_function(function_idx: usize, mut static_addr_ranges: Vec<Range<usize>>, symbols: Option<&Symbols>, addr_map: &AddrMap, memory: &MemReader, intro: StyledText, palette: &Palette) -> Disassembly {
     clean_up_ranges(&mut static_addr_ranges);
 
     let mut res = Disassembly {text: intro, lines: Vec::new(), error: None, longest_line: 0, symbols_shard: None};
@@ -164,21 +168,21 @@ pub fn disassemble_function(function_idx: usize, mut static_addr_ranges: Vec<Ran
 
     for (addr_range_idx, static_addr_range) in static_addr_ranges.iter().enumerate() {
         if static_addr_range.len() > 100_000_000 {
-            return res.with_error(error!(Sanity, "{} MB to disassemble, suspiciously much", static_addr_range.len() / 1_000_000));
+            return res.with_error(error!(Sanity, "{} MB to disassemble, suspiciously much", static_addr_range.len() / 1_000_000), palette);
         }
 
         let mut buf: Vec<u8> = Vec::new();
         let code: &[u8] = if let Some(symbols) = &symbols {
             // Read the machine code from file rather than memory so that it doesn't show our breakpoint instructions.
             match symbols.elf.addr_range_to_offset_range(static_addr_range.start, static_addr_range.end) {
-                None => return res.with_error(error!(Dwarf, "function address range out of bounds of executable: {:x}-{:x}", static_addr_range.start, static_addr_range.end)),
+                None => return res.with_error(error!(Dwarf, "function address range out of bounds of executable: {:x}-{:x}", static_addr_range.start, static_addr_range.end), palette),
                 Some((start, end)) => &symbols.elf.data()[start..end],
             }
         } else {
             buf.resize(static_addr_range.len(), 0);
             match memory.read(addr_map.static_to_dynamic(static_addr_range.start), &mut buf) {
                 Ok(()) => (),
-                Err(e) => return res.with_error(e),
+                Err(e) => return res.with_error(e, palette),
             }
             &buf
         };
@@ -187,7 +191,7 @@ pub fn disassemble_function(function_idx: usize, mut static_addr_ranges: Vec<Ran
 
         if addr_range_idx != 0 {
             res.text.close_line();
-            styled_write!(res.text, Style::default(),  "----------");
+            styled_write!(res.text, palette.disas_default,  "----------");
             res.text.close_line();
             res.text.close_line();
             for i in 0..3 {
@@ -236,14 +240,14 @@ pub fn disassemble_function(function_idx: usize, mut static_addr_ranges: Vec<Ran
                     *leaf_line = Some(line.clone());
                     let file = &symbols.files[file];
                     let name = file.filename.as_os_str().to_string_lossy();
-                    styled_write!(res.text, Style::default().add_modifier(Modifier::DIM), "{: <1$}", "", prelude_width);
+                    styled_write!(res.text, palette.default_dim, "{: <1$}", "", prelude_width);
                     let indent_span_idx = res.text.spans.len() - *res.text.lines.last().unwrap();
-                    styled_write!(res.text, Style::default().add_modifier(Modifier::DIM), "{}", indent);
-                    styled_write!(res.text, Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM), "{}", name);
+                    styled_write!(res.text, palette.default_dim, "{}", indent);
+                    styled_write!(res.text, palette.location_filename.add_modifier(Modifier::DIM), "{}", name);
                     if line.line() != 0 {
-                        styled_write!(res.text, Style::default().fg(Color::Green).add_modifier(Modifier::DIM), ":{}", line.line());
+                        styled_write!(res.text, palette.location_line_number.add_modifier(Modifier::DIM), ":{}", line.line());
                         if line.column() != 0 {
-                            styled_write!(res.text, Style::default().fg(Color::Green).add_modifier(Modifier::DIM), ":{}", line.column());
+                            styled_write!(res.text, palette.location_column_number.add_modifier(Modifier::DIM), ":{}", line.column());
                         }
                     }
                     res.text.close_line();
@@ -270,10 +274,10 @@ pub fn disassemble_function(function_idx: usize, mut static_addr_ranges: Vec<Ran
 
                         write_line_number(subfunction.call_line.clone(), DisassemblyLineKind::InlinedCallLineNumber, &mut res, &indent, &mut cur_leaf_line, cur_subfunction.clone());
 
-                        styled_write!(res.text, Style::default().add_modifier(Modifier::DIM), "{: <1$}", "", prelude_width);
+                        styled_write!(res.text, palette.default_dim, "{: <1$}", "", prelude_width);
                         let indent_span_idx = res.text.spans.len() - *res.text.lines.last().unwrap();
-                        styled_write!(res.text, Style::default().add_modifier(Modifier::DIM), "{}", indent);
-                        styled_write!(res.text, Style::default().add_modifier(Modifier::DIM), "{}", callee_name);
+                        styled_write!(res.text, palette.default_dim, "{}", indent);
+                        styled_write!(res.text, palette.default_dim, "{}", callee_name);
                         res.text.close_line();
                         res.lines.push(DisassemblyLineInfo {kind: DisassemblyLineKind::InlinedFunctionName, addr: instruction.ip() as usize, leaf_line: cur_leaf_line.clone(), subfunction: cur_subfunction.clone(), indent_span_idx});
                     }
@@ -291,8 +295,8 @@ pub fn disassemble_function(function_idx: usize, mut static_addr_ranges: Vec<Ran
 
             // Write the actual asm instruction.
 
-            styled_write!(res.text, Style::default().add_modifier(Modifier::DIM), "{:012x} ", instruction.ip());
-            styled_write!(res.text, Style::default().add_modifier(Modifier::DIM).fg(Color::Cyan), "<{: >+1$x}> ", instruction.ip() as usize - addr, rel_addr_len);
+            styled_write!(res.text, palette.default_dim, "{:012x} ", instruction.ip());
+            styled_write!(res.text, palette.disas_relative_address, "<{: >+1$x}> ", instruction.ip() as usize - addr, rel_addr_len);
 
             let jump_arrow = match instruction.flow_control() {
                 FlowControl::Next => " ",
@@ -312,11 +316,11 @@ pub fn disassemble_function(function_idx: usize, mut static_addr_ranges: Vec<Ran
                     }
                 }
             };
-            styled_write!(res.text, Style::default().add_modifier(Modifier::DIM), " {} ", jump_arrow);
+            styled_write!(res.text, palette.disas_jump_arrow, " {} ", jump_arrow);
             let indent_span_idx = res.text.spans.len() - *res.text.lines.last().unwrap();
-            styled_write!(res.text, Style::default().add_modifier(Modifier::DIM), "{}", indent);
+            styled_write!(res.text, palette.default_dim, "{}", indent);
 
-            formatter.format(&instruction, &mut res);
+            formatter.format(&instruction, &mut StyledFormatter {palette, text: &mut res.text});
 
             res.text.close_line();
             res.lines.push(DisassemblyLineInfo {kind: DisassemblyLineKind::Instruction, addr: instruction.ip() as usize, leaf_line: cur_leaf_line.clone(), subfunction: cur_subfunction.clone(), indent_span_idx});

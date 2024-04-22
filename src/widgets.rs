@@ -1,4 +1,4 @@
-use crate::{*, search::*, pool::*, symbols_registry::*, util::*, error::*, procfs::*};
+use crate::{*, search::*, pool::*, symbols_registry::*, util::*, error::*, procfs::*, settings::*};
 use tui::{self, layout::{Rect, Margin, Constraint}, widgets::{Paragraph, Block, Borders, Clear, Gauge, TableState, Table, Row, Cell}, style::{Style, Color, Modifier}, backend::TermionBackend, text::{Span, Spans, Text}};
 use termion::{event::{Event, Key}, raw::RawTerminal};
 use std::{io, ops::Range};
@@ -16,21 +16,21 @@ impl Scroll {
         Self {scroll: 0, cursor: 0}
     }
     
-    pub fn update(&mut self, count: usize, height: u16, keys: &mut Vec<Key>) -> Range<usize> {
-        self.update_detect_movement(count, height, keys).0
+    pub fn update(&mut self, count: usize, height: u16, keys: &mut Vec<Key>, key_binds: &KeyBindings) -> Range<usize> {
+        self.update_detect_movement(count, height, keys, key_binds).0
     }
 
-    pub fn update_cursorless(&mut self, count: usize, height: u16, keys: &mut Vec<Key>) -> Range<usize> {
+    pub fn update_cursorless(&mut self, count: usize, height: u16, keys: &mut Vec<Key>, key_binds: &KeyBindings) -> Range<usize> {
         let height = height as usize;
-        let s = TryInto::<isize>::try_into(self.scroll).unwrap_or(isize::MAX).saturating_add(Self::delta(height, keys));
+        let s = TryInto::<isize>::try_into(self.scroll).unwrap_or(isize::MAX).saturating_add(Self::delta(height, keys, key_binds));
         self.scroll = (s.max(0) as usize).min(count.saturating_sub(1));
         self.range(count, height)
     }
 
     // Returns true if any cursor movement keys were pressed (even if cursor wasn't moved).
-    pub fn update_detect_movement(&mut self, count: usize, height: u16, keys: &mut Vec<Key>) -> (Range<usize>, bool) {
+    pub fn update_detect_movement(&mut self, count: usize, height: u16, keys: &mut Vec<Key>, key_binds: &KeyBindings) -> (Range<usize>, bool) {
         let height = height as usize;
-        let d = Self::delta(height, keys);
+        let d = Self::delta(height, keys, key_binds);
         let c = TryInto::<isize>::try_into(self.cursor).unwrap_or(isize::MAX).saturating_add(d);
         self.cursor = (c.max(0) as usize).min(count.saturating_sub(1));
         self.clamp_scroll(count, height);
@@ -38,9 +38,9 @@ impl Scroll {
     }
 
     // Like update(usize::MAX), but the End key puts cursor at `count - 1` instead of some huge number.
-    pub fn update_with_virtual_space(&mut self, count: usize, height: u16, keys: &mut Vec<Key>) -> Range<usize> {
+    pub fn update_with_virtual_space(&mut self, count: usize, height: u16, keys: &mut Vec<Key>, key_binds: &KeyBindings) -> Range<usize> {
         let height = height as usize;
-        let d = Self::delta(height, keys);
+        let d = Self::delta(height, keys, key_binds);
         if d == isize::MAX {
             self.cursor = count.saturating_sub(1);
         } else {
@@ -57,17 +57,17 @@ impl Scroll {
         self.range(count, height)
     }
 
-    fn delta(height: usize, keys: &mut Vec<Key>) -> isize {
+    fn delta(height: usize, keys: &mut Vec<Key>, key_binds: &KeyBindings) -> isize {
         let mut cur = 0isize;
         let mut res: Option<isize> = None;
         keys.retain(|key| {
-            match key {
-                Key::Up | Key::Ctrl('p') => cur -= 1,
-                Key::Down | Key::Ctrl('n') => cur += 1,
-                Key::PageUp | Key::Alt('v') => cur -= height as isize,
-                Key::PageDown | Key::Ctrl('v') => cur += height as isize,
-                Key::Home => { res.get_or_insert(isize::MIN); },
-                Key::End => { res.get_or_insert(isize::MAX); },
+            match key_binds.map.get(key) {
+                Some(KeyAction::CursorUp) => cur -= 1,
+                Some(KeyAction::CursorDown) => cur += 1,
+                Some(KeyAction::PageUp) => cur -= height as isize,
+                Some(KeyAction::PageDown) => cur += height as isize,
+                Some(KeyAction::Home) => { res.get_or_insert(isize::MIN); },
+                Some(KeyAction::End) => { res.get_or_insert(isize::MAX); },
                 _ => return true,
             }
             false
@@ -113,59 +113,56 @@ pub enum TextInputEvent {
     Done, // return key
     Cancel, // escape key
     Open, // right arrow key when the cursor is at the end
-    Tab, // tab key
 }
 
 impl TextInput {
     pub fn new() -> Self { Self {text: String::new(), cursor: 0, hscroll: 0} }
     pub fn with_text(text: String) -> Self { Self {cursor: text.len(), text, hscroll: 0} }
 
-    pub fn update(&mut self, keys: &mut Vec<Key>) -> TextInputEvent {
+    pub fn update(&mut self, keys: &mut Vec<Key>, key_binds: &KeyBindings) -> TextInputEvent {
         let mut ret = TextInputEvent::None;
         keys.retain(|key| {
             if ret != TextInputEvent::None {
                 return false;
             }
-            match key {
-                Key::Char('\n') => ret = TextInputEvent::Done,
-                Key::Esc | Key::Ctrl('g') => ret = TextInputEvent::Cancel,
-
-                Key::Char('\t') => ret = TextInputEvent::Tab,
+            match (key_binds.map.get(key).cloned(), *key) {
+                (Some(KeyAction::Enter), _) => ret = TextInputEvent::Done,
+                (Some(KeyAction::Cancel), _) => ret = TextInputEvent::Cancel,
 
                 // Moving.
-                Key::Left | Key::Ctrl('b') => { self.step_back(); }
-                Key::Right | Key::Ctrl('f') => if !self.step_forward() { ret = TextInputEvent::Open; }
-                Key::Alt('f') => self.cursor = self.word_end(),
-                Key::Alt('b') => self.cursor = self.word_start(),
-                Key::Home | Key::Ctrl('a') => self.cursor = 0,
-                Key::End | Key::Ctrl('e') => self.cursor = self.text.len(),
+                (a, k) if a == Some(KeyAction::CursorLeft) || k == Key::Ctrl('b') => { self.step_back(); }
+                (a, k) if a == Some(KeyAction::CursorRight) || k == Key::Ctrl('f') => if !self.step_forward() { ret = TextInputEvent::Open; }
+                (_, Key::Alt('f')) => self.cursor = self.word_end(),
+                (_, Key::Alt('b')) => self.cursor = self.word_start(),
+                (a, k) if a == Some(KeyAction::Home) || k == Key::Ctrl('a') => self.cursor = 0,
+                (a, k) if a == Some(KeyAction::End) || k == Key::Ctrl('e') => self.cursor = self.text.len(),
 
                 // Deleting.
-                Key::Backspace => {
+                (_, Key::Backspace) => {
                     if self.step_back() {
                         self.text.remove(self.cursor);
                     }
                 }
-                Key::Delete | Key::Ctrl('d') => {
+                (_, Key::Delete) | (_, Key::Ctrl('d')) => {
                     if self.cursor < self.text.len() {
                         self.text.remove(self.cursor);
                     }
                 }
-                Key::Ctrl('k') => self.text.replace_range(self.cursor.., ""),
-                Key::Ctrl('u') => {
+                (_, Key::Ctrl('k')) => self.text.replace_range(self.cursor.., ""),
+                (_, Key::Ctrl('u')) => {
                     self.text.replace_range(..self.cursor, "");
                     self.cursor = 0;
                 }
-                Key::Ctrl('w') | Key::Alt('\x7f') => {
+                (_, Key::Ctrl('w')) | (_, /*alt+backspace*/ Key::Alt('\x7f')) => {
                     let w = self.word_start();
                     self.text.replace_range(w..self.cursor, "");
                     self.cursor = w;
                 }
-                Key::Alt('d') => self.text.replace_range(self.cursor..self.word_end(), ""),
+                (_, Key::Alt('d')) => self.text.replace_range(self.cursor..self.word_end(), ""),
 
                 // Typing.
-                Key::Char(c) => {
-                    self.text.insert(self.cursor, *c);
+                (_, Key::Char(c)) => {
+                    self.text.insert(self.cursor, c);
                     self.step_forward();
                 }
 
@@ -181,10 +178,10 @@ impl TextInput {
         ret
     }
 
-    pub fn render(&mut self, f: &mut Frame, area: Rect) {
+    pub fn render(&mut self, f: &mut Frame, area: Rect, palette: &Palette) {
         // We're not dealing with unicode correctly throughout this struct, but meh. Can be fixed if needed.
         self.hscroll = self.hscroll.min(self.cursor).max(self.cursor.saturating_sub(area.width as usize));
-        let paragraph = Paragraph::new(self.text.clone()).scroll((0, self.hscroll as u16));
+        let paragraph = Paragraph::new(self.text.clone()).block(Block::default().style(palette.default)).scroll((0, self.hscroll as u16));
         f.render_widget(paragraph, area);
         if self.cursor >= self.hscroll && self.cursor - self.hscroll <= area.width as usize {
             f.set_cursor(area.x + (self.cursor - self.hscroll) as u16, area.y);
@@ -234,11 +231,11 @@ pub enum SearchDialogEvent {
 impl SearchDialog {
     pub fn new(searcher: Box<dyn Searcher>) -> Self { Self {input: TextInput::new(), scroll: Scroll::new(), search: SymbolSearcher::new(searcher), height: 0} }
 
-    pub fn update(&mut self, keys: &mut Vec<Key>, registry: &SymbolsRegistry, binaries: Option<Vec<BinaryId>>) -> SearchDialogEvent {
-        let event = self.input.update(keys);
-        self.scroll.update(self.search.results.len(), self.height, keys);
+    pub fn update(&mut self, keys: &mut Vec<Key>, key_binds: &KeyBindings, registry: &SymbolsRegistry, binaries: Option<Vec<BinaryId>>) -> SearchDialogEvent {
+        let event = self.input.update(keys, key_binds);
+        self.scroll.update(self.search.results.len(), self.height, keys, key_binds);
         let res = match event {
-            TextInputEvent::None | TextInputEvent::Tab => SearchDialogEvent::None,
+            TextInputEvent::None => SearchDialogEvent::None,
             TextInputEvent::Cancel => return SearchDialogEvent::Cancel,
             TextInputEvent::Done if self.search.results.is_empty() => return SearchDialogEvent::Cancel,
             TextInputEvent::Open if self.search.results.is_empty() => SearchDialogEvent::None,
@@ -257,7 +254,7 @@ impl SearchDialog {
         res
     }
 
-    pub fn render(&mut self, f: &mut Frame, screen_area: Rect, title: &str) {
+    pub fn render(&mut self, f: &mut Frame, screen_area: Rect, title: &str, palette: &Palette) {
         let area = screen_area.inner(&Margin {vertical: screen_area.height / 12, horizontal: screen_area.width / 8});
         let input_area = Rect {x: area.x + 2, y: area.y + 2, width: area.width.saturating_sub(4), height: 1};
         let status_area = Rect {x: area.x + 2, y: area.y + 4, width: area.width.saturating_sub(4), height: 1};
@@ -267,14 +264,14 @@ impl SearchDialog {
         self.height = results_area.height / lines_per_result;
 
         // TODO: Subtly different background color for file/function/variable dialogs
-        let block = Block::default().title(title.to_string()).borders(Borders::ALL).style(Style::default().bg(Color::Rgb(20, 20, 20)));
+        let block = Block::default().title(title.to_string()).borders(Borders::ALL).style(palette.dialog);
         f.render_widget(Clear, area);
         f.render_widget(block, area);
         f.render_widget(Clear, input_area);
-        self.input.render(f, input_area);
+        self.input.render(f, input_area, palette);
 
         if self.search.waiting_for_symbols {
-            f.render_widget(Paragraph::new(Span::styled("waiting for symbols to load (see 'binaries' window for progress)", Style::default().bg(Color::Yellow).fg(Color::Black))), status_area);
+            f.render_widget(Paragraph::new(Span::styled("waiting for symbols to load (see 'binaries' window for progress)", palette.warning)), status_area);
         } else if self.search.complete {
             let text = if self.search.results.len() == self.search.total_results {
                 format!("{} matches ({} searched)", self.search.results.len(), PrettySize(self.search.bytes_done))
@@ -298,11 +295,11 @@ impl SearchDialog {
             }
             if have_files {
                 let mut spans: Vec<Span> = Vec::new();
-                spans.push(Span::styled(format!("{}", r.file.as_os_str().to_string_lossy()), Style::default().fg(Color::Cyan)));
+                spans.push(Span::styled(format!("{}", r.file.as_os_str().to_string_lossy()), palette.location_filename));
                 if r.line.file_idx().is_some() && r.line.line() != 0 {
-                    spans.push(Span::styled(format!(":{}", r.line.line()), Style::default().fg(Color::Green)));
+                    spans.push(Span::styled(format!(":{}", r.line.line()), palette.location_line_number));
                     if r.line.column() != 0 {
-                        spans.push(Span::styled(format!(":{}", r.line.column()), Style::default().fg(Color::Green).add_modifier(Modifier::DIM)));
+                        spans.push(Span::styled(format!(":{}", r.line.column()), palette.location_column_number));
                     }
                 }
                 lines.push(Spans::from(spans));
@@ -312,7 +309,7 @@ impl SearchDialog {
 
         let table = Table::new(rows)
             .widths(&[Constraint::Percentage(100)])
-            .highlight_style(Style::default().add_modifier(Modifier::BOLD)).highlight_symbol(">> ");
+            .highlight_style(palette.table_selected_item).highlight_symbol(">> ");
         f.render_stateful_widget(table, results_area, &mut table_state);
     }
 }

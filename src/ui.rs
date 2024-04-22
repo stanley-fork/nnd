@@ -189,16 +189,22 @@ impl UI {
         layout.new_window(Some(rows[2]), WindowType::Watches, true, "watches".to_string(), Box::new(WatchesWindow::new(false)));
         layout.new_window(Some(rows[2]), WindowType::Watches, true, "registers".to_string(), Box::new(RegistersWindow::default()));
         layout.new_window(Some(rows[2]), WindowType::Locations, true, "locations".to_string(), Box::new(LocationsWindow::default()));
+        layout.set_hotkey_number(rows[2], 1);
 
         let rows = layout.split(cols[1], Direction::Vertical, vec![0.4]);
         layout.new_window(Some(rows[0]), WindowType::Disassembly, true, "disassembly".to_string(), Box::new(DisassemblyWindow::default()));
+        layout.set_hotkey_number(rows[0], 2);
         layout.new_window(Some(rows[1]), WindowType::Code, true, "code".to_string(), Box::new(CodeWindow::default()));
+        layout.set_hotkey_number(rows[1], 3);
 
         let rows = layout.split(cols[2], Direction::Vertical, vec![0.25, 0.75]);
         layout.new_window(Some(rows[0]), WindowType::Binaries, true, "binaries".to_string(), Box::new(BinariesWindow::default()));
         layout.new_window(Some(rows[0]), WindowType::Breakpoints, true, "breakpoints".to_string(), Box::new(BreakpointsWindow::default()));
+        layout.set_hotkey_number(rows[0], 4);
         layout.new_window(Some(rows[1]), WindowType::Stack, true, "stack".to_string(), Box::new(StackWindow::default()));
+        layout.set_hotkey_number(rows[1], 5);
         let threads_window = layout.new_window(Some(rows[2]), WindowType::Threads, true, "threads".to_string(), Box::new(ThreadsWindow::default()));
+        layout.set_hotkey_number(rows[2], 6);
 
         layout.active_window = Some(threads_window);
 
@@ -279,15 +285,15 @@ impl UI {
                 Some(KeyAction::WindowUp) => self.layout.switch_to_adjacent_window(0, -1),
                 Some(KeyAction::WindowDown) => self.layout.switch_to_adjacent_window(0, 1),
                 Some(KeyAction::WindowRight) => self.layout.switch_to_adjacent_window(1, 0),
-                Some(KeyAction::Window(idx)) => self.layout.switch_to_numbered_window(*idx),
+                Some(KeyAction::Window(idx)) => self.layout.switch_to_window_with_hotkey_number(*idx),
 
                 Some(KeyAction::NextTab) => self.layout.switch_tab_in_active_window(1),
                 Some(KeyAction::PreviousTab) => self.layout.switch_tab_in_active_window(-1),
 
-                Some(KeyAction::PreviousStackFrame) => additional_keys_for_window.entry(WindowType::Stack).or_default().push(Key::Up),
-                Some(KeyAction::NextStackFrame) => additional_keys_for_window.entry(WindowType::Stack).or_default().push(Key::Down),
-                Some(KeyAction::PreviousThread) => additional_keys_for_window.entry(WindowType::Threads).or_default().push(Key::Up),
-                Some(KeyAction::NextThread) => additional_keys_for_window.entry(WindowType::Threads).or_default().push(Key::Down),
+                Some(KeyAction::PreviousStackFrame) => if let Some(k) = debugger.context.settings.keys.find(KeyAction::CursorUp) {additional_keys_for_window.entry(WindowType::Stack).or_default().push(k)},
+                Some(KeyAction::NextStackFrame) => if let Some(k) = debugger.context.settings.keys.find(KeyAction::CursorDown) {additional_keys_for_window.entry(WindowType::Stack).or_default().push(k)},
+                Some(KeyAction::PreviousThread) => if let Some(k) = debugger.context.settings.keys.find(KeyAction::CursorUp) {additional_keys_for_window.entry(WindowType::Threads).or_default().push(k)},
+                Some(KeyAction::NextThread) => if let Some(k) = debugger.context.settings.keys.find(KeyAction::CursorDown) {additional_keys_for_window.entry(WindowType::Threads).or_default().push(k)},
 
                 Some(KeyAction::ToggleProfiler) => self.state.profiler_enabled ^= true,
 
@@ -314,11 +320,11 @@ impl UI {
         } else {
             styled_write!(hints[0], Style::default(), "q - kill and quit"); hints[0].close_line();
         }
-        styled_write!(hints[1], Style::default(), "C-wasd - switch window"); hints[1].close_line();
+        styled_write!(hints[1], Style::default(), "[0-9]/C-wasd - switch window"); hints[1].close_line();
         styled_write!(hints[1], Style::default(), "C-t/C-b - switch tab"); hints[1].close_line();
         match debugger.target_state {
             ProcessState::Running | ProcessState::Stepping => {
-                styled_write!(hints[0], Style::default(), "C-c - suspend"); hints[0].close_line();
+                styled_write!(hints[0], Style::default(), "C - suspend"); hints[0].close_line();
             }
             ProcessState::Suspended => {
                 styled_write!(hints[0], Style::default(), "]/[/}}/{{ - switch frame/thread"); hints[0].close_line();
@@ -348,7 +354,7 @@ impl UI {
         let mut terminal_prof = TscScope::new(); // separately time the things that draw() does before and after calling our function, which is mostly interacting with OS terminal
         self.terminal.draw(|f| {
             debugger.log.prof.terminal_tsc += terminal_prof.finish();
-            self.layout.layout_and_render_peripherals(f, f.size());
+            self.layout.layout_and_render_peripherals(f, f.size(), &debugger.context.settings.palette);
 
             let active_window = self.layout.active_window.as_ref().copied();
             for (win_id, win) in self.layout.sorted_windows_mut() {
@@ -418,6 +424,7 @@ impl Default for RegistersWindow { fn default() -> Self { Self {scroll: Scroll::
 impl WindowContent for RegistersWindow {
     fn update_and_render(&mut self, ui: &mut UIState, debugger: &mut Debugger, mut keys: Vec<Key>, f: Option<&mut Frame>, area: Rect) {
         let f = match f { Some(f) => f, None => return };
+        let palette = &debugger.context.settings.palette;
 
         let mut rows: Vec<Row> = Vec::new();
         if let Some(frame) = ui.stack.frames.get(ui.selected_frame) {
@@ -426,16 +433,16 @@ impl WindowContent for RegistersWindow {
                 if let Ok((v, dubious)) = regs.get_int(*reg) {
                     rows.push(Row::new(vec![
                         Cell::from(format!("{}", reg)),
-                        Cell::from(format!("{:x}", v)).style(if dubious {Style::default().add_modifier(Modifier::DIM)} else {Style::default()}),
+                        Cell::from(format!("{:x}", v)).style(if dubious {palette.value_dubious} else {palette.value}),
                     ]));
                 }
             }
         }
 
-        let range = self.scroll.update_cursorless(rows.len(), area.height.saturating_sub(1), &mut keys);
+        let range = self.scroll.update_cursorless(rows.len(), area.height.saturating_sub(1), &mut keys, &debugger.context.settings.keys);
         let rows = rows[range].to_vec();
         let table = Table::new(rows)
-            .header(Row::new(vec!["reg", "value"]).style(Style::default().add_modifier(Modifier::DIM)))
+            .header(Row::new(vec!["reg", "value"]).style(palette.table_header))
             .widths(&[Constraint::Length(7), Constraint::Length(16)]);
 
         f.render_widget(table, area);
@@ -544,7 +551,7 @@ impl WatchesWindow {
         }
     }
 
-    fn populate_lines(&mut self, context: Option<&EvalContext>) {
+    fn populate_lines(&mut self, context: Option<&EvalContext>, palette: &Palette) {
         assert_eq!(self.tree.levels[0].len(), 1);
         self.lines.clear();
         let mut idxs: Vec<usize> = vec![0, 0];
@@ -592,7 +599,7 @@ impl WatchesWindow {
             if node.children.is_none() && node.value.is_ok() && context.is_some() {
                 // List children.
                 assert!(node.formatted_line[1].is_none());
-                let (has_children, children) = format_value(node.value.as_ref().unwrap(), true, &mut self.eval_state, context.as_ref().unwrap(), &mut self.tree.arena, &mut self.tree.text);
+                let (has_children, children) = format_value(node.value.as_ref().unwrap(), true, &mut self.eval_state, context.as_ref().unwrap(), &mut self.tree.arena, &mut self.tree.text, palette);
                 if lvl+1 >= self.tree.levels.len() {
                     self.tree.levels.push(Vec::new());
                 }
@@ -662,6 +669,7 @@ impl WindowContent for WatchesWindow {
         }
 
         let f = match f { Some(f) => f, None => return };
+        let palette = &debugger.context.settings.palette;
 
         let mut refresh_lines = false;
 
@@ -669,15 +677,15 @@ impl WindowContent for WatchesWindow {
             if self.text_input.is_some() {
                 return false;
             }
-            match key {
-                Key::Right => match self.lines.get(self.scroll.cursor) {
+            match debugger.context.settings.keys.map.get(key) {
+                Some(KeyAction::CursorRight) => match self.lines.get(self.scroll.cursor) {
                     Some(&(lvl, idx, _)) if self.tree.levels[lvl][idx].has_children == Some(true) => {
                         self.expanded_paths.insert(self.node_path(lvl, idx));
                         refresh_lines = true;
                     }
                     _ => (),
                 }
-                Key::Left => match self.lines.get(self.scroll.cursor) {
+                Some(KeyAction::CursorLeft) => match self.lines.get(self.scroll.cursor) {
                     Some(&(lvl, idx, expanded)) => {
                         let mut path = self.node_path(lvl, idx);
                         if !expanded {
@@ -688,7 +696,7 @@ impl WindowContent for WatchesWindow {
                     }
                     None => (),
                 }
-                Key::Char('\n') if !self.is_locals_window => match self.lines.get(self.scroll.cursor) {
+                Some(KeyAction::Enter) if !self.is_locals_window => match self.lines.get(self.scroll.cursor) {
                     Some(&(lvl, idx, _)) if lvl == 1 => {
                         let node = &self.tree.levels[lvl][idx];
                         if let Some((_, text)) = self.expressions.iter().find(|(id, _)| id == &node.child_id) {
@@ -697,11 +705,11 @@ impl WindowContent for WatchesWindow {
                     }
                     _ => (),
                 }
-                Key::Delete | Key::Backspace if !self.is_locals_window => match self.lines.get(self.scroll.cursor) {
+                Some(KeyAction::DeleteRow) if !self.is_locals_window => match self.lines.get(self.scroll.cursor) {
                     Some(&(lvl, idx, _)) if lvl == 1 => self.delete_watch(self.tree.levels[lvl][idx].child_id),
                     _ => (),
                 }
-                Key::Char('d') if !self.is_locals_window => match self.lines.get(self.scroll.cursor) {
+                Some(KeyAction::DuplicateRow) if !self.is_locals_window => match self.lines.get(self.scroll.cursor) {
                     Some(&(lvl, idx, _)) if lvl == 1 => {
                         let node = &self.tree.levels[lvl][idx];
                         if let Some(i) = self.expressions.iter().position(|(id, _)| id == &node.child_id) {
@@ -768,11 +776,11 @@ impl WindowContent for WatchesWindow {
             refresh_lines = true;
         }
         if refresh_lines {
-            self.populate_lines(context.as_ref());
+            self.populate_lines(context.as_ref(), palette);
         }
 
         let mut no_keys = Vec::new();
-        let range = self.scroll.update(self.lines.len(), area.height.saturating_sub(1), if self.text_input.is_none() {&mut keys} else {&mut no_keys});
+        let range = self.scroll.update(self.lines.len(), area.height.saturating_sub(1), if self.text_input.is_none() {&mut keys} else {&mut no_keys}, &debugger.context.settings.keys);
         self.cursor_path = match self.lines.get(self.scroll.cursor) {
             None => Vec::new(),
             Some(&(lvl, idx, _)) => self.node_path(lvl, idx),
@@ -786,7 +794,7 @@ impl WindowContent for WatchesWindow {
             let node = &mut self.tree.levels[lvl][idx];
             let expanded = expanded && node.has_children == Some(true);
             if node.formatted_line[expanded as usize].is_none() && context.is_some() && node.value.is_ok() {
-                let (has_children, _) = format_value(node.value.as_ref().unwrap(), expanded, &mut self.eval_state, context.as_ref().unwrap(), &mut self.tree.arena, &mut self.tree.text);
+                let (has_children, _) = format_value(node.value.as_ref().unwrap(), expanded, &mut self.eval_state, context.as_ref().unwrap(), &mut self.tree.arena, &mut self.tree.text, palette);
                 node.has_children = Some(has_children);
                 node.formatted_line[expanded as usize] = Some(self.tree.text.num_lines());
                 self.tree.text.close_line();
@@ -797,7 +805,7 @@ impl WindowContent for WatchesWindow {
             let is_add_watch_placeholder = !self.is_locals_window && lvl == 1 && self.expressions.last().is_some_and(|(id, s)| s.is_empty() && *id == node.child_id);
 
             // Indentation, expansion arrow, name.
-            let mut spans = vec![Span::styled("⸽".to_string().repeat(lvl - 1), Style::default().add_modifier(Modifier::DIM))];
+            let mut spans = vec![Span::styled("⸽".to_string().repeat(lvl - 1), palette.default_dim)];
             if node.has_children.unwrap_or(expanded) {
                 spans.push(Span::raw(if expanded {"▾ "} else {"▸ "}));
             } else {
@@ -807,7 +815,7 @@ impl WindowContent for WatchesWindow {
             // Dim the name if parent's value is dubious or the existence of this item comes from cache.
             if parent.dubious || (context.is_none() && (lvl > 1 || self.is_locals_window)) || is_add_watch_placeholder {
                 for span in &mut spans {
-                    span.style = span.style.add_modifier(Modifier::DIM);
+                    span.style = palette.default_dim;
                 }
             }
 
@@ -817,7 +825,7 @@ impl WindowContent for WatchesWindow {
             if let &Some(line_idx) = &node.formatted_line[expanded as usize] {
                 self.tree.text.line_out_copy(line_idx, &mut spans);
             } else if node.value.as_ref().is_err_and(|e| !e.is_value_tree_placeholder()) {
-                spans.push(Span::styled(format!("<{}>", node.value.as_ref().err().unwrap()), Style::default().bg(Color::Red).fg(Color::Black)));
+                spans.push(Span::styled(format!("<{}>", node.value.as_ref().err().unwrap()), palette.error));
             } else if !is_add_watch_placeholder {
                 spans.push(Span::raw(unavailable_reason.as_ref().unwrap().clone()));
             }
@@ -831,7 +839,7 @@ impl WindowContent for WatchesWindow {
 
             // Highlight selected line.
             if line_idx == self.scroll.cursor {
-                row = row.style(Style::default().bg(Color::Rgb(30, 30, 30)));
+                row = row.style(palette.selected_text_line);
             }
 
             if let Some((id, a, _)) = &mut self.text_input {
@@ -845,7 +853,7 @@ impl WindowContent for WatchesWindow {
 
         let column_widths = [Constraint::Length(name_column_width), Constraint::Length(area.width - name_column_width)];
         let table = Table::new(rows)
-            .header(Row::new(vec!["  name", "value"]).style(Style::default().add_modifier(Modifier::DIM)))
+            .header(Row::new(vec!["  name", "value"]).style(palette.table_header))
             .widths(&column_widths);
 
         f.render_widget(table, area);
@@ -858,9 +866,9 @@ impl WindowContent for WatchesWindow {
 
     fn update_modal(&mut self, ui: &mut UIState, debugger: &mut Debugger, keys: &mut Vec<Key>) {
         if let Some((child_id, _, input)) = &mut self.text_input {
-            let event = input.update(keys);
+            let event = input.update(keys, &debugger.context.settings.keys);
             match event {
-                TextInputEvent::None | TextInputEvent::Open | TextInputEvent::Tab => (),
+                TextInputEvent::None | TextInputEvent::Open => (),
                 TextInputEvent::Cancel => self.text_input = None,
                 TextInputEvent::Done => {
                     if let Some(i) = self.expressions.iter().position(|(id, _)| id == child_id) {
@@ -886,7 +894,7 @@ impl WindowContent for WatchesWindow {
     fn render_modal(&mut self, ui: &mut UIState, debugger: &mut Debugger, f: &mut Frame, window_area: Rect, screen_area: Rect) {
         if let Some((_, area, input)) = &mut self.text_input {
             f.render_widget(Clear, *area);
-            input.render(f, *area);
+            input.render(f, *area, &debugger.context.settings.palette);
         }
     }
 
@@ -930,11 +938,12 @@ impl Default for LocationsWindow { fn default() -> Self { Self {scroll: Scroll::
 impl WindowContent for LocationsWindow {
     fn update_and_render(&mut self, ui: &mut UIState, debugger: &mut Debugger, mut keys: Vec<Key>, f: Option<&mut Frame>, mut area: Rect) {
         let f = match f { Some(f) => f, None => return };
+        let palette = &debugger.context.settings.palette;
 
         if area.height > 0 {
             let mut a = area;
             a.height = 1;
-            let paragraph = Paragraph::new(Text {lines: vec![Spans::from(vec![Span::styled("(for address selected in disassembly window)", Style::default().add_modifier(Modifier::DIM))])]});
+            let paragraph = Paragraph::new(Text {lines: vec![Spans::from(vec![Span::styled("(for address selected in disassembly window)", palette.default_dim)])]});
             f.render_widget(paragraph, a);
             area.y += a.height;
             area.height -= a.height;
@@ -942,13 +951,13 @@ impl WindowContent for LocationsWindow {
 
         let rows = match self.fill_table(ui, debugger) {
             Ok(rows) => {
-                let range = self.scroll.update_cursorless(rows.len(), area.height.saturating_sub(1), &mut keys);
+                let range = self.scroll.update_cursorless(rows.len(), area.height.saturating_sub(1), &mut keys, &debugger.context.settings.keys);
                 rows[range].to_vec()
             }
-            Err(e) => vec![Row::new(vec![Cell::from(""), Cell::from(""), Cell::from(format!("{}", e)).style(Style::default().fg(Color::Red)), Cell::from("")])],
+            Err(e) => vec![Row::new(vec![Cell::from(""), Cell::from(""), Cell::from(format!("{}", e)).style(palette.error), Cell::from("")])],
         };
         let table = Table::new(rows)
-            .header(Row::new(vec!["name", "type", "expression", "die"]).style(Style::default().add_modifier(Modifier::DIM)))
+            .header(Row::new(vec!["name", "type", "expression", "die"]).style(palette.table_header))
             .widths(&[Constraint::Percentage(25), Constraint::Percentage(30), Constraint::Percentage(30), Constraint::Length(9)]);
 
         f.render_widget(table, area);
@@ -956,7 +965,8 @@ impl WindowContent for LocationsWindow {
 }
 
 impl LocationsWindow {
-    fn fill_table(&mut self, ui: &mut UIState, debugger: &mut Debugger) -> Result<Vec<Row<'static>>> {
+    fn fill_table(&mut self, ui: &mut UIState, debugger: &Debugger) -> Result<Vec<Row<'static>>> {
+        let palette = &debugger.context.settings.palette;
         let (binary_id, function_idx, addr) = match ui.selected_addr.clone() { Some(x) => x, None => return Ok(Vec::new()) };
         let binary = match debugger.info.binaries.get(&binary_id) {
             Some(x) => x,
@@ -985,13 +995,13 @@ impl LocationsWindow {
                         Ok(e) => format_dwarf_expression(v.expr, *e),
                         Err(e) => Err(e.clone()) };
                     let mut text = StyledText::new();
-                    print_type_name(v.type_, &mut text, 0);
+                    print_type_name(v.type_, &mut text, palette, 0);
                     rows.push(Row::new(vec![
                         Cell::from(format!("{}", unsafe {v.name()})),
                         Cell::from(text.into_line()),
                         match expr_str {
                             Ok(s) => Cell::from(s),
-                            Err(e) => Cell::from(format!("{}", e)).style(Style::default().fg(Color::Red)),
+                            Err(e) => Cell::from(format!("{}", e)).style(palette.error),
                         },
                         Cell::from(format!("{:x}", v.offset().0)),
                     ]));
@@ -1145,13 +1155,14 @@ impl DisassemblyWindow {
             // Would be nice to also support disassembling arbitrary memory, regardless of functions or binaries. E.g. for JIT-generated code.
             match Self::disassemble_function(&binary_id, function_idx, debugger) {
                 Ok(d) => d,
-                Err(e) => Disassembly::new().with_error(e),
+                Err(e) => Disassembly::new().with_error(e, &debugger.context.settings.palette),
             }
         })
     }
 
     // Would be nice to also support disassembling arbitrary memory, regardless of functions or binaries. E.g. for JIT-generated code.
     fn disassemble_function(binary_id: &BinaryId, function_idx: usize, debugger: &Debugger) -> Result<Disassembly> {
+        let palette = &debugger.context.settings.palette;
         let binary = match debugger.info.binaries.get(binary_id) {
             Some(x) => x,
             None => return err!(ProcessState, "binary not mapped"),
@@ -1161,18 +1172,18 @@ impl DisassemblyWindow {
         let function = &symbols.functions[function_idx];
 
         let mut prelude = StyledText::new();
-        styled_write!(prelude, Style::default().add_modifier(Modifier::DIM), "{}", binary_id.path);
+        styled_write!(prelude, palette.default_dim, "{}", binary_id.path);
         prelude.close_line();
         match function.debug_info_offset() {
-            Some(off) => styled_write!(prelude, Style::default().add_modifier(Modifier::DIM), "dwarf offset: 0x{:x}", off.0),
-            None => styled_write!(prelude, Style::default().add_modifier(Modifier::DIM), "function from symtab"),
+            Some(off) => styled_write!(prelude, palette.default_dim, "dwarf offset: 0x{:x}", off.0),
+            None => styled_write!(prelude, palette.default_dim, "function from symtab"),
         }
         prelude.close_line();
         prelude.close_line();
         // TODO: Print declaration site. Scroll code window to it when selected.
         // TODO: Print number of inlined call sites. Allow setting breakpoint on it.
 
-        Ok(disassemble_function(function_idx, ranges, Some(symbols.as_ref()), &binary.addr_map, &debugger.memory, prelude))
+        Ok(disassemble_function(function_idx, ranges, Some(symbols.as_ref()), &binary.addr_map, &debugger.memory, prelude, &debugger.context.settings.palette))
     }
 
     fn close_error_tab(&mut self) -> Option<usize> {
@@ -1238,7 +1249,7 @@ impl DisassemblyWindow {
 impl WindowContent for DisassemblyWindow {
     fn update_modal(&mut self, ui: &mut UIState, debugger: &mut Debugger, keys: &mut Vec<Key>) {
         if let Some(d) = &mut self.search_dialog {
-            let event = d.update(keys, &debugger.symbols, Some(debugger.info.binaries.keys().cloned().collect()));
+            let event = d.update(keys, &debugger.context.settings.keys, &debugger.symbols, Some(debugger.info.binaries.keys().cloned().collect()));
             let mut function_to_open = None;
             match event {
                 SearchDialogEvent::None => (),
@@ -1261,10 +1272,10 @@ impl WindowContent for DisassemblyWindow {
         }
 
         keys.retain(|key| {
-            match key {
-                Key::Ctrl('t') => self.switch_tab(1),
-                Key::Ctrl('b') => self.switch_tab(-1),
-                Key::Ctrl('y') => if !self.tabs.is_empty() {
+            match debugger.context.settings.keys.map.get(key) {
+                Some(KeyAction::NextTab) => self.switch_tab(1),
+                Some(KeyAction::PreviousTab) => self.switch_tab(-1),
+                Some(KeyAction::PinTab) => if !self.tabs.is_empty() {
                     let t = &mut self.tabs[self.selected_tab];
                     if !t.status.is_err() || t.pinned {
                         t.pinned ^= true;
@@ -1278,7 +1289,7 @@ impl WindowContent for DisassemblyWindow {
 
     fn render_modal(&mut self, ui: &mut UIState, debugger: &mut Debugger, f: &mut Frame, window_area: Rect, screen_area: Rect) {
         if let Some(d) = &mut self.search_dialog {
-            d.render(f, screen_area, "find function (by mangled name)");
+            d.render(f, screen_area, "find function (by mangled name)", &debugger.context.settings.palette);
         }
     }
 
@@ -1382,8 +1393,8 @@ impl WindowContent for DisassemblyWindow {
         }
 
         keys.retain(|key| {
-            match key {
-                Key::Char('o') => {
+            match debugger.context.settings.keys.map.get(key) {
+                Some(KeyAction::Open) => {
                     self.search_dialog = Some(SearchDialog::new(Box::new(FunctionSearcher)));
                     self.update_modal(ui, debugger, &mut Vec::new()); // kick off initial search with empty query
                 }
@@ -1392,6 +1403,7 @@ impl WindowContent for DisassemblyWindow {
             false
         });
 
+        let palette = &debugger.context.settings.palette;
         let mut header = StyledText::new();
         let mut disas: Option<(BinaryId, usize, &Disassembly)> = None;
         self.resolve_function_for_tab(self.selected_tab, debugger);
@@ -1399,16 +1411,16 @@ impl WindowContent for DisassemblyWindow {
         styled_write!(header, Style::default(), "{}", indent);
         match &self.tabs[self.selected_tab].status {
             DisassemblyTabStatus::Err(e) => {
-                styled_write!(header, Style::default().bg(Color::Red).fg(Color::Black), "{}", e);
+                styled_write!(header, palette.error, "{}", e);
             }
             DisassemblyTabStatus::Unresolved {locator, cached_error} => {
-                styled_write!(header, Style::default().add_modifier(Modifier::DIM), "{}", locator.demangled_name);
+                styled_write!(header, palette.default_dim, "{}", locator.demangled_name);
                 header.close_line();
                 styled_write!(header, Style::default(), "{}", indent);
-                styled_write!(header, Style::default().bg(Color::Red).fg(Color::Black), "couldn't find function: {}", cached_error.as_ref().unwrap());
+                styled_write!(header, palette.error, "couldn't find function: {}", cached_error.as_ref().unwrap());
             }
             DisassemblyTabStatus::Function {locator, function_idx} => {
-                styled_write!(header, Style::default().add_modifier(Modifier::DIM), "{}", locator.demangled_name);
+                styled_write!(header, palette.function_name, "{}", locator.demangled_name);
                 disas = Some((locator.binary_id.clone(), *function_idx, Self::find_or_disassemble_function(&mut self.cache, locator.binary_id.clone(), *function_idx, debugger)));
             }
         }
@@ -1420,12 +1432,12 @@ impl WindowContent for DisassemblyWindow {
         let mut toggle_breakpoint = false;
         let mut subfunction_level_delta = 0isize;
         keys.retain(|key| {
-            match key {
-                Key::Right => tab.hscroll = tab.hscroll.saturating_add(width),
-                Key::Left => tab.hscroll = tab.hscroll.saturating_sub(width),
-                Key::Char('b') => toggle_breakpoint ^= true,
-                Key::Char(',') => subfunction_level_delta -= 1,
-                Key::Char('.') => subfunction_level_delta += 1,
+            match debugger.context.settings.keys.map.get(key) {
+                Some(KeyAction::CursorRight) => tab.hscroll = tab.hscroll.saturating_add(width),
+                Some(KeyAction::CursorLeft) => tab.hscroll = tab.hscroll.saturating_sub(width),
+                Some(KeyAction::ToggleBreakpoint) => toggle_breakpoint ^= true,
+                Some(KeyAction::PreviousMatch) => subfunction_level_delta -= 1,
+                Some(KeyAction::NextMatch) => subfunction_level_delta += 1,
                 _ => return true
             }
             false
@@ -1438,11 +1450,11 @@ impl WindowContent for DisassemblyWindow {
             let tabs = Tabs::new(self.tabs.iter().map(
                 |t| Spans::from(vec![
                     if t.pinned {
-                        Span::raw("📌 ".to_string() + &t.title)
+                        Span::styled("📌 ".to_string() + &t.title, palette.tab_title_active)
                     } else {
-                        Span::styled(t.title.clone(), Style::default().add_modifier(Modifier::DIM))
+                        Span::styled(t.title.clone(), palette.tab_title)
                     }])).collect())
-                .select(self.selected_tab).highlight_style(Style::default().bg(Color::White).fg(Color::Black));
+                .select(self.selected_tab).highlight_style(palette.tab_title_selected);
             f.render_widget(tabs, a);
 
             area.y += 1;
@@ -1480,7 +1492,7 @@ impl WindowContent for DisassemblyWindow {
                 tab.selected_subfunction_level = subfunction_level;
                 tab.scroll.set(disas.text.num_lines(), area.height, disas.pseudo_addr_to_line(addr).unwrap_or(0))
             } else {
-                tab.scroll.update(disas.text.num_lines(), area.height, &mut keys)
+                tab.scroll.update(disas.text.num_lines(), area.height, &mut keys, &debugger.context.settings.keys)
             };
 
             let mut selected_subfunction_idx: Option<usize> = None;
@@ -1548,9 +1560,9 @@ impl WindowContent for DisassemblyWindow {
                 if ip_idx == ip_lines.len() || ip_lines[ip_idx].0 != i {
                     spans.push(Span::raw("  "));
                 } else if ip_lines[ip_idx].1 {
-                    spans.push(Span::styled("⮕ ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)));
+                    spans.push(Span::styled("⮕ ", palette.instruction_pointer));
                 } else {
-                    spans.push(Span::styled("⮕ ", Style::default().fg(Color::Blue)));
+                    spans.push(Span::styled("⮕ ", palette.additional_instruction_pointer));
                 }
 
                 let loc_idx = debugger.breakpoint_locations.partition_point(|loc| loc.addr < line_addr.addr);
@@ -1561,7 +1573,7 @@ impl WindowContent for DisassemblyWindow {
                         marker = if loc.active { "● " } else { "○ " }
                     }
                 }
-                spans.push(Span::styled(marker, Style::default().fg(Color::Blue)));
+                spans.push(Span::styled(marker, palette.secondary_breakpoint));
 
                 let indent_span_idx = spans.len() + line_addr.indent_span_idx;
                 disas.text.line_out(i, &mut spans);
@@ -1591,7 +1603,7 @@ impl WindowContent for DisassemblyWindow {
                 if i == tab.scroll.cursor && line_addr.kind != DisassemblyLineKind::Error {
                     spans.push(Span::raw(format!("{: >0$}", longest_line.max(area.width as usize) + 10))); // fill the rest of the line with spaces
                     for span in &mut spans[1..] {
-                        span.style.bg = Some(Color::Rgb(30, 30, 30));
+                        span.style.bg = palette.selected_text_line.bg.clone();
                     }
                 }
 
@@ -1622,28 +1634,29 @@ impl Default for StatusWindow { fn default() -> Self { Self {} } }
 impl WindowContent for StatusWindow {
     fn update_and_render(&mut self, ui: &mut UIState, debugger: &mut Debugger, keys: Vec<Key>, f: Option<&mut Frame>, area: Rect) {
         let f = match f { Some(f) => f, None => return };
+        let palette = &debugger.context.settings.palette;
 
         let mut items: Vec<ListItem> = Vec::new();
 
         items.push(match debugger.target_state {
-            ProcessState::NoProcess => ListItem::new("no process").style(Style::default().add_modifier(Modifier::DIM)),
-            ProcessState::Starting => ListItem::new("starting").style(Style::default().bg(Color::Yellow).fg(Color::Black)),
-            ProcessState::Exiting => ListItem::new("exiting").style(Style::default().bg(Color::Yellow).fg(Color::Black)),
-            ProcessState::Stepping => ListItem::new("stepping").style(Style::default().bg(Color::Yellow).fg(Color::Black)),
-            ProcessState::Running => ListItem::new("running").style(Style::default().bg(Color::Blue).fg(Color::Black)),
-            ProcessState::Suspended => ListItem::new("suspended").style(Style::default().bg(Color::LightGreen).fg(Color::Black)),
+            ProcessState::NoProcess => ListItem::new("no process").style(palette.default_dim),
+            ProcessState::Starting => ListItem::new("starting").style(palette.state_other),
+            ProcessState::Exiting => ListItem::new("exiting").style(palette.state_other),
+            ProcessState::Stepping => ListItem::new("stepping").style(palette.state_other),
+            ProcessState::Running => ListItem::new("running").style(palette.state_in_progress),
+            ProcessState::Suspended => ListItem::new("suspended").style(palette.state_suspended),
         });
 
         if debugger.target_state != ProcessState::NoProcess {
-            items.push(ListItem::new(Text::from(Spans::from(vec![Span::styled("pid: ", Style::default().add_modifier(Modifier::DIM)), Span::raw(format!("{}", debugger.pid))]))));
+            items.push(ListItem::new(Text::from(Spans::from(vec![Span::styled("pid: ", palette.default_dim), Span::raw(format!("{}", debugger.pid))]))));
         }
         match &debugger.persistent.path {
-            Ok(p) => items.push(ListItem::new(format!("{}/", p.display())).style(Style::default().add_modifier(Modifier::DIM))),
-            Err(e) => items.push(ListItem::new(format!("{}", e)).style(Style::default().bg(Color::Red).fg(Color::Black))),
+            Ok(p) => items.push(ListItem::new(format!("{}/", p.display())).style(palette.default_dim)),
+            Err(e) => items.push(ListItem::new(format!("{}", e)).style(palette.error)),
         }
 
         if ui.last_error != "" {
-            items.push(ListItem::new(ui.last_error.clone()).style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Red)));
+            items.push(ListItem::new(ui.last_error.clone()).style(palette.status_error));
             items.push(ListItem::new(" "));
         }
 
@@ -1666,13 +1679,14 @@ impl Default for HintsWindow { fn default() -> Self { Self {} } }
 impl WindowContent for HintsWindow {
     fn update_and_render(&mut self, ui: &mut UIState, debugger: &mut Debugger, keys: Vec<Key>, f: Option<&mut Frame>, area: Rect) {
         let f = match f { Some(f) => f, None => return };
+        let palette = &debugger.context.settings.palette;
 
         if ui.profiler_enabled {
             let mut prof = StyledText::new();
             debugger.log.prof.format_summary(&mut prof, area.width as usize);
             let prof_lines = prof.to_lines();
             let mut items: Vec<ListItem> = Vec::new();
-            items.push(ListItem::new("C-p to hide profiler").style(Style::default().add_modifier(Modifier::DIM)));
+            items.push(ListItem::new("C-p to hide profiler").style(palette.default_dim));
             for line in prof_lines {
                 items.push(ListItem::new(line));
             }
@@ -1712,8 +1726,9 @@ impl WindowContent for BinariesWindow {
         }
 
         let f = match f { Some(f) => f, None => return };
+        let palette = &debugger.context.settings.palette;
 
-        let range = self.scroll.update_cursorless(ui.binaries.len(), area.height.saturating_sub(1), &mut keys);
+        let range = self.scroll.update_cursorless(ui.binaries.len(), area.height.saturating_sub(1), &mut keys, &debugger.context.settings.keys);
 
         let mut rows: Vec<Row> = Vec::new();
         let mut column_widths = [3, 0, 11, 9];
@@ -1723,22 +1738,22 @@ impl WindowContent for BinariesWindow {
             let binary = debugger.symbols.get_if_present(id).unwrap();
             let is_mapped = debugger.info.binaries.contains_key(id);
             let mut cells: Vec<Cell> = vec![
-                Cell::from(format!("{}", idx + 1)).style(Style::default().add_modifier(Modifier::DIM)),
+                Cell::from(format!("{}", idx + 1)).style(palette.default_dim),
                 Cell::from(""),
                 // ELF or unwind error/loading/stats.
                 match &binary.elf {
-                    Err(e) if e.is_loading() => Cell::from(Span::styled("loading", Style::default().bg(Color::Blue).fg(Color::Black))),
-                    Err(e) => Cell::from(Span::styled("error", Style::default().bg(Color::Red).fg(Color::Black))),
-                    Ok(elf) => Cell::from(format!("{}", PrettySize(elf.data().len()))).style(Style::default().add_modifier(Modifier::DIM)),
+                    Err(e) if e.is_loading() => Cell::from(Span::styled("loading", palette.state_in_progress)),
+                    Err(e) => Cell::from(Span::styled("error", palette.error)),
+                    Ok(elf) => Cell::from(format!("{}", PrettySize(elf.data().len()))).style(palette.default_dim),
                 },
                 if binary.unwind.as_ref().is_err_and(|e| e.is_loading()) || binary.symbols.as_ref().is_err_and(|e| e.is_loading()) {
-                    Cell::from(Span::styled("loading", Style::default().bg(Color::Blue).fg(Color::Black).add_modifier(Modifier::DIM)))
+                    Cell::from(Span::styled("loading", palette.state_in_progress))
                 } else if binary.unwind.is_ok() && binary.symbols.is_ok() {
-                    Cell::from("ok").style(Style::default().add_modifier(Modifier::DIM))
+                    Cell::from("ok").style(palette.default_dim)
                 } else if binary.unwind.as_ref().map_or_else(|e| e.is_missing_symbols(), |_| true) && binary.symbols.as_ref().map_or_else(|e| e.is_missing_symbols(), |_| true) {
-                    Cell::from(Span::styled("no", Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::DIM)))
+                    Cell::from(Span::styled("no", palette.warning_dim))
                 } else {
-                    Cell::from(Span::styled("error", Style::default().bg(Color::Red).fg(Color::Black).add_modifier(Modifier::DIM)))
+                    Cell::from(Span::styled("error", palette.error_dim))
                 }];
             // The wide cell may have multiple lines with progress bar or errors.
             let mut lines: Vec<Spans> = vec![Spans::from(vec![Span::raw(format!("{}", id.path))])];
@@ -1758,31 +1773,31 @@ impl WindowContent for BinariesWindow {
                 // Text and progress bar combined. We assume there's no unicode.
                 let bar = wid * progress_ppm.min(1000000) / 1000000;
                 let pos = text.char_indices().skip(bar).next().unwrap().0;
-                lines.push(Spans::from(vec![Span::styled(text[..pos].to_string(), Style::default().bg(Color::Blue).fg(Color::Black)), Span::styled(text[pos..].to_string(), Style::default().bg(Color::Rgb(30, 30, 30)))]));
+                lines.push(Spans::from(vec![Span::styled(text[..pos].to_string(), palette.progress_bar_done), Span::styled(text[pos..].to_string(), palette.progress_bar_remaining)]));
             }
             if binary.elf.as_ref().is_err_and(|e| !e.is_loading()) {
-                lines.push(Spans::from(vec![Span::styled(format!("{}", binary.elf.as_ref().err().unwrap()), Style::default().bg(Color::Red).fg(Color::Black))]));
+                lines.push(Spans::from(vec![Span::styled(format!("{}", binary.elf.as_ref().err().unwrap()), palette.error)]));
             } else {
                 if binary.unwind.as_ref().is_err_and(|e| !e.is_loading()) {
                     let e = binary.unwind.as_ref().err().unwrap();
-                    lines.push(Spans::from(vec![Span::styled(format!("{}", e), if e.is_missing_symbols() {Style::default().add_modifier(Modifier::DIM)} else {Style::default().bg(Color::Red).fg(Color::Black)})]));
+                    lines.push(Spans::from(vec![Span::styled(format!("{}", e), if e.is_missing_symbols() {palette.default_dim} else {palette.error})]));
                 }
                 if binary.symbols.as_ref().is_err_and(|e| !e.is_loading()) {
                     let e = binary.symbols.as_ref().err().unwrap();
-                    lines.push(Spans::from(vec![Span::styled(format!("{}", e), if e.is_missing_symbols() {Style::default().add_modifier(Modifier::DIM)} else {Style::default().bg(Color::Red).fg(Color::Black)})]))
+                    lines.push(Spans::from(vec![Span::styled(format!("{}", e), if e.is_missing_symbols() {palette.default_dim} else {palette.error})]))
                 }
             }
             let h = lines.len();
             cells[1] = Cell::from(Text {lines});
             let mut row = Row::new(cells).height(h as u16);
             if !is_mapped {
-                row = row.style(Style::default().add_modifier(Modifier::DIM));
+                row = row.style(palette.default_dim);
             }
             rows.push(row);
         }
         let column_widths: Vec<Constraint> = column_widths.iter().map(|w| Constraint::Length(*w)).collect();
         let table = Table::new(rows)
-            .header(Row::new(vec!["idx", "name", "file", "symbols"]).style(Style::default().add_modifier(Modifier::DIM)))
+            .header(Row::new(vec!["idx", "name", "file", "symbols"]).style(palette.table_header))
             .widths(&column_widths);
 
         f.render_widget(table, area);
@@ -1879,13 +1894,13 @@ impl WindowContent for ThreadsWindow {
             if self.filter.editing {
                 return true;
             }
-            match key {
-                Key::Char('/') => {
+            match debugger.context.settings.keys.map.get(key) {
+                Some(KeyAction::Find) => {
                     self.filter.active = true;
                     self.filter.editing = true;
                     self.filter.text.cursor = self.filter.text.text.len();
                 }
-                Key::Esc | Key::Ctrl('g') => self.filter.active = false,
+                Some(KeyAction::Cancel) => self.filter.active = false,
                 _ => return true,
             }
             false
@@ -1933,7 +1948,7 @@ impl WindowContent for ThreadsWindow {
 
         let filter_height = if self.filter.active {1} else {0};
         let height = area.height.saturating_sub(1 + filter_height);
-        let mut range = self.scroll.update(filtered_tids.len(), height, &mut keys);
+        let mut range = self.scroll.update(filtered_tids.len(), height, &mut keys, &debugger.context.settings.keys);
 
         ui.selected_thread = filtered_tids.get(self.scroll.cursor).copied().unwrap_or(0);
         if selected_thread_filtered_out && ui.selected_thread != *filtered_tids.last().unwrap() {
@@ -1943,17 +1958,19 @@ impl WindowContent for ThreadsWindow {
         }
 
         let f = match f { Some(f) => f, None => return };
+        let context_temp = debugger.context.clone();
+        let palette = &context_temp.settings.palette;
 
         if filter_height == 1 && area.height > 0 {
             let message = "filter: ";
             let message_area = Rect {x: area.x, y: area.y, width: area.width.min(message.len() as u16), height: 1};
             let text_area = Rect {x: area.x + message_area.width, y: area.y, width: area.width.saturating_sub(message_area.width), height: 1};
-            let paragraph = Paragraph::new(Text {lines: vec![Spans::from(vec![Span::styled(message.to_string(), Style::default().bg(Color::Rgb(30, 30, 30)).add_modifier(Modifier::DIM))])]});
+            let paragraph = Paragraph::new(Text {lines: vec![Spans::from(vec![Span::styled(message.to_string(), palette.search_bar_dim)])]});
             f.render_widget(paragraph, message_area);
             if self.filter.editing {
-                self.filter.text.render(f, text_area);
+                self.filter.text.render(f, text_area, palette);
             } else {
-                let paragraph = Paragraph::new(Text {lines: vec![Spans::from(vec![Span::styled(self.filter.text.text.clone(), Style::default().bg(Color::Rgb(30, 30, 30)).add_modifier(Modifier::DIM))])]});
+                let paragraph = Paragraph::new(Text {lines: vec![Spans::from(vec![Span::styled(self.filter.text.text.clone(), palette.search_bar_dim)])]});
                 f.render_widget(paragraph, text_area);
             }
         }
@@ -1965,31 +1982,31 @@ impl WindowContent for ThreadsWindow {
             let stack = debugger.get_stack_trace(*tid, /* partial */ true);
             let t = debugger.threads.get(tid).unwrap();
             let mut cells = vec![
-                Cell::from(format!("{}", t.idx)).style(Style::default().add_modifier(Modifier::DIM)),
-                Cell::from(format!("{}", t.tid)).style(Style::default().add_modifier(Modifier::DIM)),
+                Cell::from(format!("{}", t.idx)).style(palette.default_dim),
+                Cell::from(format!("{}", t.tid)).style(palette.default_dim),
                 Cell::from(t.info.name.clone())];
             match t.state {
                 ThreadState::Running => cells.extend_from_slice(&[
                     Cell::from(""),
                     Cell::from(""),
                     match &debugger.stepping {
-                        Some(step) if step.tid == *tid => Cell::from(Span::styled("stepping", Style::default().bg(Color::Yellow).fg(Color::Black))),
-                        _ => Cell::from(Span::styled("running", Style::default().bg(Color::Blue).fg(Color::Black))),
+                        Some(step) if step.tid == *tid => Cell::from(Span::styled("stepping", palette.state_other)),
+                        _ => Cell::from(Span::styled("running", palette.state_in_progress)),
                     }]),
                 ThreadState::Suspended if !stack.frames.is_empty() => {
                     let f = &stack.frames[0];
                     let sf = &stack.subframes[0];
                     cells.extend_from_slice(&[
-                        Cell::from(format!("{:x}", f.addr)).style(Style::default().add_modifier(Modifier::DIM)),
+                        Cell::from(format!("{:x}", f.addr)).style(palette.default_dim),
                         if let Some(binary_id) = &f.binary_id {
                             Cell::from(format!("{}", ui.binaries.iter().position(|b| b == binary_id).unwrap() + 1))
                         } else {
-                            Cell::from("?").style(Style::default().add_modifier(Modifier::DIM))
+                            Cell::from("?").style(palette.default_dim)
                         },
                         if let Some(function_name) = &sf.function_name {
                             Cell::from(format!("{}", function_name))
                         } else {
-                            Cell::from("?").style(Style::default().add_modifier(Modifier::DIM))
+                            Cell::from("?").style(palette.default_dim)
                         }]);
                 }
                 ThreadState::Suspended => cells.extend_from_slice(&[
@@ -1997,12 +2014,12 @@ impl WindowContent for ThreadsWindow {
                     Cell::from(""),
                     if let Some(e) = &stack.truncated {
                         if e.is_loading() {
-                            Cell::from(Span::styled("[loading]", Style::default().bg(Color::Blue).fg(Color::Black).add_modifier(Modifier::DIM)))
+                            Cell::from(Span::styled("[loading]", palette.state_in_progress))
                         } else {
-                            Cell::from(Span::styled(format!("err: {}", e), Style::default().bg(Color::Red).fg(Color::Black).add_modifier(Modifier::DIM)))
+                            Cell::from(Span::styled(format!("err: {}", e), palette.error_dim))
                         }
                     } else {
-                        Cell::from(Span::styled("[empty]", Style::default().add_modifier(Modifier::DIM)))
+                        Cell::from(Span::styled("[empty]", palette.default_dim))
                     }]),
             };
 
@@ -2017,17 +2034,17 @@ impl WindowContent for ThreadsWindow {
             for stop in &t.stop_reasons {
                 match stop {
                     StopReason::Signal(_) => {
-                        row = row.style(Style::default().bg(Color::Red).fg(Color::Black));
+                        row = row.style(palette.error);
                         break;
                     }
                     StopReason::Breakpoint(_) => {
-                        row = row.style(Style::default().bg(Color::Green).fg(Color::Black));
+                        row = row.style(palette.state_suspended);
                     }
                     StopReason::Step => (),
                 }
             }
             if selected_thread_filtered_out && *tid == ui.selected_thread {
-                row = row.style(Style::default().add_modifier(Modifier::DIM));
+                row = row.style(palette.default_dim);
             }
             row
         }).collect();
@@ -2044,9 +2061,9 @@ impl WindowContent for ThreadsWindow {
         }        
         
         let table = Table::new(rows)
-            .header(Row::new(header).style(Style::default().add_modifier(Modifier::DIM)))
+            .header(Row::new(header).style(palette.table_header))
             .widths(&widths)
-            .highlight_style(Style::default().add_modifier(Modifier::BOLD)).highlight_symbol(highlight_symbol);
+            .highlight_style(palette.table_selected_item).highlight_symbol(highlight_symbol);
         
         f.render_stateful_widget(table, Rect {x: area.x, y: area.y + filter_height, width: area.width, height: area.height.saturating_sub(filter_height)}, &mut table_state);
     }
@@ -2059,10 +2076,10 @@ impl WindowContent for ThreadsWindow {
         if !self.filter.editing {
             return;
         }
-        let event = self.filter.text.update(keys);
+        let event = self.filter.text.update(keys, &debugger.context.settings.keys);
         match event {
             TextInputEvent::None | TextInputEvent::Open => (),
-            TextInputEvent::Done | TextInputEvent::Tab => {
+            TextInputEvent::Done => {
                 self.filter.editing = false;
             }
             TextInputEvent::Cancel => {
@@ -2164,7 +2181,7 @@ impl WindowContent for StackWindow {
             let thr = self.threads.entry(ui.selected_thread).or_insert((0, StableSubframeIdx::top()));
             if thr.0 == stop_count || locked {
                 self.scroll.cursor = thr.1.subframe_idx(&ui.stack);
-                scroll_source_and_disassembly |= self.scroll.update_detect_movement(num_rows, height, &mut keys).1;
+                scroll_source_and_disassembly |= self.scroll.update_detect_movement(num_rows, height, &mut keys, &debugger.context.settings.keys).1;
             } else {
                 switch_to_subframe = Some(deb_thr.subframe_to_select.unwrap_or(0));
             }
@@ -2200,6 +2217,7 @@ impl WindowContent for StackWindow {
         }
 
         let f = match f { Some(f) => f, None => return };
+        let palette = &debugger.context.settings.palette;
 
         let mut range = self.scroll.range(num_rows, height as usize);
         range.end = num_rows.min(range.end + 1); // each row takes 2 lines, so there may be a half-row at the end - render it too
@@ -2216,39 +2234,39 @@ impl WindowContent for StackWindow {
                     if let Some(n) = &subframe.function_name {
                         Span::raw(format!("{}", n))
                     } else if let Err(e) = &subframe.function {
-                        Span::styled(format!("{}", e), Style::default().bg(Color::Red).fg(Color::Black))
+                        Span::styled(format!("{}", e), palette.error)
                     } else {
-                        Span::styled("?", Style::default().add_modifier(Modifier::DIM))
+                        Span::styled("?", palette.default_dim)
                     }];
                 let mut line_spans = vec![
                     if let Some(info) = &subframe.line {
                         let name = info.path.as_os_str().to_string_lossy();
-                        Span::styled(format!("{}", name), Style::default().fg(Color::Cyan))
+                        Span::styled(format!("{}", name), palette.location_filename)
                     } else {
-                        Span::styled("?", Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM))
+                        Span::styled("?", palette.location_filename.add_modifier(Modifier::DIM))
                     }];
                 if let Some(info) = &subframe.line {
                     if info.line.line() != 0 {
-                        line_spans.push(Span::styled(format!(":{}", info.line.line()), Style::default().fg(Color::Green)));
+                        line_spans.push(Span::styled(format!(":{}", info.line.line()), palette.location_line_number));
                         if info.line.column() != 0 {
-                            line_spans.push(Span::styled(format!(":{}", info.line.column()), Style::default().fg(Color::Green).add_modifier(Modifier::DIM)));
+                            line_spans.push(Span::styled(format!(":{}", info.line.column()), palette.location_column_number));
                         }
                     }
                 }
-                let idx_spans = vec![Span::styled(format!("{}", idx), Style::default().add_modifier(Modifier::DIM))];
+                let idx_spans = vec![Span::styled(format!("{}", idx), palette.default_dim)];
 
                 let is_inlined = idx != frame.subframes.end-1;
 
                 let mut row = Row::new(vec![
                     Cell::from(Spans::from(idx_spans)),
-                    Cell::from(if is_inlined {String::new()} else {format!("{:x}", frame.addr)}).style(Style::default().add_modifier(Modifier::DIM)),
+                    Cell::from(if is_inlined {String::new()} else {format!("{:x}", frame.addr)}).style(palette.default_dim),
                     if is_inlined {
                         Cell::from("")
                     } else if let Some(b) = &frame.binary_id {
                         Cell::from(format!("{}", ui.binaries.iter().position(|x| x == b).unwrap() + 1))
                     } else {
                         Cell::from("?")
-                    }.style(Style::default().add_modifier(Modifier::DIM)),
+                    }.style(palette.default_dim),
                     Cell::from(Text {lines: vec![Spans::from(func_spans), Spans::from(line_spans)]}),
                 ]);
                 // The table widget doesn't show partial rows, so if the height is odd we have to manually set last row's height to 1 instead of 2.
@@ -2263,17 +2281,17 @@ impl WindowContent for StackWindow {
                     Cell::from(""),
                     Cell::from(""),
                     if e.is_usage() || e.is_loading() {
-                        Cell::from(Text {lines: vec![Spans::from(Span::styled(format!("{}", e), Style::default().add_modifier(Modifier::DIM))), Spans::default()]})
+                        Cell::from(Text {lines: vec![Spans::from(Span::styled(format!("{}", e), palette.default_dim)), Spans::default()]})
                     } else {
-                        Cell::from(Text {lines: vec![Spans::from(Span::styled(format!("stack truncated: {}", e), Style::default().bg(Color::Red).fg(Color::Black))), Spans::default()]})
+                        Cell::from(Text {lines: vec![Spans::from(Span::styled(format!("stack truncated: {}", e), palette.error)), Spans::default()]})
                     }
                 ]));
             }
         }
         let table = Table::new(rows)
-            .header(Row::new(vec![Text::from("idx"), Text::from("address"), Text::from("bin"), Text {lines: vec![Spans::from("location"), Spans::from(Span::styled("line", Style::default().fg(Color::Cyan)))]}]).style(Style::default().add_modifier(Modifier::DIM)).height(/* tried 2, but it looks worse */ 1))
+            .header(Row::new(vec![Text::from("idx"), Text::from("address"), Text::from("bin"), Text {lines: vec![Spans::from("location"), Spans::from(Span::styled("line", palette.location_filename))]}]).style(palette.table_header).height(/* tried 2, but it looks worse */ 1))
             .widths(&[Constraint::Length(3), Constraint::Length(12), Constraint::Length(3), Constraint::Percentage(90)])
-            .highlight_style(Style::default().add_modifier(Modifier::BOLD)).highlight_symbol(">> ");
+            .highlight_style(palette.table_selected_item).highlight_symbol(">> ");
 
         f.render_stateful_widget(table, area, &mut table_state);
     }
@@ -2320,6 +2338,7 @@ impl CodeWindow {
     }
 
     fn open_file(path_in_symbols: &Path, version: &FileVersionInfo, debugger: &Debugger) -> SourceFile {
+        let palette = &debugger.context.settings.palette;
         let mut res = SourceFile {header: StyledText::new(), text: StyledText::new(), local_path: PathBuf::new(), longest_line: 0, num_lines_in_local_file: 0};
 
         if path_in_symbols.as_os_str().is_empty() {
@@ -2346,7 +2365,7 @@ impl CodeWindow {
                 Err(_) => path_to_try.clone() };
 
             write!(res.header.chars, "{}", res.local_path.to_string_lossy()).unwrap();
-            res.header.close_span(Style::default().fg(Color::Cyan));
+            res.header.close_span(palette.location_filename);
             res.header.close_line();
 
             match Self::read_and_format_file(&mut file, debugger, &mut res, path_in_symbols) {
@@ -2361,13 +2380,13 @@ impl CodeWindow {
                         warn = false;
                     }
                     if warn {
-                        res.header.close_span(Style::default().bg(Color::Yellow).fg(Color::Black));
+                        res.header.close_span(palette.warning);
                         res.header.close_line();
                     }
                 }
                 Err(e) => {
                     write!(res.header.chars, "{}", e).unwrap();
-                    res.header.close_span(Style::default().bg(Color::Red).fg(Color::Black));
+                    res.header.close_span(palette.error);
                     res.header.close_line();
                     res.text.clear();
                 }
@@ -2382,15 +2401,15 @@ impl CodeWindow {
         res.header.close_line();
         if let Some(url) = rust_fake_path_to_url(&path_str) {
             write!(res.header.chars, "can be found here:").unwrap();
-            res.header.close_span(Style::default().add_modifier(Modifier::DIM));
+            res.header.close_span(palette.default_dim);
             res.header.close_line();
             
             write!(res.header.chars, "{}", url).unwrap();
-            res.header.close_span(Style::default().fg(Color::Blue));
+            res.header.close_span(palette.url);
             res.header.close_line();
         } else {
             write!(res.header.chars, "file not found (tried all suffixes of this path, relative to current directory)").unwrap();
-            res.header.close_span(Style::default().add_modifier(Modifier::DIM));
+            res.header.close_span(palette.default_dim);
             res.header.close_line();
         }
 
@@ -2402,6 +2421,7 @@ impl CodeWindow {
     }
 
     fn read_and_format_file(input: &mut dyn Read, debugger: &Debugger, res: &mut SourceFile, path_in_symbols: &Path) -> Result<(usize, [u8; 16])> {
+        let palette = &debugger.context.settings.palette;
         // Highlight all line+column locations where we can stop (statements and inlined function call sites).
         let mut markers: Vec<LineInfo> = Vec::new();
         for (_, binary) in debugger.symbols.iter() {
@@ -2435,7 +2455,7 @@ impl CodeWindow {
                 if line_chars_start + column > prev_span_end {
                     text.spans.push((line_chars_start + column, Style::default()));
                 }
-                text.spans.push((line_chars_start + column + 1, Style::default().bg(if marker.flags().contains(LineFlags::INLINED_FUNCTION) {Color::LightBlue} else {Color::DarkGray})));
+                text.spans.push((line_chars_start + column + 1, if marker.flags().contains(LineFlags::INLINED_FUNCTION) {palette.code_inlined_site} else {palette.code_statement}));
                 *marker_idx += 1;
             }
             text.close_span(Style::default());
@@ -2708,7 +2728,7 @@ fn rust_fake_path_to_url(path: &str) -> Option<String> {
 impl WindowContent for CodeWindow {
     fn update_modal(&mut self, ui: &mut UIState, debugger: &mut Debugger, keys: &mut Vec<Key>) {
         if let Some(d) = &mut self.search_dialog {
-            let event = d.update(keys, &debugger.symbols, None);
+            let event = d.update(keys, &debugger.context.settings.keys, &debugger.symbols, None);
             let mut file_to_open = None;
             match event {
                 SearchDialogEvent::None => (),
@@ -2730,12 +2750,12 @@ impl WindowContent for CodeWindow {
         }
 
         keys.retain(|key| {
-            match key {
+            match debugger.context.settings.keys.map.get(key) {
                 // Code window has its own tabs and consumes all tab switching inputs when active.
                 // If code window shares a region with another window, there's currently no way to switch to it. When adding layout editing mode, we should probably just disallow that.
-                Key::Ctrl('t') => self.switch_tab(1),
-                Key::Ctrl('b') => self.switch_tab(-1),
-                Key::Ctrl('y') => if !self.tabs.is_empty() {
+                Some(KeyAction::NextTab) => self.switch_tab(1),
+                Some(KeyAction::PreviousTab) => self.switch_tab(-1),
+                Some(KeyAction::PinTab) => if !self.tabs.is_empty() {
                     let t = &mut self.tabs[self.selected_tab];
                     if !t.path_in_symbols.as_os_str().is_empty() || t.pinned {
                         t.pinned ^= true;
@@ -2749,7 +2769,7 @@ impl WindowContent for CodeWindow {
 
     fn render_modal(&mut self, ui: &mut UIState, debugger: &mut Debugger, f: &mut Frame, window_area: Rect, screen_area: Rect) {
         if let Some(d) = &mut self.search_dialog {
-            d.render(f, screen_area, "find file");
+            d.render(f, screen_area, "find file", &debugger.context.settings.palette);
         }
     }
 
@@ -2812,15 +2832,15 @@ impl WindowContent for CodeWindow {
 
         let mut select_disassembly_address: isize = 0;
         keys.retain(|key| {
-            match key {
-                Key::Char('b') => self.toggle_breakpoint(false, ui, debugger),
-                Key::Char('B') => self.toggle_breakpoint(true, ui, debugger),
-                Key::Char('o') => {
+            match debugger.context.settings.keys.map.get(key) {
+                Some(KeyAction::ToggleBreakpoint) => self.toggle_breakpoint(false, ui, debugger),
+                Some(KeyAction::ToggleBreakpointEnabledness) => self.toggle_breakpoint(true, ui, debugger),
+                Some(KeyAction::Open) => {
                     self.search_dialog = Some(SearchDialog::new(Box::new(FileSearcher)));
                     self.update_modal(ui, debugger, &mut Vec::new()); // kick off initial search with empty query
                 }
-                Key::Char(',') => select_disassembly_address -= 1,
-                Key::Char('.') => select_disassembly_address += 1,
+                Some(KeyAction::PreviousMatch) => select_disassembly_address -= 1,
+                Some(KeyAction::NextMatch) => select_disassembly_address += 1,
                 _ => return true
             }
             false
@@ -2847,6 +2867,7 @@ impl WindowContent for CodeWindow {
         }
 
         let mut headers = 0u16;
+        let palette = &debugger.context.settings.palette;
 
         if area.height > 0 {
             let mut a = area;
@@ -2854,12 +2875,12 @@ impl WindowContent for CodeWindow {
             let tabs = Tabs::new(self.tabs.iter().map(
                 |t| Spans::from(vec![
                     if t.pinned {
-                        Span::raw("📌 ".to_string() + &t.title)
+                        Span::styled("📌 ".to_string() + &t.title, palette.tab_title_active)
                     } else {
                         // Italic would be better, and would remove the need for the weird pin icon, but it doesn't work in some terminals (e.g. doesn't work for me with gterm+ssh+tmux combination).
-                        Span::styled(t.title.clone(), Style::default().add_modifier(Modifier::DIM))
+                        Span::styled(t.title.clone(), palette.tab_title)
                     }])).collect())
-                .select(self.selected_tab).highlight_style(Style::default().bg(Color::White).fg(Color::Black));
+                .select(self.selected_tab).highlight_style(palette.tab_title_selected);
             f.render_widget(tabs, a);
             headers += 1;
 
@@ -2877,11 +2898,11 @@ impl WindowContent for CodeWindow {
         let height = area.height.saturating_sub(headers);
         let width = area.width.saturating_sub(2 + 2 + line_num_len as u16 + 1);
 
-        let range = tab.scroll.update(file.text.num_lines(), height, &mut keys);
+        let range = tab.scroll.update(file.text.num_lines(), height, &mut keys, &debugger.context.settings.keys);
         keys.retain(|key| {
-            match key {
-                Key::Right => tab.hscroll = tab.hscroll.saturating_add(width),
-                Key::Left => tab.hscroll = tab.hscroll.saturating_sub(width),
+            match debugger.context.settings.keys.map.get(key) {
+                Some(KeyAction::CursorRight) => tab.hscroll = tab.hscroll.saturating_add(width),
+                Some(KeyAction::CursorLeft) => tab.hscroll = tab.hscroll.saturating_sub(width),
                 _ => return true }
             false
         });
@@ -2936,12 +2957,7 @@ impl WindowContent for CodeWindow {
                     None => Span::raw("  "),
                     Some(&(col, is_selected, is_top)) => {
                         column_number = col;
-                        let style = if is_selected {
-                            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(Color::Blue)
-                        };
-                        Span::styled("⮕ ", style)
+                        Span::styled("⮕ ", if is_selected {palette.instruction_pointer} else {palette.additional_instruction_pointer})
                     }
                 };
                 spans.push(ip_span);
@@ -2950,17 +2966,17 @@ impl WindowContent for CodeWindow {
                 if idx < breakpoint_lines.len() && breakpoint_lines[idx].line == i + 1 {
                     let l = &breakpoint_lines[idx];
                     if !l.enabled {
-                        spans.push(Span::styled("○ ", Style::default().fg(Color::Blue).add_modifier(Modifier::DIM)));
+                        spans.push(Span::styled("○ ", palette.secondary_breakpoint));
                     } else {
                         let active = l.active && l.has_locations;
-                        spans.push(Span::styled(if active { "● " } else { "○ " }, Style::default().fg(if l.adjusted { Color::Blue } else { Color::Red })));
+                        spans.push(Span::styled(if active { "● " } else { "○ " }, if l.adjusted {palette.secondary_breakpoint} else {palette.breakpoint}));
                     }
                 } else {
                     spans.push(Span::raw("  "));
                 }
 
                 let line_number_span = spans.len();
-                spans.push(Span::styled(format!("{: >2$}{}", i + 1, if i < file.num_lines_in_local_file {" "} else {"~"}, line_num_len), Style::default().add_modifier(Modifier::DIM)));
+                spans.push(Span::styled(format!("{: >2$}{}", i + 1, if i < file.num_lines_in_local_file {" "} else {"~"}, line_num_len), palette.default_dim));
 
                 let contents_span = spans.len();
                 file.text.line_out(i, &mut spans);
@@ -2980,7 +2996,7 @@ impl WindowContent for CodeWindow {
                             let mut end = pos + 1;
                             while !span.content.is_char_boundary(end) { end += 1; }
                             spans.splice(i..i+1, [Span {content: span.content[..pos].to_string().into(), style: span.style},
-                                                  Span {content: span.content[pos..end].to_string().into(), style: span.style.add_modifier(Modifier::UNDERLINED)},
+                                                  Span {content: span.content[pos..end].to_string().into(), style: span.style.add_modifier(Modifier::UNDERLINED | Modifier::BOLD)},
                                                   Span {content: span.content[end..].to_string().into(), style: span.style}]);
                             break;
                         }
@@ -2996,7 +3012,7 @@ impl WindowContent for CodeWindow {
                     spans.push(Span::raw(format!("{: >0$}", file.longest_line.max(area.width as usize) + 10))); // fill the rest of the line with spaces
                     for span in &mut spans[line_number_span..] {
                         if span.style.bg.is_none() {
-                            span.style.bg = Some(Color::Rgb(30, 30, 30));
+                            span.style.bg = palette.selected_text_line.bg.clone();
                         }
                     }
                 }
@@ -3047,13 +3063,20 @@ impl WindowContent for BreakpointsWindow {
             if let Some(idx) = breakpoints.iter().position(|b| b == &id) {
                 self.scroll.cursor = idx;
 
-                if keys.contains(&Key::Delete) || keys.contains(&Key::Backspace) {
-                    debugger.remove_breakpoint(id);
-                    breakpoints.remove(self.scroll.cursor);
-                } else if keys.contains(&Key::Char('B')) {
-                    let r = debugger.toggle_breakpoint_enabledness(id);
-                    report_result(ui, &r);
-                }
+                keys.retain(|key| {
+                    match debugger.context.settings.keys.map.get(key) {
+                        Some(KeyAction::DeleteRow) => {
+                            debugger.remove_breakpoint(id);
+                            breakpoints.remove(self.scroll.cursor);
+                        }
+                        Some(KeyAction::ToggleBreakpointEnabledness) => {
+                            let r = debugger.toggle_breakpoint_enabledness(id);
+                            report_result(ui, &r);
+                        }
+                        _ => return true,
+                    }
+                    false
+                });
             }
         }
 
@@ -3067,7 +3090,7 @@ impl WindowContent for BreakpointsWindow {
         }
         locations.sort();
 
-        let (range, moved) = self.scroll.update_detect_movement(breakpoints.len(), height, &mut keys);
+        let (range, moved) = self.scroll.update_detect_movement(breakpoints.len(), height, &mut keys, &debugger.context.settings.keys);
         self.selected_breakpoint = breakpoints.get(self.scroll.cursor).copied();
 
         if moved && !breakpoints.is_empty() {
@@ -3084,29 +3107,30 @@ impl WindowContent for BreakpointsWindow {
         let on_width = area.width.saturating_sub(3+4+2+5+5+4);
         let widths = [Constraint::Length(4), Constraint::Length(2), Constraint::Length(on_width), Constraint::Length(5), Constraint::Length(5)];
 
+        let palette = &debugger.context.settings.palette;
         let mut rows: Vec<Row> = Vec::new();
         for id in &breakpoints[range] {
             let b = debugger.breakpoints.get(*id);
             let is_hit = hit_breakpoints.binary_search(id).is_ok();
-            let mut cells = vec![Cell::from(format!("{}", id.seqno)).style(Style::default().add_modifier(Modifier::DIM))];
+            let mut cells = vec![Cell::from(format!("{}", id.seqno)).style(palette.default_dim)];
             if is_hit {
-                cells.push(Cell::from("⮕ ").style(Style::default().fg(Color::Green)));
+                cells.push(Cell::from("⮕ ").style(palette.instruction_pointer));
             } else if !b.enabled {
-                cells.push(Cell::from("○ ").style(Style::default().fg(Color::Blue)));
+                cells.push(Cell::from("○ ").style(palette.secondary_breakpoint));
             } else if !b.active {
-                cells.push(Cell::from("○ ").style(Style::default().fg(Color::Red)));
+                cells.push(Cell::from("○ ").style(palette.breakpoint));
             } else {
-                cells.push(Cell::from("● ").style(Style::default().fg(Color::Red)));
+                cells.push(Cell::from("● ").style(palette.breakpoint));
             }
             match &b.on {
                 BreakpointOn::Line(on) => {
                     let name = on.path.as_os_str().to_string_lossy();
                     let mut spans = vec![
-                        Span::styled(name, Style::default().fg(Color::Cyan)),
-                        Span::styled(format!(":{}", on.line), Style::default().fg(Color::Green))];
+                        Span::styled(name, palette.location_filename),
+                        Span::styled(format!(":{}", on.line), palette.location_line_number)];
                     if let &Some(adj) = &on.adjusted_line {
-                        spans.push(Span::styled("→", Style::default().add_modifier(Modifier::DIM)));
-                        spans.push(Span::styled(format!("{}", adj), Style::default().fg(Color::Green)));
+                        spans.push(Span::styled("→", palette.default_dim));
+                        spans.push(Span::styled(format!("{}", adj), palette.location_line_number));
                     }
 
                     // Poor man's manual text alignment to the right. When we rewrite the TUI library, this should just be a flag on the table cell, or something.
@@ -3130,10 +3154,7 @@ impl WindowContent for BreakpointsWindow {
             cells.push(Cell::from(format!("{}", b.hits)));
 
             let error = b.addrs.as_ref().is_err_and(|e| !e.is_not_calculated()) || locations[locs_begin..locs_end].iter().any(|t| t.1);
-            let mut style = Style::default();
-            if error {
-                style = style.bg(Color::Red);
-            }
+            let mut style = if error {palette.error} else {Style::default()};
             if !b.enabled {
                 style = style.add_modifier(Modifier::DIM);
             }
@@ -3142,9 +3163,9 @@ impl WindowContent for BreakpointsWindow {
         }
 
         let table = Table::new(rows)
-            .header(Row::new(vec!["idx", "", "on", "locs", "hits"]).style(Style::default().add_modifier(Modifier::DIM)))
+            .header(Row::new(vec!["idx", "", "on", "locs", "hits"]).style(palette.table_header))
             .widths(&widths)
-            .highlight_style(Style::default().add_modifier(Modifier::BOLD)).highlight_symbol(">> ");
+            .highlight_style(palette.table_selected_item).highlight_symbol(">> ");
 
         f.render_stateful_widget(table, area, &mut table_state);
     }
