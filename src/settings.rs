@@ -233,7 +233,7 @@ impl Palette {
         let light_green = Color::Rgb(0x55, 0xff, 0x55);
         let light_blue = Color::Rgb(0x55, 0x55, 0xff);
         Self {
-            default: Style::default(),
+            default: Style::default().bg(black).fg(white),
             default_dim: Style::default().add_modifier(Modifier::DIM),
             window_border: Style::default().add_modifier(Modifier::DIM),
             window_border_active: Style::default().add_modifier(Modifier::BOLD),
