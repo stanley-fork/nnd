@@ -15,6 +15,7 @@ pub struct Settings {
 
     pub stdin_file: Option<String>,
     pub stdout_file: Option<String>,
+    pub stderr_file: Option<String>,
 }
 
 impl Default for Settings {
@@ -30,6 +31,7 @@ impl Default for Settings {
 
         stdin_file: None,
         stdout_file: None,
+        stderr_file: None,
     } }
 }
 
@@ -103,6 +105,7 @@ impl KeyBindings {
             (Key::Char('c'), KeyAction::Continue),
             (Key::Char('C'), KeyAction::Suspend),
             (Key::Ctrl('c'), KeyAction::Suspend),
+            (Key::Char('k'), KeyAction::Kill),
             (Key::Ctrl('w'), KeyAction::WindowUp),
             (Key::Ctrl('s'), KeyAction::WindowDown),
             (Key::Ctrl('a'), KeyAction::WindowLeft),
@@ -262,7 +265,7 @@ impl Palette {
             code_inlined_site: Style::default().bg(light_blue),
             instruction_pointer: Style::default().fg(green).add_modifier(Modifier::BOLD),
             additional_instruction_pointer: Style::default().fg(blue),
-            breakpoint: Style::default(),
+            breakpoint: Style::default().fg(red),
             secondary_breakpoint: Style::default().fg(blue),
             code_line_number: Style::default(),
             dialog: Style::default().bg(Color::Rgb(20, 20, 20)),

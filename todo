@@ -1,11 +1,10 @@
-fix things from slack:
+fix inline level highlighting in disas window
+things from slack:
   key remapping, maybe change default mapping to avoid C-a (or provide alternative)
   color palette with Rgb for everything (including default bg), maybe configurable
   add --help, move doc.txt into sections of it: --help-features, --help-watches, --help-tty
   rendering issue on mac (ssh-d to linux)
-switching to window by number, show numbers in titles
 -v for build datetime and maybe bug reporting channel name
--c to continue on startup
 parse flags better: accept both --flag=value and --flag value
 fix picking up updated binary unnecessarily
 fix float/float=int in expressions
@@ -26,7 +25,6 @@ test with 10k threads
 make closing tabs more intuitive
 do something to prevent stopping again on the same line when continuing from a breakpoint, when there are multiple locations on the same line (e.g. function args)
 "warning: DW_AT_encoding = DW_ATE_complex_float on DW_TAG_base_type is not supported" (/usr/lib/x86_64-linux-gnu/libm.so.6)
-tabs in disassembly window
 find function by address (like addr2line)
 show number of function inlined sites in disassembly window, allow setting breakpoint on it, allow opening inline-only functions
 add decl location to TypeInfo and type inspection in watch expressions

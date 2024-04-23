@@ -226,7 +226,7 @@ pub fn disassemble_function(function_idx: usize, mut static_addr_ranges: Vec<Ran
             decoder.decode_out(&mut instruction);
 
             if let Some(l) = res.lines.last() {
-                assert!(instruction.ip() as usize > l.addr);
+                assert!(instruction.ip() as usize >= l.addr); // can be == because the "-----[...]" separator above is assigned to address of the first instruction after it
             }
             let static_addr = addr_map.dynamic_to_static(instruction.ip() as usize);
             let mut indent = String::new();

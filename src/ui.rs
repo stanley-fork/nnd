@@ -3112,12 +3112,14 @@ impl WindowContent for BreakpointsWindow {
         for id in &breakpoints[range] {
             let b = debugger.breakpoints.get(*id);
             let is_hit = hit_breakpoints.binary_search(id).is_ok();
+            let locs_begin = locations.partition_point(|t| t.0 < *id);
+            let locs_end = locations.partition_point(|t| t.0 <= *id);
             let mut cells = vec![Cell::from(format!("{}", id.seqno)).style(palette.default_dim)];
             if is_hit {
                 cells.push(Cell::from("⮕ ").style(palette.instruction_pointer));
             } else if !b.enabled {
                 cells.push(Cell::from("○ ").style(palette.secondary_breakpoint));
-            } else if !b.active {
+            } else if !b.active || locs_begin == locs_end {
                 cells.push(Cell::from("○ ").style(palette.breakpoint));
             } else {
                 cells.push(Cell::from("● ").style(palette.breakpoint));
@@ -3148,8 +3150,6 @@ impl WindowContent for BreakpointsWindow {
                     cells.push(Cell::from(Spans::from(spans)));
                 }
             }
-            let locs_begin = locations.partition_point(|t| t.0 < *id);
-            let locs_end = locations.partition_point(|t| t.0 <= *id);
             cells.push(Cell::from(format!("{}", locs_end - locs_begin)));
             cells.push(Cell::from(format!("{}", b.hits)));
 

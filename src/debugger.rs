@@ -380,6 +380,7 @@ impl Debugger {
             for (id, b) in breakpoints.iter_mut() {
                 // Have to redo the mapping source-line -> address because dynamic libraries may be loaded at different addresses.
                 b.addrs = err!(NotCalculated, "");
+                b.active = false;
             }
             *self = Debugger::new(mode, command_line, context, symbols, breakpoints, persistent);
         }
@@ -419,7 +420,17 @@ impl Debugger {
                     }
                 }
             };
-            let stderr_file = self.persistent.open_or_create_file("stderr");
+            let stderr_file = match &self.context.settings.stderr_file {
+                None => self.persistent.open_or_create_file("stderr"),
+                Some(path) => match fs::File::create(path) {
+                    Ok(x) => x,
+                    Err(e) => {
+                        log!(self.log, "stderr failed: {}", e);
+                        eprintln!("failed to create stderr file '{}': {}", path, e);
+                        open_dev_null()?
+                    }
+                }
+            };
 
             pid = libc::fork();
 
