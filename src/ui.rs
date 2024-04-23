@@ -2,7 +2,7 @@ use crate::{*, debugger::*, error::*, log::*, symbols::*, symbols_registry::*, u
 use termion::screen::{ToAlternateScreen, ToMainScreen, AlternateScreen, IntoAlternateScreen};
 use termion::input::{self, TermRead};
 use termion::event::{Event, Key};
-use std::{io::{self, Write, BufRead, BufReader, Read}, mem::{self, take}, collections::{HashSet, HashMap, hash_map::Entry}, os::fd::AsRawFd, path, path::{Path, PathBuf}, fs::File, fmt::Write as FmtWrite, borrow::Cow, ops::Range, str, os::unix::ffi::OsStrExt};
+use std::{io::{self, Write, BufRead, BufReader, Read}, mem::{self, take}, collections::{HashSet, HashMap, hash_map::Entry}, os::fd::AsRawFd, path, path::{Path, PathBuf}, fs::File, fmt::Write as FmtWrite, borrow::Cow, ops::Range, str, os::unix::ffi::OsStrExt, sync::{Arc}};
 use tui::{self, backend::TermionBackend, Terminal, widgets::{Widget, Block, Borders, List, ListItem, Table, TableState, Row, Cell, Paragraph, Wrap, Tabs, Clear}, layout::{self, Constraint, Direction, Rect, Alignment, Margin}, style::{Style, Color, Modifier}, text::{Span, Spans, Text}};
 use libc::{self, pid_t};
 
@@ -1289,7 +1289,7 @@ impl WindowContent for DisassemblyWindow {
 
     fn render_modal(&mut self, ui: &mut UIState, debugger: &mut Debugger, f: &mut Frame, window_area: Rect, screen_area: Rect) {
         if let Some(d) = &mut self.search_dialog {
-            d.render(f, screen_area, "find function (by mangled name)", &debugger.context.settings.palette);
+            ui.loading |= d.render(f, screen_area, "find function (by mangled name)", &debugger.context.settings.palette);
         }
     }
 
@@ -1395,7 +1395,7 @@ impl WindowContent for DisassemblyWindow {
         keys.retain(|key| {
             match debugger.context.settings.keys.map.get(key) {
                 Some(KeyAction::Open) => {
-                    self.search_dialog = Some(SearchDialog::new(Box::new(FunctionSearcher)));
+                    self.search_dialog = Some(SearchDialog::new(Arc::new(FunctionSearcher), debugger.context.clone()));
                     self.update_modal(ui, debugger, &mut Vec::new()); // kick off initial search with empty query
                 }
                 _ => return true
@@ -1595,7 +1595,7 @@ impl WindowContent for DisassemblyWindow {
                         assert!(span.content.is_char_boundary(start) && span.content.is_char_boundary(end));
                         spans.splice(indent_span_idx..indent_span_idx+1, [
                             Span {content: span.content[..start].to_string().into(), style: span.style},
-                            Span {content: span.content[start..end].to_string().into(), style: span.style.remove_modifier(Modifier::DIM)},
+                            Span {content: span.content[start..end].to_string().into(), style: span.style.remove_modifier(Modifier::DIM).add_modifier(Modifier::BOLD)},
                             Span {content: span.content[end..].to_string().into(), style: span.style}]);
                     }
                 }
@@ -2769,7 +2769,7 @@ impl WindowContent for CodeWindow {
 
     fn render_modal(&mut self, ui: &mut UIState, debugger: &mut Debugger, f: &mut Frame, window_area: Rect, screen_area: Rect) {
         if let Some(d) = &mut self.search_dialog {
-            d.render(f, screen_area, "find file", &debugger.context.settings.palette);
+            ui.loading |= d.render(f, screen_area, "find file", &debugger.context.settings.palette);
         }
     }
 
@@ -2836,7 +2836,7 @@ impl WindowContent for CodeWindow {
                 Some(KeyAction::ToggleBreakpoint) => self.toggle_breakpoint(false, ui, debugger),
                 Some(KeyAction::ToggleBreakpointEnabledness) => self.toggle_breakpoint(true, ui, debugger),
                 Some(KeyAction::Open) => {
-                    self.search_dialog = Some(SearchDialog::new(Box::new(FileSearcher)));
+                    self.search_dialog = Some(SearchDialog::new(Arc::new(FileSearcher), debugger.context.clone()));
                     self.update_modal(ui, debugger, &mut Vec::new()); // kick off initial search with empty query
                 }
                 Some(KeyAction::PreviousMatch) => select_disassembly_address -= 1,

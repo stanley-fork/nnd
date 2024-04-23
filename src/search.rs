@@ -1,22 +1,34 @@
-use crate::{*, symbols::*, arena::*, procfs::*, symbols_registry::*, util::*};
-use std::{mem, path::PathBuf, sync::Arc, collections::HashSet, cmp::Ordering, ops::Range, os::unix::ffi::OsStrExt, path::Path};
+use crate::{*, symbols::*, arena::*, procfs::*, symbols_registry::*, util::*, context::*, executor::*};
+use std::{mem, path::PathBuf, sync::{Arc, Mutex, atomic::{AtomicBool, AtomicUsize, Ordering}}, collections::HashSet, cmp, ops::Range, os::unix::ffi::OsStrExt, path::Path};
 
 pub struct SymbolSearcher {
-    pub searcher: Box<dyn Searcher>,
+    pub searcher: Arc<dyn Searcher>,
+    context: Arc<Context>,
 
     symbols: Vec<(BinaryId, Arc<Symbols>)>,
-    pub results: Vec<SearchResult>,
-    pub total_results: usize,
     pub waiting_for_symbols: bool, // if true, the `symbols` array is incomplete, but we may still be searching and have some results
-    pub complete: bool, // `results` are complete; otherwise we're still searching
 
-    // Progress indication.
-    pub items_done: usize,
-    pub items_total: usize,
-    pub bytes_done: usize,
+    state: Arc<SearchState>,
 
     searched_query: SearchQuery,
     searched_num_symbols: usize,
+}
+
+const MAX_RESULTS: usize = 1000;
+
+#[derive(Clone)]
+pub struct SearchResults {
+    pub results: Vec<SearchResult>, // limited to MAX_RESULTS
+    pub total_results: usize, // not limited to MAX_RESULTS
+
+    pub items_done: usize,
+    pub items_total: usize, // not necessarily known in advance, may change during the search
+    pub bytes_done: usize,
+
+    pub complete: bool,
+}
+impl SearchResults {
+    fn new() -> Self { Self {results: Vec::new(), total_results: 0, items_done: 0, items_total: 0, bytes_done: 0, complete: false} }
 }
 
 // Small and fast struct for a search match. We retrieve the slow full information (SearchResultInfo) only for the items on screen.
@@ -28,7 +40,7 @@ pub struct SearchResult {
 }
 
 impl PartialOrd for SearchResult {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
         if self.score != other.score {
             Some(self.score.cmp(&other.score).reverse())
         } else {
@@ -53,16 +65,66 @@ pub struct SearchQuery {
     subsequence: String,
     // TODO: Add searching by declaration filename + optional line number (syntax: "@foo.cpp:42" in the search bar)
 }
-
 impl SearchQuery {
     fn new() -> Self { Self {subsequence: String::new()} }
     fn parse(s: &str) -> Self { Self {subsequence: s.to_string()} }
 }
 
-impl SymbolSearcher {
-    pub fn new(searcher: Box<dyn Searcher>) -> Self { SymbolSearcher {searcher, symbols: Vec::new(), results: Vec::new(), total_results: 0, waiting_for_symbols: false, complete: false, items_done: 0, items_total: 0, bytes_done: 0, searched_query: SearchQuery::new(), searched_num_symbols: 0} }
+struct SearchState {
+    results: Mutex<SearchResults>,
+    cancel: AtomicBool,
+    tasks_remaining: AtomicUsize,
+}
+impl SearchState {
+    fn new() -> Self { Self {results: Mutex::new(SearchResults::new()), cancel: AtomicBool::new(false), tasks_remaining: AtomicUsize::new(0)} }
+}
 
-    // Returns true if a new search was started; the caller should scroll to top in this case.
+fn search_task(state: Arc<SearchState>, query: SearchQuery, symbols: Arc<Symbols>, symbols_idx: usize, shard_idx: usize, searcher: Arc<dyn Searcher>, context: Arc<Context>) {
+    searcher.search(&symbols, symbols_idx, shard_idx, &query, &mut |mut res: Vec<SearchResult>, delta_items_done: usize, delta_items_total: usize, delta_bytes_done: usize| -> bool {
+        if state.cancel.load(Ordering::SeqCst) {
+            return false;
+        }
+
+        let original_count = res.len();
+        limit_results(&mut res);
+        
+        let mut r = state.results.lock().unwrap();
+        r.results.append(&mut res);
+        limit_results(&mut r.results);
+        r.total_results += original_count;
+        r.items_done = r.items_done.wrapping_add(delta_items_done);
+        r.items_total = r.items_total.wrapping_add(delta_items_total);
+        r.bytes_done = r.bytes_done.wrapping_add(delta_bytes_done);
+        true
+    });
+
+    if !state.cancel.load(Ordering::SeqCst) && state.tasks_remaining.fetch_sub(1, Ordering::SeqCst) == 1 {
+        {
+            let mut r = state.results.lock().unwrap();
+            r.complete = true;
+        }
+
+        context.wake_main_thread.write(1);
+    }
+}
+
+fn limit_results(v: &mut Vec<SearchResult>) {
+    if v.len() <= MAX_RESULTS {
+        return;
+    }
+    //asdqwe find quickselect in std library instead (but still sort the results at some point before displaying)
+    v.sort_unstable_by_key(|r| -r.score);
+    v.truncate(MAX_RESULTS);
+}
+
+impl SymbolSearcher {
+    pub fn new(searcher: Arc<dyn Searcher>, context: Arc<Context>) -> Self {
+        let s = SymbolSearcher {searcher, context, symbols: Vec::new(), waiting_for_symbols: false, state: Arc::new(SearchState::new()), searched_query: SearchQuery::new(), searched_num_symbols: 0};
+        s.state.results.lock().unwrap().complete = true;
+        s
+    }
+
+    // Returns true if a new search started; the caller should scroll to top in this case.
     pub fn update(&mut self, registry: &SymbolsRegistry, binaries: Option<Vec<BinaryId>>, query: &str) -> bool {
         let seen_binary_ids: HashSet<BinaryId> = self.symbols.iter().map(|t| t.0.clone()).collect();
         self.waiting_for_symbols = false;
@@ -82,53 +144,59 @@ impl SymbolSearcher {
             }
         }
 
-        // TODO: Poll background tasks here. Merge new results into self.results, do quickselect to limit the size (do quickselect in each task too), sort the merged results.
-
         let parsed_query = SearchQuery::parse(query);
         if (&self.searched_query, self.searched_num_symbols) == (&parsed_query, self.symbols.len()) {
             return false;
         }
 
-        self.results.clear();
-        self.total_results = 0;
-        self.complete = false;
-        (self.items_done, self.items_total, self.bytes_done) = (0, 0, 0);
+        self.state.cancel.store(true, Ordering::SeqCst);
+        self.state = Arc::new(SearchState::new());
+
         self.searched_query = parsed_query;
         self.searched_num_symbols = self.symbols.len();
 
+        let mut tasks: Vec<(/*symbols_idx*/ usize, /*shard_idx*/ usize)> = Vec::new();
+        let properties = self.searcher.properties();
         for idx in 0..self.symbols.len() {
-            // TODO: Schedule background tasks instead of searching right here.
-            // TODO: Search in multiple threads.
-            // TODO: Search by file+line if query starts with '@'; pre-filter file table here and call a different method.
-            self.searcher.search(&self.symbols[idx].1, idx, &self.searched_query, &mut |mut res: Vec<SearchResult>, delta_items_done: usize, delta_items_total: usize, delta_bytes_done: usize| -> bool {
-                self.total_results += res.len();
-                self.results.append(&mut res);
-                self.items_done = self.items_done.wrapping_add(delta_items_done);
-                self.items_total = self.items_total.wrapping_add(delta_items_total);
-                self.bytes_done = self.bytes_done.wrapping_add(delta_bytes_done);
-                true
-            });
+            if properties.parallel {
+                for shard_idx in 0..self.symbols[idx].1.shards.len() {
+                    tasks.push((idx, shard_idx));
+                }
+            } else {
+                tasks.push((idx, 0));
+            }
         }
-        self.complete = true;
-
-        self.results.sort();
+        self.state.tasks_remaining.store(tasks.len(), Ordering::SeqCst); // must happen before starting the tasks
+        for (symbols_idx, shard_idx) in tasks {
+            // TODO: Search by file+line if query starts with '@'; pre-filter file table and call a different method of Searcher.
+            let (state, query, symbols, searcher, context) = (self.state.clone(), self.searched_query.clone(), self.symbols[symbols_idx].1.clone(), self.searcher.clone(), self.context.clone());
+            self.context.executor.add(move || search_task(state, query, symbols, symbols_idx, shard_idx, searcher, context));
+        }
 
         true
     }
 
-    pub fn format_result(&self, idx: usize) -> SearchResultInfo {
-        let r = &self.results[idx];
+    pub fn get_results(&self) -> SearchResults {
+        (*self.state.results.lock().unwrap()).clone()
+    }
+
+    pub fn format_result(&self, r: &SearchResult) -> SearchResultInfo {
         let s = &self.symbols[r.symbols_idx];
         self.searcher.format_result(s.0.clone(), &s.1, &self.searched_query, r)
     }
-    
-    pub fn format_results(&self, range: Range<usize>) -> Vec<SearchResultInfo> {
+
+    pub fn format_results(&self, results: &[SearchResult]) -> Vec<SearchResultInfo> {
         let mut res: Vec<SearchResultInfo> = Vec::new();
-        for r in &self.results[range] {
+        for r in results {
             let s = &self.symbols[r.symbols_idx];
             res.push(self.searcher.format_result(s.0.clone(), &s.1, &self.searched_query, r));
         }
         res
+    }
+}
+impl Drop for SymbolSearcher {
+    fn drop(&mut self) {
+        self.state.cancel.store(true, Ordering::SeqCst);
     }
 }
 
@@ -136,16 +204,24 @@ impl SymbolSearcher {
 // Returns false if the search is cancelled.
 pub type SearchCallback<'a> = dyn FnMut(Vec<SearchResult>, /*delta_items_done*/ usize, /*delta_items_total*/ usize, /*delta_bytes_done*/ usize) -> bool + 'a;
 
-pub trait Searcher {
-    fn search(&self, symbols: &Symbols, symbols_idx: usize, query: &SearchQuery, callback: &mut SearchCallback);
+#[derive(Clone, Debug)]
+pub struct SearcherProperties {
+    pub have_names: bool,
+    pub have_files: bool,
+    // If true, we schedule one task per SymbolsShard, otherwise one task per Symbols.
+    pub parallel: bool,
+}
+
+pub trait Searcher: Sync + Send {
+    fn search(&self, symbols: &Symbols, symbols_idx: usize, shard_idx: usize, query: &SearchQuery, callback: &mut SearchCallback);
     fn format_result(&self, binary: BinaryId, symbols: &Arc<Symbols>, query: &SearchQuery, res: &SearchResult) -> SearchResultInfo;
-    fn have_names_and_files(&self) -> (bool, bool);
+    fn properties(&self) -> SearcherProperties;
 }
 
 pub struct FileSearcher;
 
 impl Searcher for FileSearcher {
-    fn search(&self, symbols: &Symbols, symbols_idx: usize, query: &SearchQuery, callback: &mut SearchCallback) {
+    fn search(&self, symbols: &Symbols, symbols_idx: usize, shard_idx: usize, query: &SearchQuery, callback: &mut SearchCallback) {
         let items_total = symbols.path_to_used_file.len();
         callback(Vec::new(), 0, items_total, 0);
         let mut res: Vec<SearchResult> = Vec::new();
@@ -165,20 +241,19 @@ impl Searcher for FileSearcher {
         SearchResultInfo {id: res.id, binary, symbols: symbols.clone(), name: String::new(), file: file.path.to_owned(), line: LineInfo::invalid()}
     }
 
-    fn have_names_and_files(&self) -> (bool, bool) {
-        (false, true)
-    }
+    fn properties(&self) -> SearcherProperties { SearcherProperties {have_names: false, have_files: true, parallel: false} }
 }
 
 pub struct FunctionSearcher;
 
 impl Searcher for FunctionSearcher {
-    fn search(&self, symbols: &Symbols, symbols_idx: usize, query: &SearchQuery, callback: &mut SearchCallback) {
-        callback(Vec::new(), 0, symbols.functions.len(), 0);
+    fn search(&self, symbols: &Symbols, symbols_idx: usize, shard_idx: usize, query: &SearchQuery, callback: &mut SearchCallback) {
+        let range = (symbols.functions.len()*shard_idx/symbols.shards.len())..(symbols.functions.len()*(shard_idx+1)/symbols.shards.len());
+        callback(Vec::new(), 0, range.len(), 0);
         let mut items_done = 0usize;
         let mut bytes_done = 0usize;
         let mut res: Vec<SearchResult> = Vec::new();
-        for (idx, function) in symbols.functions.iter().enumerate() {
+        for (idx, function) in symbols.functions[range].iter().enumerate() {
             if function.flags.contains(FunctionFlags::SENTINEL) {
                 continue;
             }
@@ -188,7 +263,7 @@ impl Searcher for FunctionSearcher {
             }
             items_done += 1;
             bytes_done += slice.len();
-            if items_done > (1 << 17) {
+            if items_done > (1 << 16) {
                 if !callback(mem::take(&mut res), mem::take(&mut items_done), 0, mem::take(&mut bytes_done)) {
                     return;
                 }
@@ -209,9 +284,7 @@ impl Searcher for FunctionSearcher {
         res
     }
 
-    fn have_names_and_files(&self) -> (bool, bool) {
-        (true, true)
-    }
+    fn properties(&self) -> SearcherProperties { SearcherProperties {have_names: true, have_files: true, parallel: true} }
 }
 
 fn fuzzy_match(haystack: &[u8], needle: &str) -> Option<i64> {

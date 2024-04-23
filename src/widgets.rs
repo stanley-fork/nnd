@@ -1,7 +1,7 @@
-use crate::{*, search::*, pool::*, symbols_registry::*, util::*, error::*, procfs::*, settings::*};
+use crate::{*, search::*, pool::*, symbols_registry::*, util::*, error::*, procfs::*, settings::*, context::*};
 use tui::{self, layout::{Rect, Margin, Constraint}, widgets::{Paragraph, Block, Borders, Clear, Gauge, TableState, Table, Row, Cell}, style::{Style, Color, Modifier}, backend::TermionBackend, text::{Span, Spans, Text}};
 use termion::{event::{Event, Key}, raw::RawTerminal};
-use std::{io, ops::Range};
+use std::{io, ops::Range, sync::Arc};
 
 pub type Backend = TermionBackend<io::Stdout>;
 pub type Frame<'a> = tui::Frame<'a, Backend>;
@@ -229,18 +229,20 @@ pub enum SearchDialogEvent {
 }
 
 impl SearchDialog {
-    pub fn new(searcher: Box<dyn Searcher>) -> Self { Self {input: TextInput::new(), scroll: Scroll::new(), search: SymbolSearcher::new(searcher), height: 0} }
+    pub fn new(searcher: Arc<dyn Searcher>, context: Arc<Context>) -> Self { Self {input: TextInput::new(), scroll: Scroll::new(), search: SymbolSearcher::new(searcher, context), height: 0} }
 
     pub fn update(&mut self, keys: &mut Vec<Key>, key_binds: &KeyBindings, registry: &SymbolsRegistry, binaries: Option<Vec<BinaryId>>) -> SearchDialogEvent {
         let event = self.input.update(keys, key_binds);
-        self.scroll.update(self.search.results.len(), self.height, keys, key_binds);
+        let results = self.search.get_results();
+        self.scroll.update(results.results.len(), self.height, keys, key_binds);
         let res = match event {
             TextInputEvent::None => SearchDialogEvent::None,
             TextInputEvent::Cancel => return SearchDialogEvent::Cancel,
-            TextInputEvent::Done if self.search.results.is_empty() => return SearchDialogEvent::Cancel,
-            TextInputEvent::Open if self.search.results.is_empty() => SearchDialogEvent::None,
+            TextInputEvent::Done if results.results.is_empty() => return SearchDialogEvent::Cancel,
+            TextInputEvent::Open if results.results.is_empty() => SearchDialogEvent::None,
             TextInputEvent::Done | TextInputEvent::Open => {
-                let res = self.search.format_result(self.scroll.cursor);
+                let r = &results.results[self.scroll.cursor.min(results.results.len() - 1)];
+                let res = self.search.format_result(r);
                 match event {
                     TextInputEvent::Done => return SearchDialogEvent::Done(res),
                     _ => SearchDialogEvent::Open(res) }
@@ -254,13 +256,13 @@ impl SearchDialog {
         res
     }
 
-    pub fn render(&mut self, f: &mut Frame, screen_area: Rect, title: &str, palette: &Palette) {
+    pub fn render(&mut self, f: &mut Frame, screen_area: Rect, title: &str, palette: &Palette) -> /*loading*/ bool {
         let area = screen_area.inner(&Margin {vertical: screen_area.height / 12, horizontal: screen_area.width / 8});
         let input_area = Rect {x: area.x + 2, y: area.y + 2, width: area.width.saturating_sub(4), height: 1};
         let status_area = Rect {x: area.x + 2, y: area.y + 4, width: area.width.saturating_sub(4), height: 1};
         let results_area = Rect {x: area.x + 2, y: area.y + 6, width: area.width.saturating_sub(4), height: area.height.saturating_sub(7)};
-        let (have_names, have_files) = self.search.searcher.have_names_and_files();
-        let lines_per_result = have_names as u16 + have_files as u16;
+        let properties = self.search.searcher.properties();
+        let lines_per_result = properties.have_names as u16 + properties.have_files as u16;
         self.height = results_area.height / lines_per_result;
 
         // TODO: Subtly different background color for file/function/variable dialogs
@@ -270,30 +272,33 @@ impl SearchDialog {
         f.render_widget(Clear, input_area);
         self.input.render(f, input_area, palette);
 
+        let res = self.search.get_results();
+
         if self.search.waiting_for_symbols {
             f.render_widget(Paragraph::new(Span::styled("waiting for symbols to load (see 'binaries' window for progress)", palette.warning)), status_area);
-        } else if self.search.complete {
-            let text = if self.search.results.len() == self.search.total_results {
-                format!("{} matches ({} searched)", self.search.results.len(), PrettySize(self.search.bytes_done))
+        } else if res.complete {
+            let text = if res.results.len() == res.total_results {
+                format!("{} matches ({} searched)", res.results.len(), PrettySize(res.bytes_done))
             } else {
-                format!("showing {}/{} matches ({} searched)", self.search.results.len(), self.search.total_results, PrettySize(self.search.bytes_done))
+                format!("showing {}/{} matches ({} searched)", res.results.len(), res.total_results, PrettySize(res.bytes_done))
             };
             f.render_widget(Paragraph::new(text), status_area);
         } else {
-            f.render_widget(Gauge::default().ratio(self.search.items_done as f64 / self.search.items_total.max(1) as f64).label(format!("{}", PrettySize(self.search.bytes_done))).use_unicode(true), status_area);
+            //asdqwe assign better colors, figure out why use_unicode draws the edge in different color
+            f.render_widget(Gauge::default().ratio(res.items_done as f64 / res.items_total.max(1) as f64).label(format!("{}", PrettySize(res.bytes_done))).use_unicode(false), status_area);
         }
 
-        let range = self.scroll.range(self.search.results.len(), self.height as usize);
+        let range = self.scroll.range(res.results.len(), self.height as usize);
         let mut table_state = TableState::default();
         table_state.select(Some(self.scroll.cursor - range.start));
 
         let mut rows: Vec<Row> = Vec::new();
-        for r in self.search.format_results(range) {
+        for r in self.search.format_results(&res.results[range]) {
             let mut lines: Vec<Spans> = Vec::new();
-            if have_names {
+            if properties.have_names {
                 lines.push(Spans::from(vec![Span::raw(format!("{}\n", r.name))]));
             }
-            if have_files {
+            if properties.have_files {
                 let mut spans: Vec<Span> = Vec::new();
                 spans.push(Span::styled(format!("{}", r.file.as_os_str().to_string_lossy()), palette.location_filename));
                 if r.line.file_idx().is_some() && r.line.line() != 0 {
@@ -311,5 +316,7 @@ impl SearchDialog {
             .widths(&[Constraint::Percentage(100)])
             .highlight_style(palette.table_selected_item).highlight_symbol(">> ");
         f.render_stateful_widget(table, results_area, &mut table_state);
+
+        !res.complete
     }
 }

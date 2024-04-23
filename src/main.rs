@@ -482,7 +482,7 @@ removing breakpoints on exit
 
 fn run(settings: Settings, attach_pid: Option<pid_t>, command_line: Option<Vec<String>>, persistent: PersistentState) -> Result<()> {
     let num_threads = thread::available_parallelism().map_or(8, |n| n.get()).min(settings.max_threads).max(1);
-    let context = Arc::new(Context {settings, executor: Executor::new(num_threads)});
+    let context = Arc::new(Context {settings, executor: Executor::new(num_threads), wake_main_thread: Arc::new(EventFD::new())});
 
     let epoll = Rc::new(Epoll::new()?);
 
@@ -552,6 +552,9 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, command_line: Option<Vec<S
     let symbols_event_fd = debugger.symbols.event_fd();
     epoll.add(symbols_event_fd.fd, libc::EPOLLIN, symbols_event_fd.fd as u64)?;
 
+    let misc_wakeup_fd = debugger.context.wake_main_thread.clone();
+    epoll.add(misc_wakeup_fd.fd, libc::EPOLLIN, misc_wakeup_fd.fd as u64)?;
+
     // Throttle rendering to <= fps. Render only when something changes.
     let mut pending_render = true;
     render_timer.set(1, 0);
@@ -576,6 +579,8 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, command_line: Option<Vec<S
                 debugger.log.prof.iteration_debugger(prof.finish());
             } else if fd == signal_pipes_read[libc::SIGWINCH as usize] {
                 drain_signal_pipe(fd);
+            } else if fd == misc_wakeup_fd.fd {
+                misc_wakeup_fd.read();
             } else if fd == STDIN_FILENO {
                 ui.buffer_input()?;
                 if !pending_render {

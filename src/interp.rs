@@ -323,7 +323,7 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                         let (x, y) = (a.cast_to_f64(), b.cast_to_f64());
                         BasicValue::F(match op {
                             BinaryOperator::Mul => x*y,
-                            BinaryOperator::Div => x.div_euclid(y),
+                            BinaryOperator::Div => x/y,
                             BinaryOperator::Rem => x.rem_euclid(y),
                             _ => panic!("huh"),
                         })
