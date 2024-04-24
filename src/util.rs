@@ -703,3 +703,11 @@ impl<R: Write> ByteWrite for R {
     fn write_str(&mut self, s: &str) -> io::Result<()> { self.write_slice(s.as_bytes()) }
     fn write_path(&mut self, s: &Path) -> io::Result<()> { self.write_slice(s.as_os_str().as_bytes()) }
 }
+
+// Horizontal space that the string would occupy on the screen.
+// For ASCII string it's just str.len(). For unicode, there are also multi-byte characters and wide characters to consider.
+// TODO: Implement (probably use the same library tui-rs uses).
+// TODO: We currently use plain len() for this purpose in a few places; find them and replace with this.
+pub fn str_width(s: &str) -> usize {
+    s.len()
+}

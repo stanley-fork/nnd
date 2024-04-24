@@ -347,8 +347,6 @@ impl UI {
                 w.content.get_hints(&mut hints[1]);
             }
         }
-        hints[0].add_modifier(Modifier::DIM);
-        hints[1].add_modifier(Modifier::DIM);
         self.state.hints = hints;
 
         let mut terminal_prof = TscScope::new(); // separately time the things that draw() does before and after calling our function, which is mostly interacting with OS terminal
@@ -1701,6 +1699,13 @@ impl WindowContent for HintsWindow {
                 if lines.len() > subarea.height as usize && subarea.height > 0 {
                     lines[subarea.height as usize - 1] = Spans::from(vec![Span::raw("…")]);
                 }
+                for line in &mut lines {
+                    for span in &mut line.0 {
+                        if span.style == Style::default() {
+                            span.style = debugger.context.settings.palette.default_dim;
+                        }
+                    }
+                }
                 let paragraph = Paragraph::new(Text {lines});
                 f.render_widget(paragraph, subarea);
             }
@@ -1805,18 +1810,16 @@ impl WindowContent for BinariesWindow {
 }
 
 struct ThreadsFilter {
-    text: TextInput,
-    active: bool,
-    editing: bool,
+    bar: SearchBar,
     cache_key: String, // when this changes, drop cached_results
     cached_results: Vec<(/*thread_idx*/ usize, /*stop_count*/ usize, /*passes_filter*/ bool)>, // sorted by thread_idx
 }
 impl ThreadsFilter {
-    fn new() -> Self { Self {text: TextInput::new(), active: false, editing: false, cache_key: String::new(), cached_results: Vec::new()} }
+    fn new() -> Self { Self {bar: SearchBar::new(), cache_key: String::new(), cached_results: Vec::new()} }
 
     // tids must be sorted
     fn filter(&mut self, tids: Vec<(usize, usize, pid_t)>, debugger: &mut Debugger) -> Vec<pid_t> {
-        let query = if self.active {self.text.text.clone()} else {String::new()};
+        let query = if self.bar.visible {self.bar.text.text.clone()} else {String::new()};
         if query != self.cache_key {
             self.cache_key = query.clone();
             self.cached_results.clear();
@@ -1891,23 +1894,16 @@ impl Default for ThreadsWindow { fn default() -> Self { Self {scroll: Scroll::ne
 impl WindowContent for ThreadsWindow {
     fn update_and_render(&mut self, ui: &mut UIState, debugger: &mut Debugger, mut keys: Vec<Key>, f: Option<&mut Frame>, area: Rect) {
         keys.retain(|key| {
-            if self.filter.editing {
+            if self.filter.bar.editing {
                 return true;
             }
             match debugger.context.settings.keys.map.get(key) {
-                Some(KeyAction::Find) => {
-                    self.filter.active = true;
-                    self.filter.editing = true;
-                    self.filter.text.cursor = self.filter.text.text.len();
-                }
-                Some(KeyAction::Cancel) => self.filter.active = false,
+                Some(KeyAction::Find) => self.filter.bar.start_editing(),
+                Some(KeyAction::Cancel) => self.filter.bar.visible = false,
                 _ => return true,
             }
             false
         });
-        if !self.filter.editing && self.filter.text.text.is_empty() {
-            self.filter.active = false;
-        }
         
         let mut tids: Vec<(usize, usize, pid_t)> = debugger.threads.values().map(|t| (t.idx, t.stop_count, t.tid)).collect();
         tids.sort_by_key(|t| t.0);
@@ -1946,8 +1942,7 @@ impl WindowContent for ThreadsWindow {
             }
         }
 
-        let filter_height = if self.filter.active {1} else {0};
-        let height = area.height.saturating_sub(1 + filter_height);
+        let height = area.height.saturating_sub(1 + self.filter.bar.height());
         let mut range = self.scroll.update(filtered_tids.len(), height, &mut keys, &debugger.context.settings.keys);
 
         ui.selected_thread = filtered_tids.get(self.scroll.cursor).copied().unwrap_or(0);
@@ -1961,19 +1956,7 @@ impl WindowContent for ThreadsWindow {
         let context_temp = debugger.context.clone();
         let palette = &context_temp.settings.palette;
 
-        if filter_height == 1 && area.height > 0 {
-            let message = "filter: ";
-            let message_area = Rect {x: area.x, y: area.y, width: area.width.min(message.len() as u16), height: 1};
-            let text_area = Rect {x: area.x + message_area.width, y: area.y, width: area.width.saturating_sub(message_area.width), height: 1};
-            let paragraph = Paragraph::new(Text {lines: vec![Spans::from(vec![Span::styled(message.to_string(), palette.search_bar_dim)])]});
-            f.render_widget(paragraph, message_area);
-            if self.filter.editing {
-                self.filter.text.render(f, text_area, palette);
-            } else {
-                let paragraph = Paragraph::new(Text {lines: vec![Spans::from(vec![Span::styled(self.filter.text.text.clone(), palette.search_bar_dim)])]});
-                f.render_widget(paragraph, text_area);
-            }
-        }
+        let area = self.filter.bar.render("filter: ", "", f, area, palette);
 
         let tids: Vec<libc::pid_t> = filtered_tids[range.clone()].to_vec();
         let selected_idx = self.scroll.cursor - range.start;
@@ -2023,7 +2006,7 @@ impl WindowContent for ThreadsWindow {
                     }]),
             };
 
-            if self.filter.editing {
+            if self.filter.bar.editing {
                 // If no row is selected, tui-rs doesn't reserve horizontal space for highlight_symbol, so the table gets
                 // shifted left and right by 3 characters every time filter editing starts and ends. Unacceptable! Add an empty column to compensate.
                 cells.insert(0, Cell::from(""));
@@ -2053,7 +2036,7 @@ impl WindowContent for ThreadsWindow {
         let mut table_state = TableState::default();
         let mut header: Vec<&'static str> = vec!["idx", "tid", "name", "addr", "bin", "function"];
         let mut widths: Vec<Constraint> = vec![Constraint::Length(5), Constraint::Length(10), Constraint::Length(15), Constraint::Length(12), Constraint::Length(3), Constraint::Percentage(100)];
-        if self.filter.editing {
+        if self.filter.bar.editing {
             header.insert(0, "");
             widths.insert(0, Constraint::Length(highlight_symbol.len() as u16 - 1));
         } else {
@@ -2065,7 +2048,7 @@ impl WindowContent for ThreadsWindow {
             .widths(&widths)
             .highlight_style(palette.table_selected_item).highlight_symbol(highlight_symbol);
         
-        f.render_stateful_widget(table, Rect {x: area.x, y: area.y + filter_height, width: area.width, height: area.height.saturating_sub(filter_height)}, &mut table_state);
+        f.render_stateful_widget(table, area, &mut table_state);
     }
 
     fn drop_caches(&mut self) {
@@ -2073,24 +2056,11 @@ impl WindowContent for ThreadsWindow {
     }
 
     fn update_modal(&mut self, ui: &mut UIState, debugger: &mut Debugger, keys: &mut Vec<Key>) {
-        if !self.filter.editing {
-            return;
-        }
-        let event = self.filter.text.update(keys, &debugger.context.settings.keys);
-        match event {
-            TextInputEvent::None | TextInputEvent::Open => (),
-            TextInputEvent::Done => {
-                self.filter.editing = false;
-            }
-            TextInputEvent::Cancel => {
-                self.filter.editing = false;
-                self.filter.active = false;
-            }
-        }
+        self.filter.bar.update(keys, &debugger.context.settings.keys);
     }
 
     fn cancel_modal(&mut self, ui: &mut UIState, debugger: &mut Debugger) {
-        self.filter.editing = false;
+        self.filter.bar.editing = false;
     }
 
     fn get_hints(&self, hints: &mut StyledText) {
@@ -2786,7 +2756,7 @@ impl WindowContent for CodeWindow {
         styled_write!(hints, Style::default(), "C-y - pin/unpin tab"); hints.close_line();
         styled_write!(hints, Style::default(), "b - toggle breakpoint"); hints.close_line();
         styled_write!(hints, Style::default(), "B - enable/disable breakpoint"); hints.close_line();
-        styled_write!(hints, Style::default(), ",/. - cycle disas addrs"); hints.close_line();
+        styled_write!(hints, Style::default(), ",/. - cycle disasm addrs"); hints.close_line();
     }
 
     fn has_persistent_state(&self) -> bool {

@@ -243,11 +243,11 @@ pub fn disassemble_function(function_idx: usize, mut static_addr_ranges: Vec<Ran
                     styled_write!(res.text, palette.default_dim, "{: <1$}", "", prelude_width);
                     let indent_span_idx = res.text.spans.len() - *res.text.lines.last().unwrap();
                     styled_write!(res.text, palette.default_dim, "{}", indent);
-                    styled_write!(res.text, palette.location_filename.add_modifier(Modifier::DIM), "{}", name);
+                    styled_write!(res.text, palette.location_filename_dim, "{}", name);
                     if line.line() != 0 {
-                        styled_write!(res.text, palette.location_line_number.add_modifier(Modifier::DIM), ":{}", line.line());
+                        styled_write!(res.text, palette.location_line_number, ":{}", line.line());
                         if line.column() != 0 {
-                            styled_write!(res.text, palette.location_column_number.add_modifier(Modifier::DIM), ":{}", line.column());
+                            styled_write!(res.text, palette.location_column_number, ":{}", line.column());
                         }
                     }
                     res.text.close_line();

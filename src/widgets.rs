@@ -1,5 +1,5 @@
 use crate::{*, search::*, pool::*, symbols_registry::*, util::*, error::*, procfs::*, settings::*, context::*};
-use tui::{self, layout::{Rect, Margin, Constraint}, widgets::{Paragraph, Block, Borders, Clear, Gauge, TableState, Table, Row, Cell}, style::{Style, Color, Modifier}, backend::TermionBackend, text::{Span, Spans, Text}};
+use tui::{self, layout::{Rect, Margin, Constraint}, widgets::{Paragraph, Block, Borders, Clear, Gauge, TableState, Table, Row, Cell}, style::{Style}, backend::TermionBackend, text::{Span, Spans, Text}};
 use termion::{event::{Event, Key}, raw::RawTerminal};
 use std::{io, ops::Range, sync::Arc};
 
@@ -318,5 +318,73 @@ impl SearchDialog {
         f.render_stateful_widget(table, results_area, &mut table_state);
 
         !res.complete
+    }
+}
+
+pub struct SearchBar {
+    pub text: TextInput,
+    pub visible: bool,
+    pub editing: bool,
+}
+impl SearchBar {
+    pub fn new() -> Self { Self {text: TextInput::new(), visible: false, editing: false} }
+
+    pub fn update(&mut self, keys: &mut Vec<Key>, key_binds: &KeyBindings) -> TextInputEvent {
+        if !self.editing {
+            return TextInputEvent::None;
+        }
+        let mut ev = self.text.update(keys, key_binds);
+        match ev {
+            TextInputEvent::None => (),
+            TextInputEvent::Done => self.editing = false,
+            TextInputEvent::Cancel => {
+                self.editing = false;
+                self.visible = false;
+            }
+            TextInputEvent::Open => ev = TextInputEvent::None,
+        }
+        if !self.editing && self.text.text.is_empty() {
+            self.visible = false;
+        }
+        ev
+    }
+
+    pub fn render(&mut self, left_text: &str, right_text: &str, f: &mut Frame, area: Rect, palette: &Palette) -> Rect {
+        if !self.visible || area.height == 0 {
+            return area;
+        }
+        let right_text_width = str_width(right_text) as u16;
+        let left_area = Rect {x: area.x, y: area.y, width: area.width.min(str_width(left_text) as u16), height: 1};
+        let right_area = Rect {x: (area.x + area.width).saturating_sub(right_text_width), y: area.y, width: right_text_width, height: 1};
+        let text_area = Rect {x: area.x + left_area.width, y: area.y, width: area.width.saturating_sub(left_area.width).saturating_sub(right_area.width), height: 1};
+        let remaining_area = Rect {x: area.x, y: area.y + 1, width: area.width, height: area.height - 1};
+
+        let paragraph = Paragraph::new(Text {lines: vec![Spans::from(vec![Span::styled(left_text, palette.search_bar_other)])]});
+        f.render_widget(paragraph, left_area);
+        let paragraph = Paragraph::new(Text {lines: vec![Spans::from(vec![Span::styled(right_text, palette.search_bar_other)])]});
+        f.render_widget(paragraph, right_area);
+
+        if self.editing {
+            self.text.render(f, text_area, palette);
+        } else {
+            let mut spans = vec![Span::styled(&self.text.text, palette.search_bar_query)];
+            if str_width(&self.text.text) < text_area.width as usize {
+                spans.push(Span::styled(format!("{: >0$}", text_area.width as usize + 10), palette.search_bar_query));
+            }
+            let paragraph = Paragraph::new(Text {lines: vec![Spans::from(spans)]});
+            f.render_widget(paragraph, text_area);
+        }
+
+        remaining_area
+    }
+
+    pub fn start_editing(&mut self) {
+        self.visible = true;
+        self.editing = true;
+        self.text.cursor = self.text.text.len();
+    }
+
+    pub fn height(&self) -> u16 {
+        if self.visible {1} else {0}
     }
 }
