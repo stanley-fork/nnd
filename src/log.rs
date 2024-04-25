@@ -141,7 +141,8 @@ impl Profiling {
             self.history.pop_front();
         }
         for t in self.history.iter().rev() {
-            if t.chars.len() + 1 <= width && out.unclosed_line_len() + t.chars.len() + 1 > width {
+            let w = str_width(&t.chars) + 1;
+            if w <= width && out.unclosed_line_width() + w > width {
                 out.close_line();
             }
             styled_write!(out, Style::default(), " ");

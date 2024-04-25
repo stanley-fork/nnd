@@ -425,8 +425,8 @@ impl StyledText {
         &self.chars[start..end]
     }
 
-    pub fn longest_line(&self) -> usize {
-        (0..self.num_lines()).map(|i| self.line_chars(i).len()).max().unwrap_or(0)
+    pub fn widest_line(&self) -> usize {
+        (0..self.num_lines()).map(|i| str_width(self.line_chars(i))).max().unwrap_or(0)
     }
 
     pub fn clear(&mut self) {
@@ -441,12 +441,12 @@ impl StyledText {
         }
     }
 
-    pub fn unclosed_line_len(&self) -> usize {
+    pub fn unclosed_line_width(&self) -> usize {
         let s = *self.lines.last().unwrap();
         if s >= self.spans.len() {
             0
         } else {
-            self.chars.len() - self.spans[s].0
+            str_width(&self.chars[self.spans[s].0..])
         }
     }
 

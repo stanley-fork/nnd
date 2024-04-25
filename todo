@@ -1,3 +1,4 @@
+continue checking all .len() calls to replace with str_width()
 things from slack:
   key remapping, maybe change default mapping to avoid C-a (or provide alternative)
   color palette with Rgb for everything (including default bg), maybe configurable

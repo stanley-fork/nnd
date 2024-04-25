@@ -1425,7 +1425,7 @@ impl WindowContent for DisassemblyWindow {
         header.close_line();
 
         let width = area.width.saturating_sub(2);
-        let longest_line = header.longest_line().max(disas.as_ref().map_or(0, |(_, _, d)| d.longest_line));
+        let widest_line = header.widest_line().max(disas.as_ref().map_or(0, |(_, _, d)| d.widest_line));
         let tab = &mut self.tabs[self.selected_tab];
         let mut toggle_breakpoint = false;
         let mut subfunction_level_delta = 0isize;
@@ -1440,7 +1440,7 @@ impl WindowContent for DisassemblyWindow {
             }
             false
         });
-        tab.hscroll = tab.hscroll.min(longest_line.saturating_sub(width as usize).try_into().unwrap_or(u16::MAX));
+        tab.hscroll = tab.hscroll.min(widest_line.saturating_sub(width as usize).try_into().unwrap_or(u16::MAX));
 
         if area.height > 0 {
             let mut a = area;
@@ -1599,7 +1599,7 @@ impl WindowContent for DisassemblyWindow {
                 }
 
                 if i == tab.scroll.cursor && line_addr.kind != DisassemblyLineKind::Error {
-                    spans.push(Span::raw(format!("{: >0$}", longest_line.max(area.width as usize) + 10))); // fill the rest of the line with spaces
+                    spans.push(Span::raw(format!("{: >0$}", widest_line.max(area.width as usize) + 10))); // fill the rest of the line with spaces
                     for span in &mut spans[1..] {
                         span.style.bg = palette.selected_text_line.bg.clone();
                     }
@@ -2285,7 +2285,7 @@ struct SourceFile {
     header: StyledText, // can contain errors or warnings, not scrollable
     text: StyledText, // includes virtual space to cover all lines+columns mentioned in debug symbols
     local_path: PathBuf, // empty if error
-    longest_line: usize,
+    widest_line: usize,
     num_lines_in_local_file: usize,
 }
 
@@ -2309,7 +2309,7 @@ impl CodeWindow {
 
     fn open_file(path_in_symbols: &Path, version: &FileVersionInfo, debugger: &Debugger) -> SourceFile {
         let palette = &debugger.context.settings.palette;
-        let mut res = SourceFile {header: StyledText::new(), text: StyledText::new(), local_path: PathBuf::new(), longest_line: 0, num_lines_in_local_file: 0};
+        let mut res = SourceFile {header: StyledText::new(), text: StyledText::new(), local_path: PathBuf::new(), widest_line: 0, num_lines_in_local_file: 0};
 
         if path_in_symbols.as_os_str().is_empty() {
             return res;
@@ -2476,7 +2476,7 @@ impl CodeWindow {
         }
         
         // This is width in bytes rather than glyphs, but that's good enough for our purposes here (upper bound on horizontal scrolling).
-        res.longest_line = res.text.longest_line();
+        res.widest_line = res.text.widest_line();
 
         Ok((buffered.count, buffered.hasher.compute().into()))
     }
@@ -2876,7 +2876,7 @@ impl WindowContent for CodeWindow {
                 _ => return true }
             false
         });
-        tab.hscroll = tab.hscroll.min(file.longest_line.saturating_sub(width as usize).try_into().unwrap_or(u16::MAX));
+        tab.hscroll = tab.hscroll.min(file.widest_line.saturating_sub(width as usize).try_into().unwrap_or(u16::MAX));
 
         struct BreakpointLine {
             line: usize,
@@ -2979,7 +2979,7 @@ impl WindowContent for CodeWindow {
                 }
 
                 if i == tab.scroll.cursor {
-                    spans.push(Span::raw(format!("{: >0$}", file.longest_line.max(area.width as usize) + 10))); // fill the rest of the line with spaces
+                    spans.push(Span::raw(format!("{: >0$}", file.widest_line.max(area.width as usize) + 10))); // fill the rest of the line with spaces; the +10 is needed because str_width() is not implemented
                     for span in &mut spans[line_number_span..] {
                         if span.style.bg.is_none() {
                             span.style.bg = palette.selected_text_line.bg.clone();

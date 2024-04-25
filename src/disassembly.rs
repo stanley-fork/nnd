@@ -31,7 +31,7 @@ pub struct Disassembly {
     pub text: StyledText,
     pub lines: Vec<DisassemblyLineInfo>,
     pub error: Option<Error>, // also baked into `text`
-    pub longest_line: usize,
+    pub widest_line: usize,
 
     pub symbols_shard: Option<(*const Symbols, usize)>, // for an assert
 }
@@ -61,7 +61,7 @@ pub enum DisassemblyLineKind {
 }
 
 impl Disassembly {
-    pub fn new() -> Self { Self {text: StyledText::new(), lines: Vec::new(), error: None, longest_line: 0, symbols_shard: None} }
+    pub fn new() -> Self { Self {text: StyledText::new(), lines: Vec::new(), error: None, widest_line: 0, symbols_shard: None} }
     
     pub fn addr_to_line(&self, addr: usize) -> Option<usize> {
         let idx = self.lines.partition_point(|l| l.addr <= addr);
@@ -96,7 +96,7 @@ impl Disassembly {
     
     pub fn finish(mut self) -> Self {
         assert_eq!(self.text.num_lines(), self.lines.len());
-        self.longest_line = self.text.longest_line();
+        self.widest_line = self.text.widest_line();
         self
     }
 }
@@ -152,7 +152,7 @@ impl<'a> SymbolResolver for Resolver<'a> {
 pub fn disassemble_function(function_idx: usize, mut static_addr_ranges: Vec<Range<usize>>, symbols: Option<&Symbols>, addr_map: &AddrMap, memory: &MemReader, intro: StyledText, palette: &Palette) -> Disassembly {
     clean_up_ranges(&mut static_addr_ranges);
 
-    let mut res = Disassembly {text: intro, lines: Vec::new(), error: None, longest_line: 0, symbols_shard: None};
+    let mut res = Disassembly {text: intro, lines: Vec::new(), error: None, widest_line: 0, symbols_shard: None};
     let addr_to_static = addr_map.dynamic_to_static(0);
     let mut subfunc_ranges: Vec<&[SubfunctionPcRange]> = Vec::new();
 
