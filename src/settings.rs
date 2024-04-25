@@ -292,7 +292,7 @@ impl Palette {
             state_suspended: Style::default().bg(light_green).fg(black),
             state_other: Style::default().bg(yellow).fg(black),
             progress_bar_done: Style::default().bg(blue).fg(black),
-            progress_bar_remaining: Style::default().bg(Color::Rgb(30, 30, 30)),
+            progress_bar_remaining: Style::default().bg(Color::Rgb(30, 30, 30)).fg(white),
             search_bar_query: Style::default().bg(Color::Rgb(80, 10, 80)),
             search_bar_other: Style::default().bg(Color::Rgb(20, 20, 20)).fg(dim(white)),
             url: Style::default().fg(blue),

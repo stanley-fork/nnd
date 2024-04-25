@@ -1120,7 +1120,7 @@ impl DisassemblyWindow {
         }
         let mut r = res[..i].to_string();
         if i < res.len() {
-            r += "...";
+            r += "…";
         }
         r
     }
@@ -2038,7 +2038,7 @@ impl WindowContent for ThreadsWindow {
         let mut widths: Vec<Constraint> = vec![Constraint::Length(5), Constraint::Length(10), Constraint::Length(15), Constraint::Length(12), Constraint::Length(3), Constraint::Percentage(100)];
         if self.filter.bar.editing {
             header.insert(0, "");
-            widths.insert(0, Constraint::Length(highlight_symbol.len() as u16 - 1));
+            widths.insert(0, Constraint::Length(str_width(highlight_symbol) as u16 - 1));
         } else {
             table_state.select(Some(selected_idx));
         }        
@@ -3105,15 +3105,12 @@ impl WindowContent for BreakpointsWindow {
                         spans.push(Span::styled(format!("{}", adj), palette.location_line_number));
                     }
 
-                    // Poor man's manual text alignment to the right. When we rewrite the TUI library, this should just be a flag on the table cell, or something.
-                    let suf: usize = spans[1..].iter().map(|s| s.content.len()).sum();
-                    let w = spans[0].content.len();
+                    // Manually cut off the text on the left side instead of right. When we rewrite the TUI library, this should just be a flag on the table cell, or something.
+                    let suf: usize = spans[1..].iter().map(|s| str_width(&s.content)).sum();
+                    let w = str_width(&spans[0].content);
                     let on_width = on_width as usize;
                     if w + suf > on_width {
-                        let mut i = w - on_width.saturating_sub(suf + 1);
-                        while !spans[0].content.is_char_boundary(i) {
-                            i += 1;
-                        }
+                        let i = str_suffix_with_width(&spans[0].content, on_width.saturating_sub(suf + 1));
                         spans[0].content = ("…".to_string() + &spans[0].content[i..]).into();
                     }
 

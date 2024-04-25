@@ -1,5 +1,5 @@
 use crate::{*, search::*, pool::*, symbols_registry::*, util::*, error::*, procfs::*, settings::*, context::*};
-use tui::{self, layout::{Rect, Margin, Constraint}, widgets::{Paragraph, Block, Borders, Clear, Gauge, TableState, Table, Row, Cell}, style::{Style}, backend::TermionBackend, text::{Span, Spans, Text}};
+use tui::{self, layout::{Rect, Margin, Constraint}, widgets::{Paragraph, Block, Borders, Clear, Gauge, TableState, Table, Row, Cell}, style::{Style, Color}, backend::TermionBackend, text::{Span, Spans, Text}};
 use termion::{event::{Event, Key}, raw::RawTerminal};
 use std::{io, ops::Range, sync::Arc};
 
@@ -179,12 +179,15 @@ impl TextInput {
     }
 
     pub fn render(&mut self, f: &mut Frame, area: Rect, palette: &Palette) {
-        // We're not dealing with unicode correctly throughout this struct, but meh. Can be fixed if needed.
-        self.hscroll = self.hscroll.min(self.cursor).max(self.cursor.saturating_sub(area.width as usize));
+        let width = str_width(&self.text);
+        let cursor_pos = str_width(&self.text[..self.cursor]);
+        let margin = (width/3).min(5);
+        self.hscroll = self.hscroll.min(cursor_pos.saturating_sub(margin)).max(cursor_pos.saturating_sub((area.width as usize).saturating_sub(margin + 1)));
+        self.hscroll = self.hscroll.min(width.saturating_sub(area.width as usize));
         let paragraph = Paragraph::new(self.text.clone()).block(Block::default().style(palette.default)).scroll((0, self.hscroll as u16));
         f.render_widget(paragraph, area);
-        if self.cursor >= self.hscroll && self.cursor - self.hscroll <= area.width as usize {
-            f.set_cursor(area.x + (self.cursor - self.hscroll) as u16, area.y);
+        if cursor_pos >= self.hscroll && cursor_pos - self.hscroll <= area.width as usize {
+            f.set_cursor(area.x + (cursor_pos - self.hscroll) as u16, area.y);
         }
     }
 
@@ -284,8 +287,7 @@ impl SearchDialog {
             };
             f.render_widget(Paragraph::new(text), status_area);
         } else {
-            //asdqwe assign better colors, figure out why use_unicode draws the edge in different color
-            f.render_widget(Gauge::default().ratio(res.items_done as f64 / res.items_total.max(1) as f64).label(format!("{}", PrettySize(res.bytes_done))).use_unicode(false), status_area);
+            f.render_widget(Gauge::default().ratio(res.items_done as f64 / res.items_total.max(1) as f64).label(format!("{}", PrettySize(res.bytes_done))).use_unicode(false).gauge_style(palette.progress_bar_remaining.fg(palette.progress_bar_done.bg.unwrap_or(Color::Reset))), status_area);
         }
 
         let range = self.scroll.range(res.results.len(), self.height as usize);

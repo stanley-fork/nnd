@@ -706,8 +706,26 @@ impl<R: Write> ByteWrite for R {
 
 // Horizontal space that the string would occupy on the screen.
 // For ASCII string it's just str.len(). For unicode, there are also multi-byte characters and wide characters to consider.
-// TODO: Implement (probably use the same library tui-rs uses).
-// TODO: We currently use plain len() for this purpose in a few places; find them and replace with this.
+// TODO: Implement properly (probably use the same library tui-rs uses).
 pub fn str_width(s: &str) -> usize {
-    s.len()
+    s.chars().count()
+}
+
+// If str_width(s) < w: returns s.len()
+// Otherwise: str_width(&s[..str_prefix_with_width(s, w)]) == w
+pub fn str_prefix_with_width(s: &str, width: usize) -> usize {
+    match s.char_indices().nth(width) {
+        None => s.len(),
+        Some((i, _)) => i,
+    }
+}
+
+pub fn str_suffix_with_width(s: &str, width: usize) -> usize {
+    if width == 0 {
+        return s.len();
+    }
+    match s.char_indices().rev().nth(width - 1) {
+        None => 0,
+        Some((i, _)) => i,
+    }
 }

@@ -112,7 +112,6 @@ fn limit_results(v: &mut Vec<SearchResult>) {
     if v.len() <= MAX_RESULTS {
         return;
     }
-    //asdqwe find quickselect in std library instead (but still sort the results at some point before displaying)
     v.sort_unstable_by_key(|r| -r.score);
     v.truncate(MAX_RESULTS);
 }
