@@ -35,3 +35,4 @@ pub mod context;
 pub mod interp;
 pub mod pretty;
 pub mod persistent;
+pub mod doc;

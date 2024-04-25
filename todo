@@ -1,9 +1,5 @@
-continue checking all .len() calls to replace with str_width()
-things from slack:
-  key remapping, maybe change default mapping to avoid C-a (or provide alternative)
-  color palette with Rgb for everything (including default bg), maybe configurable
-  rendering issue on mac (ssh-d to linux)
--v for build datetime and maybe bug reporting channel name
+replace '⸽' character with something else
+show debuggee's and debugger's pid, cpu usage and memory usage (in 2 lines in status window); maybe per-thread cpu usage in threads window; render every second, together with state autosaving
 fix picking up updated binary unnecessarily
 search and go-to-line in code window
 key to follow a jump in disas
@@ -51,7 +47,7 @@ maximizing watches window
 stop on panic when debugging rust programs
 make source window autoscroll horizontally in addition to vertically
 slice type, use it for pretty-printing rust strings
-show debuggee's and debugger's pid, cpu usage and memory usage (in 2 lines in status window); maybe per-thread cpu usage in threads window; render every second, together with state autosaving
+-v for build datetime
 
 watches, expressions
   first, implement simple expression watches
