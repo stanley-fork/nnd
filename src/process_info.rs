@@ -102,7 +102,7 @@ impl ProcessInfo {
 
 impl ThreadInfo {
     pub fn new() -> Self {
-        Self {name: err!(Internal, ""), regs: Registers::default(), partial_stack: None, stack: None, resource_stats: ThreadResourceStats::new()}
+        Self {name: Ok(String::new()), regs: Registers::default(), partial_stack: None, stack: None, resource_stats: ThreadResourceStats::new()}
     }
 
     pub fn invalidate(&mut self) {

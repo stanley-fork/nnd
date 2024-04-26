@@ -1,4 +1,3 @@
-replace '⸽' character with something else
 fix picking up updated binary unnecessarily
 search and go-to-line in code window
 key to follow a jump in disas
