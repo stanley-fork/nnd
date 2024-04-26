@@ -61,7 +61,7 @@ pub struct ThreadResourceStats {
     last_stime: Option<usize>,
 }
 impl ThreadResourceStats {
-    pub fn new() -> Self { Self {cpu_user_ns: 0, cpu_system_ns: 0, last_utime: None, last_stime: None, state: ' '} }
+    pub fn new() -> Self { Self {cpu_user_ns: 0, cpu_system_ns: 0, last_utime: None, last_stime: None, state: '?'} }
 
     pub fn cpu_percentage(&self, period_ns: usize) -> f64 {
         if period_ns == 0 {
@@ -166,29 +166,26 @@ pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) {
     }
 }
 
-pub fn refresh_thread_info(pid: pid_t, t: &mut Thread, regs: Option<Registers>, prof: Option<&mut Profiling>) {
+// Must be called when the thread gets suspended (and not immediately resumed) - to assign registers, so we can unwind the stack.
+// Nice to also call whenever the thread is created (to assign thread name) or resumed (to update the state char faster).
+// We skip calling this if the thread was suspended and immediately resumed (e.g. skipped conditional breakpoints or ignored user signals).
+pub fn refresh_thread_info(pid: pid_t, t: &mut Thread, prof: Option<&mut Profiling>) {
     if !t.exiting {
-        // Refresh thread name and state.
-        // State is also refreshed every second (or periodic_timer_seconds), but we want it to update immediately when the user suspends or resumes the process.
         match ProcStat::parse(&format!("/proc/{}/task/{}/stat", pid, t.tid)) {
             Ok(s) => {
-                t.info.name = s.comm().map(|s| s.to_string());
                 t.info.resource_stats.state = s.state;
+                t.info.name = s.comm().map(|s| s.to_string());
             }
             Err(e) => t.info.name = Err(e),
         }
     }
 
     if t.state == ThreadState::Suspended {
-        if let Some(regs) = regs {
-            t.info.regs = regs;
-        } else {
-            t.info.regs = match ptrace_getregs(t.tid, prof) {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("error: GETREGS failed: {:?}", e);
-                    Registers::default()
-                }
+        t.info.regs = match ptrace_getregs(t.tid, prof) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("error: GETREGS failed: {:?}", e);
+                Registers::default()
             }
         }
     }
@@ -201,7 +198,9 @@ pub fn refresh_resource_stats(pid: pid_t, my_stats: &mut ResourceStats, debuggee
 
     for (tid, t) in threads {
         if !t.exiting {
-            t.info.resource_stats.update(&ProcStat::parse(&format!("/proc/{}/task/{}/stat", pid, tid))?)
+            let s = ProcStat::parse(&format!("/proc/{}/task/{}/stat", pid, tid))?;
+            t.info.resource_stats.update(&s);
+            t.info.name = s.comm().map(|s| s.to_string());
         }
     }
 

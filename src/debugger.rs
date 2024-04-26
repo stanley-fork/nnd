@@ -358,7 +358,7 @@ impl Debugger {
 
         refresh_maps_and_binaries_info(&mut r);
         for t in r.threads.values_mut() {
-            refresh_thread_info(pid, t, None, Some(&mut r.log.prof));
+            refresh_thread_info(pid, t, Some(&mut r.log.prof));
         }
 
         Ok(r)
@@ -582,7 +582,8 @@ impl Debugger {
                 } else if libc::WIFSTOPPED(wstatus) {
                     let signal = libc::WSTOPSIG(wstatus);
 
-                    thread.state = ThreadState::Suspended;
+                    let thread_prev_state = mem::replace(&mut thread.state, ThreadState::Suspended);
+                    let mut thread_initial_stop = false;
                     thread.subframe_to_select = None;
                     thread.info.invalidate();
                     let mut force_resume = thread.exiting;
@@ -603,6 +604,7 @@ impl Debugger {
                             // The `signal` value in this case for newly created thread is inconsistent: sometimes SIGSTOP, sometimes SIGTRAP.
                             eprintln!("trace: thread {} got initial stop {} {}", tid, signal, signal_name(signal));
                             thread.waiting_for_initial_stop = false;
+                            thread_initial_stop = true;
                             self.set_debug_registers_for_thread(tid)?;
                         } else {
                             //eprintln!("trace: group-stop or interrupt, tid {} signal {} {}", tid, signal, signal_name(signal));
@@ -696,11 +698,18 @@ impl Debugger {
                     }
 
                     if force_resume || self.target_state_for_thread(tid) == ThreadState::Running {
-                        self.resume_thread(tid)?;
+                        // When to refresh thread info after resuming the thread:
+                        //  * For newly created thread - to assign thread name (without waiting for periodic timer).
+                        //  * For thread that was previously suspended - to assign thread state (without waiting for periodic timer).
+                        //  * Avoid refreshing if the thread was running, then suspended and immediately resumed.
+                        //    In particular, for conditional breakpoints and for benign signals (e.g. if the debuggee sends itself SIGUSR1 every millisecond for profiling).
+                        let should_refresh_thread_info = !force_resume && (thread_initial_stop || thread_prev_state == ThreadState::Suspended);
+
+                        self.resume_thread(tid, should_refresh_thread_info)?;
                     } else {
                         let t = self.threads.get_mut(&tid).unwrap();
                         t.stop_count += 1;
-                        refresh_thread_info(self.pid, t, None, Some(&mut self.log.prof));
+                        refresh_thread_info(self.pid, t, Some(&mut self.log.prof));
                     }
                 } else {
                     return err!(Internal, "waitpid() returned unexpected status: {}", wstatus);
@@ -755,7 +764,12 @@ impl Debugger {
                 self.stopping_to_handle_breakpoints = false;
                 let tids_to_resume: Vec<pid_t> = self.threads.keys().filter(|tid| self.target_state_for_thread(**tid) == ThreadState::Running).copied().collect();
                 for t in tids_to_resume {
-                    self.resume_thread(t)?;
+                    // (We refreshed after suspending, so should refresh after resuming, even though the suspension was probably brief.
+                    //  Otherwise the UI will show the threads as suspended for a second after adding a breakpoint - confusing.
+                    //  Actually it's confusing anyway: this refresh will usually show the thread as R[unning], even if it's usually S[leeping].)
+                    let should_refresh_thread_info = true;
+
+                    self.resume_thread(t, should_refresh_thread_info)?;
                 }
             }
         }
@@ -821,7 +835,7 @@ impl Debugger {
         refresh_maps_and_binaries_info(self);
         for t in self.threads.values_mut() {
             t.info.invalidate();
-            refresh_thread_info(self.pid, t, None, Some(&mut self.log.prof));
+            refresh_thread_info(self.pid, t, Some(&mut self.log.prof));
         }
 
         // Retry resolving breakpoints into addresses after symbols are loaded. Particularly useful for breakpoints loaded from state file on startup.
@@ -843,12 +857,8 @@ impl Debugger {
         let tids: Vec<pid_t> = self.threads.keys().copied().collect();
         for tid in tids {
             if self.target_state_for_thread(tid) == ThreadState::Running {
-                self.resume_thread(tid)?;
+                self.resume_thread(tid, true)?;
             }
-        }
-        refresh_maps_and_binaries_info(self);
-        for t in self.threads.values_mut() {
-            refresh_thread_info(self.pid, t, None, Some(&mut self.log.prof));
         }
 
         Ok(())
@@ -1269,13 +1279,13 @@ impl Debugger {
 
         if self.stepping.as_ref().unwrap().keep_other_threads_suspended {
             if self.target_state_for_thread(tid) == ThreadState::Running {
-                self.resume_thread(tid)?;
+                self.resume_thread(tid, true)?;
             }
         } else {
             let tids: Vec<pid_t> = self.threads.keys().copied().collect();
             for t in tids {
                 if self.target_state_for_thread(t) == ThreadState::Running {
-                    self.resume_thread(t)?;
+                    self.resume_thread(t, true)?;
                 }
             }
         }
@@ -1292,7 +1302,7 @@ impl Debugger {
         None
     }
 
-    fn resume_thread(&mut self, tid: pid_t) -> Result<()> {
+    fn resume_thread(&mut self, tid: pid_t, refresh_info: bool) -> Result<()> {
         let thread = self.threads.get_mut(&tid).unwrap();
         if thread.state == ThreadState::Running {
             return Ok(());
@@ -1307,6 +1317,11 @@ impl Debugger {
         unsafe {ptrace(op, tid, 0, sig as u64, Some(&mut self.log.prof))?};
         thread.state = ThreadState::Running;
         thread.stop_reasons.clear();
+
+        if refresh_info {
+            refresh_thread_info(self.pid, thread, Some(&mut self.log.prof));
+        }
+        
         Ok(())
     }
 
