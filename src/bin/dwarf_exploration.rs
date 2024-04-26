@@ -1,6 +1,6 @@
 #![allow(non_upper_case_globals)]
-extern crate deb;
-use deb::{*, error::{*, Result, Error}, elf::*, log::*};
+extern crate nnd;
+use nnd::{*, error::{*, Result, Error}, elf::*, log::*};
 use std::{fs::{File}, str, mem, collections::hash_map::DefaultHasher, hash::Hasher, fmt::Write as FmtWrite, io::{self, Write}, mem::drop, collections::HashMap};
 use memmap2::Mmap;
 use gimli::*;

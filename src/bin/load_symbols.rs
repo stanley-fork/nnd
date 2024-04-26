@@ -1,6 +1,6 @@
 #![allow(unused_imports)]
-extern crate deb;
-use deb::{*, error::*, elf::*, log::*, symbols::*, types::*, arena::*, util::*};
+extern crate nnd;
+use nnd::{*, error::*, elf::*, log::*, symbols::*, types::*, arena::*, util::*};
 use std::{fs::{File}, io::{self, Write}, sync::Arc, mem, sync::atomic::{AtomicBool, Ordering}, cell::UnsafeCell, thread, thread::JoinHandle};
 use memmap2::Mmap;
 
