@@ -118,7 +118,7 @@ pub struct Profiling {
     // They might take multiple epoll iterations to arrive. We group those iterations to report the whole burst of activity as one item.
     // A burst starts with a debugger event (iteration_debugger()) and ends when two consecutive renders had no debugger events in between.
     // To detect the end of a burst, we request an additional re-render whenever there were debugger events between two consecutive renders,
-    // i.e. we render an additional frame at the end of each burst, which is also useful for showing the information about the burst.
+    // i.e. we render an additional frame at the end of each burst, which is also useful for showing the profiling information about the burst.
     // (Maybe we should disable this extra rendering when profiler is not shown.)
     burst_tsc: u64,
     burst_syscall_count: usize,

@@ -184,7 +184,7 @@ impl UI {
         layout.new_window(Some(rows[0]), WindowType::Other, true, "cheat sheet".to_string(), Box::new(HintsWindow::default()));
         layout.rigidify(rows[0], 8);
         layout.new_window(Some(rows[1]), WindowType::Status, true, "status".to_string(), Box::new(StatusWindow::default()));
-        layout.rigidify(rows[1], 6);
+        layout.rigidify(rows[1], 7);
         layout.new_window(Some(rows[2]), WindowType::Watches, true, "locals".to_string(), Box::new(WatchesWindow::new(true)));
         layout.new_window(Some(rows[2]), WindowType::Watches, true, "watches".to_string(), Box::new(WatchesWindow::new(false)));
         layout.new_window(Some(rows[2]), WindowType::Watches, true, "registers".to_string(), Box::new(RegistersWindow::default()));
@@ -1646,8 +1646,11 @@ impl WindowContent for StatusWindow {
         });
 
         if debugger.target_state != ProcessState::NoProcess {
-            items.push(ListItem::new(Text::from(Spans::from(vec![Span::styled("pid: ", palette.default_dim), Span::raw(format!("{}", debugger.pid))]))));
+            items.push(ListItem::new(Text::from(Spans::from(vec![Span::styled("pid: ", palette.default_dim), Span::raw(format!("{}", debugger.pid)), Span::styled(format!(" cpu {:.0}% mem {}", debugger.info.resource_stats.cpu_percentage(), PrettySize(debugger.info.resource_stats.rss_bytes)), palette.default_dim)]))));
+        } else {
+            items.push(ListItem::new(Text::from(Spans::from(vec![Span::styled("pid: none", palette.default_dim)]))));
         }
+        items.push(ListItem::new(Text::from(Spans::from(vec![Span::styled(format!("nnd pid: {} cpu {:.0}% mem {}", my_pid(), debugger.my_resource_stats.cpu_percentage(), PrettySize(debugger.my_resource_stats.rss_bytes)), palette.default_dim)]))));
         match &debugger.persistent.path {
             Ok(p) => items.push(ListItem::new(format!("{}/", p.display())).style(palette.default_dim)),
             Err(e) => items.push(ListItem::new(format!("{}", e)).style(palette.error)),
@@ -1967,7 +1970,18 @@ impl WindowContent for ThreadsWindow {
             let mut cells = vec![
                 Cell::from(format!("{}", t.idx)).style(palette.default_dim),
                 Cell::from(format!("{}", t.tid)).style(palette.default_dim),
-                Cell::from(t.info.name.clone())];
+                match t.info.name.clone() {
+                    Ok(name) => Cell::from(name),
+                    Err(e) => Cell::from(format!("{}", e)).style(palette.error),
+                },
+                Cell::from(format!("{}", t.info.resource_stats.state)).style(match t.info.resource_stats.state {
+                    'R' | 'D' => palette.state_in_progress,
+                    'S' | 'T' | 't' => palette.state_suspended,
+                    'Z' | 'X' | 'x' => palette.error,
+                    _ => palette.state_other,
+                }),
+                Cell::from(format!("{:.0}%", t.info.resource_stats.cpu_percentage(debugger.info.resource_stats.period_ns))).style(palette.default_dim),
+            ];
             match t.state {
                 ThreadState::Running => cells.extend_from_slice(&[
                     Cell::from(""),
@@ -2034,8 +2048,8 @@ impl WindowContent for ThreadsWindow {
 
         let highlight_symbol = ">> ";
         let mut table_state = TableState::default();
-        let mut header: Vec<&'static str> = vec!["idx", "tid", "name", "addr", "bin", "function"];
-        let mut widths: Vec<Constraint> = vec![Constraint::Length(5), Constraint::Length(10), Constraint::Length(15), Constraint::Length(12), Constraint::Length(3), Constraint::Percentage(100)];
+        let mut header: Vec<&'static str> = vec!["idx", "tid", "name", "s", "cpu", "addr", "bin", "function"];
+        let mut widths: Vec<Constraint> = vec![Constraint::Length(5), Constraint::Length(10), Constraint::Length(15), Constraint::Length(1), Constraint::Length(4), Constraint::Length(12), Constraint::Length(3), Constraint::Percentage(100)];
         if self.filter.bar.editing {
             header.insert(0, "");
             widths.insert(0, Constraint::Length(str_width(highlight_symbol) as u16 - 1));

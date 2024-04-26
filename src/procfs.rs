@@ -331,15 +331,54 @@ pub fn peak_memory_usage_of_current_process() -> Result<usize> {
         }
         let (number, unit, extra) = (s.next(), s.next(), s.next());
         if let Some(x) = extra {
-            return err!(Format, "unexpected tokens in WnHWM line: {}", x);
+            return err!(Format, "unexpected tokens in VmHWM line: {}", x);
         }
         if unit != Some("kB") {
-            return err!(Format, "unexpected unit in WnHWM line: {}", unit.unwrap_or("<none>"));
+            return err!(Format, "unexpected unit in VmHWM line: {}", unit.unwrap_or("<none>"));
         }
         let number = usize::from_str(number.unwrap())?;
         return Ok(number << 10);
     }
     err!(Format, "No VmHWM line")
+}
+
+// Contents of /proc/[pid]/stat
+pub struct ProcStat {
+    comm: [u8; 33], // length, then bytes
+    pub state: char,
+    pub utime: usize, // in _SC_CLK_TCK units
+    pub stime: usize,
+    pub rss: usize, // in pages
+}
+impl ProcStat {
+    pub fn parse(path: &str) -> Result<ProcStat> {
+        let line = std::fs::read_to_string(path)?;
+
+        // We panic if parsing fails. The data comes from the kernel, not from a real file, so it should always be valid.
+
+        let open_paren = line.char_indices().find(|(_, c)| *c == '(').unwrap().0;
+        let close_paren = line.char_indices().rev().find(|(_, c)| *c == ')').unwrap().0;
+        let mut comm = [0u8; 33];
+        let comm_len = (close_paren - open_paren - 1).min(comm.len() - 1);
+        comm[1..1+comm_len].copy_from_slice(&line.as_bytes()[open_paren+1..open_paren+1+comm_len]);
+        comm[0] = comm_len as u8;
+
+        let mut tokens = line[close_paren+1..].split_whitespace();
+
+        let state = tokens.next().unwrap();
+        assert!(state.len() == 1);
+        let state = state.chars().next().unwrap();
+
+        let utime = usize::from_str(tokens.nth(10).unwrap())?;
+        let stime = usize::from_str(tokens.nth(0).unwrap())?;
+        let rss = usize::from_str(tokens.nth(8).unwrap())?;
+
+        Ok(ProcStat {comm, state, utime, stime, rss})
+    }
+
+    pub fn comm(&self) -> Result<&str> {
+        Ok(std::str::from_utf8(&self.comm[1..1+self.comm[0] as usize])?)
+    }
 }
 
 pub fn list_threads(pid: pid_t) -> Result<Vec<pid_t>> {

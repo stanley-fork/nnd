@@ -55,6 +55,7 @@ fn parse_arg(args: &mut &[String], long_name: &str, short_name: &str, bool_switc
 }
 
 fn main() {
+    precalc_global_constants();
     std::env::set_var("RUST_BACKTRACE", "full"); // (short stack traces don't work with custom panic handlers for some reason - the __rust_begin_short_backtrace/__rust_end_short_backtrace are missing)
 
     let mut settings = Settings::default();
@@ -221,13 +222,13 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, command_line: Option<Vec<S
     let render_timer = TimerFD::new();
     // for fixed fps, do this here: render_timer.set(1, frame_ns), and remove other render_timer.set(...) calls
 
-    // Periodic timer or saving state.
-    let save_timer = TimerFD::new();
-    save_timer.set(1, (context.settings.save_period_seconds * 1e9) as usize);
+    // Timer for refreshing resource stats and saving state.
+    let periodic_timer = TimerFD::new();
+    periodic_timer.set(1, (context.settings.periodic_timer_seconds * 1e9) as usize);
 
     epoll.add(STDIN_FILENO, libc::EPOLLIN, STDIN_FILENO as u64)?;
     epoll.add(render_timer.fd, libc::EPOLLIN, render_timer.fd as u64)?;
-    epoll.add(save_timer.fd, libc::EPOLLIN, save_timer.fd as u64)?;
+    epoll.add(periodic_timer.fd, libc::EPOLLIN, periodic_timer.fd as u64)?;
 
     set_terminal_to_raw_mode_etc();
     let terminal_restorer = TerminalRestorer;
@@ -305,9 +306,11 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, command_line: Option<Vec<S
                     ui.drop_caches();
                 }
                 debugger.log.prof.iteration_other(prof.finish());
-            } else if fd == save_timer.fd {
-                save_timer.read();
+            } else if fd == periodic_timer.fd {
+                periodic_timer.read();
+                debugger.refresh_resource_stats();
                 PersistentState::try_to_save_state_if_changed(&mut debugger, &mut ui);
+                debugger.log.prof.iteration_other(prof.finish());
             } else {
                 return err!(Internal, "epoll returned unexpected data: {}", fd);
             }

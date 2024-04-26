@@ -1,5 +1,4 @@
 replace '⸽' character with something else
-show debuggee's and debugger's pid, cpu usage and memory usage (in 2 lines in status window); maybe per-thread cpu usage in threads window; render every second, together with state autosaving
 fix picking up updated binary unnecessarily
 search and go-to-line in code window
 key to follow a jump in disas

@@ -8,7 +8,8 @@ pub struct Settings {
     pub fps: f64,
     pub loading_fps: f64, // how often to re-render when there's a progress bar on screen
     pub max_threads: usize,
-    pub save_period_seconds: f64, // how often to save state to file (watches, breakpoints, etc); also saved on clean exit (not on panic or crash)
+    // How often to refresh resource stats (cpu and memory usage) and save state to file (watches, breakpoints, etc). (State is also saved on clean exit, but not on panic or crash.)
+    pub periodic_timer_seconds: f64,
     // TODO: Load keys and colors from config file(s). Maybe move them out of Settings to allow hot-reloading (for experimenting with colors quickly). Probably use separate files to make it easier to share themes.
     pub keys: KeyBindings,
     pub palette: Palette,
@@ -25,7 +26,7 @@ impl Default for Settings {
         fps: 144.0,
         loading_fps: 10.0,
         max_threads: 128,
-        save_period_seconds: 1.0,
+        periodic_timer_seconds: 1.0,
         keys: KeyBindings::defaults(),
         palette: Palette::rgb_dark_theme(),
 

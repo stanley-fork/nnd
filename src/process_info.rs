@@ -1,5 +1,5 @@
 use crate::{*, debugger::*, error::*, util::*, symbols::*, symbols_registry::*, procfs::*, unwind::*, registers::*, log::*};
-use std::collections::{HashMap, hash_map::Entry};
+use std::{collections::{HashMap, hash_map::Entry}, time::Instant};
 use std::mem;
 use libc::pid_t;
 
@@ -7,10 +7,13 @@ pub struct ProcessInfo {
     pub maps: MemMapsInfo,
     // Pointers to symbols for all mapped binaries. Guaranteed to be present in SymbolsRegistry.
     pub binaries: HashMap<BinaryId, BinaryInfo>,
+
+    // CPU and memory usage, recalculated periodically (
+    pub resource_stats: ResourceStats,
 }
 
 pub struct ThreadInfo {
-    pub name: String,
+    pub name: Result<String>,
 
     pub regs: Registers,
 
@@ -23,11 +26,60 @@ pub struct ThreadInfo {
     // binary, or maybe let the user specify a regex for functions to exclude, or something.
     pub partial_stack: Option<StackTrace>,
     pub stack: Option<StackTrace>,
+
+    pub resource_stats: ThreadResourceStats,
+}
+
+pub struct ResourceStats {
+    pub period_ns: usize,
+    pub rss_bytes: usize,
+    pub all_threads: ThreadResourceStats,
+
+    pub last_timestamp: Option<Instant>,
+}
+impl ResourceStats {
+    pub fn new() -> Self { Self {period_ns: 0, rss_bytes: 0, all_threads: ThreadResourceStats::new(), last_timestamp: None} }
+
+    pub fn cpu_percentage(&self) -> f64 {
+        self.all_threads.cpu_percentage(self.period_ns)
+    }
+
+    fn update(&mut self, now: Instant, s: &ProcStat) {
+        self.period_ns = (now - mem::replace(&mut self.last_timestamp, Some(now)).unwrap_or(now).min(now)).as_nanos() as usize;
+        self.rss_bytes = s.rss * sysconf_PAGE_SIZE();
+        self.all_threads.update(s);
+    }
+}
+
+pub struct ThreadResourceStats {
+    // CPU time during the last ResourceStats.period_ns period.
+    pub cpu_user_ns: usize,
+    pub cpu_system_ns: usize,
+    pub state: char,
+
+    last_utime: Option<usize>,
+    last_stime: Option<usize>,
+}
+impl ThreadResourceStats {
+    pub fn new() -> Self { Self {cpu_user_ns: 0, cpu_system_ns: 0, last_utime: None, last_stime: None, state: ' '} }
+
+    pub fn cpu_percentage(&self, period_ns: usize) -> f64 {
+        if period_ns == 0 {
+            return 0.0;
+        }
+        (self.cpu_user_ns + self.cpu_system_ns) as f64 / period_ns as f64 * 100.0
+    }
+
+    fn update(&mut self, s: &ProcStat) {
+        self.state = s.state;
+        self.cpu_user_ns = (s.utime - mem::replace(&mut self.last_utime, Some(s.utime)).unwrap_or(s.utime)) * (1_000_000_000 / sysconf_SC_CLK_TCK());
+        self.cpu_system_ns = (s.stime - mem::replace(&mut self.last_stime, Some(s.stime)).unwrap_or(s.utime)) * (1_000_000_000 / sysconf_SC_CLK_TCK());
+    }
 }
 
 impl ProcessInfo {
     pub fn new() -> Self {
-        Self {maps: Default::default(), binaries: HashMap::new()}
+        Self {maps: Default::default(), binaries: HashMap::new(), resource_stats: ResourceStats::new()}
     }
 
     pub fn addr_to_binary(&self, addr: usize) -> Result<&BinaryInfo> {
@@ -50,7 +102,7 @@ impl ProcessInfo {
 
 impl ThreadInfo {
     pub fn new() -> Self {
-        Self {name: String::new(), regs: Registers::default(), partial_stack: None, stack: None}
+        Self {name: err!(Internal, ""), regs: Registers::default(), partial_stack: None, stack: None, resource_stats: ThreadResourceStats::new()}
     }
 
     pub fn invalidate(&mut self) {
@@ -114,9 +166,17 @@ pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) {
     }
 }
 
-pub fn refresh_thread_info(t: &mut Thread, regs: Option<Registers>, prof: Option<&mut Profiling>) {
+pub fn refresh_thread_info(pid: pid_t, t: &mut Thread, regs: Option<Registers>, prof: Option<&mut Profiling>) {
     if !t.exiting {
-        t.info.name = std::fs::read_to_string(format!("/proc/{}/comm", t.tid)).unwrap_or_else(|e| format!("error: {}", e));
+        // Refresh thread name and state.
+        // State is also refreshed every second (or periodic_timer_seconds), but we want it to update immediately when the user suspends or resumes the process.
+        match ProcStat::parse(&format!("/proc/{}/task/{}/stat", pid, t.tid)) {
+            Ok(s) => {
+                t.info.name = s.comm().map(|s| s.to_string());
+                t.info.resource_stats.state = s.state;
+            }
+            Err(e) => t.info.name = Err(e),
+        }
     }
 
     if t.state == ThreadState::Suspended {
@@ -132,6 +192,20 @@ pub fn refresh_thread_info(t: &mut Thread, regs: Option<Registers>, prof: Option
             }
         }
     }
+}
+
+pub fn refresh_resource_stats(pid: pid_t, my_stats: &mut ResourceStats, debuggee_stats: &mut ResourceStats, threads: &mut HashMap<pid_t, Thread>) -> Result<()> {
+    let now = Instant::now();
+    my_stats.update(now, &ProcStat::parse("/proc/self/stat")?);
+    debuggee_stats.update(now, &ProcStat::parse(&format!("/proc/{}/stat", pid))?);
+
+    for (tid, t) in threads {
+        if !t.exiting {
+            t.info.resource_stats.update(&ProcStat::parse(&format!("/proc/{}/task/{}/stat", pid, tid))?)
+        }
+    }
+
+    Ok(())
 }
 
 pub fn ptrace_getregs(tid: pid_t, prof: Option<&mut Profiling>) -> Result<Registers> {

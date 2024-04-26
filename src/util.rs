@@ -706,7 +706,7 @@ impl<R: Write> ByteWrite for R {
 
 // Horizontal space that the string would occupy on the screen.
 // For ASCII string it's just str.len(). For unicode, there are also multi-byte characters and wide characters to consider.
-// TODO: Implement properly (probably use the same library tui-rs uses).
+// TODO: Implement all the width-related functions below properly (probably use the same library tui-rs uses).
 pub fn str_width(s: &str) -> usize {
     s.chars().count()
 }
@@ -719,7 +719,6 @@ pub fn str_prefix_with_width(s: &str, width: usize) -> usize {
         Some((i, _)) => i,
     }
 }
-
 pub fn str_suffix_with_width(s: &str, width: usize) -> usize {
     if width == 0 {
         return s.len();
@@ -728,4 +727,37 @@ pub fn str_suffix_with_width(s: &str, width: usize) -> usize {
         None => 0,
         Some((i, _)) => i,
     }
+}
+
+// sysconf(_SC_CLK_TCK), assigned at the start of main().
+static mut SYSCONF_SC_CLK_TCK: usize = 0;
+static mut SYSCONF_PAGE_SIZE: usize = 0;
+static mut MY_PID: pid_t = 0;
+
+#[allow(non_snake_case)]
+pub fn sysconf_SC_CLK_TCK() -> usize {
+    let r = unsafe {SYSCONF_SC_CLK_TCK};
+    debug_assert!(r != 0);
+    r
+}
+#[allow(non_snake_case)]
+pub fn sysconf_PAGE_SIZE() -> usize {
+    let r = unsafe {SYSCONF_PAGE_SIZE};
+    debug_assert!(r != 0);
+    r
+}
+
+pub fn my_pid() -> pid_t {
+    unsafe {MY_PID}
+}
+
+pub fn precalc_global_constants() {
+    let assert_nonzero = |x: usize| -> usize {
+        assert!(x != 0);
+        x
+    };
+    
+    unsafe {SYSCONF_SC_CLK_TCK = assert_nonzero(libc::sysconf(libc::_SC_CLK_TCK) as usize)};
+    unsafe {SYSCONF_PAGE_SIZE = assert_nonzero(libc::sysconf(libc::_SC_PAGE_SIZE) as usize)};
+    unsafe {MY_PID = assert_nonzero(libc::getpid() as usize) as pid_t};
 }
