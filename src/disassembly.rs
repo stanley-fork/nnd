@@ -21,11 +21,11 @@ pub const MAX_X86_INSTRUCTION_BYTES: usize = 15;
 //  7ffff7c9103c <  +c>    sub rsp,20h                          Instruction               138
 //                         futex-internal.c:139:10              InlinedCallLineNumber     139         
 //                         __futex_abstimed_wait_common         InlinedFunctionName       139
-//                         ⸽futex-internal.c:77:6               LeafLineNumber            77          42 (or whatever the idx of this inlined __futex_abstimed_wait_common is)
-//  7ffff7c91040 < +10>    ⸽test rcx,rcx                        Instruction               77          42
-//  7ffff7c91043 < +13>  ↓ ⸽jne near _+100h                     Instruction               77          42
-//                         ⸽futex-internal.c:80:6               LeafLineNumber            80          42
-//  7ffff7c91049 < +19>    ⸽cmp edx,1                           Instruction               80          42
+//                         ┆futex-internal.c:77:6               LeafLineNumber            77          42 (or whatever the idx of this inlined __futex_abstimed_wait_common is)
+//  7ffff7c91040 < +10>    ┆test rcx,rcx                        Instruction               77          42
+//  7ffff7c91043 < +13>  ↓ ┆jne near _+100h                     Instruction               77          42
+//                         ┆futex-internal.c:80:6               LeafLineNumber            80          42
+//  7ffff7c91049 < +19>    ┆cmp edx,1                           Instruction               80          42
 
 pub struct Disassembly {
     pub text: StyledText,
@@ -45,7 +45,7 @@ pub struct DisassemblyLineInfo {
     pub leaf_line: Option<LineInfo>,
     // Innermost subfunction containing this line, consistent with indentation. For InlinedCallLineNumber and InlinedCallFunctionName: the *parent* subfunction (if any).
     pub subfunction: Option<usize>,
-    // Which of the spans of this line contains indentation characters ("⸽⸽⸽...") and nothing else. Used for highlighting selected subfunction level.
+    // Which of the spans of this line contains indentation characters ("┆┆┆...") and nothing else. Used for highlighting selected subfunction level.
     pub indent_span_idx: usize,
 }
 
@@ -282,7 +282,7 @@ pub fn disassemble_function(function_idx: usize, mut static_addr_ranges: Vec<Ran
                         res.lines.push(DisassemblyLineInfo {kind: DisassemblyLineKind::InlinedFunctionName, addr: instruction.ip() as usize, leaf_line: cur_leaf_line.clone(), subfunction: cur_subfunction.clone(), indent_span_idx});
                     }
                     cur_subfunction = Some(r[0].subfunction_idx);
-                    indent.push('⸽');
+                    indent.push('┆');
                 }
 
                 // Add line number information.

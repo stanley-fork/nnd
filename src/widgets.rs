@@ -316,7 +316,7 @@ impl SearchDialog {
 
         let table = Table::new(rows)
             .widths(&[Constraint::Percentage(100)])
-            .highlight_style(palette.table_selected_item).highlight_symbol(">> ");
+            .highlight_style(palette.table_selected_item).highlight_symbol("➤ ");
         f.render_stateful_widget(table, results_area, &mut table_state);
 
         !res.complete

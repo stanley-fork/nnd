@@ -803,7 +803,7 @@ impl WindowContent for WatchesWindow {
             let is_add_watch_placeholder = !self.is_locals_window && lvl == 1 && self.expressions.last().is_some_and(|(id, s)| s.is_empty() && *id == node.child_id);
 
             // Indentation, expansion arrow, name.
-            let mut spans = vec![Span::styled("⸽".to_string().repeat(lvl - 1), palette.default_dim)];
+            let mut spans = vec![Span::styled("┆".to_string().repeat(lvl - 1), palette.default_dim)];
             if node.has_children.unwrap_or(expanded) {
                 spans.push(Span::raw(if expanded {"▾ "} else {"▸ "}));
             } else {
@@ -2046,7 +2046,7 @@ impl WindowContent for ThreadsWindow {
             row
         }).collect();
 
-        let highlight_symbol = ">> ";
+        let highlight_symbol = "➤ ";
         let mut table_state = TableState::default();
         let mut header: Vec<&'static str> = vec!["idx", "tid", "name", "s", "cpu", "addr", "bin", "function"];
         let mut widths: Vec<Constraint> = vec![Constraint::Length(5), Constraint::Length(10), Constraint::Length(15), Constraint::Length(1), Constraint::Length(4), Constraint::Length(12), Constraint::Length(3), Constraint::Percentage(100)];
@@ -2275,7 +2275,7 @@ impl WindowContent for StackWindow {
         let table = Table::new(rows)
             .header(Row::new(vec![Text::from("idx"), Text::from("address"), Text::from("bin"), Text {lines: vec![Spans::from("location"), Spans::from(Span::styled("line", palette.location_filename))]}]).style(palette.table_header).height(/* tried 2, but it looks worse */ 1))
             .widths(&[Constraint::Length(3), Constraint::Length(12), Constraint::Length(3), Constraint::Percentage(90)])
-            .highlight_style(palette.table_selected_item).highlight_symbol(">> ");
+            .highlight_style(palette.table_selected_item).highlight_symbol("➤ ");
 
         f.render_stateful_widget(table, area, &mut table_state);
     }
@@ -3146,7 +3146,7 @@ impl WindowContent for BreakpointsWindow {
         let table = Table::new(rows)
             .header(Row::new(vec!["idx", "", "on", "locs", "hits"]).style(palette.table_header))
             .widths(&widths)
-            .highlight_style(palette.table_selected_item).highlight_symbol(">> ");
+            .highlight_style(palette.table_selected_item).highlight_symbol("➤ ");
 
         f.render_stateful_widget(table, area, &mut table_state);
     }
