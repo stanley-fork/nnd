@@ -4,8 +4,8 @@ pub fn print_help_chapter(arg: &str, executable_name: &str) -> bool {
     match arg {
         "--help" => println!(r###"Hi, I'm a debugger.
 
-Please (pretty please!) report all bugs, usability issues, slowness, first impressions, improvement ideas, feature requests, etc
-to #debugger in slack (if you're not in clickhouse, and this debugger reached you somehow, send reports to mk.al13n@gmail.com).
+Please (pretty please!) report all bugs, usability issues, slowness, first impressions, improvement ideas, feature requests, etc.
+If you work at ClickHouse, report to #debugger channel in slack. Otherwise email to mk.al13n+nnd@gmail.com or comment at https://al13n.itch.io/nnd
 
 Usage:
 {0} command [args...]   - run a program under the debugger (just prepend {0} to the command line)
@@ -85,8 +85,8 @@ Tips and caveats:
    (If you're curious, see ~/.nnd/<number>/log for a breakdown of which parts of the debug info take how much memory and take how long to load.)
  * For clickhouse server, use CLICKHOUSE_WATCHDOG_ENABLE=0. Otherwise it forks on startup, and the debugger doesn't follow forks.
 
-Please (pretty please!) report all bugs, usability issues, slowness, first impressions, improvement ideas, feature requests, etc
-to #debugger in slack (if you're not in clickhouse, and this debugger reached you somehow, send reports to mk.al13n@gmail.com)."###),
+Please (pretty please!) report all bugs, usability issues, slowness, first impressions, improvement ideas, feature requests, etc.
+If you work at ClickHouse, report to #debugger channel in slack. Otherwise email to mk.al13n+nnd@gmail.com or comment at https://al13n.itch.io/nnd"###),
         "--help-known-problems" =>             println!(r###"Current limitations:
  * Resizing and rearranging windows is not implemented. You need a reasonably big screen to fit all the UI without cutting off any table columns, sorry.
  * Navigation in the source code window is lacking. There's no search and no go-to-line. You pretty much have to alt-tab into a real text editor,

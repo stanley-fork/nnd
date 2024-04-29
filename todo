@@ -1,5 +1,9 @@
+fix search
+  score sorting is broken (e.g. try opening main.rs in nnd)
+  matching is broken (e.g. do function search in clickhouse for "DBWriteBufferToFileSegment" and see irrelevant results including "skim::util::atoi::he61a195c9d93b7e9")
 fix picking up updated binary unnecessarily
 search and go-to-line in code window
+key to sort by cpu usage in threads window
 key to follow a jump in disas
 instruction breakpoints
 look at profiler on ch server (1500 threads)

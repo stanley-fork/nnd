@@ -86,11 +86,15 @@ fn search_task(state: Arc<SearchState>, query: SearchQuery, symbols: Arc<Symbols
         }
 
         let original_count = res.len();
-        limit_results(&mut res);
-        
+        if res.len() > MAX_RESULTS {
+            sort_and_truncate_results(&mut res);
+        }
+
         let mut r = state.results.lock().unwrap();
-        r.results.append(&mut res);
-        limit_results(&mut r.results);
+        if !res.is_empty() {
+            r.results.append(&mut res);
+            sort_and_truncate_results(&mut r.results);
+        }
         r.total_results += original_count;
         r.items_done = r.items_done.wrapping_add(delta_items_done);
         r.items_total = r.items_total.wrapping_add(delta_items_total);
@@ -108,10 +112,7 @@ fn search_task(state: Arc<SearchState>, query: SearchQuery, symbols: Arc<Symbols
     }
 }
 
-fn limit_results(v: &mut Vec<SearchResult>) {
-    if v.len() <= MAX_RESULTS {
-        return;
-    }
+fn sort_and_truncate_results(v: &mut Vec<SearchResult>) {
     v.sort_unstable_by_key(|r| -r.score);
     v.truncate(MAX_RESULTS);
 }
@@ -252,7 +253,8 @@ impl Searcher for FunctionSearcher {
         let mut items_done = 0usize;
         let mut bytes_done = 0usize;
         let mut res: Vec<SearchResult> = Vec::new();
-        for (idx, function) in symbols.functions[range].iter().enumerate() {
+        for idx in range {
+            let function = &symbols.functions[idx];
             if function.flags.contains(FunctionFlags::SENTINEL) {
                 continue;
             }
