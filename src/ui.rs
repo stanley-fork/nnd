@@ -3040,27 +3040,26 @@ impl WindowContent for BreakpointsWindow {
         let f = match f { Some(f) => f, None => return };
         let height = area.height.saturating_sub(1);
 
+        if let &Some(id) = &self.selected_breakpoint {
+            keys.retain(|key| {
+                match debugger.context.settings.keys.map.get(key) {
+                    Some(KeyAction::DeleteRow) => {debugger.remove_breakpoint(id);}
+                    Some(KeyAction::ToggleBreakpointEnabledness) => {
+                        let r = debugger.toggle_breakpoint_enabledness(id);
+                        report_result(ui, &r);
+                    }
+                    _ => return true,
+                }
+                false
+            });
+        }
+
         let mut breakpoints: Vec<BreakpointId> = debugger.breakpoints.iter().map(|p| p.0).collect();
         breakpoints.sort_by_key(|id| id.seqno);
 
         if let &Some(id) = &self.selected_breakpoint {
             if let Some(idx) = breakpoints.iter().position(|b| b == &id) {
                 self.scroll.cursor = idx;
-
-                keys.retain(|key| {
-                    match debugger.context.settings.keys.map.get(key) {
-                        Some(KeyAction::DeleteRow) => {
-                            debugger.remove_breakpoint(id);
-                            breakpoints.remove(self.scroll.cursor);
-                        }
-                        Some(KeyAction::ToggleBreakpointEnabledness) => {
-                            let r = debugger.toggle_breakpoint_enabledness(id);
-                            report_result(ui, &r);
-                        }
-                        _ => return true,
-                    }
-                    false
-                });
             }
         }
 

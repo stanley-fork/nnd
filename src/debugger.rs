@@ -673,6 +673,7 @@ impl Debugger {
                                 self.ptrace_interrupt_all_running_threads()?;
                             }
                             if hit {
+                                assert!(self.stepping.is_none());
                                 self.target_state = ProcessState::Suspended;
 
                                 // Can't do determine_subframe_to_select() right here. Before we unwind the stack, we need to refresh thread info and mmaps info (in case new dynamic libraries were loaded).
@@ -693,6 +694,7 @@ impl Debugger {
                             thread.stop_reasons.push(StopReason::Signal(signal));
                             log!(self.log, "thread {} got {}", tid, signal_name(signal));
                             self.target_state = ProcessState::Suspended;
+                            self.cancel_stepping();
                             self.ptrace_interrupt_all_running_threads()?;
                         }
                     }
@@ -817,8 +819,8 @@ impl Debugger {
     // Removes temporary breakpoints associated with current step operation.
     // The caller is responsible for assigning target_state and suspending/resuming threads as needed.
     fn cancel_stepping(&mut self) {
-        eprintln!("trace: cancel stepping");
         if self.stepping.is_some() {
+            eprintln!("trace: cancel stepping");
             self.remove_step_breakpoints();
             self.stepping = None;
         }
@@ -1528,13 +1530,19 @@ impl Debugger {
             Ok(self.breakpoints.add(breakpoint).0)
         }
     }
-    pub fn remove_breakpoint(&mut self, id: BreakpointId) {
+    pub fn remove_breakpoint(&mut self, id: BreakpointId) -> bool {
+        if self.breakpoints.try_get(id).is_none() {
+            return false;
+        }
         self.deactivate_breakpoint(id);
         self.breakpoints.remove(id);
+        true
     }
 
-    pub fn toggle_breakpoint_enabledness(&mut self, id: BreakpointId) -> Result<()> {
-        let b = &mut self.breakpoints.get_mut(id);
+    pub fn toggle_breakpoint_enabledness(&mut self, id: BreakpointId) -> Result<bool> {
+        let b = match self.breakpoints.try_get_mut(id) {
+            None => return Ok(false),
+            Some(x) => x };
         if b.enabled {
             b.enabled = false;
             self.deactivate_breakpoint(id);
@@ -1544,7 +1552,7 @@ impl Debugger {
                 self.activate_breakpoints(vec![id])?;
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     fn activate_breakpoints(&mut self, ids: Vec<BreakpointId>) -> Result<()> {
