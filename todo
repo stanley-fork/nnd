@@ -1,3 +1,5 @@
+make u8 always be non-ambiguous non-char
+show last seen cpu usage for threads when suspended; update it when suspending (period [1, 2] seconds)
 fix picking up updated binary unnecessarily
 search and go-to-line in code window
 key to sort by cpu usage in threads window
