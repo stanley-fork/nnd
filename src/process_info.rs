@@ -73,7 +73,7 @@ impl ThreadResourceStats {
     fn update(&mut self, s: &ProcStat) {
         self.state = s.state;
         self.cpu_user_ns = (s.utime - mem::replace(&mut self.last_utime, Some(s.utime)).unwrap_or(s.utime)) * (1_000_000_000 / sysconf_SC_CLK_TCK());
-        self.cpu_system_ns = (s.stime - mem::replace(&mut self.last_stime, Some(s.stime)).unwrap_or(s.utime)) * (1_000_000_000 / sysconf_SC_CLK_TCK());
+        self.cpu_system_ns = (s.stime - mem::replace(&mut self.last_stime, Some(s.stime)).unwrap_or(s.stime)) * (1_000_000_000 / sysconf_SC_CLK_TCK());
     }
 }
 

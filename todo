@@ -2,13 +2,22 @@ make u8 always be non-ambiguous non-char
 show last seen cpu usage for threads when suspended; update it when suspending (period [1, 2] seconds)
 fix picking up updated binary unnecessarily
 search and go-to-line in code window
+when stepping in disassembly, keep focus on the selected subfunction level (if any) instead of jumping to the top of the stack after each step; similar to source code steps
+make hints window show actual key bindings instead of fixed strings
 key to sort by cpu usage in threads window
 key to follow a jump in disas
+fix selected subfunction level highlighting being broken again
+investigate regression in symbols loading speed (stuck on "parsing drawf" for ~10 seconds)
 instruction breakpoints
+hide <frame base> from locals, make it available as watchable variable instead (maybe as just `<frame base>`, maybe something nicer)
+make readable size formatting use 4 significant digits total, not up to 6
+make profiler readable again
 option to load symbols from another file (unstripped executable) - will make it usable in ch cloud
 look at profiler on ch server (1500 threads)
-make return key do something in each window: go from threads to stack -> code -> disassembly -> code; from locals create a watch? from breakpoints to code/disassembly/watch (depending on breakpoint type)
+make return key do something in each window: go from threads to stack -> code -> disassembly -> code; from locals create a watch; from watch sub-value create another watch for that field/element; from breakpoints to code/disassembly/watch (depending on breakpoint type)
 color threads based on stack hash
+"unexpectedly big memory read" (16 bytes) for f64 local variables on the stack in rust
+floating point and simd registers
 allow to put breakpoint on a whole file
 test with 10k threads
   fix O(n^2) stuff until syscalls are the slowest part
@@ -50,6 +59,8 @@ stop on panic when debugging rust programs
 make source window autoscroll horizontally in addition to vertically
 slice type, use it for pretty-printing rust strings
 -v for build datetime
+handle partially-optimized-out struct values (common in rust)
+better tab names in disas window for rust functions like "ui_prototype::ScreenBuffer::fill::h7933f74b1510f938" - take function name instead of the hash at the end (there's no formal indication, just detect 16-digit hexadecimal string)
 
 watches, expressions
   first, implement simple expression watches
@@ -128,3 +139,4 @@ get rid of tui-rs
   avoid double-borders: https://ratatui.rs/how-to/layout/collapse-borders.html
   avoid String in each Cell
   shorter syntax for styles
+snapshots and "step back"; probably don't actually revert the process state, just allow inspecting snapshot of memory+registers

@@ -153,10 +153,10 @@ fn main() {
 
             // This is not fully reliable because other threads still execute while this hook is running,
             // so the main thread may hide cursor or output a rendered frame after we restored the terminal.
-            // To minimize this, we put this at the end of the hook, importantly after the slow default hook.
+            // To minimize this, we put this near the end of the hook, importantly after the slow default hook.
             restore_terminal_mode();
 
-            // Print something to the console, otherwise it'll be left confusingly empty, like the debugger just quit silently (with nonzero exit code).
+            // Print something to the console, otherwise it'll be left confusingly empty, as if the debugger just quit silently.
             if let &Some(fd) = &original_stderr_fd {
                 let mut original_stderr = std::mem::ManuallyDrop::new(unsafe {std::fs::File::from_raw_fd(fd)});
                 let _ = writeln!(original_stderr, "panic! this usually indicates a bug, please report (to #debugger in slack, or to mk.al13n@gmail.com)");

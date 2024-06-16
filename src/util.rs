@@ -322,6 +322,7 @@ pub fn set_terminal_to_raw_mode_etc() {
         assert!((*s).is_none());
         *s = Some(io::stdout().into_raw_mode().unwrap()); // calls tcgetattr(), cfmakeraw(), and tcsetattr()
         write!(io::stdout(), "{}{}", ToAlternateScreen, termion::cursor::BlinkingBar).unwrap();
+        io::stdout().flush().unwrap();
         TERMINAL_STATE_RESTORED.store(false, Ordering::SeqCst);
     }
 }
@@ -338,8 +339,8 @@ pub fn restore_terminal_mode() {
         }
         let s = TERMINAL_STATE_TO_RESTORE.get();
         assert!((*s).is_some());
-        // (Why is "\n" needed here? Without it the original_stderr_fd in panic handler doesn't work for some reason - writing to the original stderr doesn't do anything until \n is printed to stdout, idk why.)
-        let _ = write!(io::stdout(), "{}{}{}\n", termion::cursor::BlinkingBlock, termion::cursor::Show, ToMainScreen).unwrap_or(());
+        let _ = write!(io::stdout(), "{}{}{}", termion::cursor::BlinkingBlock, termion::cursor::Show, ToMainScreen).unwrap_or(());
+        let _ = io::stdout().flush().unwrap_or(());
         *s = None; // calls tcsetattr()
     }
 }
@@ -509,19 +510,30 @@ impl fmt::Display for PrettyCount {
     }
 }
 
-// Prints byte sizes with a few digits of precision and B/KiB/MiB/GiB/TiB suffix, e.g. "42B", "12.4KiB".
+// Prints byte sizes with a few digits of precision and B/KiB/MiB/GiB/TiB suffix, e.g. "42 B", "12.4 KiB".
+// The result is at most PrettySize::MAX_LEN characters long.
 pub struct PrettySize(pub usize);
 impl fmt::Display for PrettySize {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let x = self.0;
-        if x < 1<<10 {             write!(f, "{} B", x) }
-        else if x < (1usize<<20) { write!(f, "{:.3} KiB", x as f64 / (1usize<<10) as f64) }
-        else if x < (1usize<<30) { write!(f, "{:.3} MiB", x as f64 / (1usize<<20) as f64) }
-        else if x < (1usize<<40) { write!(f, "{:.3} GiB", x as f64 / (1usize<<30) as f64) }
-        else if x < (1usize<<50) { write!(f, "{:.3} TiB", x as f64 / (1usize<<40) as f64) }
-        else if x < (1usize<<60) { write!(f, "{:.3} PiB", x as f64 / (1usize<<50) as f64) }
-        else {                     write!(f, "{:.3} EiB", x as f64 / (1usize<<60) as f64) }
+        let (den, name) = match self.0 {
+            x if x < 1usize<<10 => return write!(f, "{} B", x),
+            x if x < 1usize<<20 => (1usize<<10, "KiB"),
+            x if x < 1usize<<30 => (1usize<<20, "MiB"),
+            x if x < 1usize<<40 => (1usize<<30, "GiB"),
+            x if x < 1usize<<50 => (1usize<<40, "TiB"),
+            x if x < 1usize<<60 => (1usize<<50, "PiB"),
+            _              => (1usize<<60, "EiB"),
+        };
+        // Use at most 4 digits.
+        match self.0 as f64 / den as f64 {
+            x if x < 9.995 - 1e-12 => write!(f, "{:.2} {}", x, name), // e.g. 1.23
+            x if x < 99.95 - 1e-12 => write!(f, "{:.1} {}", x, name), // e.g. 12.3
+            x                      => write!(f, "{:.0} {}", x, name), // e.g. 1023
+        }
     }
+}
+impl PrettySize {
+    const MAX_LEN: usize = 8;
 }
 
 #[derive(Ord, Eq)]
@@ -760,4 +772,11 @@ pub fn precalc_global_constants() {
     unsafe {SYSCONF_SC_CLK_TCK = assert_nonzero(libc::sysconf(libc::_SC_CLK_TCK) as usize)};
     unsafe {SYSCONF_PAGE_SIZE = assert_nonzero(libc::sysconf(libc::_SC_PAGE_SIZE) as usize)};
     unsafe {MY_PID = assert_nonzero(libc::getpid() as usize) as pid_t};
+}
+
+#[macro_export]
+macro_rules! D {
+    () => {
+        Default::default()
+    };
 }
