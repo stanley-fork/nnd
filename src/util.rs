@@ -533,7 +533,7 @@ impl fmt::Display for PrettySize {
     }
 }
 impl PrettySize {
-    const MAX_LEN: usize = 8;
+    pub const MAX_LEN: usize = 8;
 }
 
 #[derive(Ord, Eq)]
@@ -599,7 +599,7 @@ impl<T> SyncUnsafeCell<T> {
 }
 impl<T> From<T> for SyncUnsafeCell<T> { fn from(t: T) -> SyncUnsafeCell<T> { SyncUnsafeCell::new(t) } }
 
-pub fn hash<T: Hash>(value: &T) -> usize {
+pub fn hash<T: Hash + ?Sized>(value: &T) -> usize {
     let mut hasher = DefaultHasher::new();
     value.hash(&mut hasher);
     hasher.finish() as usize

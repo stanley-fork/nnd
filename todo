@@ -1,4 +1,8 @@
+investigate crash in to_investigate
 make u8 always be non-ambiguous non-char
+key to send SIGINT to the program
+ignore anon executable mmaps, don't treat them as "binaries" (currently visible in binaries window)
+refresh cpu/ram stats more frequently; but less frequently if not focused; refresh threads less often if refreshing is slow (lots of threads)
 show last seen cpu usage for threads when suspended; update it when suspending (period [1, 2] seconds)
 fix picking up updated binary unnecessarily
 search and go-to-line in code window
