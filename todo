@@ -1,4 +1,5 @@
 investigate crash in to_investigate
+fix empty symbols loading stage name near the end
 make u8 always be non-ambiguous non-char
 key to send SIGINT to the program
 ignore anon executable mmaps, don't treat them as "binaries" (currently visible in binaries window)
