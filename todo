@@ -7,6 +7,7 @@ refresh cpu/ram stats more frequently; but less frequently if not focused; refre
 show last seen cpu usage for threads when suspended; update it when suspending (period [1, 2] seconds)
 fix picking up updated binary unnecessarily
 search and go-to-line in code window
+make search auto-case-sensitive (insensitive if all lowercase, sensitive otherwise)
 when stepping in disassembly, keep focus on the selected subfunction level (if any) instead of jumping to the top of the stack after each step; similar to source code steps
 make hints window show actual key bindings instead of fixed strings
 key to sort by cpu usage in threads window

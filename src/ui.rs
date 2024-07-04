@@ -447,33 +447,48 @@ impl WindowContent for RegistersWindow {
      }
 }
 
-pub struct ValueTreeNode {
+struct ValueTreeNode {
     name: &'static str, // points into Symbols, or into ValueTree, or static
     value: Result<Value>,
     dubious: bool,
 
-    // Identifier this node among its siblings. For purposes of remembering which subtrtees were expanded and where the cursor was, in a way that survives recalculation or partial change of the values.
-    // E.g. array index, or hash of (field name, field idx), or watch id.
-    child_id: usize,
+    // Unique identifier of this node. Hash of identities (field names or array indices or similar) of nodes on the path from the root to here.
+    // For remembering which subtrtees were expanded and where the cursor was, in a way that survives recalculation or partial change of the values.
+    identity: usize,
 
-    parent: usize, // index in previous level
+    depth: usize,
+    parent: usize,
 
-    // These are populated lazily.
-    formatted_line: [Option<usize>; 2], // [collapsed, expanded], line index in ValueTree.text
-    has_children: Option<bool>,
-    children: Option<Range<usize>>, // indices in next level
+    // How to render this node if it's [collapsed, expanded]. None if not (lazily) calculated yet.
+    formatted_line: [Option<usize>; 2],
+    expandable: Option<bool>, // populated together with either element of formatted_line
+    children: Range<usize>, // populated together with formatted_line[1]
+    //line_wrapped: Option</*lines_idxs*/ Range<usize>>,
 }
-impl Default for ValueTreeNode { fn default() -> Self { Self {name: "", value: err!(Internal, "if you're seeing this, there's a bug" /*(seeing in ui or in log, not in code, obviously)*/), dubious: false, child_id: 0, parent: 0, formatted_line: [None; 2], has_children: None, children: None} } }
+impl Default for ValueTreeNode { fn default() -> Self { Self {name: "", value: err!(Internal, "if you're seeing this, there's a bug"), dubious: false, identity: 0, depth: 0, parent: usize::MAX, formatted_line: [None, None], expandable: None, children: 0..0} } }
 
-pub struct ValueTree {
-    // Level 0 is a dummy root, level 1 is the list of watches or local variables, levels 2+ are expanded struct/array/pointer/container/etc contents.
-    levels: Vec<Vec<ValueTreeNode>>,
+struct ValueTree {
+    nodes: Vec<ValueTreeNode>,
     text: StyledText,
     arena: Arena,
+    roots: Vec<usize>, // (so it's technically a forest, but ValueTree sounds nicer, and you can always imagine an implicit root node that has these "root" nodes as children)
 }
 impl ValueTree {
-    fn new() -> Self { Self {levels: vec![Vec::new(), Vec::new()], text: StyledText::new(), arena: Arena::new()} }
+    fn new() -> Self { Self {nodes: Vec::new(), text: StyledText::new(), arena: Arena::new(), roots: Vec::new()} }
     fn clear(&mut self) { *self = Self::new(); }
+
+    fn add(&mut self, mut node: ValueTreeNode) -> usize {
+        assert!(node.depth == 0);
+        if node.parent != usize::MAX {
+            let parent = &self.nodes[node.parent];
+            node.identity = hash(&(parent.identity, node.identity));
+            node.depth = parent.depth + 1;
+        } else {
+            self.roots.push(self.nodes.len());
+        }
+        self.nodes.push(node);
+        self.nodes.len() - 1
+    }
 }
 
 struct WatchesWindow {
@@ -481,24 +496,23 @@ struct WatchesWindow {
     next_watch_id: usize,
 
     // When this changes, we recalculate everything.
-    // When the first two change, we clear expanded_paths.
     seen: (/*thread*/ pid_t, /*selected_subframe*/ usize, /*stop_count*/ usize),
 
-    expressions: Vec<(/*child_id*/ usize, String)>,
-    text_input: Option<(/*child_id*/ usize, Rect, TextInput)>, // if editing watch expression
+    expressions: Vec<(/*identity*/ usize, String)>, // watch expressions; parallel to tree.roots
+    text_input: Option<(/*identity*/ usize, Rect, TextInput)>, // if editing watch expression
 
     eval_state: EvalState,
 
     tree: ValueTree,
-    expanded_paths: HashSet<Vec<usize>>,
+    expanded_nodes: HashSet<usize>,
     cursor_path: Vec<usize>,
 
     scroll: Scroll,
-    lines: Vec<(/*level*/ usize, /*idx*/ usize, /*expanded*/ bool)>, // line index -> tree node
+    lines: Vec<(/*node_idx*/ usize, /*expanded*/ bool)>, // line index -> tree node
 }
 
 impl WatchesWindow {
-    fn new(is_locals_window: bool) -> Self { Self {is_locals_window, next_watch_id: 1, seen: (0, usize::MAX, usize::MAX), expressions: Vec::new(), eval_state: EvalState::new(), tree: ValueTree::new(), expanded_paths: HashSet::new(), cursor_path: Vec::new(), scroll: Scroll::new(), lines: Vec::new(), text_input: None} }
+    fn new(is_locals_window: bool) -> Self { Self {is_locals_window, next_watch_id: 1, seen: (0, usize::MAX, usize::MAX), expressions: Vec::new(), eval_state: EvalState::new(), tree: ValueTree::new(), expanded_nodes: HashSet::new(), cursor_path: Vec::new(), scroll: Scroll::new(), lines: Vec::new(), text_input: None} }
 
     fn clear_tree(&mut self) {
         self.lines.clear();
@@ -510,7 +524,7 @@ impl WatchesWindow {
         let (dwarf_context, function) = match self.eval_state.make_local_dwarf_eval_context(context, context.selected_subframe) {
             Ok(x) => x,
             Err(e) => {
-                self.tree.levels[1].push(ValueTreeNode {value: Err(e), ..Default::default()});
+                self.tree.add(ValueTreeNode {value: Err(e), ..Default::default()});
                 return;
             }
         };
@@ -531,12 +545,12 @@ impl WatchesWindow {
             };
             let name = unsafe {v.name()};
             let idx_per_name = *idxs_per_name.entry(name).and_modify(|x| *x += 1).or_insert(1) - 1;
-            self.tree.levels[1].push(ValueTreeNode {name, value: value.map(|val| Value {val, type_: v.type_, flags: ValueFlags::empty()}), dubious, child_id: hash(&(name, idx_per_name)), ..Default::default()});
+            self.tree.add(ValueTreeNode {name, value: value.map(|val| Value {val, type_: v.type_, flags: ValueFlags::empty()}), dubious, identity: hash(&(name, idx_per_name)), ..Default::default()});
         }
     }
 
     fn eval_watches(&mut self, context: &EvalContext) {
-        for (child_id, expr) in &self.expressions {
+        for (identity, expr) in &self.expressions {
             let (value, dubious) = if expr.is_empty() {
                 (err!(ValueTreePlaceholder, ""), false)
             } else {
@@ -545,118 +559,82 @@ impl WatchesWindow {
                     Err(e) => (Err(e), false),
                 }
             };
-            self.tree.levels[1].push(ValueTreeNode {name: self.tree.arena.add_str(expr), value, dubious, child_id: *child_id, ..Default::default()});
+            let name = self.tree.arena.add_str(expr);
+            self.tree.add(ValueTreeNode {name, value, dubious, identity: *identity, ..Default::default()});
         }
     }
 
     fn populate_lines(&mut self, context: Option<&EvalContext>, palette: &Palette) {
-        assert_eq!(self.tree.levels[0].len(), 1);
         self.lines.clear();
-        let mut idxs: Vec<usize> = vec![0, 0];
-        let mut path: Vec<usize> = vec![0];
-        let mut cursor_match = 1usize;
         let mut max_cursor_match = 0usize;
         self.scroll.cursor = 0;
-        // DFS. `idxs` is the path (idx of node at each level in `levels`) of the next node to visit. Node idxs.last() is not added to `path` yet, and may be above the end of the parent's list of children.
-        while idxs.len() > 1 {
-            let (lvl, &idx) = (idxs.len()-1, idxs.last().unwrap());
+        // DFS.
+        for root_idx in self.tree.roots.clone() {
+            let mut stack: Vec<usize> = vec![root_idx];
+            while let Some(idx) = stack.pop() {
+                let node = &self.tree.nodes[idx];
 
-            {
-                let parent = &self.tree.levels[lvl-1][idxs[idxs.len()-2]];
-                let children_end = parent.children.as_ref().map_or(0, |r| r.end);
-                if idx >= children_end {
-                    path.pop();
-                    idxs.pop();
-                    *idxs.last_mut().unwrap() += 1;
-                    continue;
-                }
-            }
-
-            let node = &self.tree.levels[lvl][idx];
-            cursor_match = cursor_match.min(lvl);
-            if cursor_match == lvl && self.cursor_path.get(lvl) == Some(&node.child_id) {
-                cursor_match += 1;
-                if cursor_match > max_cursor_match {
-                    max_cursor_match = cursor_match;
+                if node.depth + 1 > max_cursor_match && self.cursor_path.get(node.depth) == Some(&node.identity) {
+                    max_cursor_match = node.depth + 1;
                     self.scroll.cursor = self.lines.len();
                 }
-            }
 
-            path.push(node.child_id);
-            let expanded = lvl > 0 && self.expanded_paths.contains(&path);
+                let expanded = self.expanded_nodes.contains(&node.identity);
+                self.lines.push((idx, expanded));
 
-            self.lines.push((lvl, idx, expanded));
-
-            if !expanded {
-                // Skip children.
-                idxs.push(usize::MAX);
-                continue;
-            }
-
-            let node = &self.tree.levels[lvl][idx];
-            if node.children.is_none() && node.value.is_ok() && context.is_some() {
-                // List children.
-                assert!(node.formatted_line[1].is_none());
-                let (has_children, children) = format_value(node.value.as_ref().unwrap(), true, &mut self.eval_state, context.as_ref().unwrap(), &mut self.tree.arena, &mut self.tree.text, palette);
-                if lvl+1 >= self.tree.levels.len() {
-                    self.tree.levels.push(Vec::new());
+                if !expanded {
+                    // Skip children.
+                    continue;
                 }
-                let start_idx = self.tree.levels[lvl+1].len();
-                let node = &mut self.tree.levels[lvl][idx];
-                node.has_children = Some(has_children);
-                node.formatted_line[1] = Some(self.tree.text.num_lines());
-                self.tree.text.close_line();
-                node.children = Some(start_idx..start_idx+children.len());
-                let dubious = node.dubious;
-                for (name, child_id, value) in children {
-                    self.tree.levels[lvl+1].push(ValueTreeNode {name, value, dubious, child_id, parent: idx, ..Default::default()});
+
+                if node.formatted_line[1].is_none() && node.value.is_ok() && context.is_some() {
+                    // List children.
+                    let (expandable, children) = format_value(node.value.as_ref().unwrap(), true, &mut self.eval_state, context.as_ref().unwrap(), &mut self.tree.arena, &mut self.tree.text, palette);
+                    let start_idx = self.tree.nodes.len();
+                    let node = &mut self.tree.nodes[idx];
+                    node.formatted_line[1] = Some(self.tree.text.num_lines());
+                    node.expandable = Some(expandable);
+                    node.children = start_idx..start_idx+children.len();
+                    let dubious = node.dubious;
+                    self.tree.text.close_line();
+                    for (name, identity, value) in children {
+                        self.tree.add(ValueTreeNode {name, value, dubious, identity, parent: idx, ..Default::default()});
+                    }
+                }
+
+                let node = &self.tree.nodes[idx];
+                for c in node.children.clone().rev() {
+                    stack.push(c);
                 }
             }
-
-            // Go to the first child.
-            idxs.push(self.tree.levels[lvl][idx].children.as_ref().map_or(usize::MAX, |c| c.start));
         }
-    }
-
-    fn node_path(&self, mut lvl: usize, mut idx: usize) -> Vec<usize> {
-        let mut path: Vec<usize> = Vec::new();
-        while lvl > 0 {
-            let node = &self.tree.levels[lvl][idx];
-            path.push(node.child_id);
-            idx = node.parent;
-            lvl -= 1;
-        }
-        path.push(0);
-        path.reverse();
-        path
     }
 
     fn populate_tree_with_placeholders(&mut self) {
         if self.is_locals_window {
-            self.tree.levels[1].push(ValueTreeNode {value: err!(ValueTreePlaceholder, ""), ..Default::default()});
+            self.tree.add(ValueTreeNode {value: err!(ValueTreePlaceholder, ""), ..Default::default()});
         } else {
-            for (child_id, expr) in &self.expressions {
-                self.tree.levels[1].push(ValueTreeNode {name: self.tree.arena.add_str(expr), child_id: *child_id, value: err!(ValueTreePlaceholder, ""), ..Default::default()});
+            for (identity, expr) in &self.expressions {
+                let name = self.tree.arena.add_str(expr);
+                self.tree.add(ValueTreeNode {name, identity: *identity, value: err!(ValueTreePlaceholder, ""), ..Default::default()});
             }
         }
     }
 
-    fn delete_watch(&mut self, child_id: usize) {
+    fn delete_watch(&mut self, identity: usize) {
         assert!(!self.is_locals_window);
-        self.expressions.retain(|(id, _)| *id != child_id);
-        if self.cursor_path.get(1) == Some(&child_id) && self.tree.levels.len() > 1 {
-            if let Some(i) = self.tree.levels[1].iter().position(|n| n.child_id == child_id) {
-                if i + 1 < self.tree.levels[1].len() {
-                    self.cursor_path = vec![0, self.tree.levels[1][i+1].child_id];
-                } else if i > 0 {
-                    self.cursor_path = vec![0, self.tree.levels[1][i-1].child_id];
-                }
+        let i = match self.expressions.iter().position(|(id, _)| *id == identity) {
+            None => return,
+            Some(x) => x };
+        self.expressions.remove(i);
+        if !self.tree.roots.is_empty() {
+            self.tree.roots.remove(i);
+
+            if self.cursor_path.get(0) == Some(&identity) && !self.tree.roots.is_empty() {
+                let i = i.min(self.tree.roots.len() - 1);
+                self.cursor_path = vec![self.tree.nodes[self.tree.roots[i]].identity];
             }
         }
-        // Clear the tree to trigger recalculating it.
-        // This is not ideal when editing/deleting watches while running because remembered values and subtrees turn into "<running>" placeholder.
-        // But fixing it doesn't seem the extra code and risk of bugs (we'd have two code paths for editing the tree, one of them used infrequently).
-        self.clear_tree();
     }
 }
 
@@ -677,46 +655,60 @@ impl WindowContent for WatchesWindow {
             }
             match debugger.context.settings.keys.map.get(key) {
                 Some(KeyAction::CursorRight) => match self.lines.get(self.scroll.cursor) {
-                    Some(&(lvl, idx, _)) if self.tree.levels[lvl][idx].has_children == Some(true) => {
-                        self.expanded_paths.insert(self.node_path(lvl, idx));
-                        refresh_lines = true;
+                    Some(&(idx, _)) => {
+                        let node = &self.tree.nodes[idx];
+                        if node.expandable == Some(true) {
+                            self.expanded_nodes.insert(node.identity);
+                            refresh_lines = true;
+                        }
                     }
                     _ => (),
                 }
                 Some(KeyAction::CursorLeft) => match self.lines.get(self.scroll.cursor) {
-                    Some(&(lvl, idx, expanded)) => {
-                        let mut path = self.node_path(lvl, idx);
-                        if !expanded {
-                            path.pop();
-                        }
-                        self.expanded_paths.remove(&path);
+                    Some(&(idx, expanded)) => {
+                        let node = &self.tree.nodes[idx];
+                        if expanded {
+                            self.expanded_nodes.remove(&node.identity);
+                        } else if node.depth > 0 {
+                            self.expanded_nodes.remove(&self.tree.nodes[node.parent].identity);
+                        };
                         refresh_lines = true;
                     }
                     None => (),
                 }
                 Some(KeyAction::Enter) if !self.is_locals_window => match self.lines.get(self.scroll.cursor) {
-                    Some(&(lvl, idx, _)) if lvl == 1 => {
-                        let node = &self.tree.levels[lvl][idx];
-                        if let Some((_, text)) = self.expressions.iter().find(|(id, _)| id == &node.child_id) {
-                            self.text_input = Some((node.child_id, Rect::default(), TextInput::with_text(text.clone())));
+                    Some(&(idx, _)) => {
+                        let node = &self.tree.nodes[idx];
+                        if node.depth == 0 {
+                            if let Some((_, text)) = self.expressions.iter().find(|(id, _)| id == &node.identity) {
+                                self.text_input = Some((node.identity, Rect::default(), TextInput::with_text(text.clone())));
+                            }
                         }
                     }
                     _ => (),
                 }
                 Some(KeyAction::DeleteRow) if !self.is_locals_window => match self.lines.get(self.scroll.cursor) {
-                    Some(&(lvl, idx, _)) if lvl == 1 => self.delete_watch(self.tree.levels[lvl][idx].child_id),
+                    Some(&(idx, _)) => {
+                        let node = &self.tree.nodes[idx];
+                        if node.depth == 0 {
+                            self.delete_watch(node.identity);
+                            refresh_lines = true;
+                        }
+                    }
                     _ => (),
                 }
                 Some(KeyAction::DuplicateRow) if !self.is_locals_window => match self.lines.get(self.scroll.cursor) {
-                    Some(&(lvl, idx, _)) if lvl == 1 => {
-                        let node = &self.tree.levels[lvl][idx];
-                        if let Some(i) = self.expressions.iter().position(|(id, _)| id == &node.child_id) {
-                            let id = self.next_watch_id;
-                            let s = self.expressions[i].1.clone();
-                            self.next_watch_id += 1;
-                            self.expressions.insert(i + 1, (id, s));
-                            self.cursor_path = vec![0, id];
-                            self.clear_tree();
+                    Some(&(idx, _)) => {
+                        let node = &self.tree.nodes[idx];
+                        if node.depth == 0 {
+                            if let Some(i) = self.expressions.iter().position(|(id, _)| id == &node.identity) {
+                                let id = self.next_watch_id;
+                                let s = self.expressions[i].1.clone();
+                                self.next_watch_id += 1;
+                                self.expressions.insert(i + 1, (id, s));
+                                self.cursor_path = vec![id];
+                                self.clear_tree();
+                            }
                         }
                     }
                     _ => (),
@@ -737,7 +729,7 @@ impl WindowContent for WatchesWindow {
                 let t = (ui.selected_thread, ui.selected_subframe, thread.stop_count);
                 if t != self.seen {
                     if self.is_locals_window && (t.0, t.1) != (self.seen.0, self.seen.1) {
-                        //self.expanded_paths.clear();
+                        //self.expanded_nodes.clear();
                     }
                     self.seen = t;
                     refresh_values = true;
@@ -749,12 +741,12 @@ impl WindowContent for WatchesWindow {
         if !self.expressions.last().is_some_and(|(_, s)| s.is_empty()) {
             // Add the "<add watch>" placeholder watch.
             self.expressions.push((self.next_watch_id, String::new()));
-            self.cursor_path = vec![0, self.next_watch_id];
+            self.cursor_path = vec![self.next_watch_id];
             self.next_watch_id += 1;
             self.clear_tree();
         }
 
-        if context.is_some() && (refresh_values || self.tree.levels[0].is_empty()) {
+        if context.is_some() && (refresh_values || self.tree.nodes.is_empty()) {
             let context = context.as_ref().unwrap();
             self.clear_tree();
             self.eval_state.update(context);
@@ -763,55 +755,56 @@ impl WindowContent for WatchesWindow {
             } else {
                 self.eval_watches(context);
             }
-        } else if self.tree.levels[0].is_empty() {
+            refresh_lines = true;
+        } else if self.tree.nodes.is_empty() {
             self.populate_tree_with_placeholders();
             self.seen.2 = usize::MAX;
-        }
-
-        if self.tree.levels[0].is_empty() {
-            let count = self.tree.levels[1].len();
-            self.tree.levels[0].push(ValueTreeNode {children: Some(0..count), ..Default::default()});
             refresh_lines = true;
         }
+
         if refresh_lines {
             self.populate_lines(context.as_ref(), palette);
         }
 
         let mut no_keys = Vec::new();
         let range = self.scroll.update(self.lines.len(), area.height.saturating_sub(1), if self.text_input.is_none() {&mut keys} else {&mut no_keys}, &debugger.context.settings.keys);
-        self.cursor_path = match self.lines.get(self.scroll.cursor) {
-            None => Vec::new(),
-            Some(&(lvl, idx, _)) => self.node_path(lvl, idx),
+        self.cursor_path.clear();
+        if let Some(&(mut idx, _)) = self.lines.get(self.scroll.cursor) {
+            while idx != usize::MAX {
+                let node = &self.tree.nodes[idx];
+                self.cursor_path.push(node.identity);
+                idx = node.parent;
+            }
+            self.cursor_path.reverse();
         };
 
         let name_column_width = area.width / 3;
         let mut rows: Vec<Row> = Vec::new();
         for line_idx in range.clone() {
-            let &(lvl, idx, expanded) = &self.lines[line_idx];
-            assert!(lvl > 0);
-            let node = &mut self.tree.levels[lvl][idx];
-            let expanded = expanded && node.has_children == Some(true);
+            let &(idx, expanded) = &self.lines[line_idx];
+            let node = &mut self.tree.nodes[idx];
+            let expanded = expanded && node.expandable == Some(true);
             if node.formatted_line[expanded as usize].is_none() && context.is_some() && node.value.is_ok() {
-                let (has_children, _) = format_value(node.value.as_ref().unwrap(), expanded, &mut self.eval_state, context.as_ref().unwrap(), &mut self.tree.arena, &mut self.tree.text, palette);
-                node.has_children = Some(has_children);
+                assert!(!expanded); // (if this doesn't hold, we have to also populate node.children here)
+                let (expandable, _) = format_value(node.value.as_ref().unwrap(), expanded, &mut self.eval_state, context.as_ref().unwrap(), &mut self.tree.arena, &mut self.tree.text, palette);
+                node.expandable = Some(expandable);
                 node.formatted_line[expanded as usize] = Some(self.tree.text.num_lines());
                 self.tree.text.close_line();
             }
-            let node = &self.tree.levels[lvl][idx];
-            let parent = &self.tree.levels[lvl-1][node.parent];
-            // The "<add watch>" line at the end.
-            let is_add_watch_placeholder = !self.is_locals_window && lvl == 1 && self.expressions.last().is_some_and(|(id, s)| s.is_empty() && *id == node.child_id);
+            let node = &self.tree.nodes[idx];
+            // Is this the "<add watch>" line at the end.
+            let is_add_watch_placeholder = !self.is_locals_window && node.depth == 0 && self.expressions.last().is_some_and(|(id, s)| s.is_empty() && *id == node.identity);
 
             // Indentation, expansion arrow, name.
-            let mut spans = vec![Span::styled("┆".to_string().repeat(lvl - 1), palette.default_dim)];
-            if node.has_children.unwrap_or(expanded) {
+            let mut spans = vec![Span::styled("┆".to_string().repeat(node.depth), palette.default_dim)];
+            if node.expandable.unwrap_or(expanded) {
                 spans.push(Span::raw(if expanded {"▾ "} else {"▸ "}));
             } else {
                 spans.push(Span::raw("  "));
             }
             spans.push(Span::raw(if is_add_watch_placeholder {"<add watch>".to_string()} else {node.name.to_string()}));
             // Dim the name if parent's value is dubious or the existence of this item comes from cache.
-            if parent.dubious || (context.is_none() && (lvl > 1 || self.is_locals_window)) || is_add_watch_placeholder {
+            if (node.depth > 0 && self.tree.nodes[node.parent].dubious) || (context.is_none() && (node.depth > 0 || self.is_locals_window)) || is_add_watch_placeholder {
                 for span in &mut spans {
                     span.style = palette.default_dim;
                 }
@@ -841,7 +834,7 @@ impl WindowContent for WatchesWindow {
             }
 
             if let Some((id, a, _)) = &mut self.text_input {
-                if lvl == 1 && *id == node.child_id {
+                if node.depth == 0 && *id == node.identity {
                     *a = Rect {x: area.x + 2, y: area.y + 1 + (line_idx - range.start) as u16, width: name_column_width.saturating_sub(1), height: 1};
                 }
             }
@@ -863,22 +856,23 @@ impl WindowContent for WatchesWindow {
     }
 
     fn update_modal(&mut self, ui: &mut UIState, debugger: &mut Debugger, keys: &mut Vec<Key>) {
-        if let Some((child_id, _, input)) = &mut self.text_input {
+        if let Some((identity, _, input)) = &mut self.text_input {
             let event = input.update(keys, &debugger.context.settings.keys);
             match event {
                 TextInputEvent::None | TextInputEvent::Open => (),
                 TextInputEvent::Cancel => self.text_input = None,
                 TextInputEvent::Done => {
-                    if let Some(i) = self.expressions.iter().position(|(id, _)| id == child_id) {
+                    if let Some(i) = self.expressions.iter().position(|(id, _)| id == identity) {
                         if input.text.is_empty() {
                             if i + 1 != self.expressions.len() {
-                                let child_id = *child_id;
-                                self.delete_watch(child_id);
+                                let identity = *identity;
+                                self.delete_watch(identity);
+                                self.clear_tree(); // some kind of populate_lines() would be enough, but meh
                             }
                         } else {
                             self.expressions[i].1 = input.text.clone();
                             if i + 1 < self.expressions.len() {
-                                self.cursor_path = vec![0, self.expressions[i+1].0];
+                                self.cursor_path = vec![self.expressions[i+1].0];
                             }
                             self.clear_tree();
                         }
@@ -911,7 +905,7 @@ impl WindowContent for WatchesWindow {
     }
     fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {
         out.write_usize(self.expressions.len())?;
-        for (_id, expr) in &self.expressions {
+        for (_, expr) in &self.expressions {
             out.write_str(&expr)?;
         }
         Ok(())

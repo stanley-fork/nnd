@@ -470,7 +470,8 @@ pub struct Value {
 
 // Appends to out.chars. Doesn't close the line, the caller should do it after the call.
 // If expanded is true, the returned Vec is populated, and field names and array elements are not included in `out`.
-pub fn format_value(v: &Value, expanded: bool, state: &mut EvalState, context: &EvalContext, arena: &mut Arena, out: &mut StyledText, palette: &Palette) -> (/*has_children*/ bool, /*children*/ Vec<(/*name*/ &'static str, /*child_id*/ usize, Result<Value>)>) {
+// TODO: Make the /*name*/-s styled, into a second StyledText.
+pub fn format_value(v: &Value, expanded: bool, state: &mut EvalState, context: &EvalContext, arena: &mut Arena, out: &mut StyledText, palette: &Palette) -> (/*expandable*/ bool, /*children*/ Vec<(/*name*/ &'static str, /*identity*/ usize, Result<Value>)>) {
     format_value_recurse(v, expanded, state, context, arena, out, palette, (out.lines.len(), out.chars.len()), false)
 }
 
@@ -479,7 +480,7 @@ fn over_output_limit(out: &StyledText, text_start: (/*lines*/ usize, /*chars*/ u
     out.chars.len() - text_start.1 > 100000 || out.lines.len() - text_start.0 > 1000 || (out.lines.len() == text_start.0 && out.chars.len() - text_start.1 > 1000)
 }
 
-pub fn format_value_recurse(v: &Value, expanded: bool, state: &mut EvalState, context: &EvalContext, arena: &mut Arena, out: &mut StyledText, palette: &Palette, text_start: (/*lines*/ usize, /*chars*/ usize), address_already_shown: bool) -> (/*has_children*/ bool, /*children*/ Vec<(/*name*/ &'static str, /*child_id*/ usize, Result<Value>)>) {
+pub fn format_value_recurse(v: &Value, expanded: bool, state: &mut EvalState, context: &EvalContext, arena: &mut Arena, out: &mut StyledText, palette: &Palette, text_start: (/*lines*/ usize, /*chars*/ usize), address_already_shown: bool) -> (/*expandable*/ bool, /*children*/ Vec<(/*name*/ &'static str, /*identity*/ usize, Result<Value>)>) {
     // Output length limit. Also acts as recursion depth limit.
     if over_output_limit(out, text_start) {
         styled_write!(out, palette.value_warning, "…");

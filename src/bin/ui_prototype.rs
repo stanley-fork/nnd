@@ -5,6 +5,7 @@ use std::{time::{Duration, Instant, SystemTime}, thread, mem, cell::UnsafeCell, 
 use bitflags::*;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+use rand::{self, random, Rng};
 
 // =============================================== util.rs ========================================================
 
@@ -36,8 +37,7 @@ pub struct Color(u8, u8, u8);
 impl Color {
     pub fn white() -> Self { Self(255, 255, 255) }
     pub fn black() -> Self { Self(0, 0, 0) }
-    // (Assumes dark theme, use only in palette init code, not in UI code.)
-    pub fn dim(self) -> Self {
+    pub fn darker(self) -> Self {
         let f = |x| (x as usize * 2 / 3) as u8;
         Self(f(self.0), f(self.1), f(self.2))
     }
@@ -202,14 +202,26 @@ impl StyledText {
         str_width(&self.chars[self.spans[*self.lines.last().unwrap()].0..])
     }
 
-    // If t has multiple lines, they're mashed together.
-    pub fn append_to_unclosed_line(&mut self, t: &StyledText) {
-        let (n, m) = (self.spans.len(), self.chars.len());
-        self.chars.push_str(&t.chars);
-        self.spans.extend_from_slice(&t.spans);
-        for s in &mut self.spans[n..] {
-            s.0 += m;
+    pub fn import_lines(&mut self, from: &StyledText, lines: Range<usize>) -> Range<usize> {
+        let start = self.lines.len();
+        let offset = self.spans.len().wrapping_sub(from.lines[lines.start]);
+        self.lines.extend_from_slice(&from.lines[lines.clone()]);
+        for x in &mut self.lines[start..] {
+            *x = x.wrapping_add(offset);
         }
+
+        let spans = from.lines[lines.start]..from.lines[lines.end];
+        let start = self.spans.len();
+        let offset = self.chars.len().wrapping_sub(from.spans[spans.start].0);
+        self.spans.extend_from_slice(&from.spans[spans.clone()]);
+        for (x, _) in &mut self.spans[start..] {
+            *x = x.wrapping_add(offset);
+        }
+
+        let chars = from.spans[spans.start].0..from.spans[spans.end].0;
+        self.chars.push_str(&from.chars[chars]);
+
+        self.lines.len()-lines.len() .. self.lines.len()
     }
 
     pub fn line_wrap(&mut self, lines: Range<usize>, width: usize, max_lines: usize, line_wrap_indicator: &(String, String, Style), truncation_indicator: &(String, String, Style)) -> Range<usize> {
@@ -322,6 +334,8 @@ pub struct Palette {
 
     pub text_input: Style,
     pub text_input_selected: Style,
+
+    pub tree_indent: Style,
 }
 
 // ====================================================== terminal.rs ===================================================================
@@ -1086,30 +1100,36 @@ bitflags! {
 #[derive(Default)]
 pub struct WidgetFlags : u32 {
     // By default, if text doesn't fit horizontally in its Widget's width, a "…" is shown at the end. This flag disables this behavior.
-    const TEXT_TRUNCATION_INDICATOR_DISABLE = 0x2;
+    const TEXT_TRUNCATION_INDICATOR_DISABLE = 0x1;
     // If the text doesn't fit horizontally, keep a suffix rather than a prefix, and put the "…" at the start. If the text is not truncated, it's aligned left.
-    const TEXT_TRUNCATION_ALIGN_RIGHT = 0x4;
+    const TEXT_TRUNCATION_ALIGN_RIGHT = 0x2;
     // Disables text truncation indicator and enables an oddly specific behavior instead:
     // assume that the "contents" of this Widget cover the X range [0, right x coordinate of the last child, or width of draw_text if there are no children];
     // if part of this range is cut off by ancestors (e.g. hscroll area viewport), render a '<'/'>'-like symbols there, meant to show that horizontal scrolling is available.
     // This Widget itself is usually wider than its "contents". (Why not put a flag on the child instead, to avoid the awkward logic for content width?
     // Because that wouldn't show a left arrow when scrolled past the end of that child.)
-    const HSCROLL_INDICATOR_ARROWS = 0x8;
-    const LINE_WRAP = 0x10;
+    const HSCROLL_INDICATOR_ARROWS = 0x4;
+    const LINE_WRAP = 0x8;
 
     // StyleAdjstment won't be inherited from ancestors. E.g. for drawing text input box with standard background in a panel with tinted background.
-    const RESET_STYLE_ADJUSTMENT = 0x20;
+    const RESET_STYLE_ADJUSTMENT = 0x10;
 
     // If any part of this rect is visible (i.e. not clipped by parents' rects), trigger a redraw. May be useful for speculative hiding of elements,
     // but currently unused because I made everything non-speculative instead.
-    const REDRAW_IF_VISIBLE = 0x40;
+    const REDRAW_IF_VISIBLE = 0x20;
 
     // Any simple character key presses (no modifier keys, no special keys like tab or enter) are captured by this Widget as if they were in capture_keys.
     // Text navigation keys like arrow keys, home/end, etc, are not included, they should be requested through capture_keys as usual.
-    const CAPTURE_TEXT_INPUT_KEYS = 0x200;
+    const CAPTURE_TEXT_INPUT_KEYS = 0x40;
 
     // Trigger redraw is this Widget gets focused or unfocused.
-    const REDRAW_IF_FOCUS_CHANGES = 0x100;
+    const REDRAW_IF_FOCUS_CHANGES = 0x80;
+
+    // Equivalent to:
+    //   if imgui.check_mouse(MouseActions::HOVER_SUBTREE) {
+    //       widget.style_adjustment.update(imgui.palette.hovered);
+    //   }
+    const HIGHLIGHT_ON_HOVER = 0x100;
 }}
 
 bitflags! {
@@ -1210,8 +1230,9 @@ impl Widget {
     pub fn text_lines(mut self, lines: Range<usize>) -> Self { self.draw_text = Some(lines); self }
     pub fn text(mut self, line: usize) -> Self { self.draw_text = Some(line..line+1); self } // example: styled_write!(imgui.text, ...); let l = imgui.text.close_line(); Widget::new().text(l);
     pub fn fill(mut self, c: char, s: Style) -> Self { self.draw_fill = Some((c, s)); self }
-    pub fn flags(mut self, f: WidgetFlags) -> Self { self.flags = f; self }
+    pub fn flags(mut self, f: WidgetFlags) -> Self { self.flags.insert(f); self }
     pub fn style_adjustment(mut self, a: StyleAdjustment) -> Self { self.style_adjustment = a; self }
+    pub fn highlight_on_hover(mut self) -> Self { self.flags.insert(WidgetFlags::HIGHLIGHT_ON_HOVER); self }
 
     // Copy and clear all fields related to being already part of the tree. The resulting Widget can be add()ed to the tree.
     pub fn make_questionable_copy(&self) -> Self {
@@ -1862,6 +1883,9 @@ impl IMGUI {
                 draw_text = Some(Self::get_line_wrapped_text(w, &mut self.text, &self.palette));
                 show_text_truncation_indicator = false;
             }
+            if w.flags.contains(WidgetFlags::HIGHLIGHT_ON_HOVER) {
+                w.capture_mouse.insert(MouseActions::HOVER_SUBTREE);
+            }
 
             let w = &self.tree[idx.0];
 
@@ -1872,6 +1896,9 @@ impl IMGUI {
                 style_adjustment = StyleAdjustment::default();
             }
             style_adjustment.update(w.style_adjustment);
+            if w.flags.contains(WidgetFlags::HIGHLIGHT_ON_HOVER) && w.mouse.contains(MouseActions::HOVER_SUBTREE) {
+                style_adjustment.update(self.palette.hovered);
+            }
 
             if w.flags.contains(WidgetFlags::REDRAW_IF_VISIBLE) && !clip.is_empty() {
                 should_redraw = true;
@@ -2353,18 +2380,16 @@ impl Default for KeyBinds {
 // ======================================================= widgets.rs =========================================================================
 
 // React to keys like up/down/pageup/pagedown/home/end by moving `cursor`, within range [0, count).
-// `cur_parent` is used for input; the caller should make sure it's focused for navigation to work.
-// `viewport_height` and `row_height` are used for pageup/pagedown jump size; if None, use height of `cur_parent`.
+// `cur_parent` is the "viewport" widget; its height should be known (for handling PageUp/PageDown keys); it needs to be focused for the input to work.
+// `row_height` is used for PageUp/PageDown jump size.
 // Returns true iff any relevant keys were pressed, even if it didn't move the cursor (e.g. trying to move up when already at the top) - useful as a trigger to scroll the view to the cursor.
-pub fn list_cursor_navigation(cursor: &mut usize, count: usize, viewport_height: Option<usize>, row_height: usize, imgui: &mut IMGUI) -> bool {
-    list_cursor_navigation_with_variable_row_height(cursor, count, viewport_height, |_, _| row_height, imgui)
+pub fn list_cursor_navigation(cursor: &mut usize, count: usize, row_height: usize, imgui: &mut IMGUI) -> bool {
+    list_cursor_navigation_with_variable_row_height(cursor, count, |_, _| row_height, imgui)
 }
 
-pub fn list_cursor_navigation_with_variable_row_height<F: FnMut(usize, &mut IMGUI) -> usize>(cursor: &mut usize, count: usize, viewport_height: Option<usize>, mut row_height_fn: F, imgui: &mut IMGUI) -> bool {
-    let viewport_height = match viewport_height {
-        Some(x) => x,
-        None => imgui.cur().axes[1].size,
-    };
+pub fn list_cursor_navigation_with_variable_row_height<F: FnMut(usize, &mut IMGUI) -> usize>(cursor: &mut usize, count: usize, mut row_height_fn: F, imgui: &mut IMGUI) -> bool {
+    assert!(imgui.cur().axes[1].flags.contains(AxisFlags::SIZE_KNOWN));
+    let viewport_height = imgui.cur().axes[1].size;
     let actions = imgui.check_keys(&[KeyAction::CursorUp, KeyAction::CursorDown, KeyAction::PageUp, KeyAction::PageDown, KeyAction::Home, KeyAction::End]);
     let moved = !actions.is_empty();
     if count == 0 {
@@ -2446,6 +2471,7 @@ pub fn scrolling_navigation(scroll: &mut isize, scroll_to: Option<Range<isize>>,
     // ╵  ╵  ┻
     if scroll_bar.is_valid() && content_height > viewport_height {
         with_parent!(imgui, scroll_bar, {
+            imgui.cur_mut().flags.insert(WidgetFlags::HIGHLIGHT_ON_HOVER);
             assert!(imgui.cur().axes[1].flags.contains(AxisFlags::SIZE_KNOWN), "scroll bar widget height should be calculated in advance");
             let bar_height = imgui.cur().axes[1].size.saturating_sub(1); // -1 because top and bottom half-characters are empty
             if bar_height >= 3 {
@@ -2479,11 +2505,6 @@ pub fn scrolling_navigation(scroll: &mut isize, scroll_to: Option<Range<isize>>,
                     // Set scroll position from slider position. Make sure min/max slider positions correspond to min/max scroll positions.
                     *scroll = (slider_y * scroll_range + slider_range/2) / slider_range;
                     assert!(*scroll >= 0 && *scroll <= scroll_range);
-                }
-
-                if imgui.check_mouse(MouseActions::HOVER) {
-                    let a = imgui.palette.hovered;
-                    imgui.cur_mut().style_adjustment.update(a);
                 }
 
                 let start = imgui.text.num_lines();
@@ -2693,7 +2714,7 @@ impl Table {
             }
         });
         self.scroll_to_cursor |= with_parent!(imgui, self.viewport, {
-            list_cursor_navigation(&mut self.state.cursor, num_rows, None, row_height, imgui)
+            list_cursor_navigation(&mut self.state.cursor, num_rows, row_height, imgui)
         });
         let scroll_to = if self.scroll_to_cursor && num_rows > 0 {
             Some((self.state.cursor*row_height) as isize..((self.state.cursor+1)*row_height) as isize)
@@ -2712,14 +2733,10 @@ impl Table {
         with_parent!(imgui, self.rows_container, {
             let x = if self.enable_selection_icon {2} else {0}; // excluding the icon from selection highlighting looks slightly better (to me)
             let row_height = if self.lazy {AutoSize::Fixed(self.fixed_row_height)} else {AutoSize::Children};
-            with_parent!(imgui, imgui.add(widget!().identity(&id).hstack().fixed_x(x).height(row_height).fill(' ', imgui.palette.default)), {
+            with_parent!(imgui, imgui.add(widget!().identity(&id).hstack().fixed_x(x).height(row_height).fill(' ', imgui.palette.default).highlight_on_hover()), {
                 if !self.lazy && imgui.check_mouse(MouseActions::CLICK_SUBTREE) {
                     self.state.cursor = imgui.get(self.rows_container).children.len() - 1;
                     self.scroll_to_cursor = true;
-                }
-                if imgui.check_mouse(MouseActions::HOVER_SUBTREE) {
-                    let a = imgui.palette.hovered;
-                    imgui.cur_mut().style_adjustment.update(a);
                 }
                 imgui.cur_parent
             })
@@ -2859,7 +2876,7 @@ impl Table {
         if !self.lazy {
             let num_rows = imgui.get(self.rows_container).children.len();
             self.scroll_to_cursor |= with_parent!(imgui, self.viewport, {
-                list_cursor_navigation_with_variable_row_height(&mut self.state.cursor, num_rows, None, |i, imgui| imgui.get(imgui.get(self.rows_container).children[i]).axes[1].size, imgui)
+                list_cursor_navigation_with_variable_row_height(&mut self.state.cursor, num_rows, |i, imgui| imgui.get(imgui.get(self.rows_container).children[i]).axes[1].size, imgui)
             });
             let scroll_to = if self.scroll_to_cursor && num_rows > 0 {
                 let ax = &imgui.get(imgui.get(self.rows_container).children[self.state.cursor]).axes[1];
@@ -2981,14 +2998,10 @@ impl Tabs {
             let l = imgui.text.close_line();
             imgui.add(widget!().width(AutoSize::Text).text(l));
 
-            with_parent!(imgui, imgui.add(widget!().identity(&(full_title, self.tabs.len())).width(AutoSize::Children).hstack()), {
+            with_parent!(imgui, imgui.add(widget!().identity(&(full_title, self.tabs.len())).width(AutoSize::Children).hstack().highlight_on_hover()), {
                 if imgui.check_mouse(MouseActions::CLICK) {
                     self.state.selected = self.tabs.len();
                     self.scroll_to_selected_tab = true;
-                }
-                if imgui.check_mouse(MouseActions::HOVER) {
-                    let adj = imgui.palette.hovered;
-                    imgui.cur_mut().style_adjustment.update(adj);
                 }
 
                 let style = if pinned {
@@ -3142,10 +3155,12 @@ impl Default for TextInput {
 impl TextInput {
     pub fn with_text(text: String) -> Self { Self {cursor: text.len(), mark: text.len(), undo: vec![(text.clone(), text.len())], text, undo_idx: 0, hscroll: 0, scroll_to_cursor: false, moved_past_the_end: false} }
 
-    pub fn update_and_render(&mut self, imgui: &mut IMGUI) {
-        let content_widget = imgui.add(widget!().fixed_height(1).width(AutoSize::Text).fixed_x(0));
+    // Returns true if there was any input (or if scroll_to_cursor was set to true from the outside).
+    pub fn update_and_render(&mut self, imgui: &mut IMGUI) -> bool {
+        let content_widget = imgui.add(widget!().height(AutoSize::Text).width(AutoSize::Text).fixed_x(0));
         self.update(content_widget, imgui);
         self.render(content_widget, imgui);
+        mem::take(&mut self.scroll_to_cursor)
     }
 
     fn update(&mut self, content_widget: WidgetIdx, imgui: &mut IMGUI) {
@@ -3349,7 +3364,6 @@ impl TextInput {
         });
         if self.scroll_to_cursor {
             scroll_to_range(&mut self.hscroll, cursor_x..cursor_x, viewport_width);
-            self.scroll_to_cursor = false;
         }
         self.hscroll = self.hscroll.min(content_width as isize - viewport_width as isize).max(0);
         imgui.get_mut(content_widget).axes[0].rel_pos = -self.hscroll;
@@ -3377,6 +3391,8 @@ struct State {
     disassembly_hscroll: isize,
     open_function_text: TextInput,
     open_function_table_state: TableState,
+
+    watch_tree: ValueTree,
 }
 
 fn build(imgui: &mut IMGUI, state: &mut State) {
@@ -3517,7 +3533,7 @@ fn build(imgui: &mut IMGUI, state: &mut State) {
     });
 
     with_parent!(imgui, windows[2], {
-        build_watches(imgui);
+        build_watches(imgui, state);
     });
     with_parent!(imgui, windows[3], {
         build_disassembly(imgui, state);
@@ -3547,8 +3563,328 @@ fn build(imgui: &mut IMGUI, state: &mut State) {
     });
 }
 
-fn build_watches(imgui: &mut IMGUI) {
-    
+struct ValueTreeNode {
+    name: usize,
+    value: usize,
+    identity: usize,
+    children: Option<Vec<usize>>,
+    expandable: bool,
+    expanded: bool,
+    depth: usize,
+
+    // Cached line-wrapped strings. Cleared when column widths change.
+    line_wrapped: Option<[Range<usize>; /*name, value*/ 2]>,
+    // Cached vertical layout. Recalculated when the tree changes, or nodes are expanded/collapsed, etc.
+    subtree_y: Range<isize>,
+    height: usize,
+    row_idx: usize,
+}
+impl Default for ValueTreeNode { fn default() -> Self { Self {name: usize::MAX, value: usize::MAX, identity: 0, children: None, expandable: false, expanded: false, depth: 0, line_wrapped: None, subtree_y: 0..0, height: 0, row_idx: 0} } }
+
+#[derive(Default)]
+struct ValueTree {
+    nodes: Vec<ValueTreeNode>,
+    roots: Vec<usize>,
+    text: StyledText,
+
+    name_width: usize,
+    value_width: usize,
+    rows: Vec<(/*node_idx*/ usize, /*height*/ usize)>, // if empty, we need to recalculate the layout
+    content_height: usize,
+
+    cursor: usize,
+    scroll: isize,
+    scroll_to_cursor: bool,
+
+    text_input: Option<(/*identity*/ usize, TextInput, /*height*/ usize)>,
+}
+impl ValueTree {
+    fn drop_line_wrap_cache(&mut self) {
+        for n in &mut self.nodes {
+            n.line_wrapped = None;
+        }
+    }
+
+    fn do_layout(&mut self, imgui: &mut IMGUI) {
+        if !self.rows.is_empty() {
+            return;
+        }
+        let mut y = 0isize;
+        for &root in &self.roots {
+            let mut stack: Vec<(usize, u8)> = vec![(root, 0)];
+            while let Some((idx, pass)) = stack.pop() {
+                let node = &mut self.nodes[idx];
+                if pass == 1 {
+                    node.subtree_y.end = y;
+                    continue;
+                }
+                stack.push((idx, 1));
+
+                if node.expanded && node.line_wrapped.is_none() {
+                    let max_lines = 100;
+                    let name = self.text.line_wrap(node.name..node.name+1, self.name_width, max_lines, &imgui.palette.line_wrap_indicator, &imgui.palette.truncation_indicator);
+                    let value = self.text.line_wrap(node.value..node.value+1, self.value_width, max_lines, &imgui.palette.line_wrap_indicator, &imgui.palette.truncation_indicator);
+                    node.line_wrapped = Some([name, value]);
+                }
+
+                let mut height = 1;
+                let is_text_input = match &self.text_input {
+                    Some((identity, _, h)) if *identity == node.identity => {
+                        height = height.max(*h);
+                        true
+                    }
+                    _ => false,
+                };
+                if node.expanded {
+                    let [name, value] = node.line_wrapped.clone().unwrap();
+                    if !is_text_input {
+                        height = height.max(name.len());
+                    }
+                    height = height.max(value.len());
+                }
+
+                node.height = height;
+                node.subtree_y = y .. y + height as isize;
+                node.row_idx = self.rows.len();
+                self.rows.push((idx, height));
+                y += height as isize;
+
+                if !node.expanded {
+                    continue;
+                }
+
+                if node.children.is_none() {
+                    let mut children: Vec<usize> = Vec::new();
+                    let depth = node.depth;
+                    while random::<u8>() < 150 {
+                        let mut n = Self::random_node(&mut self.text, imgui);
+                        n.depth = depth + 1;
+                        self.nodes.push(n);
+                        children.push(self.nodes.len() - 1);
+                    }
+                    self.nodes[idx].children = Some(children);
+                }
+
+                for &c in self.nodes[idx].children.as_ref().unwrap().iter().rev() {
+                    stack.push((c, 0));
+                }
+            }
+        }
+        self.content_height = y as usize;
+    }
+
+    fn random_node(text: &mut StyledText, imgui: &mut IMGUI) -> ValueTreeNode {
+        let mut rand_str = || -> usize {
+            let n = ((random::<f64>() * 6.).exp() as usize).saturating_sub(1);
+            for _ in 0..n {
+                text.chars.push((b'a' + random::<u8>()%26) as char);
+            }
+            text.close_span(imgui.palette.default);
+            text.close_line()
+        };
+        ValueTreeNode {name: rand_str(), value: rand_str(), identity: random(), children: None, expandable: random(), expanded: false, depth: 0, line_wrapped: None, subtree_y: 0..0, height: 0, row_idx: 0}
+    }
+
+    fn render(&mut self, visible_y: Range<isize>, imgui: &mut IMGUI) {
+        let cursor = self.cursor;
+        for &root in &self.roots {
+            let mut stack: Vec<usize> = vec![root];
+            while let Some(idx) = stack.pop() {
+                let node = &self.nodes[idx];
+                if node.subtree_y.start >= visible_y.end || node.subtree_y.end <= visible_y.start {
+                    continue;
+                }
+
+                if node.expanded {
+                    for &c in node.children.as_ref().unwrap().iter().rev() {
+                        stack.push(c);
+                    }
+                }
+
+                let indent_limit = self.name_width / 2;
+                let indent = node.depth.min(indent_limit);
+                let draw_indent_line = node.expanded && node.depth < indent_limit && node.subtree_y.len() > 1;
+                let mut toggle_expand = false;
+                if node.expandable {
+                    let h = if draw_indent_line {node.subtree_y.len()} else {1};
+                    with_parent!(imgui, imgui.add(widget!().identity(&('e', node.identity)).fixed_width(1).fixed_height(h).fixed_x(indent as isize).fixed_y(node.subtree_y.start).vstack().highlight_on_hover()), {
+                        if imgui.check_mouse(MouseActions::CLICK) {
+                            toggle_expand = true;
+                            imgui.should_redraw = true;
+                        }
+                        let arrow = if node.expanded {'▾'} else {'▸'};
+                        imgui.add(widget!().fixed_height(1).fill(arrow, imgui.palette.default));
+                        if h > 1 {
+                            let bar = if node.depth + 1 == indent_limit {'┼'} else {'┆'};
+                            imgui.add(widget!().fill(bar, imgui.palette.tree_indent));
+                        }
+                    });
+                }
+
+                let reduced_name_width = self.name_width.saturating_sub(indent + 2);
+                with_parent!(imgui, imgui.add(widget!().identity(&('n', node.identity)).fixed_width(reduced_name_width + self.value_width).fixed_height(node.height).fixed_x(indent as isize + 2).fixed_y(node.subtree_y.start).hstack().highlight_on_hover()), {
+                    if imgui.check_mouse(MouseActions::CLICK) {
+                        self.cursor = node.row_idx;
+                        self.scroll_to_cursor = true;
+                        imgui.should_redraw = true;
+                    }
+                    if node.row_idx == cursor {
+                        let a = imgui.palette.selected;
+                        imgui.cur_mut().style_adjustment.update(a);
+                        imgui.focus();
+                        if !imgui.check_focus() && self.text_input.is_some() {
+                            self.text_input = None;
+                            imgui.should_redraw = true;
+                        }
+                    }
+                    let mut w = widget!().fixed_width(reduced_name_width);
+                    if !self.text_input.as_ref().is_some_and(|(identity, _, _)| *identity == node.identity) {
+                        let lines = if node.expanded {
+                            node.line_wrapped.as_ref().unwrap()[0].clone()
+                        } else {
+                            node.name..node.name+1
+                        };
+                        w = w.text_lines(imgui.text.import_lines(&self.text, lines));
+                    }
+                    imgui.add(w);
+                    let lines = if node.expanded {
+                        node.line_wrapped.as_ref().unwrap()[1].clone()
+                    } else {
+                        node.value..node.value+1
+                    };
+                    let text = imgui.text.import_lines(&self.text, lines);
+                    imgui.add(widget!().fixed_width(self.value_width).text_lines(text));
+                });
+
+                if toggle_expand {
+                    self.nodes[idx].expanded ^= true;
+                }
+            }
+        }
+    }
+}
+
+fn build_watches(imgui: &mut IMGUI, state: &mut State) {
+    assert!(imgui.cur().axes[0].flags.contains(AxisFlags::SIZE_KNOWN) && imgui.cur().axes[1].flags.contains(AxisFlags::SIZE_KNOWN));
+    imgui.cur_mut().axes[1].flags.insert(AxisFlags::STACK);
+    let header_widget = imgui.add(widget!().fixed_height(1).hstack());
+    let container_widget = imgui.add(widget!().height(AutoSize::Remainder(1.0)).hstack());
+    imgui.layout_children(1);
+    let (viewport_widget, scroll_bar, movable_widget, content_widget, text_input_widget);
+    with_parent!(imgui, container_widget, {
+        viewport_widget = imgui.add(widget!().width(AutoSize::Remainder(1.0)));
+        scroll_bar = imgui.add(widget!().fixed_width(1));
+        imgui.layout_children(0);
+    });
+    let width = imgui.calculate_size(viewport_widget, 0);
+    let name_width = width * 4 / 10;
+    let value_width = width - name_width;
+    with_parent!(imgui, viewport_widget, {
+        movable_widget = imgui.add(widget!().fixed_height(0));
+        with_parent!(imgui, movable_widget, {
+            content_widget = imgui.add(widget!().fixed_height(0));
+            // Create text input widget early to get its height early.
+            // TODO: This was a bad idea, in real code use its height from last frame instead, and request redraw if it changes. Then it can just live inside the row.
+            text_input_widget = imgui.add(widget!().height(AutoSize::Children).fixed_width(name_width));
+
+            with_parent!(imgui, content_widget, {imgui.multifocus()});
+            with_parent!(imgui, text_input_widget, {imgui.multifocus()});
+        });
+    });
+    with_parent!(imgui, header_widget, {
+        styled_write!(imgui.text, imgui.palette.table_header, "  name");
+        let l = imgui.text.close_line();
+        imgui.add(widget!().fixed_width(name_width).text(l));
+        styled_write!(imgui.text, imgui.palette.table_header, "value");
+        let l = imgui.text.close_line();
+        imgui.add(widget!().fixed_width(value_width).text(l));
+    });
+
+    let tree = &mut state.watch_tree;
+
+    if (name_width, value_width) != (tree.name_width, tree.value_width) {
+        tree.drop_line_wrap_cache();
+        (tree.name_width, tree.value_width) = (name_width, value_width);
+    }
+
+    let mut scroll_to_cursor = mem::take(&mut tree.scroll_to_cursor);
+    with_parent!(imgui, viewport_widget, {
+        scroll_to_cursor |= list_cursor_navigation_with_variable_row_height(&mut tree.cursor, tree.rows.len(), |i, _imgui| tree.rows[i].1, imgui);
+    });
+    // IRL we'd form cursor_path here using lasts frame's rows and tree.
+
+    for action in imgui.check_keys(&[KeyAction::CursorLeft, KeyAction::CursorRight, KeyAction::Enter, KeyAction::DeleteRow, KeyAction::DuplicateRow, KeyAction::Cancel]) {
+        if action == KeyAction::DuplicateRow {
+            tree.nodes.push(ValueTree::random_node(&mut tree.text, imgui));
+            tree.roots.push(tree.nodes.len() - 1);
+            tree.rows.clear();
+            continue;
+        }
+        let idx = match tree.rows.get(tree.cursor) {
+            None => continue,
+            Some(x) => x.0 };
+        let node = &mut tree.nodes[idx];
+        match action {
+            KeyAction::CursorLeft if tree.text_input.is_none() => {
+                node.expanded = false;
+            }
+            KeyAction::CursorRight if tree.text_input.is_none() => {
+                //asdqwe allow expanding unexpandable (for line wrapping)
+                node.expanded = node.expandable;
+            }
+            KeyAction::Enter => if node.depth == 0 {
+                //asdqwe investigate why text input doesn't work
+                if let Some((identity, input, _)) = &mut tree.text_input {
+                    if node.identity == *identity {
+                        styled_write!(tree.text, imgui.palette.default, "{}", input.text);
+                        node.name = tree.text.close_line();
+                    }
+                    tree.text_input = None;
+                } else {
+                    tree.text_input = Some((node.identity, TextInput::with_text(tree.text.get_line_str(node.name).to_string()), 0));
+                }
+            }
+            KeyAction::Cancel => if tree.text_input.is_some() {
+                tree.text_input = None;
+            }
+            KeyAction::DeleteRow if tree.text_input.is_none() => if node.depth == 0 {
+                let i = tree.roots.iter().position(|ix| *ix == idx).unwrap();
+                tree.roots.remove(i);
+            }
+            _ => panic!("huh"),
+        }
+        tree.rows.clear();
+    }
+
+    if let Some((_, input, height)) = &mut tree.text_input {
+        with_parent!(imgui, text_input_widget, {
+            scroll_to_cursor |= input.update_and_render(imgui);
+        });
+        let h = imgui.calculate_size(text_input_widget, 1);
+        if h != *height {
+            *height = h;
+            tree.rows.clear();
+        }
+    }
+
+    tree.do_layout(imgui);
+
+    tree.cursor = tree.cursor.min(tree.rows.len().saturating_sub(1));
+    let scroll_to = if scroll_to_cursor && !tree.rows.is_empty() {
+        Some(tree.nodes[tree.rows[tree.cursor].0].subtree_y.clone())
+    } else {
+        None
+    };
+
+    imgui.get_mut(movable_widget).axes[1].size = tree.content_height;
+    imgui.get_mut(content_widget).axes[1].size = tree.content_height;
+
+    let root_widget = imgui.cur_parent;
+    let visible_y = with_parent!(imgui, viewport_widget, {
+        scrolling_navigation(&mut tree.scroll, scroll_to, root_widget, scroll_bar, imgui)
+    });
+
+    tree.render(visible_y, imgui);
 }
 
 fn build_open_function_dialog(imgui: &mut IMGUI, state: &mut State) {
@@ -3649,7 +3985,7 @@ fn build_disassembly(imgui: &mut IMGUI, state: &mut State) {
                     }
                 });
 
-                scroll_to_cursor |= list_cursor_navigation(&mut state.disassembly_cursor, num_lines, None, 1, imgui);
+                scroll_to_cursor |= list_cursor_navigation(&mut state.disassembly_cursor, num_lines, 1, imgui);
                 let scroll_to = if scroll_to_cursor {Some(state.disassembly_cursor as isize..state.disassembly_cursor as isize+1)} else {None};
                 let range = scrolling_navigation(&mut state.disassembly_scroll, scroll_to, body_widget, scroll_bar, imgui);
 
@@ -3661,13 +3997,9 @@ fn build_disassembly(imgui: &mut IMGUI, state: &mut State) {
                         }
                         styled_write!(imgui.text, imgui.palette.default, "{}", lines[line_idx % lines_mod]);
                         let l = imgui.text.close_line();
-                        with_parent!(imgui, imgui.add(widget!().identity(&line_idx).fixed_height(1).fixed_y(line_idx as isize).fill(' ', imgui.palette.default).flags(WidgetFlags::HSCROLL_INDICATOR_ARROWS)), {
+                        with_parent!(imgui, imgui.add(widget!().identity(&line_idx).fixed_height(1).fixed_y(line_idx as isize).fill(' ', imgui.palette.default).flags(WidgetFlags::HSCROLL_INDICATOR_ARROWS).highlight_on_hover()), {
                             if line_idx == state.disassembly_cursor {
                                 let adj = imgui.palette.selected;
-                                imgui.cur_mut().style_adjustment.update(adj);
-                            }
-                            if imgui.check_mouse(MouseActions::HOVER_SUBTREE) {
-                                let adj = imgui.palette.hovered;
                                 imgui.cur_mut().style_adjustment.update(adj);
                             }
                             imgui.add(widget!().fixed_height(1).width(AutoSize::Text).text(l));
@@ -3817,7 +4149,7 @@ fn main() -> Result<()> {
     imgui.mouse_mode = MouseMode::Full;
     imgui.palette = Palette {
         default: Style {fg: Color::white(), ..D!()},
-        default_dim: Style {fg: Color::white().dim(), ..D!()},
+        default_dim: Style {fg: Color::white().darker(), ..D!()},
         error: Style {fg: Color(255, 50, 50), ..D!()},
         running: Style {fg: Color(70, 70, 180), ..D!()},
         suspended: Style {fg: Color(70, 180, 70), ..D!()},
@@ -3826,28 +4158,30 @@ fn main() -> Result<()> {
         selected: StyleAdjustment {add_fg: (20, 20, 20), add_bg: (50, 50, 50), ..D!()},
         hovered: StyleAdjustment {add_fg: (20, 20, 20), add_bg: (25, 25, 25), ..D!()},
 
-        table_header: Style {fg: Color::white().dim(), ..D!()},
+        table_header: Style {fg: Color::white().darker(), ..D!()},
         //striped_table: StyleAdjustment {add_fg: (0, 0, 0), add_bg: (20, 20, 20), ..D!()},
         striped_table: StyleAdjustment::default(),
 
-        tab_title: Style {fg: Color::white().dim(), ..D!()},
+        tab_title: Style {fg: Color::white().darker(), ..D!()},
         tab_title_pinned: Style {fg: Color::white(), ..D!()},
-        tab_separator: (" | ".to_string(), Style {fg: Color::white().dim(), ..D!()}),
+        tab_separator: (" | ".to_string(), Style {fg: Color::white().darker(), ..D!()}),
 
-        placeholder_fill: Some(('.', Style {fg: Color::white().dim(), bg: Color::black(), ..D!()})),
-        truncation_indicator: (("…".to_string(), "…".to_string(), Style {fg: Color::white().dim(), ..D!()})),
-        hscroll_indicator: (("❮".to_string(), "❯".to_string(), Style {fg: Color::white().dim(), ..D!()})),
-        line_wrap_indicator: (String::new(), "\\".to_string(), Style {fg: Color::white().dim(), ..D!()}),
+        placeholder_fill: Some(('.', Style {fg: Color::white().darker(), bg: Color::black(), ..D!()})),
+        truncation_indicator: (("…".to_string(), "…".to_string(), Style {fg: Color::white().darker(), ..D!()})),
+        hscroll_indicator: (("❮".to_string(), "❯".to_string(), Style {fg: Color::white().darker(), ..D!()})),
+        line_wrap_indicator: (String::new(), "\\".to_string(), Style {fg: Color::white().darker(), ..D!()}),
 
         progress_bar: Style {fg: Color(70, 90, 200), bg: Color(20, 30, 50), ..D!()},
-        scroll_bar_background: Style {fg: Color::white().dim(), ..D!()},
-        scroll_bar_slider: Style {fg: Color::white().dim(), ..D!()},
+        scroll_bar_background: Style {fg: Color::white().darker(), ..D!()},
+        scroll_bar_slider: Style {fg: Color::white().darker(), ..D!()},
 
         tooltip: StyleAdjustment {add_bg: (30, 40, 50), ..D!()},
         dialog: StyleAdjustment {add_fg: (10, 10, 10), add_bg: (20, 20, 20), ..D!()},
 
         text_input: Style {fg: Color::white(), ..D!()},
         text_input_selected: Style {fg: Color::white(), bg: Color(30, 30, 150), ..D!()},
+
+        tree_indent: Style {fg: Color::white().darker(), ..D!()},
     };
 
     loop {
