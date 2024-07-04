@@ -3153,7 +3153,7 @@ impl Default for TextInput {
     fn default() -> Self { Self {text: String::new(), cursor: 0, mark: 0, undo: vec![(String::new(), 0)], undo_idx: 0, hscroll: 0, scroll_to_cursor: false, moved_past_the_end: false} }
 }
 impl TextInput {
-    pub fn with_text(text: String) -> Self { Self {cursor: text.len(), mark: text.len(), undo: vec![(text.clone(), text.len())], text, undo_idx: 0, hscroll: 0, scroll_to_cursor: false, moved_past_the_end: false} }
+    pub fn with_text(text: String) -> Self { Self {cursor: text.len(), mark: text.len(), undo: vec![(text.clone(), text.len())], text, undo_idx: 0, hscroll: 0, scroll_to_cursor: true, moved_past_the_end: false} }
 
     // Returns true if there was any input (or if scroll_to_cursor was set to true from the outside).
     pub fn update_and_render(&mut self, imgui: &mut IMGUI) -> bool {
@@ -3622,6 +3622,7 @@ impl ValueTree {
 
                 if node.expanded && node.line_wrapped.is_none() {
                     let max_lines = 100;
+                    //asdqwe name is narrower: -3, -indent
                     let name = self.text.line_wrap(node.name..node.name+1, self.name_width, max_lines, &imgui.palette.line_wrap_indicator, &imgui.palette.truncation_indicator);
                     let value = self.text.line_wrap(node.value..node.value+1, self.value_width, max_lines, &imgui.palette.line_wrap_indicator, &imgui.palette.truncation_indicator);
                     node.line_wrapped = Some([name, value]);
@@ -3682,7 +3683,7 @@ impl ValueTree {
             text.close_span(imgui.palette.default);
             text.close_line()
         };
-        ValueTreeNode {name: rand_str(), value: rand_str(), identity: random(), children: None, expandable: random(), expanded: false, depth: 0, line_wrapped: None, subtree_y: 0..0, height: 0, row_idx: 0}
+        ValueTreeNode {name: rand_str(), value: rand_str(), identity: random(), children: None, expandable: random::<u8>() < 200, expanded: false, depth: 0, line_wrapped: None, subtree_y: 0..0, height: 0, row_idx: 0}
     }
 
     fn render(&mut self, visible_y: Range<isize>, imgui: &mut IMGUI) {
@@ -3691,7 +3692,8 @@ impl ValueTree {
             let mut stack: Vec<usize> = vec![root];
             while let Some(idx) = stack.pop() {
                 let node = &self.nodes[idx];
-                if node.subtree_y.start >= visible_y.end || node.subtree_y.end <= visible_y.start {
+                let is_text_input = self.text_input.as_ref().is_some_and(|(identity, _, _)| *identity == node.identity);
+                if (node.subtree_y.start >= visible_y.end || node.subtree_y.end <= visible_y.start) && !is_text_input {
                     continue;
                 }
 
@@ -3722,7 +3724,7 @@ impl ValueTree {
                 }
 
                 let reduced_name_width = self.name_width.saturating_sub(indent + 2);
-                with_parent!(imgui, imgui.add(widget!().identity(&('n', node.identity)).fixed_width(reduced_name_width + self.value_width).fixed_height(node.height).fixed_x(indent as isize + 2).fixed_y(node.subtree_y.start).hstack().highlight_on_hover()), {
+                with_parent!(imgui, imgui.add(widget!().identity(&('n', node.identity)).fixed_width(reduced_name_width + self.value_width).fixed_height(node.height).fixed_x(indent as isize + 2).fixed_y(node.subtree_y.start).hstack().highlight_on_hover().fill(' ', imgui.palette.default)), {
                     if imgui.check_mouse(MouseActions::CLICK) {
                         self.cursor = node.row_idx;
                         self.scroll_to_cursor = true;
@@ -3738,7 +3740,7 @@ impl ValueTree {
                         }
                     }
                     let mut w = widget!().fixed_width(reduced_name_width);
-                    if !self.text_input.as_ref().is_some_and(|(identity, _, _)| *identity == node.identity) {
+                    if !is_text_input {
                         let lines = if node.expanded {
                             node.line_wrapped.as_ref().unwrap()[0].clone()
                         } else {
@@ -3764,6 +3766,12 @@ impl ValueTree {
     }
 }
 
+//asdqwe rewrite:
+// * don't do layout manually, use last frame layout and REDRAW_IF_VISIBLE; only skip long runs of unexpanded siblings; or is it not possible to prevent initial formatting this way without too much speculative manual layout?
+// * put text input inside the row
+// * allow expanding the unexpandable (for line wrapping)
+// * space between the columns
+// * fix the name line wrap width (hopefully by using automatic line wrapping instead)
 fn build_watches(imgui: &mut IMGUI, state: &mut State) {
     assert!(imgui.cur().axes[0].flags.contains(AxisFlags::SIZE_KNOWN) && imgui.cur().axes[1].flags.contains(AxisFlags::SIZE_KNOWN));
     imgui.cur_mut().axes[1].flags.insert(AxisFlags::STACK);
@@ -3785,7 +3793,7 @@ fn build_watches(imgui: &mut IMGUI, state: &mut State) {
             content_widget = imgui.add(widget!().fixed_height(0));
             // Create text input widget early to get its height early.
             // TODO: This was a bad idea, in real code use its height from last frame instead, and request redraw if it changes. Then it can just live inside the row.
-            text_input_widget = imgui.add(widget!().height(AutoSize::Children).fixed_width(name_width));
+            text_input_widget = imgui.add(widget!().height(AutoSize::Children).fixed_width(name_width.saturating_sub(2)).fixed_x(2).fixed_y(0));
 
             with_parent!(imgui, content_widget, {imgui.multifocus()});
             with_parent!(imgui, text_input_widget, {imgui.multifocus()});
@@ -3833,11 +3841,11 @@ fn build_watches(imgui: &mut IMGUI, state: &mut State) {
                 node.expanded = node.expandable;
             }
             KeyAction::Enter => if node.depth == 0 {
-                //asdqwe investigate why text input doesn't work
                 if let Some((identity, input, _)) = &mut tree.text_input {
                     if node.identity == *identity {
                         styled_write!(tree.text, imgui.palette.default, "{}", input.text);
                         node.name = tree.text.close_line();
+                        node.line_wrapped = None;
                     }
                     tree.text_input = None;
                 } else {
@@ -3876,6 +3884,11 @@ fn build_watches(imgui: &mut IMGUI, state: &mut State) {
         None
     };
 
+    if !tree.rows.is_empty() {
+        let w = imgui.get_mut(text_input_widget);
+        w.axes[1].rel_pos = tree.nodes[tree.rows[tree.cursor].0].subtree_y.start;
+    }
+
     imgui.get_mut(movable_widget).axes[1].size = tree.content_height;
     imgui.get_mut(content_widget).axes[1].size = tree.content_height;
 
@@ -3884,7 +3897,9 @@ fn build_watches(imgui: &mut IMGUI, state: &mut State) {
         scrolling_navigation(&mut tree.scroll, scroll_to, root_widget, scroll_bar, imgui)
     });
 
-    tree.render(visible_y, imgui);
+    with_parent!(imgui, content_widget, {
+        tree.render(visible_y, imgui);
+    });
 }
 
 fn build_open_function_dialog(imgui: &mut IMGUI, state: &mut State) {
