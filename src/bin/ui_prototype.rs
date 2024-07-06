@@ -1,7 +1,7 @@
 #![allow(unused_imports)]
 extern crate nnd;
 use nnd::{*, error::*, util::*};
-use std::{time::{Duration, Instant, SystemTime}, thread, mem, cell::UnsafeCell, sync::atomic::{AtomicBool, Ordering}, io, io::{Write, Read}, str, os::fd::AsRawFd, ops::Range, collections::{HashMap}, panic, process, fmt::Write as fmtWrite, result, hash::Hash};
+use std::{time::{Duration, Instant, SystemTime}, thread, mem, cell::UnsafeCell, sync::atomic::{AtomicBool, Ordering}, io, io::{Write, Read}, str, os::fd::AsRawFd, ops::Range, collections::{HashMap, HashSet}, panic, process, fmt::Write as fmtWrite, result, hash::Hash};
 use bitflags::*;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -204,8 +204,8 @@ impl StyledText {
 
     pub fn import_lines(&mut self, from: &StyledText, lines: Range<usize>) -> Range<usize> {
         let start = self.lines.len();
-        let offset = self.spans.len().wrapping_sub(from.lines[lines.start]);
-        self.lines.extend_from_slice(&from.lines[lines.clone()]);
+        let offset = self.num_spans().wrapping_sub(from.lines[lines.start]);
+        self.lines.extend_from_slice(&from.lines[lines.start+1..lines.end+1]);
         for x in &mut self.lines[start..] {
             *x = x.wrapping_add(offset);
         }
@@ -213,7 +213,7 @@ impl StyledText {
         let spans = from.lines[lines.start]..from.lines[lines.end];
         let start = self.spans.len();
         let offset = self.chars.len().wrapping_sub(from.spans[spans.start].0);
-        self.spans.extend_from_slice(&from.spans[spans.clone()]);
+        self.spans.extend_from_slice(&from.spans[spans.start+1..spans.end+1]);
         for (x, _) in &mut self.spans[start..] {
             *x = x.wrapping_add(offset);
         }
@@ -221,12 +221,12 @@ impl StyledText {
         let chars = from.spans[spans.start].0..from.spans[spans.end].0;
         self.chars.push_str(&from.chars[chars]);
 
-        self.lines.len()-lines.len() .. self.lines.len()
+        self.num_lines()-lines.len() .. self.num_lines()
     }
 
-    pub fn line_wrap(&mut self, lines: Range<usize>, width: usize, max_lines: usize, line_wrap_indicator: &(String, String, Style), truncation_indicator: &(String, String, Style)) -> Range<usize> {
+    pub fn line_wrap(&mut self, lines: Range<usize>, width: usize, max_lines: usize, line_wrap_indicator: &(String, String, Style), truncation_indicator: &(String, String, Style), mut out_lines: Option<&mut Vec<(/*start_x*/ isize, /*line_idx*/ usize, /*bytes*/ Range<usize>)>>) -> Range<usize> {
         let start = self.num_lines();
-        for line_idx in lines {
+        for line_idx in lines.clone() {
             let spans_end = self.lines[line_idx + 1];
             let mut span_idx = self.lines[line_idx];
             let line_end = self.spans[spans_end].0;
@@ -234,16 +234,24 @@ impl StyledText {
             let mut pos = line_start;
             let mut remaining_width = str_width(&self.chars[pos..line_end]);
             if pos == line_end {
+                if let Some(v) = &mut out_lines {
+                    v.push((0, line_idx - lines.start, 0..0));
+                }
+                if self.num_lines() - start + 1 >= max_lines && line_idx + 1 < lines.end {
+                    styled_write!(self, truncation_indicator.2, "{}", truncation_indicator.1);
+                }
                 self.close_line();
                 continue;
             }
             while pos < line_end {
-                let width = if pos == line_start {
-                    width
+                let out_line_start_pos = pos;
+                let out_line_start_x = if pos == line_start {
+                    0
                 } else {
                     styled_write!(self, line_wrap_indicator.2, "{}", line_wrap_indicator.0);
-                    width.saturating_sub(str_width(&line_wrap_indicator.0))
+                    str_width(&line_wrap_indicator.0)
                 };
+                let width = width.saturating_sub(out_line_start_x);
                 let last_line = self.num_lines() - start + 1 >= max_lines;
                 let end_indicator = if last_line {truncation_indicator} else {line_wrap_indicator};
                 let (n, w) = if remaining_width <= width {
@@ -268,7 +276,11 @@ impl StyledText {
                 }
                 remaining_width -= w;
 
-                if pos < line_end {
+                if let Some(v) = &mut out_lines {
+                    v.push((out_line_start_x as isize, line_idx - lines.start, out_line_start_pos - line_start .. pos - line_start));
+                }
+
+                if pos < line_end || (last_line && line_idx + 1 < lines.end) {
                     styled_write!(self, end_indicator.2, "{}", end_indicator.1);
                     if last_line {
                         self.close_line();
@@ -279,6 +291,39 @@ impl StyledText {
             }
         }
         start..self.num_lines()
+    }
+
+    fn split_by_newline_character(&mut self, line: usize, mut out_lines: Option<&mut Vec</*bytes*/ Range<usize>>>) -> /*lines*/ Range<usize> {
+        let res_lines_start = self.num_lines();
+        let src_chars_start = self.spans[self.lines[line]].0;
+
+        let mut line_start_byte = 0;
+        let mut do_close_line = |text: &mut StyledText, i: usize| {
+            text.close_line();
+            let i = i - src_chars_start;
+            if let Some(v) = &mut out_lines {
+                v.push(line_start_byte..i);
+            }
+            line_start_byte = i;
+        };
+
+        for span_idx in self.lines[line]..self.lines[line+1] {
+            let mut i = self.spans[span_idx].0;
+            let (span_end, style) = self.spans[span_idx+1].clone();
+            while let Some(n) = self.chars[i..span_end].find('\n') {
+                unsafe {self.chars.as_mut_vec().extend_from_within(i..i+n)};
+                self.chars.push(' '); // empty cell at the end of line representing the '\n', useful in TextInput for indicating whether the \n is selected
+                self.close_span(style);
+
+                i += n + 1;
+                do_close_line(self, i);
+            }
+            unsafe {self.chars.as_mut_vec().extend_from_within(i..span_end)};
+            self.close_span(style);
+        }
+        do_close_line(self, self.spans[self.lines[line+1]].0);
+
+        res_lines_start..self.num_lines()
     }
 }
 
@@ -697,7 +742,7 @@ impl Key {
     pub fn any_mods(self) -> KeyEx { KeyEx {key: self, mods: ModKeys::ANY} }
     pub fn is_ordinary_char(self) -> bool {
         match self {
-            Self::Char('\t') | Self::Char('\n') => false,
+            Self::Char('\t') | Self::Char('\n') | Self::Char('\r') => false,
             Self::Char(_) => true,
             _ => false,
         }
@@ -1086,6 +1131,7 @@ pub struct AxisFlags: u32 {
 pub struct Axis {
     pub flags: AxisFlags,
     pub auto_size: AutoSize,
+    pub min_size: usize,
     pub max_size: usize,
 
     pub size: usize,
@@ -1094,12 +1140,21 @@ pub struct Axis {
     // Position relative to the screen. Calculated only at the end of the frame, when rendering. Any value assigned before that is ignored.
     abs_pos: isize,
 }
-impl Default for Axis { fn default() -> Self { Self {flags: AxisFlags::empty(), auto_size: AutoSize::Parent, max_size: usize::MAX, size: 0, rel_pos: 0, abs_pos: 0} } }
+impl Default for Axis { fn default() -> Self { Self {flags: AxisFlags::empty(), auto_size: AutoSize::Parent, min_size: 0, max_size: usize::MAX, size: 0, rel_pos: 0, abs_pos: 0} } }
+impl Axis {
+    // Index in `axes` list.
+    pub const X: usize = 0;
+    pub const Y: usize = 1;
+
+    pub fn reset_size(&mut self) {
+        self.flags.remove(AxisFlags::SIZE_KNOWN);
+    }
+}
 
 bitflags! {
 #[derive(Default)]
 pub struct WidgetFlags : u32 {
-    // By default, if text doesn't fit horizontally in its Widget's width, a "…" is shown at the end. This flag disables this behavior.
+    // By default, if text doesn't fit horizontally or vertically in its Widget's width, a "…" is shown at the end. This flag disables this behavior.
     const TEXT_TRUNCATION_INDICATOR_DISABLE = 0x1;
     // If the text doesn't fit horizontally, keep a suffix rather than a prefix, and put the "…" at the start. If the text is not truncated, it's aligned left.
     const TEXT_TRUNCATION_ALIGN_RIGHT = 0x2;
@@ -1130,6 +1185,9 @@ pub struct WidgetFlags : u32 {
     //       widget.style_adjustment.update(imgui.palette.hovered);
     //   }
     const HIGHLIGHT_ON_HOVER = 0x100;
+
+    // This widget's identity won't be hashed into children identities. Instead, the nearest ancestor without this flag will be hashed. As if this widget didn't exist and its children were its parent's children.
+    const SKIP_IDENTITY = 0x200;
 }}
 
 bitflags! {
@@ -1158,7 +1216,7 @@ pub struct Widget {
     // Line of the source code that created this widget. Useful for debugging.
     pub source_line: u32,
     
-    pub axes: [Axis; 2], // x, y
+    pub axes: [Axis; 2], // X, Y
     pub flags: WidgetFlags,
 
     pub draw_text: Option<Range<usize>>, // lines in IMGUI.text
@@ -1215,18 +1273,20 @@ impl Widget {
     pub fn identity<T: Hash + ?Sized>(mut self, t: &T) -> Self { self.identity = hash::<T>(t); self } // example: identity(("row", row_id))
     pub fn source_line(mut self, l: u32) -> Self { self.source_line = l; self }
     pub fn parent(mut self, parent: WidgetIdx) -> Self { self.parent = parent; self }
-    pub fn width(mut self, s: AutoSize) -> Self { self.axes[0].auto_size = s; self }
-    pub fn height(mut self, s: AutoSize) -> Self { self.axes[1].auto_size = s; self }
-    pub fn fixed_width(mut self, s: usize) -> Self { self.axes[0].auto_size = AutoSize::Fixed(s); self }
-    pub fn fixed_height(mut self, s: usize) -> Self { self.axes[1].auto_size = AutoSize::Fixed(s); self }
-    pub fn max_width(mut self, s: usize) -> Self { self.axes[0].max_size = s; self }
-    pub fn max_height(mut self, s: usize) -> Self { self.axes[1].max_size = s; self }
+    pub fn width(mut self, s: AutoSize) -> Self { self.axes[Axis::X].auto_size = s; self }
+    pub fn height(mut self, s: AutoSize) -> Self { self.axes[Axis::Y].auto_size = s; self }
+    pub fn fixed_width(mut self, s: usize) -> Self { self.axes[Axis::X].auto_size = AutoSize::Fixed(s); self }
+    pub fn fixed_height(mut self, s: usize) -> Self { self.axes[Axis::Y].auto_size = AutoSize::Fixed(s); self }
+    pub fn min_width(mut self, s: usize) -> Self { self.axes[Axis::X].min_size = s; self }
+    pub fn min_height(mut self, s: usize) -> Self { self.axes[Axis::Y].min_size = s; self }
+    pub fn max_width(mut self, s: usize) -> Self { self.axes[Axis::X].max_size = s; self }
+    pub fn max_height(mut self, s: usize) -> Self { self.axes[Axis::Y].max_size = s; self }
     pub fn hstack(mut self) -> Self { self.axes[0].flags.insert(AxisFlags::STACK); self }
     pub fn vstack(mut self) -> Self { self.axes[1].flags.insert(AxisFlags::STACK); self }
-    pub fn fixed_x(mut self, x: isize) -> Self { self.axes[0].rel_pos = x; self.axes[0].flags.insert(AxisFlags::POS_KNOWN); self }
-    pub fn fixed_y(mut self, y: isize) -> Self { self.axes[1].rel_pos = y; self.axes[1].flags.insert(AxisFlags::POS_KNOWN); self }
-    pub fn hcenter(mut self) -> Self { self.axes[0].flags.insert(AxisFlags::CENTER); self }
-    pub fn vcenter(mut self) -> Self { self.axes[1].flags.insert(AxisFlags::CENTER); self }
+    pub fn fixed_x(mut self, x: isize) -> Self { self.axes[Axis::X].rel_pos = x; self.axes[0].flags.insert(AxisFlags::POS_KNOWN); self }
+    pub fn fixed_y(mut self, y: isize) -> Self { self.axes[Axis::Y].rel_pos = y; self.axes[1].flags.insert(AxisFlags::POS_KNOWN); self }
+    pub fn hcenter(mut self) -> Self { self.axes[Axis::X].flags.insert(AxisFlags::CENTER); self }
+    pub fn vcenter(mut self) -> Self { self.axes[Axis::Y].flags.insert(AxisFlags::CENTER); self }
     pub fn text_lines(mut self, lines: Range<usize>) -> Self { self.draw_text = Some(lines); self }
     pub fn text(mut self, line: usize) -> Self { self.draw_text = Some(line..line+1); self } // example: styled_write!(imgui.text, ...); let l = imgui.text.close_line(); Widget::new().text(l);
     pub fn fill(mut self, c: char, s: Style) -> Self { self.draw_fill = Some((c, s)); self }
@@ -1408,8 +1468,8 @@ impl IMGUI {
         }
 
         // Do x before y because text height may depend on its width if line wrapping is enabled.
-        self.do_layout(0);
-        self.do_layout(1);
+        self.layout_subtree(self.root, Axis::X);
+        self.layout_subtree(self.root, Axis::Y);
 
         let start_time = Instant::now();
         self.render(screen);
@@ -1468,8 +1528,8 @@ impl IMGUI {
                 match &axis.auto_size {
                     AutoSize::Fixed(_) => { Self::try_calculate_simple_size(&mut w, ax, &mut self.text, &self.palette); }
                     AutoSize::Text => (), // text is often assigned by set_text(), after add()
-                    AutoSize::Parent if parent.axes[ax].flags.contains(AxisFlags::SIZE_KNOWN) => { axis.size = parent.axes[ax].size.min(axis.max_size); axis.flags.insert(AxisFlags::SIZE_KNOWN); }
-                    AutoSize::Remainder(_) if axis.flags.contains(AxisFlags::STACK) && axis.max_size != usize::MAX => panic!("max_size with AutoSize::Remainder is not supported"),
+                    AutoSize::Parent if parent.axes[ax].flags.contains(AxisFlags::SIZE_KNOWN) => { axis.size = parent.axes[ax].size.max(axis.min_size).min(axis.max_size); axis.flags.insert(AxisFlags::SIZE_KNOWN); }
+                    AutoSize::Remainder(_) if axis.flags.contains(AxisFlags::STACK) && (axis.min_size != 0 || axis.max_size != usize::MAX) => panic!("min_size/max_size with AutoSize::Remainder is not supported"),
                     AutoSize::Children | AutoSize::Remainder(_) | AutoSize::Parent => (),
                 }
             }
@@ -1478,7 +1538,17 @@ impl IMGUI {
         if w.identity == 0 {
             w.identity = parent.children.len();
         }
-        w.identity = hash(&(w.identity, parent.identity));
+        {
+            let mut idx = w.parent;
+            while idx.is_valid() {
+                let p = &self.tree[idx.0];
+                if !p.flags.contains(WidgetFlags::SKIP_IDENTITY) {
+                    w.identity = hash(&(w.identity, p.identity));
+                    break;
+                }
+                idx = p.parent;
+            }
+        }
         w.depth = parent.depth + 1;
 
         self.carry_widget_state_from_previous_frame(&mut w);
@@ -1517,6 +1587,25 @@ impl IMGUI {
         } else if !parent.focus_children.iter().any(|c| *c == self.cur_parent) {
             parent.focus_children.push(self.cur_parent);
         }
+    }
+
+    // Focus current widget within the subtree of its ancestor. If that ancestor ends up focused, this widget will be focused.
+    pub fn relative_focus(&mut self, ancestor: WidgetIdx) {
+        let mut idx = self.cur_parent;
+        let mut parent_idx = self.cur().parent;
+        while parent_idx.is_valid() {
+            let w = &mut self.tree[parent_idx.0];
+            if !w.focus_children.is_empty() {
+                return;
+            }
+            w.focus_children.push(idx);
+            if parent_idx == ancestor {
+                return;
+            }
+            idx = parent_idx;
+            parent_idx = w.parent;
+        }
+        panic!("ancestor is not an ancestor");
     }
 
     // Checks whether this widget was focused on the previous frame. Sets REDRAW_IF_FOCUS_CHANGES flag.
@@ -1586,6 +1675,35 @@ impl IMGUI {
             }
         }
         self.calculate_children_layout(idx, axis_idx, &mut scratch);
+    }
+
+    pub fn layout_subtree(&mut self, root: WidgetIdx, ax: usize) {
+        // DFS 1: bottom-to-top to calculate sizes that depend on children.
+        self.calculate_bottom_up_sizes(root, ax, true);
+
+        // DFS 2: top-to-bottom to calculate sizes that depend on parent, and calculate positions.
+        let mut stack: Vec<WidgetIdx> = vec![root];
+        let mut scratch: Vec<WidgetIdx> = Vec::new();
+        while let Some(idx) = stack.pop() {
+            self.calculate_children_layout(idx, ax, &mut scratch);
+
+            for &c in &self.tree[idx.0].children {
+                stack.push(c);
+            }
+        }
+    }
+
+    // Adds up rel_pos values on the path from ancestor to descendant. All these positions must have been already calculated, e.g. using layout_subtree().
+    pub fn relative_position(&self, ancestor: WidgetIdx, mut descendant: WidgetIdx, ax: usize) -> isize {
+        let mut res = 0isize;
+        while descendant != ancestor {
+            assert!(descendant.is_valid(), "relative_position(): ancestor is not an ancestor");
+            let w = &self.tree[descendant.0];
+            assert!(w.axes[ax].flags.contains(AxisFlags::POS_KNOWN), "relative_position(): layout not calculated");
+            res += w.axes[ax].rel_pos;
+            descendant = w.parent;
+        }
+        res
     }
 
     // Convenience functions.
@@ -1741,7 +1859,7 @@ impl IMGUI {
                         }
                     }
                     let axis = &mut self.tree[idx.0].axes[ax];
-                    axis.size = size.min(axis.max_size);
+                    axis.size = size.max(axis.min_size).min(axis.max_size);
                     axis.flags.insert(AxisFlags::SIZE_KNOWN);
                 }
             }
@@ -1751,13 +1869,13 @@ impl IMGUI {
     fn try_calculate_simple_size(w: &mut Widget, ax: usize, text: &mut StyledText, palette: &Palette) -> bool {
         let size = match w.axes[ax].auto_size {
             AutoSize::Fixed(s) => s,
-            AutoSize::Text if ax == 0 && !w.draw_text.as_ref().is_some_and(|r| !r.is_empty()) => panic!("widget on line {} has width is AutoSize::Text, but no lines in draw_text", w.source_line),
-            AutoSize::Text if ax == 0 => w.draw_text.clone().unwrap().map(|j| str_width(text.get_line_str(j))).max().unwrap_or(0), // text width
+            AutoSize::Text if ax == Axis::X && !w.draw_text.as_ref().is_some_and(|r| !r.is_empty()) => panic!("widget on line {} has width is AutoSize::Text, but no lines in draw_text", w.source_line),
+            AutoSize::Text if ax == Axis::X => w.draw_text.clone().unwrap().map(|j| str_width(text.get_line_str(j))).max().unwrap_or(0), // text width
             AutoSize::Text if !w.flags.contains(WidgetFlags::LINE_WRAP) => w.draw_text.as_ref().unwrap().len(), // height without line wrap
             AutoSize::Text if w.axes[0].flags.contains(AxisFlags::SIZE_KNOWN) => Self::get_line_wrapped_text(w, text, palette).len(), // height with line wrap
             _ => return false,
         };
-        let size = size.min(w.axes[ax].max_size);
+        let size = size.max(w.axes[ax].min_size).min(w.axes[ax].max_size);
         w.axes[ax].size = size;
         w.axes[ax].flags.insert(AxisFlags::SIZE_KNOWN);
         true
@@ -1767,7 +1885,14 @@ impl IMGUI {
         match &w.line_wrapped_text {
             Some(x) => x.clone(),
             None => {
-                let r = text.line_wrap(w.draw_text.clone().unwrap(), w.axes[0].size, /*max_lines*/ 1000, &palette.line_wrap_indicator, &palette.truncation_indicator);
+                let max_lines = if w.axes[Axis::Y].flags.contains(AxisFlags::SIZE_KNOWN) {
+                    w.axes[Axis::Y].size
+                } else if w.axes[Axis::Y].max_size != usize::MAX {
+                    w.axes[Axis::Y].max_size
+                } else {
+                    1000
+                };
+                let r = text.line_wrap(w.draw_text.clone().unwrap(), w.axes[Axis::X].size, max_lines, &palette.line_wrap_indicator, &palette.truncation_indicator, None);
                 w.line_wrapped_text = Some(r.clone());
                 r
             }
@@ -1791,8 +1916,8 @@ impl IMGUI {
 
             if !child_axis.flags.contains(AxisFlags::SIZE_KNOWN) {
                 match &child_axis.auto_size {
-                    AutoSize::Parent => { child_axis.size = parent_size.min(child_axis.max_size); child_axis.flags.insert(AxisFlags::SIZE_KNOWN); }
-                    AutoSize::Remainder(f) if !flags.contains(AxisFlags::STACK) => { child_axis.size = ((parent_size as f64 * f.max(0.0) + 0.5) as usize).min(child_axis.max_size); child_axis.flags.insert(AxisFlags::SIZE_KNOWN); }
+                    AutoSize::Parent => { child_axis.size = parent_size.max(child_axis.min_size).min(child_axis.max_size); child_axis.flags.insert(AxisFlags::SIZE_KNOWN); }
+                    AutoSize::Remainder(f) if !flags.contains(AxisFlags::STACK) => { child_axis.size = ((parent_size as f64 * f.max(0.0) + 0.5) as usize).max(child_axis.min_size).min(child_axis.max_size); child_axis.flags.insert(AxisFlags::SIZE_KNOWN); }
                     AutoSize::Remainder(f) => remainder_helper.declare_remainder_fraction(*f, child_idx.0),
                     AutoSize::Children | AutoSize::Fixed(_) | AutoSize::Text => panic!("size {:?} was supposed to be resolved by now", child_axis.auto_size),
                 }
@@ -1812,7 +1937,7 @@ impl IMGUI {
                     AutoSize::Remainder(f) => f,
                     _ => panic!("huh"),
                 };
-                child_axis.size = remainder_helper.calculate_remainder_fraction(*f, child_idx.0).min(child_axis.max_size);
+                child_axis.size = remainder_helper.calculate_remainder_fraction(*f, child_idx.0).max(child_axis.min_size).min(child_axis.max_size);
                 child_axis.flags.insert(AxisFlags::SIZE_KNOWN);
             }
             if !child_axis.flags.contains(AxisFlags::POS_KNOWN) {
@@ -1821,25 +1946,10 @@ impl IMGUI {
                 } else {
                     child_axis.rel_pos = position;
                 }
+                child_axis.flags.insert(AxisFlags::POS_KNOWN);
             }
             if flags.contains(AxisFlags::STACK) {
                 position = child_axis.rel_pos + child_axis.size as isize;
-            }
-        }
-    }
-
-    fn do_layout(&mut self, ax: usize) {
-        // DFS 1: bottom-to-top to calculate sizes that depend on children.
-        self.calculate_bottom_up_sizes(self.root, ax, true);
-
-        // DFS 2: top-to-bottom to calculate sizes that depend on parent, and calculate positions.
-        let mut stack: Vec<WidgetIdx> = vec![self.root];
-        let mut scratch: Vec<WidgetIdx> = Vec::new();
-        while let Some(idx) = stack.pop() {
-            self.calculate_children_layout(idx, ax, &mut scratch);
-
-            for &c in &self.tree[idx.0].children {
-                stack.push(c);
             }
         }
     }
@@ -1874,14 +1984,16 @@ impl IMGUI {
             }
 
             let mut draw_text = w.draw_text.clone();
-            let mut show_text_truncation_indicator = !w.flags.contains(WidgetFlags::TEXT_TRUNCATION_INDICATOR_DISABLE);
+            let mut show_horizontal_text_truncation_indicator = !w.flags.contains(WidgetFlags::TEXT_TRUNCATION_INDICATOR_DISABLE);
+            let mut show_vertical_text_truncation_indicator = !w.flags.contains(WidgetFlags::TEXT_TRUNCATION_INDICATOR_DISABLE);
 
             let w = &mut self.tree[idx.0];
             w.axes[0].abs_pos = pos[0];
             w.axes[1].abs_pos = pos[1];
             if draw_text.is_some() && w.flags.contains(WidgetFlags::LINE_WRAP) {
                 draw_text = Some(Self::get_line_wrapped_text(w, &mut self.text, &self.palette));
-                show_text_truncation_indicator = false;
+                show_horizontal_text_truncation_indicator = false;
+                show_vertical_text_truncation_indicator = false;
             }
             if w.flags.contains(WidgetFlags::HIGHLIGHT_ON_HOVER) {
                 w.capture_mouse.insert(MouseActions::HOVER_SUBTREE);
@@ -1911,7 +2023,7 @@ impl IMGUI {
 
             if w.flags.contains(WidgetFlags::HSCROLL_INDICATOR_ARROWS) {
                 let content_width = if let Some(idx) = w.children.last() {
-                    (self.tree[idx.0].axes[0].rel_pos + self.tree[idx.0].axes[0].size as isize).max(0)
+                    (self.tree[idx.0].axes[Axis::X].rel_pos + self.tree[idx.0].axes[Axis::X].size as isize).max(0)
                 } else if let Some(r) = w.draw_text.clone() {
                     r.map(|i| str_width(self.text.get_line_str(i))).max().unwrap_or(0) as isize
                 } else {
@@ -1932,7 +2044,7 @@ impl IMGUI {
                     clip.x += wid as isize;
                     clip.w -= wid;
                 }
-                show_text_truncation_indicator = false;
+                show_horizontal_text_truncation_indicator = false;
             }
 
             if let Some((c, style)) = w.draw_fill.clone() {
@@ -1962,15 +2074,20 @@ impl IMGUI {
 
             if let Some(text_range) = draw_text {
                 for (y_offset, line_idx) in text_range.clone().enumerate() {
+                    if y_offset >= rect.h {
+                        break;
+                    }
                     let mut spans = self.text.get_line(line_idx);
                     let line_str = self.text.get_line_str(line_idx);
                     let y = rect.y + y_offset as isize;
                     let mut x = rect.x;
+                    let indicate_vertical_truncation = show_vertical_text_truncation_indicator && y_offset + 1 == rect.h && line_idx + 1 < text_range.end;
+                    let mut indicate_horizontal_truncation = show_horizontal_text_truncation_indicator;
 
                     if str_width(line_str) <= rect.w {
-                        show_text_truncation_indicator = false;
+                        indicate_horizontal_truncation = false;
                     } else if w.flags.contains(WidgetFlags::TEXT_TRUNCATION_ALIGN_RIGHT) {
-                        if show_text_truncation_indicator {
+                        if indicate_horizontal_truncation {
                             x = screen.put_text(&self.palette.truncation_indicator.0, style_adjustment.apply(self.palette.truncation_indicator.2), x, y, clip);
                         }
                         let lim = (rect.right() - x).max(0) as usize;
@@ -1990,7 +2107,7 @@ impl IMGUI {
                             break;
                         }
                         // Print the rest of the spans the normal way.
-                        show_text_truncation_indicator = false;
+                        indicate_horizontal_truncation = false;
                     }
 
                     for span_idx in self.text.get_line(line_idx) {
@@ -2000,7 +2117,7 @@ impl IMGUI {
                             break;
                         }
                     }
-                    if show_text_truncation_indicator && rect.w > 0 {
+                    if (indicate_vertical_truncation || indicate_horizontal_truncation) && rect.w > 0 {
                         screen.put_text(&self.palette.truncation_indicator.1, style_adjustment.apply(self.palette.truncation_indicator.2), rect.right() - str_width(&self.palette.truncation_indicator.1) as isize, y, clip);
                     }
                 }
@@ -2263,6 +2380,7 @@ pub enum KeyAction {
     Copy,
     Paste,
     Cut,
+    NewLine,
 }
 
 pub struct KeyBinds {
@@ -2346,6 +2464,7 @@ impl Default for KeyBinds {
                 (Key::Char('N').plain(), KeyAction::StepOverInstruction),
                 (Key::Char('f').plain(), KeyAction::StepOut),
                 (Key::Char('F').plain(), KeyAction::StepOutNoInline),
+                // (Ctrl+tab and ctrl+shift+tab are unrepresentable in ansi escape codes.)
                 (Key::Char('t').ctrl(), KeyAction::NextTab),
                 (Key::Char('b').ctrl(), KeyAction::PreviousTab),
                 (Key::Char('y').ctrl(), KeyAction::PinTab),
@@ -2370,6 +2489,7 @@ impl Default for KeyBinds {
                 (Key::Char('c').ctrl(), KeyAction::Copy),
                 (Key::Char('x').ctrl(), KeyAction::Cut),
                 (Key::Char('v').ctrl(), KeyAction::Paste),
+                (Key::Char('\n').alt(), KeyAction::NewLine),
             ]),
             action_to_keys: HashMap::new()};
         res.init();
@@ -2388,8 +2508,8 @@ pub fn list_cursor_navigation(cursor: &mut usize, count: usize, row_height: usiz
 }
 
 pub fn list_cursor_navigation_with_variable_row_height<F: FnMut(usize, &mut IMGUI) -> usize>(cursor: &mut usize, count: usize, mut row_height_fn: F, imgui: &mut IMGUI) -> bool {
-    assert!(imgui.cur().axes[1].flags.contains(AxisFlags::SIZE_KNOWN));
-    let viewport_height = imgui.cur().axes[1].size;
+    assert!(imgui.cur().axes[Axis::Y].flags.contains(AxisFlags::SIZE_KNOWN));
+    let viewport_height = imgui.cur().axes[Axis::Y].size;
     let actions = imgui.check_keys(&[KeyAction::CursorUp, KeyAction::CursorDown, KeyAction::PageUp, KeyAction::PageDown, KeyAction::Home, KeyAction::End]);
     let moved = !actions.is_empty();
     if count == 0 {
@@ -2401,7 +2521,7 @@ pub fn list_cursor_navigation_with_variable_row_height<F: FnMut(usize, &mut IMGU
             KeyAction::CursorDown => *cursor = (*cursor + 1).min(count - 1),
             KeyAction::PageDown => {
                 // Take current row's top y coordinate, add viewport height, find the row that covers that y coordinate.
-                let mut offset = viewport_height;
+                let mut offset = viewport_height.saturating_sub(2);
                 let mut i = (*cursor).min(count - 1);
                 while i + 1 < count {
                     let h = row_height_fn(i, imgui);
@@ -2417,7 +2537,7 @@ pub fn list_cursor_navigation_with_variable_row_height<F: FnMut(usize, &mut IMGU
                 *cursor = i;
             }
             KeyAction::PageUp => {
-                let mut offset = viewport_height;
+                let mut offset = viewport_height.saturating_sub(2);
                 let mut i = (*cursor).min(count - 1);
                 while i > 0 {
                     let h = row_height_fn(i - 1, imgui);
@@ -2452,11 +2572,10 @@ pub fn scrolling_navigation(scroll: &mut isize, scroll_to: Option<Range<isize>>,
         *scroll += imgui.check_scroll() * imgui.key_binds.vscroll_sensitivity;
     });
 
+    let viewport_height = imgui.calculate_size(imgui.cur_parent, Axis::Y);
     let w = imgui.cur();
     assert_eq!(w.children.len(), 1);
-    assert!(w.axes[1].flags.contains(AxisFlags::SIZE_KNOWN), "scrollable viewport height must be calculated in advance");
-    let viewport_height = w.axes[1].size;
-    let content_height = imgui.calculate_size(w.children[0], 1);
+    let content_height = imgui.calculate_size(w.children[0], Axis::Y);
 
     if let Some(r) = scroll_to {
         scroll_to_range(scroll, r, viewport_height);
@@ -2471,9 +2590,8 @@ pub fn scrolling_navigation(scroll: &mut isize, scroll_to: Option<Range<isize>>,
     // ╵  ╵  ┻
     if scroll_bar.is_valid() && content_height > viewport_height {
         with_parent!(imgui, scroll_bar, {
+            let bar_height = imgui.calculate_size(scroll_bar, Axis::Y).saturating_sub(1); // -1 because top and bottom half-characters are empty
             imgui.cur_mut().flags.insert(WidgetFlags::HIGHLIGHT_ON_HOVER);
-            assert!(imgui.cur().axes[1].flags.contains(AxisFlags::SIZE_KNOWN), "scroll bar widget height should be calculated in advance");
-            let bar_height = imgui.cur().axes[1].size.saturating_sub(1); // -1 because top and bottom half-characters are empty
             if bar_height >= 3 {
                 // Rounded down because we want non-full scrollbar when the content is just slightly taller than viewport.
                 let slider_height = (bar_height * viewport_height / content_height).max(2);
@@ -2532,11 +2650,18 @@ pub fn scrolling_navigation(scroll: &mut isize, scroll_to: Option<Range<isize>>,
             }
         });
     }
+    if scroll_bar.is_valid() {
+        let s = imgui.palette.default;
+        let w = imgui.get_mut(scroll_bar);
+        if w.draw_text.is_none() {
+            w.draw_fill = Some((' ', s));
+        }
+    }
 
     let idx = imgui.cur().children[0];
     let w = imgui.get_mut(idx);
-    w.axes[1].flags.insert(AxisFlags::POS_KNOWN);
-    w.axes[1].rel_pos = -*scroll;
+    w.axes[Axis::Y].flags.insert(AxisFlags::POS_KNOWN);
+    w.axes[Axis::Y].rel_pos = -*scroll;
 
     *scroll..*scroll+viewport_height as isize
 }
@@ -2554,9 +2679,9 @@ pub fn scroll_to_range(scroll: &mut isize, r: Range<isize>, viewport: usize) {
 pub fn hscrolling_navigation(hscroll: &mut isize, imgui: &mut IMGUI) {
     let w = imgui.cur();
     assert_eq!(w.children.len(), 1, "scrollable viewport must have exactly one child (line {})", w.source_line);
-    assert!(w.axes[0].flags.contains(AxisFlags::SIZE_KNOWN), "scrollable viewport width must be calculated in advance (line {})", w.source_line);
-    let viewport_width = w.axes[0].size;
-    let content_width = imgui.calculate_size(w.children[0], 0);
+    assert!(w.axes[Axis::X].flags.contains(AxisFlags::SIZE_KNOWN), "scrollable viewport width must be calculated in advance (line {})", w.source_line);
+    let viewport_width = w.axes[Axis::X].size;
+    let content_width = imgui.calculate_size(w.children[0], Axis::X);
 
     // Scroll by viewport width-2 with each key press, the 2 to fit the HSCROLL_INDICATOR_ARROWS.
     let step = viewport_width.saturating_sub(2).max(1) as isize;
@@ -2571,8 +2696,8 @@ pub fn hscrolling_navigation(hscroll: &mut isize, imgui: &mut IMGUI) {
 
     let idx = imgui.cur().children[0];
     let w = imgui.get_mut(idx);
-    w.axes[0].flags.insert(AxisFlags::POS_KNOWN);
-    w.axes[0].rel_pos = -*hscroll;
+    w.axes[Axis::X].flags.insert(AxisFlags::POS_KNOWN);
+    w.axes[Axis::X].rel_pos = -*hscroll;
 }
 
 pub fn make_dialog_frame(dialog_root: WidgetIdx, width: AutoSize, height: AutoSize, style_adjustment: StyleAdjustment, border: Style, title: &str, imgui: &mut IMGUI) -> Option<WidgetIdx> {
@@ -2590,11 +2715,11 @@ pub fn make_dialog_frame(dialog_root: WidgetIdx, width: AutoSize, height: AutoSi
         }
         Some(x) => x,
     };
-    imgui.layout_children(0);
-    imgui.layout_children(1);
+    imgui.layout_children(Axis::X);
+    imgui.layout_children(Axis::Y);
     with_parent!(imgui, dialog, {
         imgui.check_mouse(MouseActions::CLICK); // clicking inside the dialog shouldn't close it
-        let (w, h) = (imgui.cur().axes[0].size, imgui.cur().axes[1].size);
+        let (w, h) = (imgui.cur().axes[Axis::X].size, imgui.cur().axes[Axis::Y].size);
         imgui.add(widget!().fixed_width(1).fixed_height(1).fill('┌', border));
         styled_write!(imgui.text, imgui.palette.default, "{}", title);
         let l = imgui.text.close_line();
@@ -2665,9 +2790,9 @@ impl Table {
     pub fn new(state: TableState, imgui: &mut IMGUI, columns: Vec<Column>) -> Self {
         let root = imgui.cur_parent;
         let w = imgui.get_mut(root);
-        w.axes[1].flags.insert(AxisFlags::STACK);
+        w.axes[Axis::Y].flags.insert(AxisFlags::STACK);
         assert!(w.axes[0].flags.contains(AxisFlags::SIZE_KNOWN) && w.axes[1].flags.contains(AxisFlags::SIZE_KNOWN), "Table widget requires the size to be known in advance");
-        let (width, height) = (w.axes[0].size, w.axes[1].size);
+        let (width, height) = (w.axes[Axis::X].size, w.axes[Axis::Y].size);
         let (viewport, rows_container, scroll_bar);
 
         with_parent!(imgui, root, {
@@ -2704,7 +2829,7 @@ impl Table {
         self.lazy = true;
         (self.total_rows, self.fixed_row_height) = (num_rows, row_height);
         with_parent!(imgui, self.rows_container, {
-            imgui.cur_mut().axes[1].auto_size = AutoSize::Fixed(num_rows * row_height);
+            imgui.cur_mut().axes[Axis::Y].auto_size = AutoSize::Fixed(num_rows * row_height);
             if imgui.check_mouse(MouseActions::CLICK_SUBTREE) {
                 let y = imgui.cur().mouse_pos[1];
                 if y >= 0 && (y as usize) < num_rows * row_height {
@@ -2786,14 +2911,14 @@ impl Table {
                     _ => panic!("unexpected auto_width for column {}", col.title),
                 }
                 let cell = imgui.get(row).children[col_idx];
-                col.width = col.width.max(imgui.calculate_size(cell, 0));
+                col.width = col.width.max(imgui.calculate_size(cell, Axis::X));
             }
         }
 
         let reserved = if self.enable_selection_icon {2usize} else {0};
 
         // Calculate Remainder column widths.
-        let mut remainder_helper = RemainderFractionHelper::new(imgui.get(self.rows_container).axes[0].size);
+        let mut remainder_helper = RemainderFractionHelper::new(imgui.get(self.rows_container).axes[Axis::X].size);
         remainder_helper.declare_fixed_part(self.columns.len().saturating_sub(1) + reserved);
         for (col_idx, col) in self.columns.iter_mut().enumerate() {
             match col.auto_width {
@@ -2822,9 +2947,9 @@ impl Table {
         for (col_idx, col) in self.columns.iter().enumerate() {
             let cell = imgui.get(header).children[col_idx];
             let w = imgui.get_mut(cell);
-            w.axes[0].size = col.width;
-            w.axes[0].rel_pos = reserved as isize + col.pos;
-            w.axes[0].flags.insert(AxisFlags::SIZE_KNOWN | AxisFlags::POS_KNOWN);
+            w.axes[Axis::X].size = col.width;
+            w.axes[Axis::X].rel_pos = reserved as isize + col.pos;
+            w.axes[Axis::X].flags.insert(AxisFlags::SIZE_KNOWN | AxisFlags::POS_KNOWN);
         }
         for row_idx in 0..num_rows {
             let row = imgui.get(self.rows_container).children[row_idx];
@@ -2836,10 +2961,10 @@ impl Table {
             for (col_idx, col) in self.columns.iter().enumerate() {
                 let cell = imgui.get(row).children[col_idx];
                 let w = imgui.get_mut(cell);
-                w.axes[0].auto_size = AutoSize::Fixed(col.width);
-                w.axes[0].size = col.width;
-                w.axes[0].rel_pos = col.pos;
-                w.axes[0].flags.insert(AxisFlags::SIZE_KNOWN | AxisFlags::POS_KNOWN);
+                w.axes[Axis::X].auto_size = AutoSize::Fixed(col.width);
+                w.axes[Axis::X].size = col.width;
+                w.axes[Axis::X].rel_pos = col.pos;
+                w.axes[Axis::X].flags.insert(AxisFlags::SIZE_KNOWN | AxisFlags::POS_KNOWN);
             }
         }
     }
@@ -2852,16 +2977,16 @@ impl Table {
             if !self.lazy {
                 self.row_idxs = 0..w.children.len();
             } else {
-                w.axes[1].auto_size = AutoSize::Fixed(self.total_rows * self.fixed_row_height);
+                w.axes[Axis::Y].auto_size = AutoSize::Fixed(self.total_rows * self.fixed_row_height);
                 assert_eq!(w.children.len(), self.row_idxs.len(), "number of rows created doesn't match the range returned from lazy()");
                 if !w.children.is_empty() {
                     let r = w.children[0];
                     let w = imgui.get_mut(r);
-                    w.axes[1].flags.insert(AxisFlags::POS_KNOWN);
-                    w.axes[1].rel_pos = (self.row_idxs.start * self.fixed_row_height) as isize;
+                    w.axes[Axis::Y].flags.insert(AxisFlags::POS_KNOWN);
+                    w.axes[Axis::Y].rel_pos = (self.row_idxs.start * self.fixed_row_height) as isize;
                 }
             }
-            imgui.layout_children(1);
+            imgui.layout_children(Axis::Y);
         });
     }
 
@@ -2876,10 +3001,10 @@ impl Table {
         if !self.lazy {
             let num_rows = imgui.get(self.rows_container).children.len();
             self.scroll_to_cursor |= with_parent!(imgui, self.viewport, {
-                list_cursor_navigation_with_variable_row_height(&mut self.state.cursor, num_rows, |i, imgui| imgui.get(imgui.get(self.rows_container).children[i]).axes[1].size, imgui)
+                list_cursor_navigation_with_variable_row_height(&mut self.state.cursor, num_rows, |i, imgui| imgui.get(imgui.get(self.rows_container).children[i]).axes[Axis::Y].size, imgui)
             });
             let scroll_to = if self.scroll_to_cursor && num_rows > 0 {
-                let ax = &imgui.get(imgui.get(self.rows_container).children[self.state.cursor]).axes[1];
+                let ax = &imgui.get(imgui.get(self.rows_container).children[self.state.cursor]).axes[Axis::Y];
                 Some(ax.rel_pos..ax.rel_pos + ax.size as isize)
             } else {
                 None
@@ -2899,7 +3024,7 @@ impl Table {
                 let row = imgui.cur_mut();
                 row.style_adjustment.update(a);
                 if self.enable_selection_icon {
-                    let y = row.axes[1].rel_pos;
+                    let y = row.axes[Axis::Y].rel_pos;
                     with_parent!(imgui, self.rows_container, {
                         imgui.add(widget!().fixed_width(1).fixed_x(0).fixed_height(1).fixed_y(y).fill('➤', imgui.palette.default));
                     });
@@ -2922,7 +3047,7 @@ impl Table {
         };
         let row = imgui.cur_parent;
         with_parent!(imgui, tooltip, {
-            imgui.cur_mut().axes[1].flags.insert(AxisFlags::STACK);
+            imgui.cur_mut().axes[Axis::Y].flags.insert(AxisFlags::STACK);
             let mut width = 0usize;
             for (col_idx, col) in self.columns.iter().enumerate() {
                 width = width.max(str_width(col.title));
@@ -2939,8 +3064,8 @@ impl Table {
                 }
             }
             let parent = imgui.cur().parent;
-            width = width.min(imgui.get(parent).axes[0].size);
-            imgui.cur_mut().axes[0].auto_size = AutoSize::Fixed(width);
+            width = width.min(imgui.get(parent).axes[Axis::X].size);
+            imgui.cur_mut().axes[Axis::X].auto_size = AutoSize::Fixed(width);
         });
     }
 
@@ -2957,7 +3082,7 @@ impl Table {
             w.flags.insert(WidgetFlags::LINE_WRAP);
             w.parent = to;
             if from == cell {
-                w.axes[0].auto_size = AutoSize::Parent;
+                w.axes[Axis::X].auto_size = AutoSize::Parent;
             }
             let new_to = imgui.add(w);
             for c in imgui.get(from).children.iter().rev() {
@@ -3050,19 +3175,19 @@ impl Tabs {
         self.state.hscroll += with_parent!(imgui, self.viewport, {
             imgui.check_scroll() * imgui.key_binds.hscroll_sensitivity
         });
-        let viewport_width = imgui.calculate_size(self.viewport, 0);
-        let content_width = imgui.calculate_size(self.content, 0);
+        let viewport_width = imgui.calculate_size(self.viewport, Axis::X);
+        let content_width = imgui.calculate_size(self.content, Axis::X);
         with_parent!(imgui, self.content, {
-            imgui.layout_children(0);
+            imgui.layout_children(Axis::X);
             if self.scroll_to_selected_tab && !self.tabs.is_empty() {
                 let w = imgui.get(self.tabs[self.state.selected].0);
-                scroll_to_range(&mut self.state.hscroll, w.axes[0].rel_pos..w.axes[0].rel_pos + w.axes[0].size as isize, viewport_width);
+                scroll_to_range(&mut self.state.hscroll, w.axes[Axis::X].rel_pos..w.axes[Axis::X].rel_pos + w.axes[Axis::X].size as isize, viewport_width);
             }
         });
         self.state.hscroll = self.state.hscroll.min(content_width as isize - viewport_width as isize).max(0);
         let w = imgui.get_mut(self.content);
-        w.axes[0].rel_pos = -self.state.hscroll;
-        w.axes[0].flags.insert(AxisFlags::POS_KNOWN);
+        w.axes[Axis::X].rel_pos = -self.state.hscroll;
+        w.axes[Axis::X].flags.insert(AxisFlags::POS_KNOWN);
         self.state
     }
 
@@ -3139,27 +3264,84 @@ pub struct TextInput {
     pub text: String,
     pub cursor: usize,
     pub mark: usize,
-    undo: Vec<(String, /*cursor*/ usize)>,
-    undo_idx: usize,
 
-    hscroll: isize,
+    pub multiline: bool,
+    pub line_wrap: bool,
+    pub capture_vertical_movement_keys: bool, // Up/Down arrow keys, PageUp/PageDown
+    pub capture_return_key: bool, // Char('\n'); but ctrl+return is always captured
 
     pub scroll_to_cursor: bool,
     // true if right arrow key was pressed when the cursor was already at the end.
     // For open dialog it's used as a signal to open file/function without closing the dialog.
     pub moved_past_the_end: bool,
+
+    undo: Vec<(String, /*old_cursor*/ usize, /*new_cursor*/ usize)>,
+    undo_idx: usize,
+
+    scroll: isize,
+    hscroll: isize,
+    // How the `text` characters are laid out on screen. Used for moving cursor up and down.
+    lines: Vec<(/*start_x*/ isize, /*bytes*/ Range<usize>)>,
+    viewport_height: usize,
+
+    // If moving vertically through: long line -> short line -> long line, remember the cursor horizontal position even if it's beyond the short line's width.
+    saved_x: Option<isize>,
 }
 impl Default for TextInput {
-    fn default() -> Self { Self {text: String::new(), cursor: 0, mark: 0, undo: vec![(String::new(), 0)], undo_idx: 0, hscroll: 0, scroll_to_cursor: false, moved_past_the_end: false} }
+    fn default() -> Self { Self {text: String::new(), cursor: 0, mark: 0, multiline: false, line_wrap: false, capture_vertical_movement_keys: false, capture_return_key: false, undo: vec![(String::new(), 0, 0)], undo_idx: 0, scroll: 0, hscroll: 0, scroll_to_cursor: false, moved_past_the_end: false, lines: Vec::new(), saved_x: None, viewport_height: 0} }
 }
 impl TextInput {
-    pub fn with_text(text: String) -> Self { Self {cursor: text.len(), mark: text.len(), undo: vec![(text.clone(), text.len())], text, undo_idx: 0, hscroll: 0, scroll_to_cursor: true, moved_past_the_end: false} }
+    pub fn new_with_text(text: String) -> Self { Self {cursor: text.len(), mark: text.len(), multiline: false, line_wrap: false, capture_vertical_movement_keys: false, capture_return_key: false, undo: vec![(text.clone(), text.len(), text.len())], text, undo_idx: 0, scroll: 0, hscroll: 0, scroll_to_cursor: true, moved_past_the_end: false, lines: Vec::new(), saved_x: None, viewport_height: 0} }
+    pub fn new_multiline(text: String) -> Self { Self {cursor: text.len(), mark: text.len(), multiline: true, line_wrap: true, capture_vertical_movement_keys: true, capture_return_key: false, undo: vec![(text.clone(), text.len(), text.len())], text, undo_idx: 0, scroll: 0, hscroll: 0, scroll_to_cursor: true, moved_past_the_end: false, lines: Vec::new(), saved_x: None, viewport_height: 0} }
 
     // Returns true if there was any input (or if scroll_to_cursor was set to true from the outside).
-    pub fn update_and_render(&mut self, imgui: &mut IMGUI) -> bool {
-        let content_widget = imgui.add(widget!().height(AutoSize::Text).width(AutoSize::Text).fixed_x(0));
+    // cur_parent's axes determine scrolling/resizing behavior:
+    //  * If AutoSize::Fixed, the viewport size is fixed, and the text is scrollable inside it.
+    //  * If AutoSize::Children, the viewport size is set to text size. If text is bigger than the Axis's max_size, the viewport size is clamped and scrolling is enabled.
+    // In multiline mode, space for vertical scroll bar is reserved even if the text fits (except AutoSize::Children with max_size = MAX).
+    pub fn build(&mut self, imgui: &mut IMGUI) -> bool {
+        for ax in 0..2 {
+            let axis = &imgui.cur().axes[ax];
+            assert!(axis.flags.contains(AxisFlags::SIZE_KNOWN) || axis.auto_size.is_children(), "only Fixed or Children viewport sizes are supported by TextInput; got {:?}", axis.auto_size);
+        }
+
+        {
+            let s = imgui.palette.default;
+            let w = imgui.cur_mut();
+            w.flags.insert(WidgetFlags::RESET_STYLE_ADJUSTMENT);
+            w.draw_fill = Some((' ', s));
+        }
+
+        let enable_scroll_bar = self.multiline && (imgui.cur().axes[1].flags.contains(AxisFlags::SIZE_KNOWN) || imgui.cur().axes[1].max_size < usize::MAX);
+        let (mut viewport_widget, mut scroll_bar) = (imgui.cur_parent, WidgetIdx::invalid());
+        if enable_scroll_bar {
+            imgui.cur_mut().axes[0].flags.insert(AxisFlags::STACK);
+            let mut w = widget!();
+            for ax in 0..2 {
+                let sub = if ax == 0 {1} else {0};
+                let axis = &imgui.cur().axes[ax];
+                if axis.flags.contains(AxisFlags::SIZE_KNOWN) {
+                    w.axes[ax].auto_size = AutoSize::Fixed(axis.size.saturating_sub(sub));
+                } else {
+                    w.axes[ax].auto_size = AutoSize::Children;
+                    w.axes[ax].min_size = axis.min_size.saturating_sub(sub);
+                    w.axes[ax].max_size = axis.max_size;
+                    if axis.max_size < usize::MAX {
+                        w.axes[ax].max_size = axis.max_size.saturating_sub(sub);
+                    }
+                }
+            }
+
+            viewport_widget = imgui.add(w);
+            scroll_bar = imgui.add(widget!().fixed_width(1).fixed_height(0));
+        };
+
+        let content_widget = imgui.add(widget!().parent(viewport_widget).height(AutoSize::Text).width(AutoSize::Text).fixed_x(0).flags(WidgetFlags::HSCROLL_INDICATOR_ARROWS));
+
         self.update(content_widget, imgui);
-        self.render(content_widget, imgui);
+        with_parent!(imgui, viewport_widget, {
+            self.render(content_widget, scroll_bar, imgui);
+        });
         mem::take(&mut self.scroll_to_cursor)
     }
 
@@ -3170,11 +3352,10 @@ impl TextInput {
             imgui.focus();
 
             let clicked = imgui.check_mouse(MouseActions::CLICK);
-            if let Some([x, _]) = imgui.check_drag() {
-                let i = str_prefix_with_width(&self.text, x.max(0) as usize).0;
-                self.cursor = i;
+            if let Some(pos) = imgui.check_drag() {
+                self.cursor = self.coordinates_to_offset(pos);
                 if clicked {
-                    self.mark = i;
+                    self.mark = self.cursor;
                 }
             }
         });
@@ -3184,9 +3365,22 @@ impl TextInput {
         imgui.cur_mut().capture_keys.extend_from_slice(&[
             Key::Left.any_mods(), Key::Right.any_mods(), Key::Char('b').ctrl(), Key::Char('f').ctrl(), Key::Char('b').alt(), Key::Char('f').alt(), Key::Char('B').alt(), Key::Char('F').alt(),
             Key::Home.any_mods(), Key::End.any_mods(), Key::Char('a').ctrl(), Key::Char('e').ctrl(), Key::Char('A').ctrl(), Key::Char('E').ctrl(),
+            Key::Char('<').alt(), Key::Char('>').alt(),
             Key::Backspace.any_mods(), Key::Delete.any_mods(), Key::Char('d').ctrl(), Key::Char('d').alt(), Key::Char('w').ctrl(),
             Key::Char('k').ctrl(), Key::Char('u').ctrl(),
         ]);
+        if self.capture_return_key {
+            imgui.cur_mut().capture_keys.push(Key::Char('\n').plain());
+        }
+        if self.capture_vertical_movement_keys {
+            imgui.cur_mut().capture_keys.extend_from_slice(&[
+                Key::Up.plain(), Key::Up.shift(), Key::Down.plain(), Key::Down.shift(), Key::Char('n').ctrl(), Key::Char('p').ctrl(),
+                Key::PageUp.plain(), Key::PageUp.shift(), Key::PageDown.plain(), Key::PageDown.shift(),
+                // The ctrl+v is a collision between page-down (emacs style) and paste (in text_input_key_to_action by default). The text_input_key_to_action takes precedence, but the user may unbind it and get the emacs-like behavior.
+                // (Ctrl+shift+v is unrepresentable in ansi escape codes.)
+                Key::Char('v').ctrl(), Key::Char('v').alt(), Key::Char('V').alt(),
+            ]);
+        }
         let req: Vec<KeyEx> = imgui.key_binds.text_input_key_to_action.keys().copied().collect();
         imgui.cur_mut().capture_keys.extend_from_slice(&req);
 
@@ -3194,11 +3388,14 @@ impl TextInput {
         keys.retain(|key| {
             let mut moved = true; // scroll to cursor
             let mut edited = false; // add undo entry
+            let saved_x = mem::take(&mut self.saved_x);
+            let old_cursor = self.cursor;
             match imgui.key_binds.text_input_key_to_action.get(key) {
                 Some(KeyAction::Undo) => {
                     if self.undo_idx > 0 {
+                        self.cursor = self.undo[self.undo_idx].1;
                         self.undo_idx -= 1;
-                        (self.text, self.cursor) = self.undo[self.undo_idx].clone();
+                        self.text = self.undo[self.undo_idx].0.clone();
                         self.mark = self.cursor;
                     } else {
                         moved = false;
@@ -3207,7 +3404,7 @@ impl TextInput {
                 Some(KeyAction::Redo) => {
                     if self.undo_idx + 1 < self.undo.len() {
                         self.undo_idx += 1;
-                        (self.text, self.cursor) = self.undo[self.undo_idx].clone();
+                        (self.text, _, self.cursor) = self.undo[self.undo_idx].clone();
                         self.mark = self.cursor;
                     } else {
                         moved = false;
@@ -3235,8 +3432,15 @@ impl TextInput {
                         edited = true;
                     }
                 }
+                Some(KeyAction::NewLine) if self.multiline => {
+                    self.delete_selection(false, imgui);
+                    self.text.insert(self.cursor, '\n');
+                    self.move_cursor(false, true);
+                    self.mark = self.cursor;
+                    edited = true;
+                }
                 _ => match key.key {
-                    Key::Char(c) if key.mods.is_empty() => {
+                    Key::Char(c) if (key.mods.is_empty() || c == '\n') && (c != '\n' || self.multiline) => {
                         self.delete_selection(false, imgui);
                         self.text.insert(self.cursor, c);
                         self.move_cursor(false, true);
@@ -3253,15 +3457,20 @@ impl TextInput {
                             self.mark = self.cursor;
                         }
                     }
-                    Key::Home | Key::End | Key::Char('a') | Key::Char('e') | Key::Char('A') | Key::Char('E') => {
+                    Key::Home | Key::End | Key::Char('a') | Key::Char('e') | Key::Char('A') | Key::Char('E') | Key::Char('<') | Key::Char('>') => {
                         let select = key.mods.contains(ModKeys::SHIFT) || key.key == Key::Char('A') || key.key == Key::Char('E');
-                        let home = key.key == Key::Home || key.key == Key::Char('a') || key.key == Key::Char('A');
+                        let whole_text = key.key == Key::Char('<') || key.key == Key::Char('>') || (key.mods.contains(ModKeys::CTRL) && (key.key == Key::Home || key.key == Key::End));
+                        let home = key.key == Key::Home || key.key == Key::Char('a') || key.key == Key::Char('A') || key.key == Key::Char('<');
 
-                        if home {
-                            self.cursor = 0;
-                        } else {
-                            self.cursor = self.text.len();
-                        }
+                        self.cursor = match (whole_text, home) {
+                            (true, true) => 0,
+                            (true, false) => self.text.len(),
+                            (false, home) => {
+                                let mut pos = self.offset_to_coordinates(self.cursor);
+                                pos[0] = if home {0} else {isize::MAX};
+                                self.coordinates_to_offset(pos)
+                            }
+                        };
                         if !select {
                             self.mark = self.cursor;
                         }
@@ -3278,13 +3487,31 @@ impl TextInput {
                     }
                     Key::Char('k') | Key::Char('u') if key.mods == ModKeys::CTRL => {
                         self.mark = self.cursor;
-                        self.cursor = if key.key == Key::Char('k') {
-                            self.text.len()
-                        } else {
-                            0
-                        };
+                        let mut pos = self.offset_to_coordinates(self.cursor);
+                        pos[0] = if key.key == Key::Char('k') {isize::MAX} else {0};
+                        self.cursor = self.coordinates_to_offset(pos);
                         self.delete_selection(true, imgui);
                         edited = true;
+                    }
+                    Key::Up | Key::Down | Key::Char('n') | Key::Char('p') | Key::PageUp | Key::PageDown | Key::Char('v') | Key::Char('V') => {
+                        let select = key.mods.contains(ModKeys::SHIFT);
+                        let dy = match key.key {
+                            Key::Up | Key::Char('p') => -1,
+                            Key::Down | Key::Char('n') => 1,
+                            k if k == Key::PageUp || (k == Key::Char('v') && key.mods.contains(ModKeys::ALT)) => -(self.viewport_height.saturating_sub(2) as isize),
+                            _ => self.viewport_height.saturating_sub(2) as isize,
+                        };
+
+                        let mut pos = self.offset_to_coordinates(self.cursor);
+
+                        pos[0] = saved_x.unwrap_or(pos[0]);
+                        self.saved_x = Some(pos[0]);
+
+                        pos[1] += dy;
+                        self.cursor = self.coordinates_to_offset(pos);
+                        if !select {
+                            self.mark = self.cursor;
+                        }
                     }
                     _ => return true,
                 }
@@ -3295,7 +3522,7 @@ impl TextInput {
             if edited {
                 self.undo_idx += 1;
                 self.undo.truncate(self.undo_idx);
-                self.undo.push((self.text.clone(), self.cursor));
+                self.undo.push((self.text.clone(), old_cursor, self.cursor));
             }
             false
         });
@@ -3338,35 +3565,96 @@ impl TextInput {
         self.cursor = r.start;
         self.mark = self.cursor;
     }
-        
-    fn render(&mut self, content_widget: WidgetIdx, imgui: &mut IMGUI) {
-        let viewport_width = imgui.calculate_size(imgui.cur_parent, 0);
-        let s = imgui.palette.default;
-        let w = imgui.cur_mut();
-        w.flags.insert(WidgetFlags::RESET_STYLE_ADJUSTMENT);
-        w.draw_fill = Some((' ', s));
 
+    fn offset_to_coordinates(&self, offset: usize) -> [isize; 2] {
+        if self.lines.is_empty() {
+            return [0, 0];
+        }
+        let i = self.lines.partition_point(|(_, r)| r.end <= offset).min(self.lines.len() - 1);
+        let (start_x, range) = self.lines[i].clone();
+        let w = str_width(&self.text[range.start..offset]);
+        [start_x + w as isize, i as isize]
+    }
+
+    fn coordinates_to_offset(&self, pos: [isize; 2]) -> usize {
+        if pos[1] < 0 {
+            return 0;
+        }
+        if pos[1] >= self.lines.len() as isize {
+            return self.text.len();
+        }
+        let i = pos[1].max(0).min(self.lines.len() as isize - 1) as usize;
+        let (start_x, mut range) = self.lines[i].clone();
+        if i + 1 < self.lines.len() {
+            // Exclude the '\n'.
+            range.end -= 1;
+        }
+        let (j, _) = str_prefix_with_width(&self.text[range.clone()], (pos[0] - start_x).max(0) as usize);
+        range.start + j
+    }
+
+    fn render(&mut self, content_widget: WidgetIdx, scroll_bar: WidgetIdx, imgui: &mut IMGUI) {
         let selection = self.selection();
         styled_write!(imgui.text, imgui.palette.text_input, "{}", &self.text[..selection.start]);
         styled_write!(imgui.text, imgui.palette.text_input_selected, "{}", &self.text[selection.clone()]);
         styled_write!(imgui.text, imgui.palette.text_input, "{}", &self.text[selection.end..]);
         let l = imgui.text.close_line();
 
-        let w = imgui.get_mut(content_widget);
-        w.draw_text = Some(l..l+1);
-        let cursor_x = str_width(&self.text[..self.cursor]) as isize;
-        w.draw_cursor_if_focused = Some([cursor_x, 0]);
+        let mut line_map: Vec<Range<usize>> = Vec::new();
+        let mut line_range = if self.multiline {
+            imgui.text.split_by_newline_character(l, Some(&mut line_map))
+        } else {
+            line_map.push(0..self.text.len());
+            l..l+1
+        };
 
-        // Horizontal scrolling.
-        let content_width = imgui.calculate_size(content_widget, 0);
-        with_parent!(imgui, content_widget, { // same widget where MouseEvent::DRAG is captured, to make scrolling work while dragging
-            self.hscroll += imgui.check_scroll() * imgui.key_binds.hscroll_sensitivity;
-        });
+        imgui.get_mut(content_widget).draw_text = Some(line_range.clone());
+        let mut content_width = imgui.calculate_size(content_widget, 0);
+        let viewport_width = imgui.calculate_size(imgui.cur_parent, 0);
+
+        self.lines.clear();
+        if self.line_wrap && content_width > viewport_width {
+            let mut wrap_map: Vec<(isize, usize, Range<usize>)> = Vec::new();
+            line_range = imgui.text.line_wrap(line_range, viewport_width, 10000, &imgui.palette.line_wrap_indicator, &imgui.palette.truncation_indicator, Some(&mut wrap_map));
+            for (start_x, line_idx, r) in wrap_map {
+                self.lines.push((start_x, r.start + line_map[line_idx].start .. r.end + line_map[line_idx].start));
+            }
+            imgui.get_mut(content_widget).draw_text = Some(line_range);
+            imgui.get_mut(content_widget).axes[Axis::X].reset_size();
+            content_width = imgui.calculate_size(content_widget, 0);
+        } else {
+            for r in line_map {
+                self.lines.push((0, r));
+            }
+        }
+
+        self.viewport_height = imgui.calculate_size(imgui.cur_parent, Axis::Y);
+        if scroll_bar.is_valid() {
+            imgui.get_mut(scroll_bar).axes[Axis::Y].size = self.viewport_height;
+        }
+        
+        let cursor_pos = self.offset_to_coordinates(self.cursor);
+        imgui.get_mut(content_widget).draw_cursor_if_focused = Some(cursor_pos);
+
+        // Vertical and horizontal scrolling.
+        let scroll_wheel_widget = content_widget; // same widget where MouseEvent::DRAG is captured, to make scrolling work while dragging
+        if self.multiline {
+            let scroll_to = if self.scroll_to_cursor {
+                Some(cursor_pos[1]..cursor_pos[1]+1)
+            } else {
+                None
+            };
+            scrolling_navigation(&mut self.scroll, scroll_to, scroll_wheel_widget, scroll_bar, imgui);
+        } else {
+            with_parent!(imgui, scroll_wheel_widget, {
+                self.hscroll += imgui.check_scroll() * imgui.key_binds.hscroll_sensitivity;
+            });
+        }
         if self.scroll_to_cursor {
-            scroll_to_range(&mut self.hscroll, cursor_x..cursor_x, viewport_width);
+            scroll_to_range(&mut self.hscroll, cursor_pos[0]..cursor_pos[0], viewport_width);
         }
         self.hscroll = self.hscroll.min(content_width as isize - viewport_width as isize).max(0);
-        imgui.get_mut(content_widget).axes[0].rel_pos = -self.hscroll;
+        imgui.get_mut(content_widget).axes[Axis::X].rel_pos = -self.hscroll;
     }
 }
 
@@ -3392,13 +3680,13 @@ struct State {
     open_function_text: TextInput,
     open_function_table_state: TableState,
 
-    watch_tree: ValueTree,
+    watches: WatchesWindow,
 }
 
 fn build(imgui: &mut IMGUI, state: &mut State) {
     (state.quit, state.drop_caches) = (false, false);
     let w = imgui.cur_mut();
-    w.axes[0].flags.insert(AxisFlags::STACK);
+    w.axes[Axis::X].flags.insert(AxisFlags::STACK);
 
     let mut windows: Vec<WidgetIdx> = Vec::new();
 
@@ -3409,7 +3697,7 @@ fn build(imgui: &mut IMGUI, state: &mut State) {
         imgui.add(widget!().fill('|', imgui.palette.default_dim).fixed_width(1)),
         imgui.add(widget!().width(AutoSize::Remainder(0.2)).vstack()),
     ];
-    imgui.layout_children(0);
+    imgui.layout_children(Axis::X);
 
     // Left column.
     with_parent!(imgui, columns[0], {
@@ -3447,7 +3735,7 @@ fn build(imgui: &mut IMGUI, state: &mut State) {
         imgui.add(widget!().fill('-', imgui.palette.default_dim).text(l).fixed_height(1));
 
         windows.push(imgui.add(widget!().height(AutoSize::Remainder(0.4)).vstack()));
-        imgui.layout_children(1);
+        imgui.layout_children(Axis::Y);
     });
     // Right column.
     with_parent!(imgui, columns[4], {
@@ -3478,7 +3766,7 @@ fn build(imgui: &mut IMGUI, state: &mut State) {
         imgui.add(widget!().fill('-', imgui.palette.default_dim).text(l).fixed_height(1));
 
         windows.push(imgui.add(widget!().height(AutoSize::Remainder(0.2))));
-        imgui.layout_children(1);
+        imgui.layout_children(Axis::Y);
     });
 
     let hotkey_to_window = [2, 3, 4, 5, 7, 8, 6];
@@ -3511,7 +3799,7 @@ fn build(imgui: &mut IMGUI, state: &mut State) {
         let end = imgui.text.num_lines();
         let w = imgui.cur_mut();
         w.draw_text = Some(start..end);
-        w.axes[1].auto_size = AutoSize::Text;
+        w.axes[Axis::Y].auto_size = AutoSize::Text;
     });
     // Status window.
     with_parent!(imgui, windows[1], {
@@ -3529,11 +3817,11 @@ fn build(imgui: &mut IMGUI, state: &mut State) {
     });
 
     with_parent!(imgui, columns[0], {
-        imgui.layout_children(1);
+        imgui.layout_children(Axis::Y);
     });
 
     with_parent!(imgui, windows[2], {
-        build_watches(imgui, state);
+        state.watches.build(imgui);
     });
     with_parent!(imgui, windows[3], {
         build_disassembly(imgui, state);
@@ -3563,343 +3851,438 @@ fn build(imgui: &mut IMGUI, state: &mut State) {
     });
 }
 
+
 struct ValueTreeNode {
-    name: usize,
+    name: Range<usize>,
     value: usize,
     identity: usize,
-    children: Option<Vec<usize>>,
+    children: Option<Range<usize>>,
     expandable: bool,
-    expanded: bool,
     depth: usize,
-
-    // Cached line-wrapped strings. Cleared when column widths change.
-    line_wrapped: Option<[Range<usize>; /*name, value*/ 2]>,
-    // Cached vertical layout. Recalculated when the tree changes, or nodes are expanded/collapsed, etc.
-    subtree_y: Range<isize>,
-    height: usize,
-    row_idx: usize,
+    parent: usize,
 }
-impl Default for ValueTreeNode { fn default() -> Self { Self {name: usize::MAX, value: usize::MAX, identity: 0, children: None, expandable: false, expanded: false, depth: 0, line_wrapped: None, subtree_y: 0..0, height: 0, row_idx: 0} } }
+impl Default for ValueTreeNode { fn default() -> Self { Self {name: 0..0, value: usize::MAX, identity: 0, children: None, expandable: false, depth: 0, parent: usize::MAX} } }
+
+#[derive(Clone)]
+struct ValueTreeRow {
+    node_idx: usize,
+    expanded: bool,
+
+    widget: WidgetIdx, // invalid if we didn't create it yet
+    // Information needed to create the widget.
+    parent_widget: WidgetIdx,
+    rel_y: isize,
+    indent_built: bool,
+    // If false, widget for this row should be created by build_tree(). Otherwise widget may be created later, after layout and visibility check.
+    deferred: bool,
+}
 
 #[derive(Default)]
 struct ValueTree {
     nodes: Vec<ValueTreeNode>,
-    roots: Vec<usize>,
+    roots: Vec<(usize, String)>,
     text: StyledText,
+    rows: Vec<ValueTreeRow>,
+    expanded_nodes: HashSet<usize>,
+}
+
+#[derive(Default)]
+struct WatchesWindow {
+    tree: ValueTree,
 
     name_width: usize,
     value_width: usize,
-    rows: Vec<(/*node_idx*/ usize, /*height*/ usize)>, // if empty, we need to recalculate the layout
-    content_height: usize,
+    row_height_limit: usize,
 
-    cursor: usize,
+    cursor_path: Vec<usize>,
+    cursor_idx: usize,
     scroll: isize,
     scroll_to_cursor: bool,
 
-    text_input: Option<(/*identity*/ usize, TextInput, /*height*/ usize)>,
+    text_input: Option<(/*identity*/ usize, TextInput)>,
+    text_input_built: bool,
 }
-impl ValueTree {
-    fn drop_line_wrap_cache(&mut self) {
-        for n in &mut self.nodes {
-            n.line_wrapped = None;
-        }
-    }
+impl WatchesWindow {
+    fn build(&mut self, imgui: &mut IMGUI) {
+        // Plan:
+        //  1. Handle expand/collapse/edit-start/edit-stop inputs using last frame rows and tree.
+        //  2. Recalculate the tree if needed.
+        //  3. Build widget tree and rows list.
+        //     For nodes that affect layout of other nodes (expanded nodes, text input node) the widgets are created immediately.
+        //     For other nodes, widget creation is deferred to a later stage, after layout, to avoid building invisible nodes.
+        //     Locate cursor (map cursor_path to cursor_idx). Build TextInput, close it on focus loss.
+        //  4. layout_subtree(). Now we know the heights and coordinates of all rows.
+        //  5. Cursor navigation.
+        //  6. Scrolling navigation. Now we know which rows are visible.
+        //  7. Build the visible rows and the selected row.
+        //  8. Focus and highlight selected row.
 
-    fn do_layout(&mut self, imgui: &mut IMGUI) {
-        if !self.rows.is_empty() {
-            return;
-        }
-        let mut y = 0isize;
-        for &root in &self.roots {
-            let mut stack: Vec<(usize, u8)> = vec![(root, 0)];
-            while let Some((idx, pass)) = stack.pop() {
-                let node = &mut self.nodes[idx];
-                if pass == 1 {
-                    node.subtree_y.end = y;
-                    continue;
-                }
-                stack.push((idx, 1));
+        // Create outer widgets.
+        assert!(imgui.cur().axes[0].flags.contains(AxisFlags::SIZE_KNOWN) && imgui.cur().axes[1].flags.contains(AxisFlags::SIZE_KNOWN));
+        imgui.cur_mut().axes[Axis::Y].flags.insert(AxisFlags::STACK);
+        let root_widget = imgui.cur_parent;
+        let header_widget = imgui.add(widget!().fixed_height(1).hstack());
+        let container_widget = imgui.add(widget!().height(AutoSize::Remainder(1.0)).hstack());
+        imgui.layout_children(Axis::Y);
+        let (viewport_widget, scroll_bar, content_widget);
+        with_parent!(imgui, container_widget, {
+            viewport_widget = imgui.add(widget!().width(AutoSize::Remainder(1.0)));
+            scroll_bar = imgui.add(widget!().fixed_width(1));
+            imgui.layout_children(Axis::X);
+        });
+        let width = imgui.calculate_size(viewport_widget, Axis::X);
+        self.name_width = width * 4 / 10;
+        self.value_width = width.saturating_sub(self.name_width + 1);
+        with_parent!(imgui, viewport_widget, {
+            imgui.focus();
+            content_widget = imgui.add(widget!().height(AutoSize::Children).vstack());
+            self.row_height_limit = imgui.cur().axes[Axis::Y].size;
+        });
+        with_parent!(imgui, header_widget, {
+            styled_write!(imgui.text, imgui.palette.table_header, "  name");
+            let l = imgui.text.close_line();
+            imgui.add(widget!().fixed_width(self.name_width + 1).text(l));
+            styled_write!(imgui.text, imgui.palette.table_header, "value");
+            let l = imgui.text.close_line();
+            imgui.add(widget!().fixed_width(self.value_width).text(l));
+        });
 
-                if node.expanded && node.line_wrapped.is_none() {
-                    let max_lines = 100;
-                    //asdqwe name is narrower: -3, -indent
-                    let name = self.text.line_wrap(node.name..node.name+1, self.name_width, max_lines, &imgui.palette.line_wrap_indicator, &imgui.palette.truncation_indicator);
-                    let value = self.text.line_wrap(node.value..node.value+1, self.value_width, max_lines, &imgui.palette.line_wrap_indicator, &imgui.palette.truncation_indicator);
-                    node.line_wrapped = Some([name, value]);
-                }
-
-                let mut height = 1;
-                let is_text_input = match &self.text_input {
-                    Some((identity, _, h)) if *identity == node.identity => {
-                        height = height.max(*h);
-                        true
-                    }
-                    _ => false,
-                };
-                if node.expanded {
-                    let [name, value] = node.line_wrapped.clone().unwrap();
-                    if !is_text_input {
-                        height = height.max(name.len());
-                    }
-                    height = height.max(value.len());
-                }
-
-                node.height = height;
-                node.subtree_y = y .. y + height as isize;
-                node.row_idx = self.rows.len();
-                self.rows.push((idx, height));
-                y += height as isize;
-
-                if !node.expanded {
-                    continue;
-                }
-
-                if node.children.is_none() {
-                    let mut children: Vec<usize> = Vec::new();
-                    let depth = node.depth;
-                    while random::<u8>() < 150 {
-                        let mut n = Self::random_node(&mut self.text, imgui);
-                        n.depth = depth + 1;
-                        self.nodes.push(n);
-                        children.push(self.nodes.len() - 1);
-                    }
-                    self.nodes[idx].children = Some(children);
-                }
-
-                for &c in self.nodes[idx].children.as_ref().unwrap().iter().rev() {
-                    stack.push((c, 0));
-                }
+        // Handle input that may change the tree and doesn't need to know the layout.
+        for action in imgui.check_keys(&[KeyAction::CursorLeft, KeyAction::CursorRight, KeyAction::Enter, KeyAction::DeleteRow, KeyAction::DuplicateRow, KeyAction::Cancel]) {
+            if action == KeyAction::DuplicateRow {
+                let (node, expr) = Self::random_node(&mut self.tree.text, imgui);
+                self.tree.nodes.push(node);
+                self.tree.roots.push((self.tree.nodes.len() - 1, expr));
+                continue;
             }
-        }
-        self.content_height = y as usize;
-    }
-
-    fn random_node(text: &mut StyledText, imgui: &mut IMGUI) -> ValueTreeNode {
-        let mut rand_str = || -> usize {
-            let n = ((random::<f64>() * 6.).exp() as usize).saturating_sub(1);
-            for _ in 0..n {
-                text.chars.push((b'a' + random::<u8>()%26) as char);
-            }
-            text.close_span(imgui.palette.default);
-            text.close_line()
-        };
-        ValueTreeNode {name: rand_str(), value: rand_str(), identity: random(), children: None, expandable: random::<u8>() < 200, expanded: false, depth: 0, line_wrapped: None, subtree_y: 0..0, height: 0, row_idx: 0}
-    }
-
-    fn render(&mut self, visible_y: Range<isize>, imgui: &mut IMGUI) {
-        let cursor = self.cursor;
-        for &root in &self.roots {
-            let mut stack: Vec<usize> = vec![root];
-            while let Some(idx) = stack.pop() {
-                let node = &self.nodes[idx];
-                let is_text_input = self.text_input.as_ref().is_some_and(|(identity, _, _)| *identity == node.identity);
-                if (node.subtree_y.start >= visible_y.end || node.subtree_y.end <= visible_y.start) && !is_text_input {
-                    continue;
+            let idx = match self.tree.rows.get(self.cursor_idx) {
+                None => continue,
+                Some(x) => x.node_idx };
+            let node = &mut self.tree.nodes[idx];
+            match action {
+                KeyAction::CursorLeft if self.text_input.is_none() => {
+                    self.tree.expanded_nodes.remove(&node.identity);
+                    self.scroll_to_cursor = true;
                 }
-
-                if node.expanded {
-                    for &c in node.children.as_ref().unwrap().iter().rev() {
-                        stack.push(c);
-                    }
+                KeyAction::CursorRight if self.text_input.is_none() => {
+                    self.tree.expanded_nodes.insert(node.identity);
+                    self.scroll_to_cursor = true;
                 }
-
-                let indent_limit = self.name_width / 2;
-                let indent = node.depth.min(indent_limit);
-                let draw_indent_line = node.expanded && node.depth < indent_limit && node.subtree_y.len() > 1;
-                let mut toggle_expand = false;
-                if node.expandable {
-                    let h = if draw_indent_line {node.subtree_y.len()} else {1};
-                    with_parent!(imgui, imgui.add(widget!().identity(&('e', node.identity)).fixed_width(1).fixed_height(h).fixed_x(indent as isize).fixed_y(node.subtree_y.start).vstack().highlight_on_hover()), {
-                        if imgui.check_mouse(MouseActions::CLICK) {
-                            toggle_expand = true;
-                            imgui.should_redraw = true;
+                KeyAction::Enter if node.depth == 0 => {
+                    if let Some(i) = self.tree.roots.iter().position(|(ix, _)| *ix == idx) {
+                        if let Some((identity, input)) = &mut self.text_input {
+                            if node.identity == *identity {
+                                self.tree.roots[i].1 = input.text.clone();
+                                node.name = Self::format_name(&mut self.tree.text, &input.text, imgui);
+                            }
+                            self.text_input = None;
+                        } else {
+                            self.text_input = Some((node.identity, TextInput::new_multiline(self.tree.roots[i].1.clone())));
                         }
-                        let arrow = if node.expanded {'▾'} else {'▸'};
-                        imgui.add(widget!().fixed_height(1).fill(arrow, imgui.palette.default));
-                        if h > 1 {
+                        self.scroll_to_cursor = true;
+                    }
+                }
+                KeyAction::Cancel if self.text_input.is_some() => {
+                    self.text_input = None;
+                    self.scroll_to_cursor = true;
+                }
+                KeyAction::DeleteRow if self.text_input.is_none() && node.depth == 0 => {
+                    self.tree.roots.retain(|(ix, _)| *ix != idx);
+                    self.scroll_to_cursor = true;
+                }
+                _ => (),
+            }
+        }
+
+        // (irl reevaluate the tree here)
+
+        // Build the list of rows and most of the widget tree.
+        with_parent!(imgui, content_widget, {
+            self.build_tree(imgui);
+        });
+
+        imgui.layout_subtree(content_widget, Axis::Y);
+
+        let visible_rows;
+        with_parent!(imgui, viewport_widget, {
+            let get_row_height = |row: &ValueTreeRow, imgui: &mut IMGUI| -> usize {
+                if !row.widget.is_valid() {
+                    return 1;
+                }
+                let w = imgui.get(row.widget);
+                assert!(w.axes[Axis::Y].flags.contains(AxisFlags::SIZE_KNOWN));
+                w.axes[Axis::Y].size
+            };
+            
+            // Move the cursor.
+            self.scroll_to_cursor |= list_cursor_navigation_with_variable_row_height(&mut self.cursor_idx, self.tree.rows.len(), |row_idx, imgui| get_row_height(&self.tree.rows[row_idx], imgui), imgui);
+
+            let get_row_y_range = |row: &ValueTreeRow, imgui: &mut IMGUI| -> Range<isize> {
+                let start = imgui.relative_position(content_widget, row.parent_widget, Axis::Y) + row.rel_y;
+                let height = get_row_height(row, imgui);
+                start..start+height as isize
+            };
+
+            // Handle scrolling.
+            let mut scroll_to: Option<Range<isize>> = None;
+            if mem::take(&mut self.scroll_to_cursor) && !self.tree.rows.is_empty() {
+                scroll_to = Some(get_row_y_range(&self.tree.rows[self.cursor_idx], imgui));
+            }
+            let visible_y = scrolling_navigation(&mut self.scroll, scroll_to, root_widget, scroll_bar, imgui);
+
+            visible_rows =
+                self.tree.rows.partition_point(|row| get_row_y_range(row, imgui).end <= visible_y.start) ..
+                self.tree.rows.partition_point(|row| get_row_y_range(row, imgui).start < visible_y.end);
+        });
+
+        for row_idx in visible_rows {
+            if !self.tree.rows[row_idx].widget.is_valid() {
+                self.build_row(row_idx, None, imgui);
+            }
+        }
+        if !self.tree.rows.is_empty() {
+            if !self.tree.rows[self.cursor_idx].widget.is_valid() {
+                self.build_row(self.cursor_idx, None, imgui);
+            }
+            with_parent!(imgui, self.tree.rows[self.cursor_idx].widget, {
+                imgui.focus();
+                let a = imgui.palette.selected;
+                imgui.cur_mut().style_adjustment.update(a);
+            });
+        }
+
+        if !mem::take(&mut self.text_input_built) && self.text_input.is_some() {
+            self.text_input = None;
+            imgui.should_redraw = true;
+        }
+
+        // Convert cursor_idx to cursor_path to make it robust to changing the tree.
+        // Do it late because build_row() may change cursor_idx (on click).
+        self.cursor_path.clear();
+        if !self.tree.rows.is_empty() {
+            let mut node_idx = self.tree.rows[self.cursor_idx].node_idx;
+            while node_idx != usize::MAX {
+                let node = &self.tree.nodes[node_idx];
+                self.cursor_path.push(node.identity);
+                node_idx = node.parent;
+            }
+            self.cursor_path.reverse();
+        }
+    }
+
+    fn build_tree(&mut self, imgui: &mut IMGUI) {
+        self.tree.rows.clear();
+
+        let mut stack: Vec<ValueTreeRow> = Vec::new();
+        let roots = mem::take(&mut self.tree.roots);
+        self.prebuild_children(0..roots.len(), Some(&roots), &mut stack, imgui);
+        self.tree.roots = roots;
+
+        let mut clicked_row: Option<usize> = None;
+        while let Some(row) = stack.pop() {
+            self.tree.rows.push(row.clone());
+            let row_idx = self.tree.rows.len() - 1;
+
+            let node = &self.tree.nodes[row.node_idx];
+
+            if self.cursor_path.get(node.depth) == Some(&node.identity) {
+                self.cursor_idx = row_idx;
+            }
+
+            if row.deferred {
+                continue;
+            }
+
+            if row.expanded && node.expandable {
+                let subtree_content;
+                with_parent!(imgui, row.parent_widget, {
+                    let indent_limit = self.name_width / 2;
+                    let mut offset = 0;
+                    if node.depth < indent_limit {
+                        offset = 1;
+                        with_parent!(imgui, imgui.add(widget!().identity(&('e', node.identity)).fixed_width(1).vstack().highlight_on_hover()), {
+                            if imgui.check_mouse(MouseActions::CLICK) {
+                                self.tree.expanded_nodes.remove(&node.identity);
+                                imgui.should_redraw = true;
+                            }
+                            imgui.add(widget!().fixed_height(1).fill('▾', imgui.palette.default));
                             let bar = if node.depth + 1 == indent_limit {'┼'} else {'┆'};
                             imgui.add(widget!().fill(bar, imgui.palette.tree_indent));
+                        });
+                    }
+
+                    assert!(imgui.cur().axes[Axis::X].flags.contains(AxisFlags::SIZE_KNOWN));
+                    let remaining_width = imgui.cur().axes[Axis::X].size.saturating_sub(offset);
+                    subtree_content = imgui.add(widget!().identity(&('s', node.identity)).fixed_width(remaining_width).fixed_x(offset as isize).height(AutoSize::Children).vstack());
+
+                    let row = &mut self.tree.rows[row_idx];
+                    row.parent_widget = subtree_content;
+                    row.indent_built = true;
+                });
+
+                let mut clicked = false;
+                self.build_row(row_idx, Some(&mut clicked), imgui);
+                if clicked {
+                    clicked_row = Some(row_idx);
+                }
+                let node = &self.tree.nodes[row.node_idx];
+
+                if node.children.is_none() {
+                    let start = self.tree.nodes.len();
+                    let depth = node.depth;
+                    while random::<u8>() < 200 {
+                        let (mut n, _) = Self::random_node(&mut self.tree.text, imgui);
+                        n.depth = depth + 1;
+                        n.parent = row.node_idx;
+                        self.tree.nodes.push(n);
+                    }
+                    let end = self.tree.nodes.len();
+                    self.tree.nodes[row.node_idx].children = Some(start..end);
+                }
+                let children = self.tree.nodes[row.node_idx].children.clone().unwrap();
+                with_parent!(imgui, subtree_content, {
+                    self.prebuild_children(children, None, &mut stack, imgui);
+                });
+            } else {
+                // Line wrapping but no children.
+                let mut clicked = false;
+                self.build_row(row_idx, Some(&mut clicked), imgui);
+                if clicked {
+                    clicked_row = Some(row_idx);
+                }
+            }
+        }
+        if let Some(i) = clicked_row {
+            self.cursor_idx = i;
+        }
+    }
+
+    // Detect runs of consecutive simple-layout nodes (unexpanded, no text input). Create parent widgets for them, to be filled out later if visible. Push all nodes to the stack to be visited by DFS.
+    fn prebuild_children(&mut self, range: Range<usize>, nodes_list: Option<&Vec<(usize, String)>>, stack: &mut Vec<ValueTreeRow>, imgui: &mut IMGUI) {
+        let stack_start = stack.len();
+        let mut run: Option<(WidgetIdx, usize)> = None;
+        let end_run = |run: Option<(WidgetIdx, usize)>, imgui: &mut IMGUI| {
+            if let Some((w, n)) = run {
+                imgui.get_mut(w).axes[Axis::Y].size = n;
+            }
+        };
+        for idx0 in range {
+            let node_idx = if let Some(v) = nodes_list.clone() {
+                v[idx0].0
+            } else {
+                idx0
+            };
+
+            let node = &self.tree.nodes[node_idx];
+            let expanded = self.tree.expanded_nodes.contains(&node.identity);
+            let is_text_input = self.text_input.as_ref().is_some_and(|(identity, _)| *identity == node.identity);
+            let deferred = !expanded && !is_text_input && node.name.len() <= 1;
+
+            let mut row = ValueTreeRow {node_idx, expanded, widget: WidgetIdx::invalid(), parent_widget: WidgetIdx::invalid(), rel_y: 0, indent_built: false, deferred};
+
+            if deferred {
+                let (w, n) = run.get_or_insert_with(|| {
+                    (imgui.add(widget!().flags(WidgetFlags::SKIP_IDENTITY).fixed_height(0)), 0)
+                });
+                row.parent_widget = *w;
+                row.rel_y = *n as isize;
+                *n += 1;
+            } else {
+                end_run(mem::take(&mut run), imgui);
+                row.parent_widget = imgui.add(widget!().flags(WidgetFlags::SKIP_IDENTITY).height(AutoSize::Children));
+            }
+
+            stack.push(row);
+        }
+        end_run(run, imgui);
+        stack[stack_start..].reverse();
+    }
+
+    fn build_row(&mut self, row_idx: usize, mut out_clicked: Option<&mut bool>, imgui: &mut IMGUI) {
+        let row = &self.tree.rows[row_idx];
+        let node = &self.tree.nodes[row.node_idx];
+        let row_widget;
+
+        // Draw '▸' if needed and create row widget.
+        with_parent!(imgui, row.parent_widget, {
+            let mut offset = 1;
+            if !row.indent_built {
+                offset = 2;
+                if node.expandable {
+                    with_parent!(imgui, imgui.add(widget!().identity(&('e', node.identity)).fixed_width(1).fixed_height(1).fixed_y(row.rel_y).fill('▸', imgui.palette.default).highlight_on_hover()), {
+                        if imgui.check_mouse(MouseActions::CLICK) {
+                            self.tree.expanded_nodes.insert(node.identity);
+                            imgui.should_redraw = true;
                         }
                     });
                 }
-
-                let reduced_name_width = self.name_width.saturating_sub(indent + 2);
-                with_parent!(imgui, imgui.add(widget!().identity(&('n', node.identity)).fixed_width(reduced_name_width + self.value_width).fixed_height(node.height).fixed_x(indent as isize + 2).fixed_y(node.subtree_y.start).hstack().highlight_on_hover().fill(' ', imgui.palette.default)), {
-                    if imgui.check_mouse(MouseActions::CLICK) {
-                        self.cursor = node.row_idx;
-                        self.scroll_to_cursor = true;
-                        imgui.should_redraw = true;
-                    }
-                    if node.row_idx == cursor {
-                        let a = imgui.palette.selected;
-                        imgui.cur_mut().style_adjustment.update(a);
-                        imgui.focus();
-                        if !imgui.check_focus() && self.text_input.is_some() {
-                            self.text_input = None;
-                            imgui.should_redraw = true;
-                        }
-                    }
-                    let mut w = widget!().fixed_width(reduced_name_width);
-                    if !is_text_input {
-                        let lines = if node.expanded {
-                            node.line_wrapped.as_ref().unwrap()[0].clone()
-                        } else {
-                            node.name..node.name+1
-                        };
-                        w = w.text_lines(imgui.text.import_lines(&self.text, lines));
-                    }
-                    imgui.add(w);
-                    let lines = if node.expanded {
-                        node.line_wrapped.as_ref().unwrap()[1].clone()
-                    } else {
-                        node.value..node.value+1
-                    };
-                    let text = imgui.text.import_lines(&self.text, lines);
-                    imgui.add(widget!().fixed_width(self.value_width).text_lines(text));
-                });
-
-                if toggle_expand {
-                    self.nodes[idx].expanded ^= true;
-                }
             }
-        }
-    }
-}
-
-//asdqwe rewrite:
-// * don't do layout manually, use last frame layout and REDRAW_IF_VISIBLE; only skip long runs of unexpanded siblings; or is it not possible to prevent initial formatting this way without too much speculative manual layout?
-// * put text input inside the row
-// * allow expanding the unexpandable (for line wrapping)
-// * space between the columns
-// * fix the name line wrap width (hopefully by using automatic line wrapping instead)
-fn build_watches(imgui: &mut IMGUI, state: &mut State) {
-    assert!(imgui.cur().axes[0].flags.contains(AxisFlags::SIZE_KNOWN) && imgui.cur().axes[1].flags.contains(AxisFlags::SIZE_KNOWN));
-    imgui.cur_mut().axes[1].flags.insert(AxisFlags::STACK);
-    let header_widget = imgui.add(widget!().fixed_height(1).hstack());
-    let container_widget = imgui.add(widget!().height(AutoSize::Remainder(1.0)).hstack());
-    imgui.layout_children(1);
-    let (viewport_widget, scroll_bar, movable_widget, content_widget, text_input_widget);
-    with_parent!(imgui, container_widget, {
-        viewport_widget = imgui.add(widget!().width(AutoSize::Remainder(1.0)));
-        scroll_bar = imgui.add(widget!().fixed_width(1));
-        imgui.layout_children(0);
-    });
-    let width = imgui.calculate_size(viewport_widget, 0);
-    let name_width = width * 4 / 10;
-    let value_width = width - name_width;
-    with_parent!(imgui, viewport_widget, {
-        movable_widget = imgui.add(widget!().fixed_height(0));
-        with_parent!(imgui, movable_widget, {
-            content_widget = imgui.add(widget!().fixed_height(0));
-            // Create text input widget early to get its height early.
-            // TODO: This was a bad idea, in real code use its height from last frame instead, and request redraw if it changes. Then it can just live inside the row.
-            text_input_widget = imgui.add(widget!().height(AutoSize::Children).fixed_width(name_width.saturating_sub(2)).fixed_x(2).fixed_y(0));
-
-            with_parent!(imgui, content_widget, {imgui.multifocus()});
-            with_parent!(imgui, text_input_widget, {imgui.multifocus()});
+            assert!(imgui.cur().axes[Axis::X].flags.contains(AxisFlags::SIZE_KNOWN));
+            let remaining_width = imgui.cur().axes[Axis::X].size.saturating_sub(offset);
+            row_widget = imgui.add(widget!().identity(&node.identity).fixed_x(offset as isize).fixed_width(remaining_width).height(AutoSize::Children).fixed_y(row.rel_y).fill(' ', imgui.palette.default).highlight_on_hover());
         });
-    });
-    with_parent!(imgui, header_widget, {
-        styled_write!(imgui.text, imgui.palette.table_header, "  name");
-        let l = imgui.text.close_line();
-        imgui.add(widget!().fixed_width(name_width).text(l));
-        styled_write!(imgui.text, imgui.palette.table_header, "value");
-        let l = imgui.text.close_line();
-        imgui.add(widget!().fixed_width(value_width).text(l));
-    });
 
-    let tree = &mut state.watch_tree;
-
-    if (name_width, value_width) != (tree.name_width, tree.value_width) {
-        tree.drop_line_wrap_cache();
-        (tree.name_width, tree.value_width) = (name_width, value_width);
-    }
-
-    let mut scroll_to_cursor = mem::take(&mut tree.scroll_to_cursor);
-    with_parent!(imgui, viewport_widget, {
-        scroll_to_cursor |= list_cursor_navigation_with_variable_row_height(&mut tree.cursor, tree.rows.len(), |i, _imgui| tree.rows[i].1, imgui);
-    });
-    // IRL we'd form cursor_path here using lasts frame's rows and tree.
-
-    for action in imgui.check_keys(&[KeyAction::CursorLeft, KeyAction::CursorRight, KeyAction::Enter, KeyAction::DeleteRow, KeyAction::DuplicateRow, KeyAction::Cancel]) {
-        if action == KeyAction::DuplicateRow {
-            tree.nodes.push(ValueTree::random_node(&mut tree.text, imgui));
-            tree.roots.push(tree.nodes.len() - 1);
-            tree.rows.clear();
-            continue;
-        }
-        let idx = match tree.rows.get(tree.cursor) {
-            None => continue,
-            Some(x) => x.0 };
-        let node = &mut tree.nodes[idx];
-        match action {
-            KeyAction::CursorLeft if tree.text_input.is_none() => {
-                node.expanded = false;
-            }
-            KeyAction::CursorRight if tree.text_input.is_none() => {
-                //asdqwe allow expanding unexpandable (for line wrapping)
-                node.expanded = node.expandable;
-            }
-            KeyAction::Enter => if node.depth == 0 {
-                if let Some((identity, input, _)) = &mut tree.text_input {
-                    if node.identity == *identity {
-                        styled_write!(tree.text, imgui.palette.default, "{}", input.text);
-                        node.name = tree.text.close_line();
-                        node.line_wrapped = None;
-                    }
-                    tree.text_input = None;
+        // Draw name and value, update text input if needed.
+        with_parent!(imgui, row_widget, {
+            if imgui.check_mouse(MouseActions::CLICK) {
+                if let Some(c) = &mut out_clicked {
+                    **c = true;
                 } else {
-                    tree.text_input = Some((node.identity, TextInput::with_text(tree.text.get_line_str(node.name).to_string()), 0));
+                    self.cursor_idx = row_idx;
+                    imgui.should_redraw = true;
                 }
+                self.scroll_to_cursor = true;
             }
-            KeyAction::Cancel => if tree.text_input.is_some() {
-                tree.text_input = None;
-            }
-            KeyAction::DeleteRow if tree.text_input.is_none() => if node.depth == 0 {
-                let i = tree.roots.iter().position(|ix| *ix == idx).unwrap();
-                tree.roots.remove(i);
-            }
-            _ => panic!("huh"),
-        }
-        tree.rows.clear();
-    }
 
-    if let Some((_, input, height)) = &mut tree.text_input {
-        with_parent!(imgui, text_input_widget, {
-            scroll_to_cursor |= input.update_and_render(imgui);
+            let name_width = imgui.cur().axes[Axis::X].size.saturating_sub(self.value_width + 1);
+            let flags = if row.expanded {WidgetFlags::LINE_WRAP} else {WidgetFlags::empty()};
+
+            // Add value first so that name text input can obstruct it if it grows wide.
+            let lines = imgui.text.import_lines(&self.tree.text, node.value..node.value+1);
+            imgui.add(widget!().fixed_width(self.value_width).fixed_x(name_width as isize + 1).height(AutoSize::Text).max_height(self.row_height_limit).flags(flags).text_lines(lines));
+
+            if self.text_input.as_ref().is_some_and(|(identity, _)| *identity == node.identity) {
+                let focused = imgui.check_focus();
+                with_parent!(imgui, imgui.add(widget!().identity(&"input").width(AutoSize::Children).min_width(name_width).max_width(name_width + self.value_width + 1).height(AutoSize::Children).max_height(self.row_height_limit)), {
+                    imgui.relative_focus(row_widget);
+                    if focused {
+                        let input = &mut self.text_input.as_mut().unwrap().1;
+                        self.scroll_to_cursor |= input.build(imgui);
+                        self.text_input_built = true;
+                    }
+                });
+            } else {
+                let lines = imgui.text.import_lines(&self.tree.text, node.name.clone());
+                assert!(lines.start <= lines.end);
+                assert!(lines.end <= imgui.text.num_lines());
+                imgui.add(widget!().fixed_width(name_width).height(AutoSize::Text).max_height(self.row_height_limit).flags(flags).text_lines(lines));
+            }
         });
-        let h = imgui.calculate_size(text_input_widget, 1);
-        if h != *height {
-            *height = h;
-            tree.rows.clear();
-        }
+
+        self.tree.rows[row_idx].widget = row_widget;
     }
 
-    tree.do_layout(imgui);
-
-    tree.cursor = tree.cursor.min(tree.rows.len().saturating_sub(1));
-    let scroll_to = if scroll_to_cursor && !tree.rows.is_empty() {
-        Some(tree.nodes[tree.rows[tree.cursor].0].subtree_y.clone())
-    } else {
-        None
-    };
-
-    if !tree.rows.is_empty() {
-        let w = imgui.get_mut(text_input_widget);
-        w.axes[1].rel_pos = tree.nodes[tree.rows[tree.cursor].0].subtree_y.start;
+    fn random_node(text: &mut StyledText, imgui: &mut IMGUI) -> (ValueTreeNode, String) {
+        let append_random_string = |out: &mut String| {
+            let n = ((random::<f64>() * 6.).exp() as usize).saturating_sub(1);
+            for _ in 0..n {
+                out.push((b'a' + random::<u8>()%26) as char);
+            }
+        };
+        let mut name_str = String::new();
+        append_random_string(&mut name_str);
+        append_random_string(&mut text.chars);
+        text.close_span(imgui.palette.default);
+        let value = text.close_line();
+        let name = Self::format_name(text, &name_str, imgui);
+        (ValueTreeNode {name, value, identity: random(), children: None, expandable: random::<u8>() < 200, depth: 0, parent: usize::MAX}, name_str)
     }
 
-    imgui.get_mut(movable_widget).axes[1].size = tree.content_height;
-    imgui.get_mut(content_widget).axes[1].size = tree.content_height;
-
-    let root_widget = imgui.cur_parent;
-    let visible_y = with_parent!(imgui, viewport_widget, {
-        scrolling_navigation(&mut tree.scroll, scroll_to, root_widget, scroll_bar, imgui)
-    });
-
-    with_parent!(imgui, content_widget, {
-        tree.render(visible_y, imgui);
-    });
+    fn format_name(text: &mut StyledText, name: &str, imgui: &mut IMGUI) -> Range<usize> {
+        styled_write!(text, imgui.palette.default, "{}", name);
+        let l = text.close_line();
+        text.split_by_newline_character(l, None)
+    }
 }
 
 fn build_open_function_dialog(imgui: &mut IMGUI, state: &mut State) {
@@ -3911,11 +4294,11 @@ fn build_open_function_dialog(imgui: &mut IMGUI, state: &mut State) {
         Some(x) => x,
         None => return };
     with_parent!(imgui, dialog, {
-        imgui.cur_mut().axes[1].flags.insert(AxisFlags::STACK);
+        imgui.cur_mut().axes[Axis::Y].flags.insert(AxisFlags::STACK);
 
         with_parent!(imgui, imgui.add(widget!().identity("search input").fixed_height(1)), {
             imgui.focus();
-            state.open_function_text.update_and_render(imgui);
+            state.open_function_text.build(imgui);
         });
 
         let start = imgui.text.close_line();
@@ -3924,7 +4307,7 @@ fn build_open_function_dialog(imgui: &mut IMGUI, state: &mut State) {
         imgui.add(widget!().height(AutoSize::Text).text_lines(start..end));
 
         let table_widget = imgui.add(widget!().identity("table").height(AutoSize::Remainder(1.0)));
-        imgui.layout_children(1);
+        imgui.layout_children(Axis::Y);
         with_parent!(imgui, table_widget, {
             imgui.multifocus();
             let mut table = Table::new(mem::take(&mut state.open_function_table_state), imgui, vec![Column::new("", AutoSize::Remainder(1.0))]);
@@ -3941,10 +4324,10 @@ fn build_open_function_dialog(imgui: &mut IMGUI, state: &mut State) {
 fn build_disassembly(imgui: &mut IMGUI, state: &mut State) {
     build_open_function_dialog(imgui, state);
 
-    imgui.cur_mut().axes[1].flags.insert(AxisFlags::STACK);
+    imgui.cur_mut().axes[Axis::Y].flags.insert(AxisFlags::STACK);
     let tabs_widget = imgui.add(widget!().fixed_height(1));
     let body_widget = imgui.add(widget!().height(AutoSize::Remainder(1.0)).hstack());
-    imgui.layout_children(1);
+    imgui.layout_children(Axis::Y);
 
     with_parent!(imgui, tabs_widget, {
         imgui.focus();
@@ -3971,7 +4354,7 @@ fn build_disassembly(imgui: &mut IMGUI, state: &mut State) {
         imgui.multifocus();
         h_viewport = imgui.add(widget!().width(AutoSize::Remainder(1.0)));
         scroll_bar = imgui.add(widget!().fixed_width(1));
-        imgui.layout_children(0);
+        imgui.layout_children(Axis::X);
     });
     with_parent!(imgui, h_viewport, {
         let h_content = imgui.add(widget!().identity(&(func, tab_idx)).fixed_width(widest_line).vstack());
@@ -3983,7 +4366,7 @@ fn build_disassembly(imgui: &mut IMGUI, state: &mut State) {
             });
 
             let v_viewport = imgui.add(widget!().height(AutoSize::Remainder(1.0)));
-            imgui.layout_children(1);
+            imgui.layout_children(Axis::Y);
 
             with_parent!(imgui, v_viewport, {
                 imgui.focus();
@@ -4046,8 +4429,8 @@ fn build_binaries(imgui: &mut IMGUI, state: &mut State) {
         table.text_cell(imgui);
         with_parent!(imgui, table.start_cell(imgui), {
             let w = imgui.cur_mut();
-            w.axes[1].flags.insert(AxisFlags::STACK);
-            w.axes[1].auto_size = AutoSize::Children;
+            w.axes[Axis::Y].flags.insert(AxisFlags::STACK);
+            w.axes[Axis::Y].auto_size = AutoSize::Children;
             with_parent!(imgui, imgui.add(widget!().height(AutoSize::Text).flags(WidgetFlags::TEXT_TRUNCATION_ALIGN_RIGHT)), {
                 styled_write!(imgui.text, imgui.palette.default, "{}", paths[i%paths.len()]);
                 imgui.set_text();
@@ -4194,7 +4577,7 @@ fn main() -> Result<()> {
         dialog: StyleAdjustment {add_fg: (10, 10, 10), add_bg: (20, 20, 20), ..D!()},
 
         text_input: Style {fg: Color::white(), ..D!()},
-        text_input_selected: Style {fg: Color::white(), bg: Color(30, 30, 150), ..D!()},
+        text_input_selected: Style {fg: Color::white(), bg: Color(30, 30, 200), ..D!()},
 
         tree_indent: Style {fg: Color::white().darker(), ..D!()},
     };
@@ -4280,5 +4663,3 @@ fn main() -> Result<()> {
 // Plan:
 //  * figure out how to do the "stack truncated" thing in stack window; just make it a normal selectable row, to allow tooltip for full error message?
 //  * disassembly inline level lines - not gonna be clickable?
-//  * watches (at least decide how it'll work with line wrapping and windowing)
-//  * multiline text edit in watches
