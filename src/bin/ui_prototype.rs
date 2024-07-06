@@ -339,50 +339,6 @@ macro_rules! styled_write {
     );
 }
 
-#[derive(Default)]
-pub struct Palette {
-    pub default: Style,
-    pub default_dim: Style,
-    pub error: Style,
-
-    pub running: Style,
-    pub suspended: Style,
-    pub function: Style,
-
-    // How to highlight things like selected table row or selected code line.
-    pub selected: StyleAdjustment,
-    // How to highlight clickable widgets on mouse hover.
-    pub hovered: StyleAdjustment,
-    // How to draw widgets with REDRAW_IF_VISIBLE flag, as a sort of loading indicator. Normally it should be visible very rarely and only for one frame.
-    pub placeholder_fill: Option<(char, Style)>,
-    // What to prepend/append when text is truncated on the left/right. E.g. '…'.
-    pub truncation_indicator: (/*left*/ String, /*right*/ String, Style),
-    // What to show at left and right ends of something horizontally scrollable. E.g.: '<', '>'
-    pub hscroll_indicator: (/*left*/ String, /*right*/ String, Style),
-    pub line_wrap_indicator: (/*start_of_line*/ String, /*end_of_line*/ String, Style),
-
-    pub table_header: Style,
-    pub striped_table: StyleAdjustment,
-
-    pub tab_title: Style,
-    pub tab_title_pinned: Style,
-    pub tab_separator: (String, Style),
-
-    // fg - left side, bg - right side.
-    pub progress_bar: Style,
-
-    pub scroll_bar_background: Style,
-    pub scroll_bar_slider: Style,
-
-    pub tooltip: StyleAdjustment,
-    pub dialog: StyleAdjustment,
-
-    pub text_input: Style,
-    pub text_input_selected: Style,
-
-    pub tree_indent: Style,
-}
-
 // ====================================================== terminal.rs ===================================================================
 
 
@@ -2316,6 +2272,50 @@ impl RemainderFractionHelper {
 
 // ======================================================= settings.rs =========================================================================
 
+
+#[derive(Default)]
+pub struct Palette {
+    pub default: Style,
+    pub default_dim: Style,
+    pub error: Style,
+
+    pub running: Style,
+    pub suspended: Style,
+    pub function: Style,
+
+    // How to highlight things like selected table row or selected code line.
+    pub selected: StyleAdjustment,
+    // How to highlight clickable widgets on mouse hover.
+    pub hovered: StyleAdjustment,
+    // How to draw widgets with REDRAW_IF_VISIBLE flag, as a sort of loading indicator. Normally it should be visible very rarely and only for one frame.
+    pub placeholder_fill: Option<(char, Style)>,
+    // What to prepend/append when text is truncated on the left/right. E.g. '…'.
+    pub truncation_indicator: (/*left*/ String, /*right*/ String, Style),
+    // What to show at left and right ends of something horizontally scrollable. E.g.: '<', '>'
+    pub hscroll_indicator: (/*left*/ String, /*right*/ String, Style),
+    pub line_wrap_indicator: (/*start_of_line*/ String, /*end_of_line*/ String, Style),
+
+    pub table_header: Style,
+    pub striped_table: StyleAdjustment,
+
+    pub tab_title: Style,
+    pub tab_title_pinned: Style,
+    pub tab_separator: (String, Style),
+
+    // fg - left side, bg - right side.
+    pub progress_bar: Style,
+
+    pub scroll_bar_background: Style,
+    pub scroll_bar_slider: Style,
+
+    pub tooltip: StyleAdjustment,
+    pub dialog: StyleAdjustment,
+
+    pub text_input: Style,
+    pub text_input_selected: Style,
+
+    pub tree_indent: Style,
+}
 
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Clone, Copy)]
 pub enum KeyAction {
