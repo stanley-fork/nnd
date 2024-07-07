@@ -1,6 +1,5 @@
-use crate::{*, symbols::*, error::*, symbols_registry::*, util::*, procfs::*, settings::*};
+use crate::{*, symbols::*, error::*, symbols_registry::*, util::*, procfs::*, settings::*, common_ui::*};
 use std::{fmt::Write, ops::Range};
-use tui::{text::{Span, Spans, Text}, style::{Style, Color, Modifier}};
 use iced_x86::*;
 
 pub const MAX_X86_INSTRUCTION_BYTES: usize = 15;
@@ -61,7 +60,7 @@ pub enum DisassemblyLineKind {
 }
 
 impl Disassembly {
-    pub fn new() -> Self { Self {text: StyledText::new(), lines: Vec::new(), error: None, widest_line: 0, symbols_shard: None} }
+    pub fn new() -> Self { Self {text: StyledText::default(), lines: Vec::new(), error: None, widest_line: 0, symbols_shard: None} }
     
     pub fn addr_to_line(&self, addr: usize) -> Option<usize> {
         let idx = self.lines.partition_point(|l| l.addr <= addr);
@@ -96,7 +95,7 @@ impl Disassembly {
     
     pub fn finish(mut self) -> Self {
         assert_eq!(self.text.num_lines(), self.lines.len());
-        self.widest_line = self.text.widest_line();
+        self.widest_line = self.text.widest_line(0..self.text.num_lines());
         self
     }
 }
@@ -243,11 +242,11 @@ pub fn disassemble_function(function_idx: usize, mut static_addr_ranges: Vec<Ran
                     styled_write!(res.text, palette.default_dim, "{: <1$}", "", prelude_width);
                     let indent_span_idx = res.text.spans.len() - *res.text.lines.last().unwrap();
                     styled_write!(res.text, palette.default_dim, "{}", indent);
-                    styled_write!(res.text, palette.location_filename_dim, "{}", name);
+                    styled_write!(res.text, palette.disas_filename, "{}", name);
                     if line.line() != 0 {
-                        styled_write!(res.text, palette.location_line_number, ":{}", line.line());
+                        styled_write!(res.text, palette.line_number, ":{}", line.line());
                         if line.column() != 0 {
-                            styled_write!(res.text, palette.location_column_number, ":{}", line.column());
+                            styled_write!(res.text, palette.column_number, ":{}", line.column());
                         }
                     }
                     res.text.close_line();

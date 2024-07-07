@@ -1,7 +1,6 @@
-use crate::{util::*, arena::*, log::*, *, settings::*};
+use crate::{util::*, arena::*, log::*, *, settings::*, common_ui::*};
 use std::{hint, collections::{HashMap, hash_map::{DefaultHasher, Entry}}, hash::{Hash, Hasher}, sync::{Mutex, atomic::{AtomicUsize, Ordering}}, ptr, mem, result, io::Write, slice, ops::Range, fmt, fmt::Write as fmtWrite};
 use bitflags::*;
-use tui::style::{Style, Color, Modifier};
 use gimli::DebugInfoOffset;
 
 // There are usually lots of types (millions or tens of millions) in debug symbols, so we have to use somewhat efficient data structures for them
@@ -398,7 +397,7 @@ impl fmt::Debug for DumpType {
 
 pub fn print_type_name(t: *const TypeInfo, out: &mut StyledText, palette: &Palette, recursion_depth: usize) {
     if recursion_depth > 100 {
-        styled_write!(out, palette.value_warning, "…");
+        styled_write!(out, palette.truncation_indicator.2, "{}", palette.truncation_indicator.1);
         return;
     }
     unsafe {
@@ -413,9 +412,9 @@ pub fn print_type_name(t: *const TypeInfo, out: &mut StyledText, palette: &Palet
                 // Print length before name (instead of e.g. Rust syntax [type; len]) because name may be long and cut off.
                 styled_write!(out, palette.value_misc, "[");
                 if a.flags.contains(ArrayFlags::LEN_KNOWN) {
-                    styled_write!(out, palette.value_misc, "{}", a.len);
+                    styled_write!(out, palette.value, "{}", a.len);
                 } else {
-                    styled_write!(out, palette.value_misc_dim, "<length unknown>");
+                    styled_write!(out, palette.value_misc, "<length unknown>");
                 }
                 styled_write!(out, palette.value_misc, "] ");
                 print_type_name((*a).type_, out, palette, recursion_depth + 1);

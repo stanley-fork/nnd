@@ -36,3 +36,6 @@ pub mod interp;
 pub mod pretty;
 pub mod persistent;
 pub mod doc;
+pub mod common_ui;
+pub mod imgui;
+pub mod terminal;

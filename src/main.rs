@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
 #![allow(unused_imports)]
-use nnd::{*, elf::*, error::*, debugger::*, util::*, ui::*, log::*, process_info::*, symbols::*, symbols_registry::*, procfs::*, unwind::*, range_index::*, settings::*, context::*, executor::*, persistent::*, doc::*};
+use nnd::{*, elf::*, error::*, debugger::*, util::*, ui::*, log::*, process_info::*, symbols::*, symbols_registry::*, procfs::*, unwind::*, range_index::*, settings::*, context::*, executor::*, persistent::*, doc::*, terminal::*, common_ui::*};
 use std::{rc::Rc, mem, fs, os::fd::{FromRawFd}, io::Read, io, io::Write, panic, process, thread, thread::ThreadId, cell::UnsafeCell, ptr, pin::Pin, sync::Arc, str::FromStr};
 use libc::{self, STDIN_FILENO, pid_t};
 
@@ -84,6 +84,16 @@ fn main() {
             settings.stderr_file = Some(v);
         } else if let Some(_) = parse_arg(&mut args, "--continue", "-c", true) {
             settings.stop_on_initial_exec = false;
+        } else if let Some(m) = parse_arg(&mut args, "--mouse", "-m", false) { // TODO: document
+            settings.mouse_mode = match &m.to_lowercase()[..] {
+                "full" => MouseMode::Full,
+                "no-hover" => MouseMode::NoHover,
+                "disabled" | "no" | "none" => MouseMode::Disabled,
+                _ => {
+                    eprintln!("unrecognized --mouse mode: '{}'; expected one of: full, no-hover, disabled", m);
+                    process::exit(1);
+                }
+            };
         } else if print_help_chapter(&args[0], &all_args[0]) {
             process::exit(0);
         } else {
@@ -154,7 +164,7 @@ fn main() {
             // This is not fully reliable because other threads still execute while this hook is running,
             // so the main thread may hide cursor or output a rendered frame after we restored the terminal.
             // To minimize this, we put this near the end of the hook, importantly after the slow default hook.
-            restore_terminal_mode();
+            restore_terminal();
 
             // Print something to the console, otherwise it'll be left confusingly empty, as if the debugger just quit silently.
             if let &Some(fd) = &original_stderr_fd {
@@ -218,11 +228,10 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, command_line: Option<Vec<S
     }
 
     let frame_ns = (1e9 / context.settings.fps) as usize;
-    let loading_frame_ns = (1e9 / context.settings.loading_fps) as usize;
     let render_timer = TimerFD::new();
     // for fixed fps, do this here: render_timer.set(1, frame_ns), and remove other render_timer.set(...) calls
 
-    // Timer for refreshing resource stats and saving state.
+    // Timer for refreshing resource stats and saving state. TODO: Currently progress bar updates also rely on this. Use animation system instead (after implementing it).
     let periodic_timer = TimerFD::new();
     periodic_timer.set(1, (context.settings.periodic_timer_seconds * 1e9) as usize);
 
@@ -230,8 +239,8 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, command_line: Option<Vec<S
     epoll.add(render_timer.fd, libc::EPOLLIN, render_timer.fd as u64)?;
     epoll.add(periodic_timer.fd, libc::EPOLLIN, periodic_timer.fd as u64)?;
 
-    set_terminal_to_raw_mode_etc();
-    let terminal_restorer = TerminalRestorer;
+    let _restorer = TerminalRestorer;
+    configure_terminal(context.settings.mouse_mode)?;
 
     let mut debugger: Pin<Box<Debugger>>;
     if let &Some(pid) = &attach_pid {
@@ -243,7 +252,7 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, command_line: Option<Vec<S
     }
     defer! { unsafe { *DEBUGGER_TO_DROP_ON_PANIC.get() = None; } }
 
-    let mut ui = UI::new()?;
+    let mut ui = UI::new();
 
     match PersistentState::load_state(&mut debugger, &mut ui) {
         Ok(()) => (),
@@ -280,14 +289,16 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, command_line: Option<Vec<S
                     debugger.drop_caches()?;
                     ui.drop_caches();
                 }
-                debugger.log.prof.iteration_debugger(prof.finish());
+                //asdqwe debugger.log.prof.iteration_debugger(prof.finish());
             } else if fd == signal_pipes_read[libc::SIGWINCH as usize] {
                 drain_signal_pipe(fd);
             } else if fd == misc_wakeup_fd.fd {
                 misc_wakeup_fd.read();
             } else if fd == STDIN_FILENO {
-                ui.buffer_input()?;
-                if !pending_render {
+                let significant = ui.buffer_input()?;
+                if !significant {
+                    schedule_render = false;
+                } else if !pending_render {
                     render_now = true;
                 }
             } else if fd == render_timer.fd {
@@ -305,12 +316,12 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, command_line: Option<Vec<S
                     debugger.drop_caches()?;
                     ui.drop_caches();
                 }
-                debugger.log.prof.iteration_other(prof.finish());
+                //asdqwe debugger.log.prof.iteration_other(prof.finish());
             } else if fd == periodic_timer.fd {
                 periodic_timer.read();
                 debugger.refresh_resource_stats();
                 PersistentState::try_to_save_state_if_changed(&mut debugger, &mut ui);
-                debugger.log.prof.iteration_other(prof.finish());
+                //asdqwe debugger.log.prof.iteration_other(prof.finish());
             } else {
                 return err!(Internal, "epoll returned unexpected data: {}", fd);
             }
@@ -319,25 +330,22 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, command_line: Option<Vec<S
         if render_now {
             assert!(!pending_render);
             let prof = TscScope::new();
-            schedule_render = debugger.log.prof.iteration_render_start();
+            //asdqwe schedule_render = debugger.log.prof.iteration_render_start();
 
-            let res = ui.update_and_render(&mut debugger)?;
+            ui.update_and_render(&mut debugger)?;
 
-            if res.quit {
+            if ui.should_quit {
                 // Clean exit. Save state and call destructors. The only important destructor is TerminalRestorer.
                 PersistentState::try_to_save_state_if_changed(&mut debugger, &mut ui);
                 return Ok(());
             }
 
-            schedule_render |= res.redraw || res.drop_caches;
-            if res.drop_caches {
+            schedule_render |= ui.imgui.should_redraw || ui.should_drop_caches;
+            if ui.should_drop_caches {
                 debugger.drop_caches()?;
                 ui.drop_caches();
             }
-            if !schedule_render && res.loading {
-                render_timer.set(loading_frame_ns, 0);
-            }
-            debugger.log.prof.iteration_render_end(prof.finish());
+            //asdqwe debugger.log.prof.iteration_render_end(prof.finish());
         }
 
         if schedule_render && !pending_render {

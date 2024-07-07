@@ -1,6 +1,6 @@
 #![allow(unused_imports)]
 extern crate nnd;
-use nnd::{*, error::*, util::*};
+use nnd::{*, error::*};
 use std::{time::{Duration, Instant, SystemTime}, thread, mem, cell::UnsafeCell, sync::atomic::{AtomicBool, Ordering}, io, io::{Write, Read}, str, os::fd::AsRawFd, ops::Range, collections::{HashMap, HashSet}, panic, process, fmt::Write as fmtWrite, result, hash::Hash};
 use bitflags::*;
 use unicode_segmentation::UnicodeSegmentation;
@@ -138,6 +138,12 @@ pub fn str_suffix_with_width(s: &str, width: usize) -> (/*start_byte_idx*/ usize
     (0, w)
 }
 
+// Text. Consists of lines. Each line consists of spans. Each span has one Style.
+// We usually use this struct as a sort of arena that contains many unrelated pieces of text, each piece identified by range of line numbers (Range<usize>).
+// There are num_lines() "closed" lines, and an "unclosed" line at the end (which may be empty).
+// The unclosed line is used only as a staging area for building a new line; by convention, it should be closed before the line is used, and before anyone else tries to append other lines to the StyledText.
+// Use styled_write!(text, style, "...", ...) to add spans to the unclosed line. Or append to `chars` and call close_span().
+// Use close_line() to close the unclosed line.
 pub struct StyledText {
     // Each array describes ranges of indiced in the next array. This is to have just 3 memory allocations instead of lots of tiny allocations in Vec<Vec<String>>.
     // A span can't straddle lines. There can be an "unclosed" last line, and "unclosed" last span; by convention, consumers (e.g. Widget) usually expect the relevant spans and lines to be closed.
@@ -188,8 +194,8 @@ impl StyledText {
         self.spans[self.lines[i]].0..self.spans[self.lines[i+1]].0
     }
 
-    pub fn widest_line(&self) -> usize {
-        (0..self.num_lines()).map(|i| str_width(self.get_line_str(i))).max().unwrap_or(0)
+    pub fn widest_line(&self, lines: Range<usize>) -> usize {
+        lines.map(|i| str_width(self.get_line_str(i))).max().unwrap_or(0)
     }
 
     pub fn clear(&mut self) {
@@ -1297,7 +1303,6 @@ pub struct IMGUI {
     // It's recommended to assign these on startup.
 
     pub palette: Palette,
-    pub mouse_mode: MouseMode,
     pub key_binds: KeyBinds,
 
     // Current frame that's being built.
@@ -1826,7 +1831,7 @@ impl IMGUI {
         let size = match w.axes[ax].auto_size {
             AutoSize::Fixed(s) => s,
             AutoSize::Text if ax == Axis::X && !w.draw_text.as_ref().is_some_and(|r| !r.is_empty()) => panic!("widget on line {} has width is AutoSize::Text, but no lines in draw_text", w.source_line),
-            AutoSize::Text if ax == Axis::X => w.draw_text.clone().unwrap().map(|j| str_width(text.get_line_str(j))).max().unwrap_or(0), // text width
+            AutoSize::Text if ax == Axis::X => text.widest_line(w.draw_text.clone().unwrap()), // text width
             AutoSize::Text if !w.flags.contains(WidgetFlags::LINE_WRAP) => w.draw_text.as_ref().unwrap().len(), // height without line wrap
             AutoSize::Text if w.axes[0].flags.contains(AxisFlags::SIZE_KNOWN) => Self::get_line_wrapped_text(w, text, palette).len(), // height with line wrap
             _ => return false,
@@ -1981,7 +1986,7 @@ impl IMGUI {
                 let content_width = if let Some(idx) = w.children.last() {
                     (self.tree[idx.0].axes[Axis::X].rel_pos + self.tree[idx.0].axes[Axis::X].size as isize).max(0)
                 } else if let Some(r) = w.draw_text.clone() {
-                    r.map(|i| str_width(self.text.get_line_str(i))).max().unwrap_or(0) as isize
+                    self.text.widest_line(r) as isize
                 } else {
                     0
                 };
@@ -4469,7 +4474,7 @@ fn build_breakpoints(imgui: &mut IMGUI) {
     imgui.cur_mut().draw_text = Some(start..end);
 }
 
-fn build_stack(imgui: &mut IMGUI) {
+fn build_stack(_imgui: &mut IMGUI) {
     
 }
 
@@ -4544,7 +4549,6 @@ fn main() -> Result<()> {
     let mut write_secs = 0f64;
     
     let mut imgui = IMGUI::default();
-    imgui.mouse_mode = MouseMode::Full;
     imgui.palette = Palette {
         default: Style {fg: Color::white(), ..D!()},
         default_dim: Style {fg: Color::white().darker(), ..D!()},

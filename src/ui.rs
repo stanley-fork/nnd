@@ -1,28 +1,20 @@
-use crate::{*, debugger::*, error::*, log::*, symbols::*, symbols_registry::*, util::*, registers::*, procfs::*, unwind::*, disassembly::*, pool::*, layout::*, settings::*, context::*, types::*, expr::*, widgets::*, search::*, arena::*, interp::*};
-use termion::screen::{ToAlternateScreen, ToMainScreen, AlternateScreen, IntoAlternateScreen};
-use termion::input::{self, TermRead};
-use termion::event::{Event, Key};
+use crate::{*, debugger::*, error::*, log::*, symbols::*, symbols_registry::*, util::*, registers::*, procfs::*, unwind::*, disassembly::*, pool::*, layout::*, settings::*, context::*, types::*, expr::*, widgets::*, search::*, arena::*, interp::*, imgui::*, common_ui::*, terminal::*};
 use std::{io::{self, Write, BufRead, BufReader, Read}, mem::{self, take}, collections::{HashSet, HashMap, hash_map::Entry}, os::fd::AsRawFd, path, path::{Path, PathBuf}, fs::File, fmt::Write as FmtWrite, borrow::Cow, ops::Range, str, os::unix::ffi::OsStrExt, sync::{Arc}};
-use tui::{self, backend::TermionBackend, Terminal, widgets::{Widget, Block, Borders, List, ListItem, Table, TableState, Row, Cell, Paragraph, Wrap, Tabs, Clear}, layout::{self, Constraint, Direction, Rect, Alignment, Margin}, style::{Style, Color, Modifier}, text::{Span, Spans, Text}};
 use libc::{self, pid_t};
 
 pub struct UI {
-    terminal: Terminal<Backend>,
-    input_events: input::Events<NonblockingRead>,
+    pub terminal: Terminal,
+    pub imgui: IMGUI,
+    input: InputReader,
     state: UIState,
     layout: Layout,
-    keys: Vec<Key>,
+
+    // These are assigned by build(), to be checked and acted on by the caller.
+    pub should_quit: bool,
+    pub should_drop_caches: bool,
 }
 
-#[derive(Debug)]
-pub struct UIUpdateResult {
-    pub quit: bool,
-    pub drop_caches: bool,
-    pub redraw: bool,
-    pub loading: bool, // redraw periodically
-}
-impl Default for UIUpdateResult { fn default() -> Self { Self {quit: false, drop_caches: false, redraw: false, loading: false} } }
-
+#[derive(Default)]
 pub struct UIState {
     last_error: String, // reset on next key press
     hints: [StyledText; 2], // 2 columns
@@ -42,19 +34,11 @@ pub struct UIState {
     // Communication between windows, for interactions like:
     //  * when switching stack frames (for any of a number of reasons, including the above), scroll to the corresponding source file+line and disassembly instruction,
     //  * when selecting a breakpoint in the breakpoints window, scroll to the corresponding line in source and instruction and disassembly.
-    // Currently this type of information only flows in one direction, with no circular dependencies: breakpoints -> threads -> stack -> (source, disassembly).
-    // But that might change in future, e.g. maybe source and disassembly window will be able to both scroll each other when requested.
     // The only_if_error_tab solves the following; typically the should_scroll_* are first requested before symbols are loaded; that makes source and disassembly windows initially show errors;
     // when symbols are loaded, we want to try again and stop showing errors; but maybe the user already opened some non-error file and is looking at it - then we shouldn't forcefully switch to current file;
     // so we set this flag, which tells the windows to scroll only if the error tab is selected.
     should_scroll_source: Option<(Option<SourceScrollTarget>, /*only_if_on_error_tab*/ bool)>,
     should_scroll_disassembly: Option<(Result<DisassemblyScrollTarget>, /*only_if_on_error_tab*/ bool)>,
-
-    // If window A makes a change that may be visible in window B (e.g. source window adds a breakpoint, which will appear in breakpoints window),
-    // and A's WindowType > B's WindowType, then A should set this flag to true to trigger another frame to be rendered immediately after this one.
-    should_redraw: bool,
-    // If there's a progress bar on screen, redraw periodically. This is separate from being notified when loading completes - that happens without delay through event fd.
-    loading: bool,
 }
 
 struct SourceScrollTarget {
@@ -71,25 +55,12 @@ struct DisassemblyScrollTarget {
 }
 
 pub trait WindowContent {
-    fn update_and_render(&mut self, ui: &mut UIState, debugger: &mut Debugger, keys: Vec<Key>, f: Option<&mut Frame>, area: Rect);
+    fn build(&mut self, ui: &mut UIState, debugger: &mut Debugger, imgui: &mut IMGUI);
 
     // Called after some symbols finished loading, or if the user requested a redraw.
     fn drop_caches(&mut self) {}
 
-    fn get_hints(&self, hints: &mut StyledText) {}
-
-    // We have two cases of "modal" interaction:
-    //  * Text input inside a window, e.g. editing a watch expression.
-    //  * Modal dialog, e.g. opening a file. Rendered on top of all windows, but it still "belongs" to a window (e.g. open file dialog belongs to the source code window).
-    // At most one modal interaction can be active at a time. The interaction gets to process keyboard inputs before any windows or global hotkeys (in particular, for text input vs single-key hotkeys).
-    // Only the active window can have a modal interaction; if the window becomes inactive, the interaction is cancelled.
-
-    // Called for active window before processing input or updating any other windows.
-    fn update_modal(&mut self, ui: &mut UIState, debugger: &mut Debugger, keys: &mut Vec<Key>) {}
-    // Called when window ceases to be active.
-    fn cancel_modal(&mut self, ui: &mut UIState, debugger: &mut Debugger) {}
-    // Called for active window after rendering all windows. May call f.set_cursor() to show the cursor. It's also ok to call set_cursor() from modal window's update_and_render(), if that's more convenient.
-    fn render_modal(&mut self, ui: &mut UIState, debugger: &mut Debugger, f: &mut Frame, window_area: Rect, screen_area: Rect) {}
+    fn get_hints(&self, hints: &mut StyledText, imgui: &mut IMGUI) {}
 
     fn has_persistent_state(&self) -> bool {false}
     fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {panic!("unreachable")}
@@ -119,17 +90,12 @@ pub enum WindowType {
 }
 
 impl UI {
-    pub fn new() -> Result<Self> {
-        let stdout = io::stdout();
-        let backend = TermionBackend::new(stdout);
-        let terminal = Terminal::new(backend)?;
-
-        let nonblocking_stdin = NonblockingRead {fd: io::stdin().as_raw_fd()};
-        let input_events = nonblocking_stdin.events();
-
+    pub fn new() -> Self {
         let layout = Self::default_layout();
+        let imgui = IMGUI::default();
+        // TODO: Load keys and colors from config file(s), do hot-reloading (for experimenting with colors quickly).
 
-        Ok(UI {terminal, input_events, layout, keys: Vec::new(), state: UIState {last_error: String::new(), hints: [StyledText::new(), StyledText::new()], profiler_enabled: false, selected_thread: 0, selected_addr: None, binaries: Vec::new(), stack: StackTrace::error(error!(Loading, "")), selected_frame: 0, selected_subframe: 0, should_scroll_source: None, should_scroll_disassembly: None, should_redraw: false, loading: false}})
+        Self {terminal: Terminal::new(), input: InputReader::new(), layout, imgui, state: UIState::default(), should_drop_caches: false, should_quit: false}
     }
 
     pub fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {
@@ -178,80 +144,93 @@ impl UI {
         // Other windows we could add: terminal, memory, detached watch.
 
         let mut layout = Layout::new();
-        let cols = layout.split(layout.root, Direction::Horizontal, vec![0.3, 0.75]);
+        let cols = layout.split(layout.root, Axis::X, vec![0.3, 0.75]);
 
-        let rows = layout.split(cols[0], Direction::Vertical, vec![0.3, 0.4]);
-        layout.new_window(Some(rows[0]), WindowType::Other, true, "cheat sheet".to_string(), Box::new(HintsWindow::default()));
-        layout.rigidify(rows[0], 8);
-        layout.new_window(Some(rows[1]), WindowType::Status, true, "status".to_string(), Box::new(StatusWindow::default()));
-        layout.rigidify(rows[1], 7);
-        layout.new_window(Some(rows[2]), WindowType::Watches, true, "locals".to_string(), Box::new(WatchesWindow::new(true)));
-        layout.new_window(Some(rows[2]), WindowType::Watches, true, "watches".to_string(), Box::new(WatchesWindow::new(false)));
+        let rows = layout.split(cols[0], Axis::Y, vec![0.3, 0.4]);
+        let hints_window = layout.new_window(Some(rows[0]), WindowType::Other, true, "cheat sheet".to_string(), Box::new(HintsWindow::default()));
+        layout.set_fixed_size(hints_window, Axis::Y, 8);
+        let status_window = layout.new_window(Some(rows[1]), WindowType::Status, true, "status".to_string(), Box::new(StatusWindow::default()));
+        layout.set_fixed_size(status_window, Axis::Y, 7);
+        let mut w = WatchesWindow::default();
+        w.is_locals_window = true;
+        let locals_window = layout.new_window(Some(rows[2]), WindowType::Watches, true, "locals".to_string(), Box::new(w));
+        let watches_window = layout.new_window(Some(rows[2]), WindowType::Watches, true, "watches".to_string(), Box::new(WatchesWindow::default()));
         layout.new_window(Some(rows[2]), WindowType::Watches, true, "registers".to_string(), Box::new(RegistersWindow::default()));
         layout.new_window(Some(rows[2]), WindowType::Locations, true, "locations".to_string(), Box::new(LocationsWindow::default()));
-        layout.set_hotkey_number(rows[2], 1);
 
-        let rows = layout.split(cols[1], Direction::Vertical, vec![0.4]);
-        layout.new_window(Some(rows[0]), WindowType::Disassembly, true, "disassembly".to_string(), Box::new(DisassemblyWindow::default()));
-        layout.set_hotkey_number(rows[0], 2);
-        layout.new_window(Some(rows[1]), WindowType::Code, true, "code".to_string(), Box::new(CodeWindow::default()));
-        layout.set_hotkey_number(rows[1], 3);
+        let rows = layout.split(cols[1], Axis::Y, vec![0.4]);
+        let disassembly_window = layout.new_window(Some(rows[0]), WindowType::Disassembly, true, "disassembly".to_string(), Box::new(DisassemblyWindow::default()));
+        let code_window = layout.new_window(Some(rows[1]), WindowType::Code, true, "code".to_string(), Box::new(CodeWindow::default()));
 
-        let rows = layout.split(cols[2], Direction::Vertical, vec![0.25, 0.75]);
+        let rows = layout.split(cols[2], Axis::Y, vec![0.25, 0.75]);
         layout.new_window(Some(rows[0]), WindowType::Binaries, true, "binaries".to_string(), Box::new(BinariesWindow::default()));
-        layout.new_window(Some(rows[0]), WindowType::Breakpoints, true, "breakpoints".to_string(), Box::new(BreakpointsWindow::default()));
-        layout.set_hotkey_number(rows[0], 4);
-        layout.new_window(Some(rows[1]), WindowType::Stack, true, "stack".to_string(), Box::new(StackWindow::default()));
-        layout.set_hotkey_number(rows[1], 5);
+        let breakpoints_window = layout.new_window(Some(rows[0]), WindowType::Breakpoints, true, "breakpoints".to_string(), Box::new(BreakpointsWindow::default()));
+        let stack_window = layout.new_window(Some(rows[1]), WindowType::Stack, true, "stack".to_string(), Box::new(StackWindow::default()));
         let threads_window = layout.new_window(Some(rows[2]), WindowType::Threads, true, "threads".to_string(), Box::new(ThreadsWindow::default()));
-        layout.set_hotkey_number(rows[2], 6);
+
+        layout.set_hotkey_number(locals_window, 0);
+        layout.set_hotkey_number(watches_window, 1);
+        layout.set_hotkey_number(disassembly_window, 2);
+        layout.set_hotkey_number(code_window, 3);
+        layout.set_hotkey_number(breakpoints_window, 4);
+        layout.set_hotkey_number(stack_window, 5);
+        layout.set_hotkey_number(threads_window, 6);
 
         layout.active_window = Some(threads_window);
 
         layout
     }
 
-    pub fn buffer_input(&mut self) -> Result<()> {
-        while let Some(event) = self.input_events.next() {
-            let event = match event {
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) => return Err(Error::from_io_error(e, "stdin read failed".to_string())),
-                Ok(e) => e,
-            };
-            match event {
-                Event::Key(key) => self.keys.push(key),
-                Event::Mouse(_) => (),
-                Event::Unsupported(_) => (),
+    pub fn buffer_input(&mut self) -> Result<bool> {
+        let mut evs: Vec<Event> = Vec::new();
+        self.input.read(&mut evs)?;
+
+        let mut significant = false;
+        for e in &evs {
+            match e {
+                Event::Key(_) => significant = true,
+                Event::Mouse(m) if m.event == MouseEvent::Press => significant = true,
+                _ => (),
             }
         }
+        if significant {
+            self.state.last_error = String::new();
+        }
+
+        Ok(self.imgui.buffer_input(&evs))
+    }
+
+    pub fn update_and_render(&mut self, debugger: &mut Debugger) -> Result<()> {
+        let mut buffer = self.terminal.start_frame(self.imgui.palette.default)?;
+        self.imgui.start_build(buffer.width, buffer.height);
+
+        self.build(debugger)?;
+
+        if self.should_quit {
+            return Ok(());
+        }
+
+        self.imgui.end_build(&mut buffer);
+
+        let commands = self.terminal.prepare_command_buffer(&buffer, self.imgui.should_show_cursor.clone());
+        self.terminal.present(buffer, commands)?;
         Ok(())
     }
 
-    pub fn update_and_render(&mut self, debugger: &mut Debugger) -> Result<UIUpdateResult> {
-        let mut res = UIUpdateResult::default();
-        let mut keys = mem::take(&mut self.keys);
-        if !keys.is_empty() {
-            self.state.last_error = String::new();
-        }
-        /* this sounded like a good idea, but it breaks copy-pasting into the terminal
-        if keys.len() > 100 {
-            self.state.last_error = format!("dropping {} inputs", keys.len());
-            eprintln!("warning: dropping {} inputs", keys.len());
-            keys.clear();
-        }*/
+    fn build(&mut self, debugger: &mut Debugger) -> Result<()> {
+        self.should_drop_caches = false;
 
-        let active_window_id = self.layout.active_window.clone();
-        if let &Some(id) = &active_window_id {
-            let w = self.layout.windows.get_mut(id);
-            w.content.update_modal(&mut self.state, debugger, &mut keys);
-        }
+        let w = self.imgui.get_mut(self.imgui.content_root);
+        w.flags.insert(WidgetFlags::CAPTURE_ALL_KEYS);
+        let keys = w.keys.clone();
 
-        let mut remaining_keys: Vec<Key> = Vec::new();
-        let mut additional_keys_for_window: HashMap<WindowType, Vec<Key>> = HashMap::new();
-        let mut deferred_step_keys: Vec<KeyAction> = Vec::new();
-        for key in keys {
-            match debugger.context.settings.keys.map.get(&key) {
-                Some(KeyAction::Quit) => return Ok(UIUpdateResult {quit: true, ..Default::default()}),
+        // Handle some of the global hotkeys. Windows may also handle their global hotkeys by attaching them to the content_root widget, e.g. threads window handling global hotkeys for switching threads.
+        for key in &keys {
+            match self.imgui.key_binds.key_to_action.get(key) {
+                Some(KeyAction::Quit) => {
+                    self.should_quit = true;
+                    return Ok(());
+                }
                 Some(KeyAction::Run) => {
                     let r = debugger.start_child();
                     report_result(&mut self.state, &r);
@@ -268,133 +247,97 @@ impl UI {
                     let r = debugger.murder();
                     report_result(&mut self.state, &r);
                 }
-                Some(x) if [KeyAction::StepIntoLine, KeyAction::StepIntoInstruction, KeyAction::StepOverLine, KeyAction::StepOverColumn, KeyAction::StepOverInstruction, KeyAction::StepOut, KeyAction::StepOutNoInline].contains(x) => {
-                    // Initiate step later, after StackWindow updates selected_subframe.
-                    // Otherwise rapid repeated step-over can effectively step-into instead of -over because selected_subframe is 0 and not assigned yet.
-                    // This is kind of a hack, maybe there's a better way to think about input handling in general (separate update from render again?),
-                    // but this is working fine for now.
-                    deferred_step_keys.push(*x);
-                }
 
                 Some(KeyAction::DropCaches) => {
-                    self.terminal.clear()?;
-                    res.drop_caches = true;
+                    self.terminal.clear()?; // do this only on hotkey, not when drop_caches is initiated by e.g. symbols loading
+                    self.should_drop_caches = true;
                 }
 
-                Some(KeyAction::WindowLeft) => self.layout.switch_to_adjacent_window(-1, 0),
-                Some(KeyAction::WindowUp) => self.layout.switch_to_adjacent_window(0, -1),
-                Some(KeyAction::WindowDown) => self.layout.switch_to_adjacent_window(0, 1),
-                Some(KeyAction::WindowRight) => self.layout.switch_to_adjacent_window(1, 0),
-                Some(KeyAction::Window(idx)) => self.layout.switch_to_window_with_hotkey_number(*idx),
+                //asdqwe move these to Layout
+                //Some(KeyAction::WindowLeft) => self.layout.switch_to_adjacent_window(-1, 0),
+                //Some(KeyAction::WindowUp) => self.layout.switch_to_adjacent_window(0, -1),
+                //Some(KeyAction::WindowDown) => self.layout.switch_to_adjacent_window(0, 1),
+                //Some(KeyAction::WindowRight) => self.layout.switch_to_adjacent_window(1, 0),
+                //Some(KeyAction::Window(idx)) => self.layout.switch_to_window_with_hotkey_number(*idx),
+                //Some(KeyAction::NextTab) => self.layout.switch_tab_in_active_window(1),
+                //Some(KeyAction::PreviousTab) => self.layout.switch_tab_in_active_window(-1),
 
-                Some(KeyAction::NextTab) => self.layout.switch_tab_in_active_window(1),
-                Some(KeyAction::PreviousTab) => self.layout.switch_tab_in_active_window(-1),
-
-                Some(KeyAction::PreviousStackFrame) => if let Some(k) = debugger.context.settings.keys.find(KeyAction::CursorUp) {additional_keys_for_window.entry(WindowType::Stack).or_default().push(k)},
-                Some(KeyAction::NextStackFrame) => if let Some(k) = debugger.context.settings.keys.find(KeyAction::CursorDown) {additional_keys_for_window.entry(WindowType::Stack).or_default().push(k)},
-                Some(KeyAction::PreviousThread) => if let Some(k) = debugger.context.settings.keys.find(KeyAction::CursorUp) {additional_keys_for_window.entry(WindowType::Threads).or_default().push(k)},
-                Some(KeyAction::NextThread) => if let Some(k) = debugger.context.settings.keys.find(KeyAction::CursorDown) {additional_keys_for_window.entry(WindowType::Threads).or_default().push(k)},
+                //asdqwe do these in threads and stack windows
+                //Some(KeyAction::PreviousStackFrame) => self.state.should_switch_stack_subframe -= 1,
+                //Some(KeyAction::NextStackFrame) => self.state.should_switch_stack_subframe += 1,
+                //Some(KeyAction::PreviousThread) => self.state.should_switch_thread -= 1,
+                //Some(KeyAction::NextThread) => self.state.should_switch_thread += 1,
 
                 Some(KeyAction::ToggleProfiler) => self.state.profiler_enabled ^= true,
 
-                _ => remaining_keys.push(key),
-            }
-        }
-
-        // Notify window that it lost focus.
-        // (This only covers losing focus due to keyboard input. If more cases are added in future, e.g. auto-focusing windows depending on the process state, make sure to move this around to cover them too.)
-        if self.layout.active_window != active_window_id {
-            if let &Some(id) = &active_window_id {
-                if let Some(w) = self.layout.windows.try_get_mut(id) {
-                    w.content.cancel_modal(&mut self.state, debugger);
-                }
+                _ => (),
             }
         }
 
         // Hints window content. Keep it brief, there's not much space.
-        let mut hints = [StyledText::new(), StyledText::new()];
+        let mut hints = [StyledText::default(), StyledText::default()];
         if debugger.target_state == ProcessState::NoProcess {
-            styled_write!(hints[0], Style::default(), "q - quit"); hints[0].close_line();
+            styled_write!(hints[0], self.imgui.palette.default_dim, "q - quit"); hints[0].close_line();
         } else if debugger.mode == RunMode::Attach {
-            styled_write!(hints[0], Style::default(), "q - detach and quit"); hints[0].close_line();
+            styled_write!(hints[0], self.imgui.palette.default_dim, "q - detach and quit"); hints[0].close_line();
         } else {
-            styled_write!(hints[0], Style::default(), "q - kill and quit"); hints[0].close_line();
+            styled_write!(hints[0], self.imgui.palette.default_dim, "q - kill and quit"); hints[0].close_line();
         }
-        styled_write!(hints[1], Style::default(), "[0-9]/C-wasd - switch window"); hints[1].close_line();
-        styled_write!(hints[1], Style::default(), "C-t/C-b - switch tab"); hints[1].close_line();
+        styled_write!(hints[1], self.imgui.palette.default_dim, "[0-9]/C-wasd - switch window"); hints[1].close_line();
+        styled_write!(hints[1], self.imgui.palette.default_dim, "C-t/C-b - switch tab"); hints[1].close_line();
         match debugger.target_state {
             ProcessState::Running | ProcessState::Stepping => {
-                styled_write!(hints[0], Style::default(), "C - suspend"); hints[0].close_line();
+                styled_write!(hints[0], self.imgui.palette.default_dim, "C - suspend"); hints[0].close_line();
             }
             ProcessState::Suspended => {
-                styled_write!(hints[0], Style::default(), "]/[/}}/{{ - switch frame/thread"); hints[0].close_line();
-                styled_write!(hints[0], Style::default(), "c - continue"); hints[0].close_line();
-                styled_write!(hints[0], Style::default(), "s/n/f - step into/over/out"); hints[0].close_line();
-                styled_write!(hints[0], Style::default(), "m - step over column"); hints[0].close_line();
-                styled_write!(hints[0], Style::default(), "S/N - step into/over instruction"); hints[0].close_line();
+                styled_write!(hints[0], self.imgui.palette.default_dim, "]/[/}}/{{ - switch frame/thread"); hints[0].close_line();
+                styled_write!(hints[0], self.imgui.palette.default_dim, "c - continue"); hints[0].close_line();
+                styled_write!(hints[0], self.imgui.palette.default_dim, "s/n/f - step into/over/out"); hints[0].close_line();
+                styled_write!(hints[0], self.imgui.palette.default_dim, "m - step over column"); hints[0].close_line();
+                styled_write!(hints[0], self.imgui.palette.default_dim, "S/N - step into/over instruction"); hints[0].close_line();
             }
             ProcessState::NoProcess if debugger.mode == RunMode::Run => {
-                styled_write!(hints[0], Style::default(), "r - start"); hints[0].close_line();
+                styled_write!(hints[0], self.imgui.palette.default_dim, "r - start"); hints[0].close_line();
             }
             _ => (),
         }
         if debugger.mode == RunMode::Run && debugger.target_state != ProcessState::NoProcess {
-            styled_write!(hints[0], Style::default(), "k - kill"); hints[0].close_line();
+            styled_write!(hints[0], self.imgui.palette.default_dim, "k - kill"); hints[0].close_line();
         }
         if let &Some(id) = &self.layout.active_window {
             if let Some(w) = self.layout.windows.try_get(id) {
                 hints[1].close_line();
-                w.content.get_hints(&mut hints[1]);
+                w.content.get_hints(&mut hints[1], &mut self.imgui);
             }
         }
         self.state.hints = hints;
 
-        let mut terminal_prof = TscScope::new(); // separately time the things that draw() does before and after calling our function, which is mostly interacting with OS terminal
-        self.terminal.draw(|f| {
-            debugger.log.prof.terminal_tsc += terminal_prof.finish();
-            self.layout.layout_and_render_peripherals(f, f.size(), &debugger.context.settings.palette);
+        // Build windows.
+        self.layout.build(&mut self.imgui);
+        for (_, win) in self.layout.sorted_windows_mut() {
+            with_parent!(self.imgui, win.widget, {
+                win.content.build(&mut self.state, debugger, &mut self.imgui);
+            });
+        }
 
-            let active_window = self.layout.active_window.as_ref().copied();
-            for (win_id, win) in self.layout.sorted_windows_mut() {
-                let mut keys_for_window = if &Some(win_id) == &active_window { mem::take(&mut remaining_keys) } else { Vec::new() };
-                if let Some(k) = additional_keys_for_window.get(&win.type_) {
-                    keys_for_window.extend_from_slice(k);
-                }
-                if let &Some(area) = &win.area {
-                    win.content.update_and_render(&mut self.state, debugger, keys_for_window, Some(f), area);
-                } else {
-                    win.content.update_and_render(&mut self.state, debugger, keys_for_window, None, Rect::default());
-                }
-            }
-
-            if let &Some(id) = &active_window {
-                let win = self.layout.windows.get_mut(id);
-                win.content.render_modal(&mut self.state, debugger, f, win.area.as_ref().copied().unwrap_or(Rect::default()), f.size());
-            }
-
-            terminal_prof = TscScope::new();
-        })?;
-        debugger.log.prof.terminal_tsc += terminal_prof.finish();
-
-        for x in deferred_step_keys {
-            let (kind, by_instructions, use_line_number_with_column) = match x {
-                KeyAction::StepIntoLine => (StepKind::Into, false, false),
-                KeyAction::StepIntoInstruction => (StepKind::Into, true, false),
-                KeyAction::StepOverLine => (StepKind::Over, false, false),
-                KeyAction::StepOverColumn => (StepKind::Over, false, true),
-                KeyAction::StepOverInstruction => (StepKind::Over, true, false),
-                KeyAction::StepOut => (StepKind::Out, false, false),
-                KeyAction::StepOutNoInline => (StepKind::Out, true, false),
-                _ => panic!("huh"),
+        // Stepping has to be handled after updating windows because selected_subframe is assigned by StackWindow.
+        for key in &keys {
+            let (kind, by_instructions, use_line_number_with_column) = match self.imgui.key_binds.key_to_action.get(key) {
+                Some(KeyAction::StepIntoLine) => (StepKind::Into, false, false),
+                Some(KeyAction::StepIntoInstruction) => (StepKind::Into, true, false),
+                Some(KeyAction::StepOverLine) => (StepKind::Over, false, false),
+                Some(KeyAction::StepOverColumn) => (StepKind::Over, false, true),
+                Some(KeyAction::StepOverInstruction) => (StepKind::Over, true, false),
+                Some(KeyAction::StepOut) => (StepKind::Out, false, false),
+                Some(KeyAction::StepOutNoInline) => (StepKind::Out, true, false),
+                _ => continue,
             };
             let r = debugger.step(self.state.selected_thread, self.state.selected_subframe, kind, by_instructions, use_line_number_with_column);
             report_result(&mut self.state, &r);
-            self.state.should_redraw = true;
+            self.imgui.should_redraw = true;
         }
 
-        res.redraw = mem::take(&mut self.state.should_redraw);
-        res.loading = mem::take(&mut self.state.loading);
-        Ok(res)
+        Ok(())
     }
 
     pub fn drop_caches(&mut self) {
@@ -413,14 +356,15 @@ fn report_result<R>(ui: &mut UIState, r: &Result<R>) {
     }
 }
 
+// TODO: Make it a subtree in locals instead.
+#[derive(Default)]
 struct RegistersWindow {
-    scroll: Scroll,
+    table_state: TableState,
 }
 
-impl Default for RegistersWindow { fn default() -> Self { Self {scroll: Scroll::new()} } }
-
 impl WindowContent for RegistersWindow {
-    fn update_and_render(&mut self, ui: &mut UIState, debugger: &mut Debugger, mut keys: Vec<Key>, f: Option<&mut Frame>, area: Rect) {
+    fn build(&mut self, ui: &mut UIState, debugger: &mut Debugger, imgui: &mut IMGUI) {
+        /*asdqwe
         let f = match f { Some(f) => f, None => return };
         let palette = &debugger.context.settings.palette;
 
@@ -443,10 +387,11 @@ impl WindowContent for RegistersWindow {
             .header(Row::new(vec!["reg", "value"]).style(palette.table_header))
             .widths(&[Constraint::Length(7), Constraint::Length(16)]);
 
-        f.render_widget(table, area);
+        f.render_widget(table, area);*/
      }
 }
 
+/*asdqwe
 struct ValueTreeNode {
     name: &'static str, // points into Symbols, or into ValueTree, or static
     value: Result<Value>,
@@ -474,7 +419,7 @@ struct ValueTree {
     roots: Vec<usize>, // (so it's technically a forest, but ValueTree sounds nicer, and you can always imagine an implicit root node that has these "root" nodes as children)
 }
 impl ValueTree {
-    fn new() -> Self { Self {nodes: Vec::new(), text: StyledText::new(), arena: Arena::new(), roots: Vec::new()} }
+    fn new() -> Self { Self {nodes: Vec::new(), text: StyledText::default(), arena: Arena::new(), roots: Vec::new()} }
     fn clear(&mut self) { *self = Self::new(); }
 
     fn add(&mut self, mut node: ValueTreeNode) -> usize {
@@ -489,8 +434,9 @@ impl ValueTree {
         self.nodes.push(node);
         self.nodes.len() - 1
     }
-}
+}*/
 
+#[derive(Default)]
 struct WatchesWindow {
     is_locals_window: bool,
     next_watch_id: usize,
@@ -500,7 +446,7 @@ struct WatchesWindow {
 
     expressions: Vec<(/*identity*/ usize, String)>, // watch expressions; parallel to tree.roots
     text_input: Option<(/*identity*/ usize, Rect, TextInput)>, // if editing watch expression
-
+/*asdqwe
     eval_state: EvalState,
 
     tree: ValueTree,
@@ -508,12 +454,11 @@ struct WatchesWindow {
     cursor_path: Vec<usize>,
 
     scroll: Scroll,
-    lines: Vec<(/*node_idx*/ usize, /*expanded*/ bool)>, // line index -> tree node
+    lines: Vec<(/*node_idx*/ usize, /*expanded*/ bool)>, // line index -> tree node */
 }
 
 impl WatchesWindow {
-    fn new(is_locals_window: bool) -> Self { Self {is_locals_window, next_watch_id: 1, seen: (0, usize::MAX, usize::MAX), expressions: Vec::new(), eval_state: EvalState::new(), tree: ValueTree::new(), expanded_nodes: HashSet::new(), cursor_path: Vec::new(), scroll: Scroll::new(), lines: Vec::new(), text_input: None} }
-
+/*asdqwe
     fn clear_tree(&mut self) {
         self.lines.clear();
         self.tree.clear();
@@ -635,11 +580,12 @@ impl WatchesWindow {
                 self.cursor_path = vec![self.tree.nodes[self.tree.roots[i]].identity];
             }
         }
-    }
+    }*/
 }
 
 impl WindowContent for WatchesWindow {
-    fn update_and_render(&mut self, ui: &mut UIState, debugger: &mut Debugger, mut keys: Vec<Key>, f: Option<&mut Frame>, area: Rect) {
+    fn build(&mut self, ui: &mut UIState, debugger: &mut Debugger, imgui: &mut IMGUI) {
+        /*asdqwe
         if let Some((_, area, _)) = &mut self.text_input {
             *area = Rect::default();
         }
@@ -894,10 +840,10 @@ impl WindowContent for WatchesWindow {
         self.text_input = None;
     }
 
-    fn get_hints(&self, hints: &mut StyledText) {
-        styled_write!(hints, Style::default(), "ret - edit"); hints.close_line();
-        styled_write!(hints, Style::default(), "d - duplicate"); hints.close_line();
-        styled_write!(hints, Style::default(), "backspace - delete"); hints.close_line();
+    fn get_hints(&self, hints: &mut StyledText, imgui: &mut IMGUI) {
+        styled_write!(hints, imgui.palette.default_dim, "ret - edit"); hints.close_line();
+        styled_write!(hints, imgui.palette.default_dim, "d - duplicate"); hints.close_line();
+        styled_write!(hints, imgui.palette.default_dim, "backspace - delete"); hints.close_line();
     }
 
     fn has_persistent_state(&self) -> bool {
@@ -918,17 +864,17 @@ impl WindowContent for WatchesWindow {
             self.expressions.push((id, expr));
         }
         Ok(())
+    }*/
     }
 }
 
+#[derive(Default)]
 struct LocationsWindow {
-    scroll: Scroll,
+    table_state: TableState,
 }
-
-impl Default for LocationsWindow { fn default() -> Self { Self {scroll: Scroll::new()} } }
-
 impl WindowContent for LocationsWindow {
-    fn update_and_render(&mut self, ui: &mut UIState, debugger: &mut Debugger, mut keys: Vec<Key>, f: Option<&mut Frame>, mut area: Rect) {
+    fn build(&mut self, ui: &mut UIState, debugger: &mut Debugger, imgui: &mut IMGUI) {
+        /*
         let f = match f { Some(f) => f, None => return };
         let palette = &debugger.context.settings.palette;
 
@@ -952,11 +898,11 @@ impl WindowContent for LocationsWindow {
             .header(Row::new(vec!["name", "type", "expression", "die"]).style(palette.table_header))
             .widths(&[Constraint::Percentage(25), Constraint::Percentage(30), Constraint::Percentage(30), Constraint::Length(9)]);
 
-        f.render_widget(table, area);
+        f.render_widget(table, area);*/
     }
 }
 
-impl LocationsWindow {
+impl LocationsWindow {/*asdqwe
     fn fill_table(&mut self, ui: &mut UIState, debugger: &Debugger) -> Result<Vec<Row<'static>>> {
         let palette = &debugger.context.settings.palette;
         let (binary_id, function_idx, addr) = match ui.selected_addr.clone() { Some(x) => x, None => return Ok(Vec::new()) };
@@ -986,7 +932,7 @@ impl LocationsWindow {
                     let expr_str = match &encoding {
                         Ok(e) => format_dwarf_expression(v.expr, *e),
                         Err(e) => Err(e.clone()) };
-                    let mut text = StyledText::new();
+                    let mut text = StyledText::default();
                     print_type_name(v.type_, &mut text, palette, 0);
                     rows.push(Row::new(vec![
                         Cell::from(format!("{}", unsafe {v.name()})),
@@ -1001,7 +947,7 @@ impl LocationsWindow {
             }
         }
         Ok(rows)
-    }
+    }*/
 }
 
 struct DisassemblyFunctionLocator {
@@ -1026,27 +972,26 @@ struct DisassemblyTab {
     title: String,
     status: DisassemblyTabStatus,
 
-    scroll: Scroll,
     selected_subfunction_level: u16,
-    hscroll: u16,
     pinned: bool,
+    //asdqwe scroll, hscroll, cursor
 }
 impl Default for DisassemblyTab {
-    fn default() -> Self { Self {status: DisassemblyTabStatus::Err(error!(Internal, "uninitialized")), title: String::new(), scroll: Scroll::new(), selected_subfunction_level: u16::MAX, hscroll: 0, pinned: false} }
+    fn default() -> Self { Self {status: DisassemblyTabStatus::Err(error!(Internal, "uninitialized")), title: String::new(), selected_subfunction_level: u16::MAX, pinned: false} }
 }
 
 struct DisassemblyWindow {
     tabs: Vec<DisassemblyTab>,
     cache: HashMap<(BinaryId, usize), Disassembly>,
-    selected_tab: usize,
+    tabs_state: TabsState,
     search_dialog: Option<SearchDialog>,
     source_scrolled_to: Option<(BinaryId, /*function_idx*/ usize, /*disas_line*/ usize, /*selected_subfunction_level*/ u16)>,
 }
 
-impl Default for DisassemblyWindow { fn default() -> Self { Self {tabs: Vec::new(), cache: HashMap::new(), selected_tab: 0, search_dialog: None, source_scrolled_to: None} } }
+impl Default for DisassemblyWindow { fn default() -> Self { Self {tabs: Vec::new(), cache: HashMap::new(), tabs_state: TabsState::default(), search_dialog: None, source_scrolled_to: None} } }
 
-// (A lot of tab management code is copy-pasted from CodeWindow. Would be nice to deduplicate it, but it's not obvious what's a good way to do it.)
-impl DisassemblyWindow {
+//asdqwe (A lot of tab management code is copy-pasted from CodeWindow. Would be nice to deduplicate it, but it's not obvious what's a good way to do it.)
+impl DisassemblyWindow {/*asdqwe
     fn open_function(&mut self, target: Result<DisassemblyScrollTarget>, debugger: &Debugger) -> Result<()> {
         let target = match target {
             Ok(x) => x,
@@ -1163,7 +1108,7 @@ impl DisassemblyWindow {
         let ranges = symbols.function_addr_ranges(function_idx);
         let function = &symbols.functions[function_idx];
 
-        let mut prelude = StyledText::new();
+        let mut prelude = StyledText::default();
         styled_write!(prelude, palette.default_dim, "{}", binary_id.path);
         prelude.close_line();
         match function.debug_info_offset() {
@@ -1235,10 +1180,12 @@ impl DisassemblyWindow {
 
     fn switch_tab(&mut self, delta: isize) {
         self.selected_tab = (self.selected_tab as isize + delta).rem_euclid(self.tabs.len().max(1) as isize) as usize;
-    }
+    }*/
 }
 
 impl WindowContent for DisassemblyWindow {
+    fn build(&mut self, ui: &mut UIState, debugger: &mut Debugger, imgui: &mut IMGUI) {
+        /*asdqwe
     fn update_modal(&mut self, ui: &mut UIState, debugger: &mut Debugger, keys: &mut Vec<Key>) {
         if let Some(d) = &mut self.search_dialog {
             let event = d.update(keys, &debugger.context.settings.keys, &debugger.symbols, Some(debugger.info.binaries.keys().cloned().collect()));
@@ -1289,11 +1236,11 @@ impl WindowContent for DisassemblyWindow {
         self.search_dialog = None;
     }
 
-    fn get_hints(&self, hints: &mut StyledText) {
-        hints.chars.push_str("o - find function"); hints.close_span(Style::default()); hints.close_line();
-        hints.chars.push_str("C-y - pin/unpin tab"); hints.close_span(Style::default()); hints.close_line();
-        hints.chars.push_str(",/. - select level"); hints.close_span(Style::default()); hints.close_line();
-        // TODO: hints.chars.push_str("b - toggle breakpoint"); hints.close_span(Style::default()); hints.close_line();
+    fn get_hints(&self, hints: &mut StyledText, imgui: &mut IMGUI) {
+        hints.chars.push_str("o - find function"); hints.close_span(imgui.palette.default_dim); hints.close_line();
+        hints.chars.push_str("C-y - pin/unpin tab"); hints.close_span(imgui.palette.default_dim); hints.close_line();
+        hints.chars.push_str(",/. - select level"); hints.close_span(imgui.palette.default_dim); hints.close_line();
+        // TODO: hints.chars.push_str("b - toggle breakpoint"); hints.close_span(imgui.palette.default_dim); hints.close_line();
     }
 
     fn has_persistent_state(&self) -> bool {
@@ -1396,11 +1343,11 @@ impl WindowContent for DisassemblyWindow {
         });
 
         let palette = &debugger.context.settings.palette;
-        let mut header = StyledText::new();
+        let mut header = StyledText::default();
         let mut disas: Option<(BinaryId, usize, &Disassembly)> = None;
         self.resolve_function_for_tab(self.selected_tab, debugger);
         let indent = "";
-        styled_write!(header, Style::default(), "{}", indent);
+        styled_write!(header, imgui.palette.default, "{}", indent);
         match &self.tabs[self.selected_tab].status {
             DisassemblyTabStatus::Err(e) => {
                 styled_write!(header, palette.error, "{}", e);
@@ -1408,7 +1355,7 @@ impl WindowContent for DisassemblyWindow {
             DisassemblyTabStatus::Unresolved {locator, cached_error} => {
                 styled_write!(header, palette.default_dim, "{}", locator.demangled_name);
                 header.close_line();
-                styled_write!(header, Style::default(), "{}", indent);
+                styled_write!(header, imgui.palette.default, "{}", indent);
                 styled_write!(header, palette.error, "couldn't find function: {}", cached_error.as_ref().unwrap());
             }
             DisassemblyTabStatus::Function {locator, function_idx} => {
@@ -1615,16 +1562,15 @@ impl WindowContent for DisassemblyWindow {
                 DisassemblyTabStatus::Unresolved {cached_error, ..} => *cached_error = None,
                 _ => (),
             }
-        }
+        }*/
     }
 }
 
+#[derive(Default)]
 struct StatusWindow {}
-
-impl Default for StatusWindow { fn default() -> Self { Self {} } }
-
 impl WindowContent for StatusWindow {
-    fn update_and_render(&mut self, ui: &mut UIState, debugger: &mut Debugger, keys: Vec<Key>, f: Option<&mut Frame>, area: Rect) {
+    fn build(&mut self, ui: &mut UIState, debugger: &mut Debugger, imgui: &mut IMGUI) {
+        /*asdqwe
         let f = match f { Some(f) => f, None => return };
         let palette = &debugger.context.settings.palette;
 
@@ -1663,21 +1609,20 @@ impl WindowContent for StatusWindow {
         }
         
         let list = List::new(items);
-        f.render_widget(list, area);
+        f.render_widget(list, area);*/
     }
 }
 
+#[derive(Default)]
 struct HintsWindow {}
-
-impl Default for HintsWindow { fn default() -> Self { Self {} } }
-
 impl WindowContent for HintsWindow {
-    fn update_and_render(&mut self, ui: &mut UIState, debugger: &mut Debugger, keys: Vec<Key>, f: Option<&mut Frame>, area: Rect) {
+    fn build(&mut self, ui: &mut UIState, debugger: &mut Debugger, imgui: &mut IMGUI) {
+        /*asdqwe
         let f = match f { Some(f) => f, None => return };
         let palette = &debugger.context.settings.palette;
 
         if ui.profiler_enabled {
-            let mut prof = StyledText::new();
+            let mut prof = StyledText::default();
             debugger.log.prof.format_summary(&mut prof, area.width as usize);
             let prof_lines = prof.to_lines();
             let mut items: Vec<ListItem> = Vec::new();
@@ -1696,28 +1641,20 @@ impl WindowContent for HintsWindow {
                 if lines.len() > subarea.height as usize && subarea.height > 0 {
                     lines[subarea.height as usize - 1] = Spans::from(vec![Span::raw("…")]);
                 }
-                for line in &mut lines {
-                    for span in &mut line.0 {
-                        if span.style == Style::default() {
-                            span.style = debugger.context.settings.palette.default_dim;
-                        }
-                    }
-                }
                 let paragraph = Paragraph::new(Text {lines});
                 f.render_widget(paragraph, subarea);
             }
-        }
+        }*/
     }
 }
 
+#[derive(Default)]
 struct BinariesWindow {
-    scroll: Scroll,
+    table_state: TableState,
 }
-
-impl Default for BinariesWindow { fn default() -> Self { Self {scroll: Scroll::new()} } }
-
 impl WindowContent for BinariesWindow {
-    fn update_and_render(&mut self, ui: &mut UIState, debugger: &mut Debugger, mut keys: Vec<Key>, f: Option<&mut Frame>, area: Rect) {
+    fn build(&mut self, ui: &mut UIState, debugger: &mut Debugger, imgui: &mut IMGUI) {
+        /*asdqwe
         // Listed in order of mmap address, so the main executable is usually first, which is nice.
         ui.binaries = debugger.info.maps.list_binaries();
         // List previously seen unloaded binaries too, because they're visible to file/function open dialogs, especially if there's no debuggee process.
@@ -1802,18 +1739,17 @@ impl WindowContent for BinariesWindow {
             .header(Row::new(vec!["idx", "name", "file", "symbols"]).style(palette.table_header))
             .widths(&column_widths);
 
-        f.render_widget(table, area);
+        f.render_widget(table, area);*/
     }
 }
 
+#[derive(Default)]
 struct ThreadsFilter {
     bar: SearchBar,
     cache_key: String, // when this changes, drop cached_results
     cached_results: Vec<(/*thread_idx*/ usize, /*stop_count*/ usize, /*passes_filter*/ bool)>, // sorted by thread_idx
 }
 impl ThreadsFilter {
-    fn new() -> Self { Self {bar: SearchBar::new(), cache_key: String::new(), cached_results: Vec::new()} }
-
     // tids must be sorted
     fn filter(&mut self, tids: Vec<(usize, usize, pid_t)>, debugger: &mut Debugger) -> Vec<pid_t> {
         let query = if self.bar.visible {self.bar.text.text.clone()} else {String::new()};
@@ -1879,17 +1815,16 @@ impl ThreadsFilter {
     }
 }
 
+#[derive(Default)]
 struct ThreadsWindow {
-    scroll: Scroll,
+    table_state: TableState,
 
     seen_stop_counts: HashMap<pid_t, usize>,
     filter: ThreadsFilter,
 }
-
-impl Default for ThreadsWindow { fn default() -> Self { Self {scroll: Scroll::new(), seen_stop_counts: HashMap::new(), filter: ThreadsFilter::new() } } }
-
 impl WindowContent for ThreadsWindow {
-    fn update_and_render(&mut self, ui: &mut UIState, debugger: &mut Debugger, mut keys: Vec<Key>, f: Option<&mut Frame>, area: Rect) {
+    fn build(&mut self, ui: &mut UIState, debugger: &mut Debugger, imgui: &mut IMGUI) {
+        /*asdqwe
         keys.retain(|key| {
             if self.filter.bar.editing {
                 return true;
@@ -2068,24 +2003,12 @@ impl WindowContent for ThreadsWindow {
     }
 
     fn cancel_modal(&mut self, ui: &mut UIState, debugger: &mut Debugger) {
-        self.filter.bar.editing = false;
+        self.filter.bar.editing = false;*/
     }
 
-    fn get_hints(&self, hints: &mut StyledText) {
-        styled_write!(hints, Style::default(), "/ - filter"); hints.close_line();
+    fn get_hints(&self, hints: &mut StyledText, imgui: &mut IMGUI) {
+        styled_write!(hints, imgui.palette.default_dim, "/ - filter"); hints.close_line();
     }
-}
-
-// This window is in charge of telling source and disassembly windows when to auto-open and auto-scroll.
-struct StackWindow {
-    scroll: Scroll,
-    // Previously selected frame in each thread, so that switching threads back and forth doesn't reset the scroll.
-    // If thread's stop count changed, we switch to the top frame, unless the window is locked.
-    threads: HashMap<pid_t, (/* stop_count */ usize, StableSubframeIdx)>,
-    // When this changes, we scroll source and disassembly windows.
-    seen: (/* tid */ pid_t, StableSubframeIdx, /* frame addr */ usize),
-    // After symbols were loaded, tell disassembly and source windows to try opening the file/function again.
-    rerequest_scroll: bool,
 }
 
 // Location of a stack trace subframe that tries to stay on the "same" subframe when the stack changes slightly,
@@ -2119,10 +2042,21 @@ impl StableSubframeIdx {
     }
 }
 
-impl Default for StackWindow { fn default() -> Self { Self {scroll: Scroll::new(), threads: HashMap::new(), seen: (0, StableSubframeIdx::top(), 0), rerequest_scroll: false} } }
-
+// This window is in charge of telling source and disassembly windows when to auto-open and auto-scroll.
+struct StackWindow {
+    table_state: TableState,
+    // Previously selected frame in each thread, so that switching threads back and forth doesn't reset the scroll.
+    // If thread's stop count changed, we switch to the top frame, unless the window is locked.
+    threads: HashMap<pid_t, (/* stop_count */ usize, StableSubframeIdx)>,
+    // When this changes, we scroll source and disassembly windows.
+    seen: (/* tid */ pid_t, StableSubframeIdx, /* frame addr */ usize),
+    // After symbols were loaded, tell disassembly and source windows to try opening the file/function again.
+    rerequest_scroll: bool,
+}
+impl Default for StackWindow { fn default() -> Self { Self {table_state: TableState::default(), threads: HashMap::new(), seen: (0, StableSubframeIdx::top(), 0), rerequest_scroll: false} } }
 impl WindowContent for StackWindow {
-    fn update_and_render(&mut self, ui: &mut UIState, debugger: &mut Debugger, mut keys: Vec<Key>, f: Option<&mut Frame>, area: Rect) {
+    fn build(&mut self, ui: &mut UIState, debugger: &mut Debugger, imgui: &mut IMGUI) {
+        /*asdqwe
         ui.stack = debugger.get_stack_trace(ui.selected_thread, /* partial */ false);
         let rerequest_scroll = mem::take(&mut self.rerequest_scroll);
 
@@ -2219,9 +2153,9 @@ impl WindowContent for StackWindow {
                 let mut line_spans = vec![
                     if let Some(info) = &subframe.line {
                         let name = info.path.as_os_str().to_string_lossy();
-                        Span::styled(format!("{}", name), palette.location_filename)
+                        Span::styled(format!("{}", name), palette.filename)
                     } else {
-                        Span::styled("?", palette.location_filename.add_modifier(Modifier::DIM))
+                        Span::styled("?", palette.filename.add_modifier(Modifier::DIM))
                     }];
                 if let Some(info) = &subframe.line {
                     if info.line.line() != 0 {
@@ -2267,11 +2201,11 @@ impl WindowContent for StackWindow {
             }
         }
         let table = Table::new(rows)
-            .header(Row::new(vec![Text::from("idx"), Text::from("address"), Text::from("bin"), Text {lines: vec![Spans::from("location"), Spans::from(Span::styled("line", palette.location_filename))]}]).style(palette.table_header).height(/* tried 2, but it looks worse */ 1))
+            .header(Row::new(vec![Text::from("idx"), Text::from("address"), Text::from("bin"), Text {lines: vec![Spans::from("location"), Spans::from(Span::styled("line", palette.filename))]}]).style(palette.table_header).height(/* tried 2, but it looks worse */ 1))
             .widths(&[Constraint::Length(3), Constraint::Length(12), Constraint::Length(3), Constraint::Percentage(90)])
             .highlight_style(palette.table_selected_item).highlight_symbol("➤ ");
 
-        f.render_stateful_widget(table, area, &mut table_state);
+        f.render_stateful_widget(table, area, &mut table_state);*/
     }
 
     fn drop_caches(&mut self) {
@@ -2279,13 +2213,25 @@ impl WindowContent for StackWindow {
     }
 }
 
+// For Rust standard library code, Rust compiler uses fake paths in debug symbols, like this:
+// /rustc/5680fa18feaa87f3ff04063800aec256c3d4b4be/library/core/src/hash/sip.rs
+// which means the file can be found here:
+// https://github.com/rust-lang/rust/blob/5680fa18feaa87f3ff04063800aec256c3d4b4be/library/core/src/hash/sip.rs
+fn rust_fake_path_to_url(path: &str) -> Option<String> {
+    if path.len() < "/rustc/5680fa18feaa87f3ff04063800aec256c3d4b4be/".len() { return None; }
+    if !path.starts_with("/rustc/") { return None; }
+    if !(&path[7..47]).chars().all(|c| c.is_digit(16)) { return None; }
+    let mut res = "https://github.com/rust-lang/rust/blob/".to_string();
+    res.push_str(&path[7..]);
+    Some(res)
+}
+
 struct CodeTab {
     title: String,
     path_in_symbols: PathBuf, // empty if not known
     version_in_symbols: FileVersionInfo,
 
-    scroll: Scroll,
-    hscroll: u16,
+    //asdqwe scroll, cursor, hscroll
     pinned: bool,
 }
 
@@ -2307,17 +2253,16 @@ struct CodeWindow {
     // When this changes (usually because the user moved the cursor around the file), we scroll disassembly to the address corresponding to the selected line.
     disassembly_scrolled_to: Option<(PathBuf, FileVersionInfo, /*cursor*/ usize)>,
 }
-
 impl Default for CodeWindow { fn default() -> Self { Self {tabs: Vec::new(), file_cache: HashMap::new(), selected_tab: 0, search_dialog: None, disassembly_scrolled_to: None} } }
 
+//asdqwe check no tab title truncation happens in CodeWindow and DisassemblyWindow
 impl CodeWindow {
-    fn find_or_open_file<'a>(file_cache: &'a mut HashMap<(PathBuf, FileVersionInfo), SourceFile>, path_in_symbols: &Path, version: &FileVersionInfo, debugger: &Debugger) -> &'a SourceFile {
-        file_cache.entry((path_in_symbols.to_owned(), version.clone())).or_insert_with(|| Self::open_file(path_in_symbols, version, debugger))
+    fn find_or_open_file<'a>(file_cache: &'a mut HashMap<(PathBuf, FileVersionInfo), SourceFile>, path_in_symbols: &Path, version: &FileVersionInfo, debugger: &Debugger, palette: &Palette) -> &'a SourceFile {
+        file_cache.entry((path_in_symbols.to_owned(), version.clone())).or_insert_with(|| Self::open_file(path_in_symbols, version, debugger, palette))
     }
 
-    fn open_file(path_in_symbols: &Path, version: &FileVersionInfo, debugger: &Debugger) -> SourceFile {
-        let palette = &debugger.context.settings.palette;
-        let mut res = SourceFile {header: StyledText::new(), text: StyledText::new(), local_path: PathBuf::new(), widest_line: 0, num_lines_in_local_file: 0};
+    fn open_file(path_in_symbols: &Path, version: &FileVersionInfo, debugger: &Debugger, palette: &Palette) -> SourceFile {
+        let mut res = SourceFile {header: StyledText::default(), text: StyledText::default(), local_path: PathBuf::new(), widest_line: 0, num_lines_in_local_file: 0};
 
         if path_in_symbols.as_os_str().is_empty() {
             return res;
@@ -2343,10 +2288,10 @@ impl CodeWindow {
                 Err(_) => path_to_try.clone() };
 
             write!(res.header.chars, "{}", res.local_path.to_string_lossy()).unwrap();
-            res.header.close_span(palette.location_filename);
+            res.header.close_span(palette.filename);
             res.header.close_line();
 
-            match Self::read_and_format_file(&mut file, debugger, &mut res, path_in_symbols) {
+            match Self::read_and_format_file(&mut file, debugger, &mut res, path_in_symbols, palette) {
                 Ok((len, md5)) => {
                     let mut warn = true;
                     if version.size != 0 && version.size as usize != len {
@@ -2375,7 +2320,7 @@ impl CodeWindow {
 
         let path_str = path_in_symbols.to_string_lossy();
         write!(res.header.chars, "{}", path_str).unwrap();
-        res.header.close_span(Style::default());
+        res.header.close_span(palette.default);
         res.header.close_line();
         if let Some(url) = rust_fake_path_to_url(&path_str) {
             write!(res.header.chars, "can be found here:").unwrap();
@@ -2393,13 +2338,12 @@ impl CodeWindow {
 
         // Make a ghost file by adding LineInfo markers to empty space.
         let mut empty: &[u8] = &[];
-        Self::read_and_format_file(&mut empty, debugger, &mut res, path_in_symbols).unwrap();
+        Self::read_and_format_file(&mut empty, debugger, &mut res, path_in_symbols, palette).unwrap();
 
         res
     }
 
-    fn read_and_format_file(input: &mut dyn Read, debugger: &Debugger, res: &mut SourceFile, path_in_symbols: &Path) -> Result<(usize, [u8; 16])> {
-        let palette = &debugger.context.settings.palette;
+    fn read_and_format_file(input: &mut dyn Read, debugger: &Debugger, res: &mut SourceFile, path_in_symbols: &Path, palette: &Palette) -> Result<(usize, [u8; 16])> {
         // Highlight all line+column locations where we can stop (statements and inlined function call sites).
         let mut markers: Vec<LineInfo> = Vec::new();
         for (_, binary) in debugger.symbols.iter() {
@@ -2431,12 +2375,12 @@ impl CodeWindow {
                 let prev_span_end = text.spans.last().unwrap().0;
                 assert!(line_chars_start + column >= prev_span_end);
                 if line_chars_start + column > prev_span_end {
-                    text.spans.push((line_chars_start + column, Style::default()));
+                    text.spans.push((line_chars_start + column, palette.default));
                 }
                 text.spans.push((line_chars_start + column + 1, if marker.flags().contains(LineFlags::INLINED_FUNCTION) {palette.code_inlined_site} else {palette.code_statement}));
                 *marker_idx += 1;
             }
-            text.close_span(Style::default());
+            text.close_span(palette.default);
             text.close_line();
         };
 
@@ -2483,8 +2427,7 @@ impl CodeWindow {
             insert_markers_and_close_line(&mut line_idx, &mut res.text, &mut marker_idx);
         }
         
-        // This is width in bytes rather than glyphs, but that's good enough for our purposes here (upper bound on horizontal scrolling).
-        res.widest_line = res.text.widest_line();
+        res.widest_line = res.text.widest_line(0..res.text.num_lines());
 
         Ok((buffered.count, buffered.hasher.compute().into()))
     }
@@ -2498,7 +2441,7 @@ impl CodeWindow {
             "?".to_string()
         }
     }
-
+/*
     fn switch_to_file(&mut self, path_in_symbols: &Path, version: &FileVersionInfo, debugger: &Debugger) {
         if let Some(i) = self.tabs.iter().position(|t| &t.path_in_symbols == path_in_symbols && &t.version_in_symbols == version) {
             self.selected_tab = i;
@@ -2687,23 +2630,12 @@ impl CodeWindow {
 
             break;
         }
-    }
-}
-
-// For Rust standard library code, Rust compiler uses fake paths in debug symbols, like this:
-// /rustc/5680fa18feaa87f3ff04063800aec256c3d4b4be/library/core/src/hash/sip.rs
-// which means the file can be found here:
-// https://github.com/rust-lang/rust/blob/5680fa18feaa87f3ff04063800aec256c3d4b4be/library/core/src/hash/sip.rs
-fn rust_fake_path_to_url(path: &str) -> Option<String> {
-    if path.len() < "/rustc/5680fa18feaa87f3ff04063800aec256c3d4b4be/".len() { return None; }
-    if !path.starts_with("/rustc/") { return None; }
-    if !(&path[7..47]).chars().all(|c| c.is_digit(16)) { return None; }
-    let mut res = "https://github.com/rust-lang/rust/blob/".to_string();
-    res.push_str(&path[7..]);
-    Some(res)
+    }*/
 }
 
 impl WindowContent for CodeWindow {
+    fn build(&mut self, ui: &mut UIState, debugger: &mut Debugger, imgui: &mut IMGUI) {
+        /*asdqwe
     fn update_modal(&mut self, ui: &mut UIState, debugger: &mut Debugger, keys: &mut Vec<Key>) {
         if let Some(d) = &mut self.search_dialog {
             let event = d.update(keys, &debugger.context.settings.keys, &debugger.symbols, None);
@@ -2759,12 +2691,12 @@ impl WindowContent for CodeWindow {
         self.file_cache.clear();
     }
 
-    fn get_hints(&self, hints: &mut StyledText) {
-        styled_write!(hints, Style::default(), "o - open file"); hints.close_line();
-        styled_write!(hints, Style::default(), "C-y - pin/unpin tab"); hints.close_line();
-        styled_write!(hints, Style::default(), "b - toggle breakpoint"); hints.close_line();
-        styled_write!(hints, Style::default(), "B - enable/disable breakpoint"); hints.close_line();
-        styled_write!(hints, Style::default(), ",/. - cycle disasm addrs"); hints.close_line();
+    fn get_hints(&self, hints: &mut StyledText, imgui: &mut IMGUI) {
+        styled_write!(hints, imgui.palette.default_dim, "o - open file"); hints.close_line();
+        styled_write!(hints, imgui.palette.default_dim, "C-y - pin/unpin tab"); hints.close_line();
+        styled_write!(hints, imgui.palette.default_dim, "b - toggle breakpoint"); hints.close_line();
+        styled_write!(hints, imgui.palette.default_dim, "B - enable/disable breakpoint"); hints.close_line();
+        styled_write!(hints, imgui.palette.default_dim, ",/. - cycle disasm addrs"); hints.close_line();
     }
 
     fn has_persistent_state(&self) -> bool {
@@ -2869,7 +2801,7 @@ impl WindowContent for CodeWindow {
         let tab = match self.tabs.get_mut(self.selected_tab) {
             None => return,
             Some(t) => t };
-        let file = Self::find_or_open_file(&mut self.file_cache, &tab.path_in_symbols, &tab.version_in_symbols, debugger);
+        let file = Self::find_or_open_file(&mut self.file_cache, &tab.path_in_symbols, &tab.version_in_symbols, debugger, &imgui.palette);
         headers += file.header.num_lines() as u16;
 
         let line_num_len = (file.text.num_lines().saturating_add(1) as f64).log10().ceil() as usize;
@@ -2982,7 +2914,7 @@ impl WindowContent for CodeWindow {
                     }
                     if !found {
                         spans.push(Span::raw(" ".to_string().repeat(pos)));
-                        spans.push(Span::styled(" ", Style::default().add_modifier(Modifier::UNDERLINED)));
+                        spans.push(Span::styled(" ", imgui.palette.ip_column.apply(imgui.palette.default)));
                     }
                 }
 
@@ -3002,24 +2934,23 @@ impl WindowContent for CodeWindow {
 
         f.render_widget(paragraph, area);
 
-        self.scroll_disassembly_if_needed(suppress_disassembly_autoscroll, select_disassembly_address, ui, debugger);
+        self.scroll_disassembly_if_needed(suppress_disassembly_autoscroll, select_disassembly_address, ui, debugger);*/
     }
 }
 
+#[derive(Default)]
 struct BreakpointsWindow {
-    scroll: Scroll,
+    table_state: TableState,
     selected_breakpoint: Option<BreakpointId>,
 }
-
-impl Default for BreakpointsWindow { fn default() -> Self { Self {scroll: Scroll::new(), selected_breakpoint: None} } }
-
 impl WindowContent for BreakpointsWindow {
-    fn get_hints(&self, hints: &mut StyledText) {
-        hints.chars.push_str("<del> - delete breakpoint"); hints.close_span(Style::default()); hints.close_line();
-        hints.chars.push_str("B - enable/disable"); hints.close_span(Style::default()); hints.close_line();
+    fn get_hints(&self, hints: &mut StyledText, imgui: &mut IMGUI) {
+        hints.chars.push_str("<del> - delete breakpoint"); hints.close_span(imgui.palette.default_dim); hints.close_line();
+        hints.chars.push_str("B - enable/disable"); hints.close_span(imgui.palette.default_dim); hints.close_line();
     }
 
-    fn update_and_render(&mut self, ui: &mut UIState, debugger: &mut Debugger, mut keys: Vec<Key>, f: Option<&mut Frame>, area: Rect) {
+    fn build(&mut self, ui: &mut UIState, debugger: &mut Debugger, imgui: &mut IMGUI) {
+        /*asdqwe
         let mut hit_breakpoints: Vec<BreakpointId> = Vec::new();
         for (tid, thread) in &debugger.threads {
             for reason in &thread.stop_reasons {
@@ -3105,7 +3036,7 @@ impl WindowContent for BreakpointsWindow {
                 BreakpointOn::Line(on) => {
                     let name = on.path.as_os_str().to_string_lossy();
                     let mut spans = vec![
-                        Span::styled(name, palette.location_filename),
+                        Span::styled(name, palette.filename),
                         Span::styled(format!(":{}", on.line), palette.location_line_number)];
                     if let &Some(adj) = &on.adjusted_line {
                         spans.push(Span::styled("→", palette.default_dim));
@@ -3128,7 +3059,7 @@ impl WindowContent for BreakpointsWindow {
             cells.push(Cell::from(format!("{}", b.hits)));
 
             let error = b.addrs.as_ref().is_err_and(|e| !e.is_not_calculated()) || locations[locs_begin..locs_end].iter().any(|t| t.1);
-            let mut style = if error {palette.error} else {Style::default()};
+            let mut style = if error {palette.error} else {palette.default};
             if !b.enabled {
                 style = style.add_modifier(Modifier::DIM);
             }
@@ -3141,6 +3072,6 @@ impl WindowContent for BreakpointsWindow {
             .widths(&widths)
             .highlight_style(palette.table_selected_item).highlight_symbol("➤ ");
 
-        f.render_stateful_widget(table, area, &mut table_state);
+        f.render_stateful_widget(table, area, &mut table_state);*/
     }
 }

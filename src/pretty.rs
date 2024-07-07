@@ -1,6 +1,5 @@
-use crate::{*, types::*, error::*, expr::*, util::*, settings::*};
+use crate::{*, types::*, error::*, expr::*, util::*, settings::*, common_ui::*};
 use std::{mem, fmt::Write};
-use tui::style::{Style, Modifier, Color};
 
 // Apply pretty-printers and other transformations to a value. Used both for printing and expression evaluaion.
 // E.g. this function may turn an std::vector<int> into a *[int; 123], making it appear as an array both when printed whole
@@ -121,9 +120,9 @@ pub fn prettify_value(val: &Value, state: &mut EvalState, context: &EvalContext)
 
 // Append a span to Option<&mut StyledText> if it's Some. The Option must be mut.
 macro_rules! styled_write_maybe {
-    ($out:expr, $style:expr, $($arg:tt)*) => (
+    ($out:expr, $style:ident, $($arg:tt)*) => (
         if let Some((out, palette)) = &mut ($out) {
-            styled_write!(out, $style, $($arg)*);
+            styled_write!(out, palette.$style, $($arg)*);
         }
     );
 }
@@ -141,9 +140,9 @@ pub fn reflect_meta_value(val: &Value, state: &mut EvalState, context: &EvalCont
             let t = unsafe {&*t};
             let mut show_size = false;
             match &t.t {
-                Type::Unknown => styled_write_maybe!(out, Style::default(), "unknown type"),
+                Type::Unknown => styled_write_maybe!(out, default, "unknown type"),
                 Type::Primitive(p) => {
-                    styled_write_maybe!(out, Style::default(), "{}",
+                    styled_write_maybe!(out, type_name, "{}",
                                         if p.contains(PrimitiveFlags::FLOAT) {
                                             "float"
                                         } else if p.contains(PrimitiveFlags::BOOL) {
@@ -166,7 +165,7 @@ pub fn reflect_meta_value(val: &Value, state: &mut EvalState, context: &EvalCont
                     builder.add_usize_field("type", unsafe {mem::transmute(a.type_)}, state.builtin_types.meta_type);
                 }
                 Type::Struct(s) => {
-                    styled_write_maybe!(out, Style::default(), "{}", if s.flags.contains(StructFlags::UNION) {"union"} else {"struct"});
+                    styled_write_maybe!(out, keyword, "{}", if s.flags.contains(StructFlags::UNION) {"union"} else {"struct"});
                     show_size = true;
                     let mut fields = StructBuilder::default();
                     for f in s.fields() {
@@ -176,7 +175,7 @@ pub fn reflect_meta_value(val: &Value, state: &mut EvalState, context: &EvalCont
                     builder.add_field("fields", fields);
                 }
                 Type::Enum(e) => {
-                    styled_write_maybe!(out, Style::default(), "enum");
+                    styled_write_maybe!(out, keyword, "enum");
                     show_size = true;
                     let mut items = StructBuilder::default();
                     let mut size = unsafe {(*e.type_).calculate_size()};
@@ -191,17 +190,17 @@ pub fn reflect_meta_value(val: &Value, state: &mut EvalState, context: &EvalCont
                     builder.add_usize_field("type", unsafe {mem::transmute(e.type_)}, state.builtin_types.meta_type);
                 }
                 Type::MetaType | Type::MetaField => {
-                    styled_write_maybe!(out, Style::default(), "{}", match &t.t { Type::MetaType => "type", Type::MetaField => "field", _ => panic!("huh") });
+                    styled_write_maybe!(out, default, "{}", match &t.t { Type::MetaType => "type", Type::MetaField => "field", _ => panic!("huh") });
                     return builder.finish("", val.flags, &mut state.types);
                 }
             }
             let size = t.calculate_size();
             if show_size {
-                styled_write_maybe!(out, Style::default(), " ({} bytes):", size);
+                styled_write_maybe!(out, default, " ({} bytes):", size);
             }
             builder.add_usize_field("size", size, state.builtin_types.u64_);
             if !t.name.is_empty() {
-                styled_write_maybe!(out, Style::default(), " {}", t.name);
+                styled_write_maybe!(out, default, " {}", t.name);
                 builder.add_str_field("name", t.name, &mut state.types, &state.builtin_types);
             }
             // TODO: Decl file+line.
@@ -216,10 +215,10 @@ pub fn reflect_meta_value(val: &Value, state: &mut EvalState, context: &EvalCont
             let f = unsafe {&*f};
             builder.add_usize_field("type", unsafe {mem::transmute(f.type_)}, state.builtin_types.meta_type);
             if f.bit_offset % 8 == 0 {
-                styled_write_maybe!(out, Style::default(), "offset {}: ", f.bit_offset / 8);
+                styled_write_maybe!(out, default, "offset {}: ", f.bit_offset / 8);
                 builder.add_usize_field("offset", f.bit_offset / 8, state.builtin_types.u64_);
             } else {
-                styled_write_maybe!(out, Style::default(), "bit_offset {}: ", f.bit_offset);
+                styled_write_maybe!(out, default, "bit_offset {}: ", f.bit_offset);
                 builder.add_usize_field("bit_offset", f.bit_offset, state.builtin_types.u64_);
             }
             if let Some((text, palette)) = &mut out {print_type_name(f.type_, *text, *palette, 0);}

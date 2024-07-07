@@ -1,6 +1,4 @@
 use crate::{*, error::*, log::*};
-use termion::{raw::{RawTerminal, IntoRawMode}, screen::{ToAlternateScreen, ToMainScreen}};
-use tui::{text::{Span, Spans, Text}, style::{Style, Color, Modifier}};
 use libc::{pid_t, c_char, c_void};
 use std::{io, io::{Read, BufReader, BufRead, Write}, str::FromStr, ptr, mem, mem::ManuallyDrop, fmt, os::fd::RawFd, ffi::{CStr, OsString}, os::unix::ffi::{OsStringExt, OsStrExt}, arch::asm, cell::UnsafeCell, sync::atomic::{AtomicBool, Ordering}, ops::{Deref, DerefMut, FnOnce}, fs::File, collections::{BinaryHeap, hash_map::DefaultHasher}, hash::{Hash, Hasher}, cmp::Ord, cmp, path::{Path, PathBuf}};
 
@@ -200,42 +198,6 @@ impl Drop for EventFD {
     }
 }
 
-pub struct NonblockingRead {
-    pub fd: RawFd,
-}
-
-// Does a poll() with zero timeout before every read. Returns WouldBlock if there's nothing available to read.
-impl Read for NonblockingRead {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        unsafe {
-            loop { // retry EINTR
-                let mut pfd = libc::pollfd {fd: self.fd, events: libc::POLLIN, revents: 0};
-                let r = libc::poll(&mut pfd as *mut libc::pollfd, 1, 0);
-                if r < 0 {
-                    let e = io::Error::last_os_error();
-                    if e.kind() == io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    return Err(e);
-                }
-                if r == 0 {
-                    return Err(io::Error::from_raw_os_error(libc::EWOULDBLOCK));
-                }
-
-                let r = libc::read(self.fd, buf.as_ptr() as *mut libc::c_void, buf.len());
-                if r < 0 {
-                    let e = io::Error::last_os_error();
-                    if e.kind() == io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    return Err(e);
-                }
-                return Ok(r as usize);
-            }
-        }
-    }
-}
-
 // Usage: offsetof!(MyStruct, some_field)
 // Works with nested structs too: offsetof!(MyStruct, some_field.some_subfield)
 #[macro_export]
@@ -311,168 +273,7 @@ impl Limiter {
     }
 }
 
-static mut TERMINAL_STATE_TO_RESTORE: UnsafeCell<Option<RawTerminal<io::Stdout>>> = UnsafeCell::new(None);
-static mut TERMINAL_STATE_RESTORED: AtomicBool = AtomicBool::new(true);
 
-// Changes terminal state to raw mode, alternate screen, and bar cursor.
-// Called once at program startup. Not thread safe.
-pub fn set_terminal_to_raw_mode_etc() {
-    unsafe {
-        let s = TERMINAL_STATE_TO_RESTORE.get();
-        assert!((*s).is_none());
-        *s = Some(io::stdout().into_raw_mode().unwrap()); // calls tcgetattr(), cfmakeraw(), and tcsetattr()
-        write!(io::stdout(), "{}{}", ToAlternateScreen, termion::cursor::BlinkingBar).unwrap();
-        io::stdout().flush().unwrap();
-        TERMINAL_STATE_RESTORED.store(false, Ordering::SeqCst);
-    }
-}
-
-// Undoes the changes made by set_terminal_to_raw_mode_etc(), and also unhides cursor (which tui::terminal::Terminal::draw() hides).
-// If called multiple times, only the first call does anything. Can be called in parallel (but only the first call waits for the changes to be made; if there's a parallel call, it'll return immediately, possibly before the terminal was actually restored).
-// It's important to try to always call this at least once before the process exits, including on panics.
-// Otherwise we'll leave the terminal in a borked state for the user (but it's easy to unbork: `reset`).
-// Would be nice to call this on signals too (e.g. SIGSEGV and SIGTERM) (even though it's not signal-safe), but currently we don't, because I couldn't find a way to both have a SIGSEGV handler and propagate the original fault address (si_addr), e.g. if a debugger is attached to this process.
-pub fn restore_terminal_mode() {
-    unsafe {
-        if TERMINAL_STATE_RESTORED.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        let s = TERMINAL_STATE_TO_RESTORE.get();
-        assert!((*s).is_some());
-        let _ = write!(io::stdout(), "{}{}{}", termion::cursor::BlinkingBlock, termion::cursor::Show, ToMainScreen).unwrap_or(());
-        let _ = io::stdout().flush().unwrap_or(());
-        *s = None; // calls tcsetattr()
-    }
-}
-
-pub struct TerminalRestorer;
-
-impl Drop for TerminalRestorer {
-    fn drop(&mut self) {
-        restore_terminal_mode();
-    }
-}
-
-// Text with styles, like Spans but more efficient.
-// To add a span: (1) append to `chars`, (2) spans.push((chars.len(), style)).
-//                Or: styled_write!(text, style, format, args).
-// To add a line: (1) add one or more spans as above, (2) lines.push(spans.len()).
-pub struct StyledText {
-    // Each array describes ranges of indiced in the next array. This is to have just 3 memory allocations instead of lots of tiny allocations in Vec<Vec<String>>.
-    // The +-1 situation gets kinda nasty, maybe this would be better with Range<usize> instead of usize, even though that's more memory and more code.
-    pub lines: Vec<usize>,
-    pub spans: Vec<(usize, Style)>,
-    pub chars: String,
-}
-
-impl StyledText {
-    pub fn new() -> Self {
-        Self {chars: String::new(), spans: vec![(0, Style::default())], lines: vec![1]}
-    }
-
-    pub fn close_span(&mut self, style: Style) {
-        if self.spans.last().unwrap().0 != self.chars.len() {
-            self.spans.push((self.chars.len(), style));
-        }
-    }
-
-    pub fn close_line(&mut self) {
-        self.lines.push(self.spans.len());
-    }
-
-    pub fn line_out<'a>(&'a self, idx: usize, out: &mut Vec<Span<'a>>) {
-        for i in self.lines[idx]..self.lines[idx+1] {
-            out.push(Span::styled(&self.chars[self.spans[i-1].0..self.spans[i].0], self.spans[i].1));
-        }
-    }
-    pub fn line_out_copy<'a>(&self, idx: usize, out: &mut Vec<Span<'a>>) {
-        for i in self.lines[idx]..self.lines[idx+1] {
-            out.push(Span::styled(self.chars[self.spans[i-1].0..self.spans[i].0].to_string(), self.spans[i].1));
-        }
-    }
-    pub fn to_lines<'a>(&'a self) -> Vec<Spans<'a>> {
-        let mut r: Vec<Spans> = Vec::new();
-        for i in 0..self.num_lines() {
-            let mut v: Vec<Span> = Vec::new();
-            self.line_out(i, &mut v);
-            r.push(Spans::from(v));
-        }
-        r
-    }
-
-    // Ignores line boundaries and mashes all lines together, including the unclosed trailing line, if any.
-    // Allocates a String for each Span, so pretty inefficient, don't use for long texts.
-    pub fn into_line(self) -> Spans<'static> {
-        let mut r: Vec<Span> = Vec::new();
-        for i in 1..self.spans.len() {
-            r.push(Span::styled(self.chars[self.spans[i-1].0..self.spans[i].0].to_string(), self.spans[i].1));
-        }
-        Spans(r)
-    }
-
-    // Number of closed lines.
-    pub fn num_lines(&self) -> usize {
-        self.lines.len() - 1
-    }
-
-    // If line_idx == num_lines(), returns the unclosed line.
-    pub fn line_chars(&self, line_idx: usize) -> &str {
-        let start = self.spans[self.lines[line_idx]-1].0;
-        let end = if line_idx+1 < self.lines.len() {
-            self.spans[self.lines[line_idx+1]-1].0
-        } else {
-            self.chars.len()
-        };
-        &self.chars[start..end]
-    }
-
-    pub fn widest_line(&self) -> usize {
-        (0..self.num_lines()).map(|i| str_width(self.line_chars(i))).max().unwrap_or(0)
-    }
-
-    pub fn clear(&mut self) {
-        self.chars.clear();
-        self.spans.truncate(1);
-        self.lines.truncate(1);
-    }
-
-    pub fn add_modifier(&mut self, m: Modifier) {
-        for s in &mut self.spans {
-            s.1 = s.1.add_modifier(m);
-        }
-    }
-
-    pub fn unclosed_line_width(&self) -> usize {
-        let s = *self.lines.last().unwrap();
-        if s >= self.spans.len() {
-            0
-        } else {
-            str_width(&self.chars[self.spans[s].0..])
-        }
-    }
-
-    // If t has multiple lines, they're mashed together.
-    pub fn append_to_unclosed_line(&mut self, t: &StyledText) {
-        let (n, m) = (self.spans.len(), self.chars.len());
-        self.chars.push_str(&t.chars);
-        self.spans.extend_from_slice(&t.spans);
-        for s in &mut self.spans[n..] {
-            s.0 += m;
-        }
-    }
-}
-
-// Append a span to StyledText:
-// styled_write!(out, Style::default().add_modifier(Modifier::DIM), "foo: {}, bar: {}", foo, bar);
-#[macro_export]
-macro_rules! styled_write {
-    ($out:expr, $style:expr, $($arg:tt)*) => (
-        {
-            let _ = write!(($out).chars, $($arg)*);
-            ($out).close_span($style);
-        }
-    );
-}
 
 #[repr(align(128))]
 pub struct CachePadded<T> {
@@ -714,31 +515,6 @@ impl<R: Write> ByteWrite for R {
     fn write_slice(&mut self, s: &[u8]) -> io::Result<()> { self.write_usize(s.len())?; self.write_all(s) }
     fn write_str(&mut self, s: &str) -> io::Result<()> { self.write_slice(s.as_bytes()) }
     fn write_path(&mut self, s: &Path) -> io::Result<()> { self.write_slice(s.as_os_str().as_bytes()) }
-}
-
-// Horizontal space that the string would occupy on the screen.
-// For ASCII string it's just str.len(). For unicode, there are also multi-byte characters and wide characters to consider.
-// TODO: Implement all the width-related functions below properly (probably use the same library tui-rs uses).
-pub fn str_width(s: &str) -> usize {
-    s.chars().count()
-}
-
-// If str_width(s) < w: returns s.len()
-// Otherwise: str_width(&s[..str_prefix_with_width(s, w)]) == w
-pub fn str_prefix_with_width(s: &str, width: usize) -> usize {
-    match s.char_indices().nth(width) {
-        None => s.len(),
-        Some((i, _)) => i,
-    }
-}
-pub fn str_suffix_with_width(s: &str, width: usize) -> usize {
-    if width == 0 {
-        return s.len();
-    }
-    match s.char_indices().rev().nth(width - 1) {
-        None => 0,
-        Some((i, _)) => i,
-    }
 }
 
 // sysconf(_SC_CLK_TCK), assigned at the start of main().

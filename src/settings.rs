@@ -1,18 +1,14 @@
-use termion::event::Key;
-use tui::style::{Style, Modifier, Color};
+use crate::{*, terminal::*, common_ui::*};
 use std::collections::HashMap;
 
 pub struct Settings {
     pub tab_width: usize,
     pub stop_on_initial_exec: bool,
     pub fps: f64,
-    pub loading_fps: f64, // how often to re-render when there's a progress bar on screen
     pub max_threads: usize,
     // How often to refresh resource stats (cpu and memory usage) and save state to file (watches, breakpoints, etc). (State is also saved on clean exit, but not on panic or crash.)
     pub periodic_timer_seconds: f64,
-    // TODO: Load keys and colors from config file(s). Maybe move them out of Settings to allow hot-reloading (for experimenting with colors quickly). Probably use separate files to make it easier to share themes.
-    pub keys: KeyBindings,
-    pub palette: Palette,
+    pub mouse_mode: MouseMode,
 
     pub stdin_file: Option<String>,
     pub stdout_file: Option<String>,
@@ -24,11 +20,9 @@ impl Default for Settings {
         tab_width: 2,
         stop_on_initial_exec: true,
         fps: 144.0,
-        loading_fps: 10.0,
         max_threads: 128,
-        periodic_timer_seconds: 1.0,
-        keys: KeyBindings::defaults(),
-        palette: Palette::rgb_dark_theme(),
+        periodic_timer_seconds: 0.25,
+        mouse_mode: MouseMode::Full,
 
         stdin_file: None,
         stdout_file: None,
@@ -36,13 +30,194 @@ impl Default for Settings {
     } }
 }
 
+pub struct Palette {
+    pub default: Style,
+    pub default_dim: Style,
+    pub error: Style,
+    pub warning: Style,
+
+    pub running: Style,
+    pub suspended: Style,
+    pub function_name: Style,
+    pub filename: Style,
+    pub line_number: Style,
+    pub column_number: Style,
+    pub type_name: Style,
+    pub field_name: Style,
+    pub keyword: Style,
+    pub hotkey: Style,
+
+    pub state_running: Style,
+    pub state_suspended: Style,
+    pub state_other: Style,
+
+    // How to highlight things like selected table row or selected code line.
+    pub selected: StyleAdjustment,
+    // How to highlight clickable widgets on mouse hover.
+    pub hovered: StyleAdjustment,
+    // How to draw widgets with REDRAW_IF_VISIBLE flag, as a sort of loading indicator. It should be visible very rarely and only for one frame.
+    pub placeholder_fill: Option<(char, Style)>,
+    // What to prepend/append when text is truncated on the left/right. E.g. '…'.
+    pub truncation_indicator: (/*left*/ String, /*right*/ String, Style),
+    // What to show at left and right ends of something horizontally scrollable. E.g.: '<', '>'
+    pub hscroll_indicator: (/*left*/ String, /*right*/ String, Style),
+    pub line_wrap_indicator: (/*start_of_line*/ String, /*end_of_line*/ String, Style),
+
+    pub table_header: Style,
+    pub striped_table: StyleAdjustment,
+
+    pub tab_title: Style,
+    pub tab_title_pinned: Style,
+    pub tab_separator: (String, Style),
+
+    // fg - left side, bg - right side.
+    pub progress_bar: Style,
+
+    pub scroll_bar_background: Style,
+    pub scroll_bar_slider: Style,
+
+    pub tooltip: StyleAdjustment,
+    pub dialog: StyleAdjustment,
+
+    pub text_input: Style,
+    pub text_input_selected: Style,
+
+    pub tree_indent: Style,
+
+    pub window_border: Style,
+    pub window_border_active: Style,
+
+    pub value: Style,
+    pub value_misc: Style,
+    pub value_dubious: StyleAdjustment,
+
+    pub code_statement: Style,
+    pub code_inlined_site: Style,
+    pub code_instruction_pointer_column: StyleAdjustment,
+    pub instruction_pointer: Style,
+    pub additional_instruction_pointer: Style,
+    pub breakpoint: Style,
+    pub secondary_breakpoint: Style,
+    pub code_line_number: Style,
+    pub url: Style,
+    pub disas_default: Style,
+    pub disas_keyword: Style,
+    pub disas_mnemonic: Style,
+    pub disas_register: Style,
+    pub disas_number: Style,
+    pub disas_function: Style,
+    pub disas_jump_arrow: Style,
+    pub disas_relative_address: Style,
+    pub disas_filename: Style,
+}
+impl Default for Palette {
+    fn default() -> Self {
+        let black = Color(0, 0, 0);
+        let white = Color(0xff, 0xff, 0xff);
+        let red = Color(255, 50, 50);
+        let green = Color(0, 0xaa, 0);
+        let blue = Color(0x63, 0x84, 0xff);
+        let yellow = Color(0xaa, 0x55, 0);
+        let cyan = Color(0, 0xaa, 0xaa);
+        let magenta = Color(0xaa, 0, 0xaa);
+        let dark_gray = Color(0x55, 0x55, 0x55);
+        let light_green = Color(0x55, 0xff, 0x55);
+        let light_blue = Color(0x55, 0x55, 0xff);
+
+        Self {
+            default: Style {fg: white, ..D!()},
+            default_dim: Style {fg: white.darker(), ..D!()},
+            error: Style {fg: red, ..D!()},
+            warning: Style {fg: yellow, ..D!()},
+
+            running: Style {fg: blue, ..D!()},
+            suspended: Style {fg: light_green, ..D!()},
+            function_name: Style {fg: white, ..D!()},
+            filename: Style {fg: cyan, ..D!()},
+            line_number: Style {fg: green, ..D!()},
+            column_number: Style {fg: green.darker(), ..D!()},
+            type_name: Style {fg: white, ..D!()},
+            field_name: Style {fg: white, ..D!()},
+            keyword: Style {fg: white, ..D!()},
+            hotkey: Style {fg: white, modifier: Modifier::UNDERLINED, ..D!()},
+
+            state_running: Style {bg: blue, fg: black, ..D!()},
+            state_suspended: Style {bg: light_green, fg: black, ..D!()},
+            state_other: Style {bg: yellow, fg: black, ..D!()},
+
+            selected: StyleAdjustment {add_fg: (20, 20, 20), add_bg: (50, 50, 50), ..D!()},
+            hovered: StyleAdjustment {add_fg: (20, 20, 20), add_bg: (25, 25, 25), ..D!()},
+
+            table_header: Style {fg: white.darker(), ..D!()},
+            //striped_table: StyleAdjustment {add_fg: (0, 0, 0), add_bg: (20, 20, 20), ..D!()},
+            striped_table: StyleAdjustment::default(),
+
+            tab_title: Style {fg: white.darker(), ..D!()},
+            tab_title_pinned: Style {fg: white, ..D!()},
+            tab_separator: (" | ".to_string(), Style {fg: white.darker(), ..D!()}),
+
+            placeholder_fill: Some(('.', Style {fg: white.darker(), bg: black, ..D!()})),
+            truncation_indicator: (("…".to_string(), "…".to_string(), Style {fg: white.darker(), ..D!()})),
+            hscroll_indicator: (("❮".to_string(), "❯".to_string(), Style {fg: white.darker(), ..D!()})),
+            line_wrap_indicator: (String::new(), "\\".to_string(), Style {fg: white.darker(), ..D!()}),
+
+            progress_bar: Style {fg: blue, bg: Color(30, 30, 30), ..D!()},
+            scroll_bar_background: Style {fg: white.darker(), ..D!()},
+            scroll_bar_slider: Style {fg: white.darker(), ..D!()},
+
+            tooltip: StyleAdjustment {add_bg: (30, 40, 50), ..D!()},
+            dialog: StyleAdjustment {add_fg: (10, 10, 10), add_bg: (20, 20, 20), ..D!()},
+
+            text_input: Style {fg: white, ..D!()},
+            text_input_selected: Style {fg: white, bg: blue, ..D!()},
+
+            tree_indent: Style {fg: white.darker(), ..D!()},
+
+            window_border: Style {fg: white.darker(), ..D!()},
+            window_border_active: Style {fg: white, modifier: Modifier::BOLD, ..D!()},
+
+            value: Style {fg: white, ..D!()},
+            value_misc: Style {fg: white.darker(), ..D!()},
+            value_dubious: StyleAdjustment {add_fg: (-100, -100, -100), ..D!()},
+
+            code_statement: Style {fg: white, bg: dark_gray, ..D!()},
+            code_inlined_site: Style {fg: white, bg: light_blue, ..D!()},
+            code_instruction_pointer_column: StyleAdjustment {add_bg: (0, 100, 0), add_modifier: Modifier::UNDERLINED, ..D!()},
+            instruction_pointer: Style {fg: green, modifier: Modifier::BOLD, ..D!()},
+            additional_instruction_pointer: Style {fg: blue, ..D!()},
+            breakpoint: Style {fg: red, ..D!()},
+            secondary_breakpoint: Style {fg: blue, ..D!()},
+            code_line_number: Style {fg: white, ..D!()},
+            url: Style {fg: blue, ..D!()},
+            disas_default: Style {fg: white, ..D!()},
+            disas_keyword: Style {fg: white.darker(), ..D!()},
+            disas_mnemonic: Style {fg: green, modifier: Modifier::BOLD, ..D!()},
+            disas_register: Style {fg: blue, ..D!()},
+            disas_number: Style {fg: cyan, ..D!()},
+            disas_function: Style {fg: magenta, ..D!()},
+            disas_jump_arrow: Style {fg: white, ..D!()},
+            disas_relative_address: Style {fg: cyan.darker(), ..D!()}, 
+            disas_filename: Style {fg: cyan.darker(), ..D!()},
+       }
+    }
+}
+
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Clone, Copy)]
 pub enum KeyAction {
     Quit,
+
     Run,
     Continue,
     Suspend,
     Kill,
+
+    StepIntoLine,
+    StepIntoInstruction,
+    StepOverLine,
+    StepOverColumn,
+    StepOverInstruction,
+    StepOut,
+    StepOutNoInline,
 
     WindowUp,
     WindowDown,
@@ -62,14 +237,7 @@ pub enum KeyAction {
     PageDown,
     Home,
     End,
-
-    StepIntoLine,
-    StepIntoInstruction,
-    StepOverLine,
-    StepOverColumn,
-    StepOverInstruction,
-    StepOut,
-    StepOutNoInline,
+    Tooltip,
 
     NextTab,
     PreviousTab,
@@ -90,221 +258,126 @@ pub enum KeyAction {
 
     DropCaches,
     ToggleProfiler,
+
+    // Text input.
+    Undo,
+    Redo,
+    Copy,
+    Paste,
+    Cut,
+    NewLine,
 }
 
-pub struct KeyBindings {
-    pub map: HashMap<Key, KeyAction>,
-    // Can add a separate map for text editing, and maybe maps for other modes of some kind.
-    // Currently most of the text editing keys are hardcoded.
+pub struct KeyBinds {
+    pub key_to_action: HashMap<KeyEx, KeyAction>,
+    pub action_to_keys: HashMap<KeyAction, Vec<KeyEx>>,
+    pub text_input_key_to_action: HashMap<KeyEx, KeyAction>,
+    pub vscroll_sensitivity: isize,
+    pub hscroll_sensitivity: isize,
 }
-
-impl KeyBindings {
-    pub fn defaults() -> Self {
-        Self {map: HashMap::from([
-            (Key::Char('q'), KeyAction::Quit),
-            (Key::Char('r'), KeyAction::Run),
-            (Key::Char('c'), KeyAction::Continue),
-            (Key::Char('C'), KeyAction::Suspend),
-            (Key::Ctrl('c'), KeyAction::Suspend),
-            (Key::Char('k'), KeyAction::Kill),
-            (Key::Ctrl('w'), KeyAction::WindowUp),
-            (Key::Ctrl('s'), KeyAction::WindowDown),
-            (Key::Ctrl('a'), KeyAction::WindowLeft),
-            (Key::Ctrl('d'), KeyAction::WindowRight),
-            (Key::Char('0'), KeyAction::Window(0)),
-            (Key::Char('1'), KeyAction::Window(1)),
-            (Key::Char('2'), KeyAction::Window(2)),
-            (Key::Char('3'), KeyAction::Window(3)),
-            (Key::Char('4'), KeyAction::Window(4)),
-            (Key::Char('5'), KeyAction::Window(5)),
-            (Key::Char('6'), KeyAction::Window(6)),
-            (Key::Char('7'), KeyAction::Window(7)),
-            (Key::Char('8'), KeyAction::Window(8)),
-            (Key::Char('9'), KeyAction::Window(9)),
-            (Key::Up, KeyAction::CursorUp),
-            (Key::Down, KeyAction::CursorDown),
-            (Key::Left, KeyAction::CursorLeft),
-            (Key::Right, KeyAction::CursorRight),
-            (Key::Char('\n'), KeyAction::Enter),
-            (Key::Delete, KeyAction::DeleteRow),
-            (Key::Backspace, KeyAction::DeleteRow),
-            (Key::Esc, KeyAction::Cancel),
-            (Key::Ctrl('g'), KeyAction::Cancel),
-            (Key::PageUp, KeyAction::PageUp),
-            (Key::Alt('v'), KeyAction::PageUp),
-            (Key::PageDown, KeyAction::PageDown),
-            (Key::Ctrl('v'), KeyAction::PageDown),
-            (Key::Home, KeyAction::Home),
-            (Key::End, KeyAction::End),
-            (Key::Char('s'), KeyAction::StepIntoLine),
-            (Key::Char('S'), KeyAction::StepIntoInstruction),
-            (Key::Char('n'), KeyAction::StepOverLine),
-            (Key::Char('m'), KeyAction::StepOverColumn),
-            (Key::Char('N'), KeyAction::StepOverInstruction),
-            (Key::Char('f'), KeyAction::StepOut),
-            (Key::Char('F'), KeyAction::StepOutNoInline),
-            (Key::Ctrl('t'), KeyAction::NextTab),
-            (Key::Ctrl('b'), KeyAction::PreviousTab),
-            (Key::Ctrl('y'), KeyAction::PinTab),
-            (Key::Char(']'), KeyAction::NextStackFrame),
-            (Key::Char('['), KeyAction::PreviousStackFrame),
-            (Key::Char('}'), KeyAction::NextThread),
-            (Key::Char('{'), KeyAction::PreviousThread),
-            (Key::Char('.'), KeyAction::NextMatch),
-            (Key::Char(','), KeyAction::PreviousMatch),
-            (Key::Char('o'), KeyAction::Open),
-            (Key::Char('b'), KeyAction::ToggleBreakpoint),
-            (Key::Char('B'), KeyAction::ToggleBreakpointEnabledness),
-            (Key::Char('/'), KeyAction::Find),
-            (Key::Char('d'), KeyAction::DuplicateRow),
-            (Key::Ctrl('l'), KeyAction::DropCaches),
-            (Key::Ctrl('p'), KeyAction::ToggleProfiler),
-        ])}
-    }
-
-    pub fn find(&self, action: KeyAction) -> Option<Key> {
-        self.map.iter().find(|(k, a)| **a == action).map(|(k, a)| *k)
-    }
-}
-
-pub struct Palette {
-    pub default: Style,
-    pub default_dim: Style,
-    pub window_border: Style,
-    pub window_border_active: Style,
-    pub window_hotkey: Style,
-    pub error: Style,
-    pub error_dim: Style,
-    pub warning: Style,
-    pub warning_dim: Style,
-    pub status_error: Style,
-    pub type_name: Style,
-    pub value: Style,
-    pub value_dubious: Style,
-    pub value_warning: Style,
-    pub value_error: Style,
-    pub value_field_name: Style,
-    pub value_misc: Style,
-    pub value_misc_dim: Style,
-    pub function_name: Style,
-    pub location_filename: Style,
-    pub location_filename_dim: Style,
-    pub location_line_number: Style,
-    pub location_line_number_dim: Style,
-    pub location_column_number: Style,
-    pub location_column_number_dim: Style,
-    pub table_header: Style,
-    pub table_selected_item: Style,
-    pub selected_text_line: Style,
-    pub code_statement: Style,
-    pub code_inlined_site: Style,
-    pub code_line_number: Style,
-    pub instruction_pointer: Style,
-    pub additional_instruction_pointer: Style,
-    pub breakpoint: Style,
-    pub secondary_breakpoint: Style,
-    pub dialog: Style,
-    pub tab_title: Style,
-    pub tab_title_active: Style,
-    pub tab_title_selected: Style,
-    pub state_in_progress: Style,
-    pub state_suspended: Style,
-    pub state_other: Style,
-    pub progress_bar_done: Style,
-    pub progress_bar_remaining: Style,
-    pub search_bar_query: Style,
-    pub search_bar_other: Style,
-    pub url: Style,
-    pub disas_default: Style,
-    pub disas_keyword: Style,
-    pub disas_mnemonic: Style,
-    pub disas_register: Style,
-    pub disas_number: Style,
-    pub disas_function: Style,
-    pub disas_jump_arrow: Style,
-    pub disas_relative_address: Style,
-}
-
-impl Palette {
-    fn rgb_dark_theme() -> Self {
-        // If you want a theme that uses terminal colors instead of hard-coded RGB, this can be a starting point:
-        // replace these variables with corresponding Color::* named colors, and find some replacements for the remaining Color::Rgb-s below.
-        let black = Color::Rgb(0, 0, 0);
-        let white = Color::Rgb(0xff, 0xff, 0xff);
-        let red = Color::Rgb(0xaa, 0, 0);
-        let green = Color::Rgb(0, 0xaa, 0);
-        let blue = Color::Rgb(0x63, 0x84, 0xff);
-        let yellow = Color::Rgb(0xaa, 0x55, 0);
-        let cyan = Color::Rgb(0, 0xaa, 0xaa);
-        let magenta = Color::Rgb(0xaa, 0, 0xaa);
-        let dark_gray = Color::Rgb(0x55, 0x55, 0x55);
-        let light_green = Color::Rgb(0x55, 0xff, 0x55);
-        let light_blue = Color::Rgb(0x55, 0x55, 0xff);
-        
-        // Modifier::DIM doesn't do anything if Rgb color was specified. So we have to dim the colors manually.
-        let dim = |color: Color| -> Color {
-            match color {
-                Color::Rgb(r, g, b) => Color::Rgb(r-r/3, g-g/3, b-b/3),
-                _ => panic!("expected Rgb color"),
+impl KeyBinds {
+    pub fn actions_to_keys(&self, actions: &[KeyAction]) -> Vec<KeyEx> {
+        let mut r: Vec<KeyEx> = Vec::new();
+        for action in actions {
+            if let Some(keys) = self.action_to_keys.get(action) {
+                r.extend_from_slice(keys);
             }
-        };
-        
-        Self {
-            default: Style::default().bg(black).fg(white),
-            default_dim: Style::default().fg(dim(white)),
-            window_border: Style::default().fg(dim(white)),
-            window_border_active: Style::default().add_modifier(Modifier::BOLD),
-            window_hotkey: Style::default().add_modifier(Modifier::UNDERLINED),
-            error: Style::default().bg(red).fg(black),
-            error_dim: Style::default().bg(dim(red)).fg(black),
-            status_error: Style::default().add_modifier(Modifier::BOLD).fg(red),
-            warning: Style::default().bg(yellow).fg(black),
-            warning_dim: Style::default().bg(dim(yellow)).fg(black),
-            type_name: Style::default(),
-            value: Style::default(),
-            value_dubious: Style::default().fg(dim(white)),
-            value_warning: Style::default().fg(yellow),
-            value_error: Style::default().fg(red),
-            value_field_name: Style::default().fg(green),
-            value_misc: Style::default(),
-            value_misc_dim: Style::default().fg(dim(white)),
-            function_name: Style::default(),
-            location_filename: Style::default().fg(cyan),
-            location_filename_dim: Style::default().fg(dim(cyan)),
-            location_line_number: Style::default().fg(green),
-            location_line_number_dim: Style::default().fg(dim(green)),
-            location_column_number: Style::default().fg(dim(green)),
-            location_column_number_dim: Style::default().fg(dim(dim(green))),
-            table_header: Style::default().fg(dim(white)),
-            table_selected_item: Style::default().add_modifier(Modifier::BOLD),
-            selected_text_line: Style::default().bg(Color::Rgb(30, 30, 30)),
-            code_statement: Style::default().bg(dark_gray),
-            code_inlined_site: Style::default().bg(light_blue),
-            instruction_pointer: Style::default().fg(green).add_modifier(Modifier::BOLD),
-            additional_instruction_pointer: Style::default().fg(blue),
-            breakpoint: Style::default().fg(red),
-            secondary_breakpoint: Style::default().fg(blue),
-            code_line_number: Style::default(),
-            dialog: Style::default().bg(Color::Rgb(20, 20, 20)),
-            tab_title: Style::default().fg(dim(white)),
-            tab_title_active: Style::default(),
-            tab_title_selected: Style::default().bg(white).fg(black),
-            state_in_progress: Style::default().bg(blue).fg(black),
-            state_suspended: Style::default().bg(light_green).fg(black),
-            state_other: Style::default().bg(yellow).fg(black),
-            progress_bar_done: Style::default().bg(blue).fg(black),
-            progress_bar_remaining: Style::default().bg(Color::Rgb(30, 30, 30)).fg(white),
-            search_bar_query: Style::default().bg(Color::Rgb(80, 10, 80)),
-            search_bar_other: Style::default().bg(Color::Rgb(20, 20, 20)).fg(dim(white)),
-            url: Style::default().fg(blue),
-            disas_default: Style::default(),
-            disas_keyword: Style::default().fg(dim(white)),
-            disas_mnemonic: Style::default().fg(green).add_modifier(Modifier::BOLD),
-            disas_register: Style::default().fg(blue),
-            disas_number: Style::default().fg(cyan),
-            disas_function: Style::default().fg(magenta),
-            disas_jump_arrow: Style::default(),
-            disas_relative_address: Style::default().fg(dim(cyan)),
         }
+        r
+    }
+
+    pub fn keys_to_actions(&self, keys: &[KeyEx]) -> Vec<KeyAction> {
+        let mut res: Vec<KeyAction> = Vec::new();
+        for key in keys {
+            if let Some(action) = self.key_to_action.get(key) {
+                res.push(action.clone());
+            }
+        }
+        res
+    }
+
+    fn init(&mut self) {
+        for (key, action) in &self.key_to_action {
+            self.action_to_keys.entry(action.clone()).or_default().push(key.clone());
+        }
+    }
+}
+impl Default for KeyBinds {
+    fn default() -> Self {
+        let mut res = Self {
+            vscroll_sensitivity: 1, hscroll_sensitivity: 10, key_to_action: HashMap::from([
+                (Key::Char('q').plain(), KeyAction::Quit),
+                (Key::Char('r').plain(), KeyAction::Run),
+                (Key::Char('c').plain(), KeyAction::Continue),
+                (Key::Char('C').plain(), KeyAction::Suspend),
+                (Key::Char('c').ctrl(), KeyAction::Suspend),
+                (Key::Char('k').plain(), KeyAction::Kill),
+                (Key::Char('w').ctrl(), KeyAction::WindowUp),
+                (Key::Char('s').ctrl(), KeyAction::WindowDown),
+                (Key::Char('a').ctrl(), KeyAction::WindowLeft),
+                (Key::Char('d').ctrl(), KeyAction::WindowRight),
+                (Key::Char('0').plain(), KeyAction::Window(0)),
+                (Key::Char('1').plain(), KeyAction::Window(1)),
+                (Key::Char('2').plain(), KeyAction::Window(2)),
+                (Key::Char('3').plain(), KeyAction::Window(3)),
+                (Key::Char('4').plain(), KeyAction::Window(4)),
+                (Key::Char('5').plain(), KeyAction::Window(5)),
+                (Key::Char('6').plain(), KeyAction::Window(6)),
+                (Key::Char('7').plain(), KeyAction::Window(7)),
+                (Key::Char('8').plain(), KeyAction::Window(8)),
+                (Key::Char('9').plain(), KeyAction::Window(9)),
+                (Key::Up.plain(), KeyAction::CursorUp),
+                (Key::Down.plain(), KeyAction::CursorDown),
+                (Key::Left.plain(), KeyAction::CursorLeft),
+                (Key::Right.plain(), KeyAction::CursorRight),
+                (Key::Char('\n').plain(), KeyAction::Enter),
+                (Key::Delete.plain(), KeyAction::DeleteRow),
+                (Key::Backspace.plain(), KeyAction::DeleteRow),
+                (Key::Escape.plain(), KeyAction::Cancel),
+                (Key::Char('g').ctrl(), KeyAction::Cancel),
+                (Key::PageUp.plain(), KeyAction::PageUp),
+                (Key::Char('v').alt(), KeyAction::PageUp),
+                (Key::PageDown.plain(), KeyAction::PageDown),
+                (Key::Char('v').ctrl(), KeyAction::PageDown),
+                (Key::Home.plain(), KeyAction::Home),
+                (Key::End.plain(), KeyAction::End),
+                (Key::Char('i').ctrl(), KeyAction::Tooltip),
+                (Key::Char('s').plain(), KeyAction::StepIntoLine),
+                (Key::Char('S').plain(), KeyAction::StepIntoInstruction),
+                (Key::Char('n').plain(), KeyAction::StepOverLine),
+                (Key::Char('m').plain(), KeyAction::StepOverColumn),
+                (Key::Char('N').plain(), KeyAction::StepOverInstruction),
+                (Key::Char('f').plain(), KeyAction::StepOut),
+                (Key::Char('F').plain(), KeyAction::StepOutNoInline),
+                // (Ctrl+tab and ctrl+shift+tab are unrepresentable in ansi escape codes.)
+                (Key::Char('t').ctrl(), KeyAction::NextTab),
+                (Key::Char('b').ctrl(), KeyAction::PreviousTab),
+                (Key::Char('y').ctrl(), KeyAction::PinTab),
+                (Key::Char(']').plain(), KeyAction::NextStackFrame),
+                (Key::Char('[').plain(), KeyAction::PreviousStackFrame),
+                (Key::Char('}').plain(), KeyAction::NextThread),
+                (Key::Char('{').plain(), KeyAction::PreviousThread),
+                (Key::Char('.').plain(), KeyAction::NextMatch),
+                (Key::Char(',').plain(), KeyAction::PreviousMatch),
+                (Key::Char('o').plain(), KeyAction::Open),
+                (Key::Char('b').plain(), KeyAction::ToggleBreakpoint),
+                (Key::Char('B').plain(), KeyAction::ToggleBreakpointEnabledness),
+                (Key::Char('/').plain(), KeyAction::Find),
+                (Key::Char('d').plain(), KeyAction::DuplicateRow),
+                (Key::Char('l').ctrl(), KeyAction::DropCaches),
+                (Key::Char('p').ctrl(), KeyAction::ToggleProfiler),
+            ]),
+            text_input_key_to_action: HashMap::from([
+                (Key::Char('7').ctrl(), KeyAction::Undo), // ctrl+/ is indistinguishable from ctrl+7
+                (Key::Char('_').alt(), KeyAction::Redo),
+                (Key::Char('y').ctrl(), KeyAction::Paste),
+                (Key::Char('c').ctrl(), KeyAction::Copy),
+                (Key::Char('x').ctrl(), KeyAction::Cut),
+                (Key::Char('v').ctrl(), KeyAction::Paste),
+                (Key::Char('\n').alt(), KeyAction::NewLine),
+            ]),
+            action_to_keys: HashMap::new()};
+        res.init();
+        res
     }
 }

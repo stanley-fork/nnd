@@ -1,7 +1,6 @@
-use crate::{*, util::*};
+use crate::{*, util::*, common_ui::*};
 use std::{collections::VecDeque, time::Instant, mem, fmt::Write};
 use core::arch::x86_64::_rdtsc;
-use tui::style::{Style, Color, Modifier};
 
 // We should rework logging. I initially thought we'd want to show a very minimal log on screen.
 // (Not at all like a typical server log, where you spam 1 MB/s of garbage.)
@@ -108,6 +107,7 @@ impl TscScope {
     }
 }
 
+// TODO: Rework this, draw graphs instead.
 pub struct Profiling {
     pub syscall_count: usize,
     pub syscall_tsc: u64,
@@ -135,7 +135,7 @@ pub struct Profiling {
 }
 impl Profiling {
     pub fn new() -> Self { Self {syscall_count: 0, syscall_tsc: 0, debugger_event_count: 0, terminal_tsc: 0, burst_tsc: 0, burst_syscall_count: 0, burst_syscall_tsc: 0, burst_event_count: 0, burst_iterations: 0, had_debugger_events_since_last_render: false, start_time: Instant::now(), start_tsc: rdtsc(), history: VecDeque::new(), ms_per_tsc: None} }
-
+/*asdqwe
     pub fn format_summary(&mut self, out: &mut StyledText, width: usize) {
         while self.history.len() > MAX_LINES {
             self.history.pop_front();
@@ -206,7 +206,7 @@ impl Profiling {
     fn clear_iteration_counters(&mut self) {
         (self.syscall_count, self.syscall_tsc, self.debugger_event_count, self.terminal_tsc) = (0, 0, 0, 0);
     }
-
+*/
     fn get_ms_per_tsc(&mut self) -> f64 {
         if let Some(x) = &self.ms_per_tsc {
             return *x;
