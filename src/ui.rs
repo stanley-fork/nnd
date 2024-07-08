@@ -4,7 +4,7 @@ use libc::{self, pid_t};
 
 pub struct DebuggerUI {
     pub terminal: Terminal,
-    pub imgui: IMGUI,
+    pub ui: UI,
     input: InputReader,
     state: UIState,
     layout: Layout,
@@ -55,12 +55,12 @@ struct DisassemblyScrollTarget {
 }
 
 pub trait WindowContent {
-    fn build(&mut self, ui: &mut UIState, debugger: &mut Debugger, imgui: &mut IMGUI);
+    fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI);
 
     // Called after some symbols finished loading, or if the user requested a redraw.
     fn drop_caches(&mut self) {}
 
-    fn get_hints(&self, hints: &mut StyledText, imgui: &mut IMGUI) {}
+    fn get_hints(&self, hints: &mut StyledText, ui: &mut UI) {}
 
     fn has_persistent_state(&self) -> bool {false}
     fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {panic!("unreachable")}
@@ -92,10 +92,10 @@ pub enum WindowType {
 impl DebuggerUI {
     pub fn new() -> Self {
         let layout = Self::default_layout();
-        let imgui = IMGUI::default();
+        let ui = UI::default();
         // TODO: Load keys and colors from config file(s), do hot-reloading (for experimenting with colors quickly).
 
-        Self {terminal: Terminal::new(), input: InputReader::new(), layout, imgui, state: UIState::default(), should_drop_caches: false, should_quit: false}
+        Self {terminal: Terminal::new(), input: InputReader::new(), layout, ui, state: UIState::default(), should_drop_caches: false, should_quit: false}
     }
 
     pub fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {
@@ -197,12 +197,12 @@ impl DebuggerUI {
             self.state.last_error = String::new();
         }
 
-        Ok(self.imgui.buffer_input(&evs))
+        Ok(self.ui.buffer_input(&evs))
     }
 
     pub fn update_and_render(&mut self, debugger: &mut Debugger) -> Result<()> {
-        let mut buffer = self.terminal.start_frame(self.imgui.palette.default)?;
-        self.imgui.start_build(buffer.width, buffer.height);
+        let mut buffer = self.terminal.start_frame(self.ui.palette.default)?;
+        self.ui.start_build(buffer.width, buffer.height);
 
         self.build(debugger)?;
 
@@ -210,9 +210,9 @@ impl DebuggerUI {
             return Ok(());
         }
 
-        self.imgui.end_build(&mut buffer);
+        self.ui.end_build(&mut buffer);
 
-        let commands = self.terminal.prepare_command_buffer(&buffer, self.imgui.should_show_cursor.clone());
+        let commands = self.terminal.prepare_command_buffer(&buffer, self.ui.should_show_cursor.clone());
         self.terminal.present(buffer, commands)?;
         Ok(())
     }
@@ -220,13 +220,13 @@ impl DebuggerUI {
     fn build(&mut self, debugger: &mut Debugger) -> Result<()> {
         self.should_drop_caches = false;
 
-        let w = self.imgui.get_mut(self.imgui.content_root);
+        let w = self.ui.get_mut(self.ui.content_root);
         w.flags.insert(WidgetFlags::CAPTURE_ALL_KEYS);
         let keys = w.keys.clone();
 
         // Handle some of the global hotkeys. Windows may also handle their global hotkeys by attaching them to the content_root widget, e.g. threads window handling global hotkeys for switching threads.
         for key in &keys {
-            match self.imgui.key_binds.key_to_action.get(key) {
+            match self.ui.key_binds.key_to_action.get(key) {
                 Some(KeyAction::Quit) => {
                     self.should_quit = true;
                     return Ok(());
@@ -277,52 +277,52 @@ impl DebuggerUI {
         // Hints window content. Keep it brief, there's not much space.
         let mut hints = [StyledText::default(), StyledText::default()];
         if debugger.target_state == ProcessState::NoProcess {
-            styled_write!(hints[0], self.imgui.palette.default_dim, "q - quit"); hints[0].close_line();
+            styled_write!(hints[0], self.ui.palette.default_dim, "q - quit"); hints[0].close_line();
         } else if debugger.mode == RunMode::Attach {
-            styled_write!(hints[0], self.imgui.palette.default_dim, "q - detach and quit"); hints[0].close_line();
+            styled_write!(hints[0], self.ui.palette.default_dim, "q - detach and quit"); hints[0].close_line();
         } else {
-            styled_write!(hints[0], self.imgui.palette.default_dim, "q - kill and quit"); hints[0].close_line();
+            styled_write!(hints[0], self.ui.palette.default_dim, "q - kill and quit"); hints[0].close_line();
         }
-        styled_write!(hints[1], self.imgui.palette.default_dim, "[0-9]/C-wasd - switch window"); hints[1].close_line();
-        styled_write!(hints[1], self.imgui.palette.default_dim, "C-t/C-b - switch tab"); hints[1].close_line();
+        styled_write!(hints[1], self.ui.palette.default_dim, "[0-9]/C-wasd - switch window"); hints[1].close_line();
+        styled_write!(hints[1], self.ui.palette.default_dim, "C-t/C-b - switch tab"); hints[1].close_line();
         match debugger.target_state {
             ProcessState::Running | ProcessState::Stepping => {
-                styled_write!(hints[0], self.imgui.palette.default_dim, "C - suspend"); hints[0].close_line();
+                styled_write!(hints[0], self.ui.palette.default_dim, "C - suspend"); hints[0].close_line();
             }
             ProcessState::Suspended => {
-                styled_write!(hints[0], self.imgui.palette.default_dim, "]/[/}}/{{ - switch frame/thread"); hints[0].close_line();
-                styled_write!(hints[0], self.imgui.palette.default_dim, "c - continue"); hints[0].close_line();
-                styled_write!(hints[0], self.imgui.palette.default_dim, "s/n/f - step into/over/out"); hints[0].close_line();
-                styled_write!(hints[0], self.imgui.palette.default_dim, "m - step over column"); hints[0].close_line();
-                styled_write!(hints[0], self.imgui.palette.default_dim, "S/N - step into/over instruction"); hints[0].close_line();
+                styled_write!(hints[0], self.ui.palette.default_dim, "]/[/}}/{{ - switch frame/thread"); hints[0].close_line();
+                styled_write!(hints[0], self.ui.palette.default_dim, "c - continue"); hints[0].close_line();
+                styled_write!(hints[0], self.ui.palette.default_dim, "s/n/f - step into/over/out"); hints[0].close_line();
+                styled_write!(hints[0], self.ui.palette.default_dim, "m - step over column"); hints[0].close_line();
+                styled_write!(hints[0], self.ui.palette.default_dim, "S/N - step into/over instruction"); hints[0].close_line();
             }
             ProcessState::NoProcess if debugger.mode == RunMode::Run => {
-                styled_write!(hints[0], self.imgui.palette.default_dim, "r - start"); hints[0].close_line();
+                styled_write!(hints[0], self.ui.palette.default_dim, "r - start"); hints[0].close_line();
             }
             _ => (),
         }
         if debugger.mode == RunMode::Run && debugger.target_state != ProcessState::NoProcess {
-            styled_write!(hints[0], self.imgui.palette.default_dim, "k - kill"); hints[0].close_line();
+            styled_write!(hints[0], self.ui.palette.default_dim, "k - kill"); hints[0].close_line();
         }
         if let &Some(id) = &self.layout.active_window {
             if let Some(w) = self.layout.windows.try_get(id) {
                 hints[1].close_line();
-                w.content.get_hints(&mut hints[1], &mut self.imgui);
+                w.content.get_hints(&mut hints[1], &mut self.ui);
             }
         }
         self.state.hints = hints;
 
         // Build windows.
-        self.layout.build(&mut self.imgui);
+        self.layout.build(&mut self.ui);
         for (_, win) in self.layout.sorted_windows_mut() {
-            with_parent!(self.imgui, win.widget, {
-                win.content.build(&mut self.state, debugger, &mut self.imgui);
+            with_parent!(self.ui, win.widget, {
+                win.content.build(&mut self.state, debugger, &mut self.ui);
             });
         }
 
         // Stepping has to be handled after updating windows because selected_subframe is assigned by StackWindow.
         for key in &keys {
-            let (kind, by_instructions, use_line_number_with_column) = match self.imgui.key_binds.key_to_action.get(key) {
+            let (kind, by_instructions, use_line_number_with_column) = match self.ui.key_binds.key_to_action.get(key) {
                 Some(KeyAction::StepIntoLine) => (StepKind::Into, false, false),
                 Some(KeyAction::StepIntoInstruction) => (StepKind::Into, true, false),
                 Some(KeyAction::StepOverLine) => (StepKind::Over, false, false),
@@ -334,7 +334,7 @@ impl DebuggerUI {
             };
             let r = debugger.step(self.state.selected_thread, self.state.selected_subframe, kind, by_instructions, use_line_number_with_column);
             report_result(&mut self.state, &r);
-            self.imgui.should_redraw = true;
+            self.ui.should_redraw = true;
         }
 
         Ok(())
@@ -347,9 +347,9 @@ impl DebuggerUI {
     }
 }
 
-fn report_result<R>(ui: &mut UIState, r: &Result<R>) {
+fn report_result<R>(state: &mut UIState, r: &Result<R>) {
     if let Err(e) = r {
-        ui.last_error = format!("{}", e);
+        state.last_error = format!("{}", e);
         if !e.is_usage() {
             eprintln!("warning: {}", e);
         }
@@ -363,15 +363,15 @@ struct RegistersWindow {
 }
 
 impl WindowContent for RegistersWindow {
-    fn build(&mut self, ui: &mut UIState, debugger: &mut Debugger, imgui: &mut IMGUI) {
-        let l = imgui_writeln!(imgui, default, "registers");
-        imgui.add(widget!().text(l));
+    fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
+        let l = imgui_writeln!(ui, default, "registers");
+        ui.add(widget!().text(l));
         /*asdqwe
         let f = match f { Some(f) => f, None => return };
         let palette = &debugger.context.settings.palette;
 
         let mut rows: Vec<Row> = Vec::new();
-        if let Some(frame) = ui.stack.frames.get(ui.selected_frame) {
+        if let Some(frame) = state.stack.frames.get(ui.selected_frame) {
             let regs = &frame.regs;
             for reg in RegisterIdx::all() {
                 if let Ok((v, dubious)) = regs.get_int(*reg) {
@@ -586,10 +586,10 @@ impl WatchesWindow {
 }
 
 impl WindowContent for WatchesWindow {
-    fn build(&mut self, ui: &mut UIState, debugger: &mut Debugger, imgui: &mut IMGUI) {
-        styled_write!(imgui.text, imgui.palette.default, "{}", if self.is_locals_window {"locals"} else {"watches"});
-        let l = imgui.text.close_line();
-        imgui.add(widget!().text(l));
+    fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
+        styled_write!(ui.text, ui.palette.default, "{}", if self.is_locals_window {"locals"} else {"watches"});
+        let l = ui.text.close_line();
+        ui.add(widget!().text(l));
         /*asdqwe
         if let Some((_, area, _)) = &mut self.text_input {
             *area = Rect::default();
@@ -672,12 +672,12 @@ impl WindowContent for WatchesWindow {
         let mut unavailable_reason: Option<String> = None;
         let mut refresh_values = false;
         let mut context = None;
-        match debugger.threads.get(&ui.selected_thread) {
+        match debugger.threads.get(&state.selected_thread) {
             None => unavailable_reason = Some("<no process>".to_string()),
-            Some(thread) => if thread.state != ThreadState::Suspended || ui.stack.frames.is_empty() {
+            Some(thread) => if thread.state != ThreadState::Suspended || state.stack.frames.is_empty() {
                 unavailable_reason = Some("<running>".to_string());
             } else {
-                let t = (ui.selected_thread, ui.selected_subframe, thread.stop_count);
+                let t = (state.selected_thread, state.selected_subframe, thread.stop_count);
                 if t != self.seen {
                     if self.is_locals_window && (t.0, t.1) != (self.seen.0, self.seen.1) {
                         //self.expanded_nodes.clear();
@@ -685,7 +685,7 @@ impl WindowContent for WatchesWindow {
                     self.seen = t;
                     refresh_values = true;
                 }
-                context = Some(debugger.make_eval_context(&ui.stack, ui.selected_subframe));
+                context = Some(debugger.make_eval_context(&state.stack, state.selected_subframe));
             }
         }
 
@@ -806,7 +806,7 @@ impl WindowContent for WatchesWindow {
         self.seen.2 = usize::MAX;
     }
 
-    fn update_modal(&mut self, ui: &mut UIState, debugger: &mut Debugger, keys: &mut Vec<Key>) {
+    fn update_modal(&mut self, state: &mut UIState, debugger: &mut Debugger, keys: &mut Vec<Key>) {
         if let Some((identity, _, input)) = &mut self.text_input {
             let event = input.update(keys, &debugger.context.settings.keys);
             match event {
@@ -834,21 +834,21 @@ impl WindowContent for WatchesWindow {
         }
     }
 
-    fn render_modal(&mut self, ui: &mut UIState, debugger: &mut Debugger, f: &mut Frame, window_area: Rect, screen_area: Rect) {
+    fn render_modal(&mut self, state: &mut UIState, debugger: &mut Debugger, f: &mut Frame, window_area: Rect, screen_area: Rect) {
         if let Some((_, area, input)) = &mut self.text_input {
             f.render_widget(Clear, *area);
             input.render(f, *area, &debugger.context.settings.palette);
         }
     }
 
-    fn cancel_modal(&mut self, ui: &mut UIState, debugger: &mut Debugger) {
+    fn cancel_modal(&mut self, state: &mut UIState, debugger: &mut Debugger) {
         self.text_input = None;
     }
 
-    fn get_hints(&self, hints: &mut StyledText, imgui: &mut IMGUI) {
-        styled_write!(hints, imgui.palette.default_dim, "ret - edit"); hints.close_line();
-        styled_write!(hints, imgui.palette.default_dim, "d - duplicate"); hints.close_line();
-        styled_write!(hints, imgui.palette.default_dim, "backspace - delete"); hints.close_line();
+    fn get_hints(&self, hints: &mut StyledText, ui: &mut UI) {
+        styled_write!(hints, ui.palette.default_dim, "ret - edit"); hints.close_line();
+        styled_write!(hints, ui.palette.default_dim, "d - duplicate"); hints.close_line();
+        styled_write!(hints, ui.palette.default_dim, "backspace - delete"); hints.close_line();
     }
 
     fn has_persistent_state(&self) -> bool {
@@ -878,10 +878,10 @@ struct LocationsWindow {
     table_state: TableState,
 }
 impl WindowContent for LocationsWindow {
-    fn build(&mut self, ui: &mut UIState, debugger: &mut Debugger, imgui: &mut IMGUI) {
-        styled_write!(imgui.text, imgui.palette.default, "locations");
-        let l = imgui.text.close_line();
-        imgui.add(widget!().text(l));
+    fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
+        styled_write!(ui.text, ui.palette.default, "locations");
+        let l = ui.text.close_line();
+        ui.add(widget!().text(l));
         /*
         let f = match f { Some(f) => f, None => return };
         let palette = &debugger.context.settings.palette;
@@ -911,9 +911,9 @@ impl WindowContent for LocationsWindow {
 }
 
 impl LocationsWindow {/*asdqwe
-    fn fill_table(&mut self, ui: &mut UIState, debugger: &Debugger) -> Result<Vec<Row<'static>>> {
+    fn fill_table(&mut self, state: &mut UIState, debugger: &Debugger) -> Result<Vec<Row<'static>>> {
         let palette = &debugger.context.settings.palette;
-        let (binary_id, function_idx, addr) = match ui.selected_addr.clone() { Some(x) => x, None => return Ok(Vec::new()) };
+        let (binary_id, function_idx, addr) = match state.selected_addr.clone() { Some(x) => x, None => return Ok(Vec::new()) };
         let binary = match debugger.info.binaries.get(&binary_id) {
             Some(x) => x,
             None => return err!(ProcessState, "binary not mapped"),
@@ -1192,12 +1192,12 @@ impl DisassemblyWindow {/*asdqwe
 }
 
 impl WindowContent for DisassemblyWindow {
-    fn build(&mut self, ui: &mut UIState, debugger: &mut Debugger, imgui: &mut IMGUI) {
-        styled_write!(imgui.text, imgui.palette.default, "disas");
-        let l = imgui.text.close_line();
-        imgui.add(widget!().text(l));
+    fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
+        styled_write!(ui.text, ui.palette.default, "disas");
+        let l = ui.text.close_line();
+        ui.add(widget!().text(l));
         /*asdqwe
-    fn update_modal(&mut self, ui: &mut UIState, debugger: &mut Debugger, keys: &mut Vec<Key>) {
+    fn update_modal(&mut self, state: &mut UIState, debugger: &mut Debugger, keys: &mut Vec<Key>) {
         if let Some(d) = &mut self.search_dialog {
             let event = d.update(keys, &debugger.context.settings.keys, &debugger.symbols, Some(debugger.info.binaries.keys().cloned().collect()));
             let mut function_to_open = None;
@@ -1237,21 +1237,21 @@ impl WindowContent for DisassemblyWindow {
         });
     }
 
-    fn render_modal(&mut self, ui: &mut UIState, debugger: &mut Debugger, f: &mut Frame, window_area: Rect, screen_area: Rect) {
+    fn render_modal(&mut self, state: &mut UIState, debugger: &mut Debugger, f: &mut Frame, window_area: Rect, screen_area: Rect) {
         if let Some(d) = &mut self.search_dialog {
             ui.loading |= d.render(f, screen_area, "find function (by mangled name)", &debugger.context.settings.palette);
         }
     }
 
-    fn cancel_modal(&mut self, ui: &mut UIState, debugger: &mut Debugger) {
+    fn cancel_modal(&mut self, state: &mut UIState, debugger: &mut Debugger) {
         self.search_dialog = None;
     }
 
-    fn get_hints(&self, hints: &mut StyledText, imgui: &mut IMGUI) {
-        hints.chars.push_str("o - find function"); hints.close_span(imgui.palette.default_dim); hints.close_line();
-        hints.chars.push_str("C-y - pin/unpin tab"); hints.close_span(imgui.palette.default_dim); hints.close_line();
-        hints.chars.push_str(",/. - select level"); hints.close_span(imgui.palette.default_dim); hints.close_line();
-        // TODO: hints.chars.push_str("b - toggle breakpoint"); hints.close_span(imgui.palette.default_dim); hints.close_line();
+    fn get_hints(&self, hints: &mut StyledText, ui: &mut UI) {
+        hints.chars.push_str("o - find function"); hints.close_span(ui.palette.default_dim); hints.close_line();
+        hints.chars.push_str("C-y - pin/unpin tab"); hints.close_span(ui.palette.default_dim); hints.close_line();
+        hints.chars.push_str(",/. - select level"); hints.close_span(ui.palette.default_dim); hints.close_line();
+        // TODO: hints.chars.push_str("b - toggle breakpoint"); hints.close_span(ui.palette.default_dim); hints.close_line();
     }
 
     fn has_persistent_state(&self) -> bool {
@@ -1295,9 +1295,9 @@ impl WindowContent for DisassemblyWindow {
         Ok(())
     }
 
-    fn update_and_render(&mut self, ui: &mut UIState, debugger: &mut Debugger, mut keys: Vec<Key>, f: Option<&mut Frame>, mut area: Rect) {
-        ui.selected_addr = ui.stack.frames.get(ui.selected_frame).and_then(|f| {
-            let sf = &ui.stack.subframes[f.subframes.end-1];
+    fn update_and_render(&mut self, state: &mut UIState, debugger: &mut Debugger, mut keys: Vec<Key>, f: Option<&mut Frame>, mut area: Rect) {
+        state.selected_addr = state.stack.frames.get(state.selected_frame).and_then(|f| {
+            let sf = &state.stack.subframes[f.subframes.end-1];
             match (&f.binary_id, &sf.function) {
                 (Some(b), Ok((_, function_idx))) => Some((b.clone(), *function_idx, f.pseudo_addr)),
                 _ => None,
@@ -1310,8 +1310,8 @@ impl WindowContent for DisassemblyWindow {
         };
 
         let mut scroll_to_addr: Option<(usize, u16)> = None;
-        let suppress_code_autoscroll = ui.should_scroll_disassembly.is_some();
-        if let Some((target, only_if_on_error_tab)) = mem::take(&mut ui.should_scroll_disassembly) {
+        let suppress_code_autoscroll = state.should_scroll_disassembly.is_some();
+        if let Some((target, only_if_on_error_tab)) = mem::take(&mut state.should_scroll_disassembly) {
             let mut tab_to_restore: Option<usize> = None;
             if only_if_on_error_tab {
                 tab_to_restore = self.close_error_tab();
@@ -1358,7 +1358,7 @@ impl WindowContent for DisassemblyWindow {
         let mut disas: Option<(BinaryId, usize, &Disassembly)> = None;
         self.resolve_function_for_tab(self.selected_tab, debugger);
         let indent = "";
-        styled_write!(header, imgui.palette.default, "{}", indent);
+        styled_write!(header, ui.palette.default, "{}", indent);
         match &self.tabs[self.selected_tab].status {
             DisassemblyTabStatus::Err(e) => {
                 styled_write!(header, palette.error, "{}", e);
@@ -1366,7 +1366,7 @@ impl WindowContent for DisassemblyWindow {
             DisassemblyTabStatus::Unresolved {locator, cached_error} => {
                 styled_write!(header, palette.default_dim, "{}", locator.demangled_name);
                 header.close_line();
-                styled_write!(header, imgui.palette.default, "{}", indent);
+                styled_write!(header, ui.palette.default, "{}", indent);
                 styled_write!(header, palette.error, "couldn't find function: {}", cached_error.as_ref().unwrap());
             }
             DisassemblyTabStatus::Function {locator, function_idx} => {
@@ -1430,9 +1430,9 @@ impl WindowContent for DisassemblyWindow {
             }
             
             let mut ip_lines: Vec<(usize, /*selected*/ bool)> = Vec::new();
-            for (idx, frame) in ui.stack.frames.iter().enumerate() {
+            for (idx, frame) in state.stack.frames.iter().enumerate() {
                 if let Some(line) = disas.pseudo_addr_to_line(frame.pseudo_addr) {
-                    ip_lines.push((line, idx == ui.selected_frame));
+                    ip_lines.push((line, idx == state.selected_frame));
                 }
             }
             ip_lines.sort_unstable_by_key(|k| (k.0, !k.1));
@@ -1451,7 +1451,7 @@ impl WindowContent for DisassemblyWindow {
 
             if let Some(disas_line) = disas.lines.get(tab.scroll.cursor) {
                 if disas_line.addr != 0 && disas_line.addr != usize::MAX {
-                    ui.selected_addr = Some((binary_id.clone(), function_idx, disas_line.addr));
+                    state.selected_addr = Some((binary_id.clone(), function_idx, disas_line.addr));
                 }
 
                 if let Some(binary) = debugger.info.binaries.get(&binary_id) {
@@ -1496,7 +1496,7 @@ impl WindowContent for DisassemblyWindow {
             if !suppress_code_autoscroll && self.source_scrolled_to.as_ref() != Some(&key) {
                 self.source_scrolled_to = Some(key);
                 if let Some(target) = source_line {
-                    ui.should_scroll_source = Some((Some(target), false));
+                    state.should_scroll_source = Some((Some(target), false));
                     ui.should_redraw = true;
                 }
             }
@@ -1580,53 +1580,53 @@ impl WindowContent for DisassemblyWindow {
 #[derive(Default)]
 struct StatusWindow {}
 impl WindowContent for StatusWindow {
-    fn build(&mut self, ui: &mut UIState, debugger: &mut Debugger, imgui: &mut IMGUI) {
-        imgui.cur_mut().axes[Axis::Y].flags.insert(AxisFlags::STACK);
-        let start = imgui.text.num_lines();
+    fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
+        ui.cur_mut().axes[Axis::Y].flags.insert(AxisFlags::STACK);
+        let start = ui.text.num_lines();
 
         match debugger.target_state {
-            ProcessState::NoProcess => imgui_writeln!(imgui, default_dim, "no process"),
-            ProcessState::Starting => imgui_writeln!(imgui, state_other, "starting"),
-            ProcessState::Exiting => imgui_writeln!(imgui, state_other, "exiting"),
-            ProcessState::Stepping => imgui_writeln!(imgui, state_other, "stepping"),
-            ProcessState::Running => imgui_writeln!(imgui, running, "running"),
-            ProcessState::Suspended => imgui_writeln!(imgui, suspended, "suspended"),
+            ProcessState::NoProcess => imgui_writeln!(ui, default_dim, "no process"),
+            ProcessState::Starting => imgui_writeln!(ui, state_other, "starting"),
+            ProcessState::Exiting => imgui_writeln!(ui, state_other, "exiting"),
+            ProcessState::Stepping => imgui_writeln!(ui, state_other, "stepping"),
+            ProcessState::Running => imgui_writeln!(ui, running, "running"),
+            ProcessState::Suspended => imgui_writeln!(ui, suspended, "suspended"),
         };
 
         if debugger.target_state != ProcessState::NoProcess {
-            imgui_write!(imgui, default_dim, "pid: ");
-            imgui_write!(imgui, default, "{}", debugger.pid);
-            imgui_writeln!(imgui, default_dim, " cpu {:.0}% mem {}", debugger.info.resource_stats.cpu_percentage(), PrettySize(debugger.info.resource_stats.rss_bytes));
+            imgui_write!(ui, default_dim, "pid: ");
+            imgui_write!(ui, default, "{}", debugger.pid);
+            imgui_writeln!(ui, default_dim, " cpu {:.0}% mem {}", debugger.info.resource_stats.cpu_percentage(), PrettySize(debugger.info.resource_stats.rss_bytes));
         } else {
-            imgui_writeln!(imgui, default_dim, "pid: none");
+            imgui_writeln!(ui, default_dim, "pid: none");
         }
-        imgui_writeln!(imgui, default_dim, "nnd pid: {} cpu {:.0}% mem {}", my_pid(), debugger.my_resource_stats.cpu_percentage(), PrettySize(debugger.my_resource_stats.rss_bytes));
+        imgui_writeln!(ui, default_dim, "nnd pid: {} cpu {:.0}% mem {}", my_pid(), debugger.my_resource_stats.cpu_percentage(), PrettySize(debugger.my_resource_stats.rss_bytes));
         match &debugger.persistent.path {
-            Ok(p) => imgui_writeln!(imgui, default_dim, "{}/", p.display()),
-            Err(e) => imgui_writeln!(imgui, error, "{}", e),
+            Ok(p) => imgui_writeln!(ui, default_dim, "{}/", p.display()),
+            Err(e) => imgui_writeln!(ui, error, "{}", e),
         };
 
-        if ui.last_error != "" {
-            imgui_writeln!(imgui, error, "{}", ui.last_error);
+        if state.last_error != "" {
+            imgui_writeln!(ui, error, "{}", state.last_error);
         }
-        imgui.text.close_line();
-        let end = imgui.text.num_lines();
+        ui.text.close_line();
+        let end = ui.text.num_lines();
 
-        imgui.add(widget!().text_lines(start..end).height(AutoSize::Text));
-        let log_widget = imgui.add(widget!().height(AutoSize::Remainder(1.0)));
-        imgui.layout_children(Axis::Y);
+        ui.add(widget!().text_lines(start..end).height(AutoSize::Text));
+        let log_widget = ui.add(widget!().height(AutoSize::Remainder(1.0)));
+        ui.layout_children(Axis::Y);
 
-        with_parent!(imgui, log_widget, {
-            let space_left = imgui.cur().axes[Axis::Y].get_fixed_size();
+        with_parent!(ui, log_widget, {
+            let space_left = ui.cur().axes[Axis::Y].get_fixed_size();
             eprintln!("asdqwe space: {}", space_left);
             let log_lines = debugger.log.lines.len();
-            let start = imgui.text.num_lines();
+            let start = ui.text.num_lines();
             for line in &debugger.log.lines.make_contiguous()[log_lines.saturating_sub(space_left)..] {
                 eprintln!("asdqwe line: {}", line);
-                imgui_writeln!(imgui, default, "{}", line);
+                imgui_writeln!(ui, default, "{}", line);
             }
-            let end = imgui.text.num_lines();
-            imgui.cur_mut().draw_text = Some(start..end);
+            let end = ui.text.num_lines();
+            ui.cur_mut().draw_text = Some(start..end);
         });
     }
 }
@@ -1634,15 +1634,15 @@ impl WindowContent for StatusWindow {
 #[derive(Default)]
 struct HintsWindow {}
 impl WindowContent for HintsWindow {
-    fn build(&mut self, ui: &mut UIState, debugger: &mut Debugger, imgui: &mut IMGUI) {
-        styled_write!(imgui.text, imgui.palette.default, "frame {}", imgui.frame_idx);
-        let l = imgui.text.close_line();
-        imgui.add(widget!().text(l));
+    fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
+        styled_write!(ui.text, ui.palette.default, "frame {}", ui.frame_idx);
+        let l = ui.text.close_line();
+        ui.add(widget!().text(l));
         /*asdqwe
         let f = match f { Some(f) => f, None => return };
         let palette = &debugger.context.settings.palette;
 
-        if ui.profiler_enabled {
+        if state.profiler_enabled {
             let mut prof = StyledText::default();
             debugger.log.prof.format_summary(&mut prof, area.width as usize);
             let prof_lines = prof.to_lines();
@@ -1658,7 +1658,7 @@ impl WindowContent for HintsWindow {
             for i in 0..2 {
                 let subarea = Rect {x, y: area.y, width: (area.width.saturating_sub(1) + i as u16)/2, height: area.height};
                 x += subarea.width;
-                let mut lines = ui.hints[i].to_lines();
+                let mut lines = state.hints[i].to_lines();
                 if lines.len() > subarea.height as usize && subarea.height > 0 {
                     lines[subarea.height as usize - 1] = Spans::from(vec![Span::raw("…")]);
                 }
@@ -1674,57 +1674,57 @@ struct BinariesWindow {
     table_state: TableState,
 }
 impl WindowContent for BinariesWindow {
-    fn build(&mut self, ui: &mut UIState, debugger: &mut Debugger, imgui: &mut IMGUI) {
+    fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
         // Listed in order of mmap address, so the main executable is usually first, which is nice.
-        ui.binaries = debugger.info.maps.list_binaries();
+        state.binaries = debugger.info.maps.list_binaries();
         // List previously seen unloaded binaries too, because they're visible to file/function open dialogs, especially if there's no debuggee process.
         for id in debugger.symbols.list() {
             if !debugger.info.binaries.contains_key(&id) {
-                ui.binaries.push(id);
+                state.binaries.push(id);
             }
         }
 
-        let mut table = Table::new(mem::take(&mut self.table_state), imgui, vec![Column::new("idx", AutoSize::Fixed(3)), Column::new("name", AutoSize::Remainder(1.0)), Column::new("file", AutoSize::Fixed(PrettySize::MAX_LEN))]);
-        for (idx, id) in ui.binaries.iter().enumerate() {
+        let mut table = Table::new(mem::take(&mut self.table_state), ui, vec![Column::new("idx", AutoSize::Fixed(3)), Column::new("name", AutoSize::Remainder(1.0)), Column::new("file", AutoSize::Fixed(PrettySize::MAX_LEN))]);
+        for (idx, id) in state.binaries.iter().enumerate() {
             let binary = debugger.symbols.get_if_present(id).unwrap();
             let is_mapped = debugger.info.binaries.contains_key(id);
-            table.start_row(hash(id), imgui);
+            table.start_row(hash(id), ui);
 
-            imgui_writeln!(imgui, default_dim, "{}", idx + 1);
-            table.text_cell(imgui);
+            imgui_writeln!(ui, default_dim, "{}", idx + 1);
+            table.text_cell(ui);
 
             // Path, progress bar, error message.
-            with_parent!(imgui, table.start_cell(imgui), {
-                imgui.cur_mut().axes[Axis::Y].flags.insert(AxisFlags::STACK);
+            with_parent!(ui, table.start_cell(ui), {
+                ui.cur_mut().axes[Axis::Y].flags.insert(AxisFlags::STACK);
 
                 // Path.
-                let style = if is_mapped {imgui.palette.default} else {imgui.palette.default_dim};
-                let l = styled_writeln!(imgui.text, style, "{}", id.path);
-                imgui.add(widget!().height(AutoSize::Text).flags(WidgetFlags::TEXT_TRUNCATION_ALIGN_RIGHT).text(l));
+                let style = if is_mapped {ui.palette.default} else {ui.palette.default_dim};
+                let l = styled_writeln!(ui.text, style, "{}", id.path);
+                ui.add(widget!().height(AutoSize::Text).flags(WidgetFlags::TEXT_TRUNCATION_ALIGN_RIGHT).text(l));
 
                 // Progress bar.
                 let mut indicated_loading = false;
                 if binary.symbols.as_ref().is_err_and(|e| e.is_loading()) {
                     let (progress_ppm, loading_stage) = debugger.symbols.get_progress(id);
-                    let l = imgui_writeln!(imgui, default, "{}% ({})", (progress_ppm + 5000) / 10000, loading_stage);
+                    let l = imgui_writeln!(ui, default, "{}% ({})", (progress_ppm + 5000) / 10000, loading_stage);
                     let mut w = widget!().height(AutoSize::Text).text(l);
-                    w.draw_progress_bar = Some((progress_ppm as f64 / 1e6, imgui.palette.progress_bar));
-                    imgui.add(w);
+                    w.draw_progress_bar = Some((progress_ppm as f64 / 1e6, ui.palette.progress_bar));
+                    ui.add(w);
                     indicated_loading = true;
                 }
 
                 // Error.
-                let start = imgui.text.num_lines();
+                let start = ui.text.num_lines();
                 let mut print_error = |e: &Error| {
                     if e.is_loading() {
                         if !indicated_loading {
-                            imgui_writeln!(imgui, default_dim, "loading");
+                            imgui_writeln!(ui, default_dim, "loading");
                             indicated_loading = true;
                         }
                         return;
                     }
-                    let style = if e.is_missing_symbols() {imgui.palette.default_dim} else {imgui.palette.error};
-                    styled_writeln!(imgui.text, style, "{}", e);
+                    let style = if e.is_missing_symbols() {ui.palette.default_dim} else {ui.palette.error};
+                    styled_writeln!(ui.text, style, "{}", e);
                 };
                 if let Err(e) = &binary.elf {
                     print_error(e);
@@ -1736,22 +1736,22 @@ impl WindowContent for BinariesWindow {
                         print_error(e);
                     }
                 }
-                let end = imgui.text.num_lines() - start;
+                let end = ui.text.num_lines() - start;
                 if end > start {
-                    imgui.add(widget!().height(AutoSize::Text).text_lines(start..end));
+                    ui.add(widget!().height(AutoSize::Text).text_lines(start..end));
                 }
             });
 
             // ELF or unwind error/loading/stats.
             match &binary.elf {
-                Err(e) if e.is_loading() => imgui_writeln!(imgui, running, "loading"),
-                Err(e) => imgui_writeln!(imgui, error, "error"),
-                Ok(elf) => imgui_writeln!(imgui, default_dim, "{}", PrettySize(elf.data().len())),
+                Err(e) if e.is_loading() => imgui_writeln!(ui, running, "loading"),
+                Err(e) => imgui_writeln!(ui, error, "error"),
+                Ok(elf) => imgui_writeln!(ui, default_dim, "{}", PrettySize(elf.data().len())),
             };
-            table.text_cell(imgui);
+            table.text_cell(ui);
         }
 
-        self.table_state = table.finish(imgui);
+        self.table_state = table.finish(ui);
     }
 }
 
@@ -1835,10 +1835,10 @@ struct ThreadsWindow {
     filter: ThreadsFilter,
 }
 impl WindowContent for ThreadsWindow {
-    fn build(&mut self, ui: &mut UIState, debugger: &mut Debugger, imgui: &mut IMGUI) {
-        styled_write!(imgui.text, imgui.palette.default, "threads");
-        let l = imgui.text.close_line();
-        imgui.add(widget!().text(l));
+    fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
+        styled_write!(ui.text, ui.palette.default, "threads");
+        let l = ui.text.close_line();
+        ui.add(widget!().text(l));
         /*asdqwe
         keys.retain(|key| {
             if self.filter.bar.editing {
@@ -1874,17 +1874,17 @@ impl WindowContent for ThreadsWindow {
             if seen {
                 continue;
             }
-            ui.selected_thread = *tid;
+            state.selected_thread = *tid;
         }
 
         // If selected thread doesn't pass the filter, awkwardly add it to the list anyway, greyed out.
         let mut selected_thread_filtered_out = false;
-        if debugger.threads.get(&ui.selected_thread).is_some() {
-            if let Some(i) = filtered_tids.iter().position(|x| *x == ui.selected_thread) {
+        if debugger.threads.get(&state.selected_thread).is_some() {
+            if let Some(i) = filtered_tids.iter().position(|x| *x == state.selected_thread) {
                 self.scroll.cursor = i;
             } else {
                 selected_thread_filtered_out = true;
-                filtered_tids.push(ui.selected_thread);
+                filtered_tids.push(state.selected_thread);
                 self.scroll.cursor = filtered_tids.len() - 1;
             }
         }
@@ -1892,8 +1892,8 @@ impl WindowContent for ThreadsWindow {
         let height = area.height.saturating_sub(1 + self.filter.bar.height());
         let mut range = self.scroll.update(filtered_tids.len(), height, &mut keys, &debugger.context.settings.keys);
 
-        ui.selected_thread = filtered_tids.get(self.scroll.cursor).copied().unwrap_or(0);
-        if selected_thread_filtered_out && ui.selected_thread != *filtered_tids.last().unwrap() {
+        state.selected_thread = filtered_tids.get(self.scroll.cursor).copied().unwrap_or(0);
+        if selected_thread_filtered_out && state.selected_thread != *filtered_tids.last().unwrap() {
             selected_thread_filtered_out = false;
             filtered_tids.pop();
             range = self.scroll.range(filtered_tids.len(), height as usize);
@@ -1940,7 +1940,7 @@ impl WindowContent for ThreadsWindow {
                     cells.extend_from_slice(&[
                         Cell::from(format!("{:x}", f.addr)).style(palette.default_dim),
                         if let Some(binary_id) = &f.binary_id {
-                            Cell::from(format!("{}", ui.binaries.iter().position(|b| b == binary_id).unwrap() + 1))
+                            Cell::from(format!("{}", state.binaries.iter().position(|b| b == binary_id).unwrap() + 1))
                         } else {
                             Cell::from("?").style(palette.default_dim)
                         },
@@ -1984,7 +1984,7 @@ impl WindowContent for ThreadsWindow {
                     StopReason::Step => (),
                 }
             }
-            if selected_thread_filtered_out && *tid == ui.selected_thread {
+            if selected_thread_filtered_out && *tid == state.selected_thread {
                 row = row.style(palette.default_dim);
             }
             row
@@ -2013,16 +2013,16 @@ impl WindowContent for ThreadsWindow {
         self.filter.cached_results.clear();
     }
 
-    fn update_modal(&mut self, ui: &mut UIState, debugger: &mut Debugger, keys: &mut Vec<Key>) {
+    fn update_modal(&mut self, state: &mut UIState, debugger: &mut Debugger, keys: &mut Vec<Key>) {
         self.filter.bar.update(keys, &debugger.context.settings.keys);
     }
 
-    fn cancel_modal(&mut self, ui: &mut UIState, debugger: &mut Debugger) {
+    fn cancel_modal(&mut self, state: &mut UIState, debugger: &mut Debugger) {
         self.filter.bar.editing = false;*/
     }
 
-    fn get_hints(&self, hints: &mut StyledText, imgui: &mut IMGUI) {
-        styled_write!(hints, imgui.palette.default_dim, "/ - filter"); hints.close_line();
+    fn get_hints(&self, hints: &mut StyledText, ui: &mut UI) {
+        styled_write!(hints, ui.palette.default_dim, "/ - filter"); hints.close_line();
     }
 }
 
@@ -2070,24 +2070,24 @@ struct StackWindow {
 }
 impl Default for StackWindow { fn default() -> Self { Self {table_state: TableState::default(), threads: HashMap::new(), seen: (0, StableSubframeIdx::top(), 0), rerequest_scroll: false} } }
 impl WindowContent for StackWindow {
-    fn build(&mut self, ui: &mut UIState, debugger: &mut Debugger, imgui: &mut IMGUI) {
-        styled_write!(imgui.text, imgui.palette.default, "stack");
-        let l = imgui.text.close_line();
-        imgui.add(widget!().text(l));
+    fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
+        styled_write!(ui.text, ui.palette.default, "stack");
+        let l = ui.text.close_line();
+        ui.add(widget!().text(l));
         /*asdqwe
-        ui.stack = debugger.get_stack_trace(ui.selected_thread, /* partial */ false);
+        state.stack = debugger.get_stack_trace(state.selected_thread, /* partial */ false);
         let rerequest_scroll = mem::take(&mut self.rerequest_scroll);
 
         let header_height = 1usize;
         let height = area.height.saturating_sub(header_height as u16) / 2;
         let locked = false; // TODO: assign this after implementing window locking
 
-        assert_eq!(ui.stack.frames.is_empty(), ui.stack.subframes.is_empty());
-        let num_rows = ui.stack.subframes.len() + ui.stack.truncated.is_some() as usize; // add a fake row for error message if the stack is truncated
+        assert_eq!(state.stack.frames.is_empty(), state.stack.subframes.is_empty());
+        let num_rows = state.stack.subframes.len() + state.stack.truncated.is_some() as usize; // add a fake row for error message if the stack is truncated
 
-        if ui.stack.frames.is_empty() {
-            ui.selected_frame = 0;
-            ui.selected_subframe = 0;
+        if state.stack.frames.is_empty() {
+            state.selected_frame = 0;
+            state.selected_subframe = 0;
         } else {
             // Behaviors that we're trying to implement here:
             //  * when switching threads back and forth without resuming the process, remember per-thread selected frame and auto-switch to that,
@@ -2103,14 +2103,14 @@ impl WindowContent for StackWindow {
             //  * when symbols loading completes, retry scrolling the source and disassembly windows, but only if they're currently showing an error (to avoid yanking valid file the user is looking at),
             //  * if the stack window is locked, and the process was stopped and resumed, and current frame's address changed, scroll the source and disassembly (if address didn't change, don't scroll).
 
-            let deb_thr = debugger.threads.get(&ui.selected_thread).unwrap();
+            let deb_thr = debugger.threads.get(&state.selected_thread).unwrap();
             let stop_count = deb_thr.stop_count;
             let mut switch_to_subframe: Option<usize> = None;
             let mut scroll_source_and_disassembly = false;
 
-            let thr = self.threads.entry(ui.selected_thread).or_insert((0, StableSubframeIdx::top()));
+            let thr = self.threads.entry(state.selected_thread).or_insert((0, StableSubframeIdx::top()));
             if thr.0 == stop_count || locked {
-                self.scroll.cursor = thr.1.subframe_idx(&ui.stack);
+                self.scroll.cursor = thr.1.subframe_idx(&state.stack);
                 scroll_source_and_disassembly |= self.scroll.update_detect_movement(num_rows, height, &mut keys, &debugger.context.settings.keys).1;
             } else {
                 switch_to_subframe = Some(deb_thr.subframe_to_select.unwrap_or(0));
@@ -2122,18 +2122,18 @@ impl WindowContent for StackWindow {
                 scroll_source_and_disassembly = true;
             }
 
-            self.scroll.cursor = self.scroll.cursor.min(ui.stack.subframes.len() - 1); // move the cursor away from the fake row (but allow initially placing it there, just to scroll to it)
-            ui.selected_subframe = self.scroll.cursor;
-            let subframe = &ui.stack.subframes[ui.selected_subframe];
-            ui.selected_frame = subframe.frame_idx;
-            let frame = &ui.stack.frames[subframe.frame_idx];
-            thr.1 = StableSubframeIdx::new(&ui.stack, ui.selected_subframe);
+            self.scroll.cursor = self.scroll.cursor.min(state.stack.subframes.len() - 1); // move the cursor away from the fake row (but allow initially placing it there, just to scroll to it)
+            state.selected_subframe = self.scroll.cursor;
+            let subframe = &state.stack.subframes[state.selected_subframe];
+            state.selected_frame = subframe.frame_idx;
+            let frame = &state.stack.frames[subframe.frame_idx];
+            thr.1 = StableSubframeIdx::new(&state.stack, state.selected_subframe);
 
-            let cur = (ui.selected_thread, thr.1, frame.addr);
+            let cur = (state.selected_thread, thr.1, frame.addr);
             scroll_source_and_disassembly |= cur != self.seen;
             if scroll_source_and_disassembly || rerequest_scroll {
                 ui.should_scroll_source = Some((subframe.line.as_ref().map(|line| SourceScrollTarget {path: line.path.clone(), version: line.version.clone(), line: line.line.line()}), !scroll_source_and_disassembly));
-                ui.should_scroll_disassembly = Some((match &ui.stack.subframes[frame.subframes.end - 1].function {
+                ui.should_scroll_disassembly = Some((match &state.stack.subframes[frame.subframes.end - 1].function {
                     Ok((_, function_idx)) => Ok(DisassemblyScrollTarget {binary_id: frame.binary_id.clone().unwrap(), function_idx: *function_idx, addr: frame.pseudo_addr,
                                                                          subfunction_level: if ui.selected_subframe == frame.subframes.start {u16::MAX} else {(frame.subframes.end - ui.selected_subframe) as u16}}),
                     Err(e) => Err(e.clone()),
@@ -2157,9 +2157,9 @@ impl WindowContent for StackWindow {
 
         let mut rows: Vec<Row> = Vec::new();
         for idx in range {
-            if idx < ui.stack.subframes.len() {
-                let subframe = &ui.stack.subframes[idx];
-                let frame = &ui.stack.frames[subframe.frame_idx];
+            if idx < state.stack.subframes.len() {
+                let subframe = &state.stack.subframes[idx];
+                let frame = &state.stack.frames[subframe.frame_idx];
                 let func_spans = vec![
                     if let Some(n) = &subframe.function_name {
                         Span::raw(format!("{}", n))
@@ -2205,7 +2205,7 @@ impl WindowContent for StackWindow {
                 }
                 rows.push(row);
             } else {
-                let e = ui.stack.truncated.as_ref().unwrap();
+                let e = state.stack.truncated.as_ref().unwrap();
                 rows.push(Row::new(vec![
                     Cell::from(""),
                     Cell::from(""),
@@ -2474,7 +2474,7 @@ impl CodeWindow {
         self.selected_tab = (self.selected_tab as isize + delta).rem_euclid(self.tabs.len().max(1) as isize) as usize;
     }
 
-    fn toggle_breakpoint(&mut self, toggle_enabledness: bool, ui: &mut UIState, debugger: &mut Debugger) {
+    fn toggle_breakpoint(&mut self, toggle_enabledness: bool, state: &mut UIState, debugger: &mut Debugger) {
         if self.tabs.is_empty() {
             return;
         }
@@ -2544,7 +2544,7 @@ impl CodeWindow {
         }
     }
 
-    fn scroll_disassembly_if_needed(&mut self, suppress: bool, select: isize, ui: &mut UIState, debugger: &Debugger) {
+    fn scroll_disassembly_if_needed(&mut self, suppress: bool, select: isize, state: &mut UIState, debugger: &Debugger) {
         let key = match self.disassembly_scroll_key() {
             None => return,
             Some(key) if Some(&key) == self.disassembly_scrolled_to.as_ref() && select == 0 => return,
@@ -2652,12 +2652,12 @@ impl CodeWindow {
 }
 
 impl WindowContent for CodeWindow {
-    fn build(&mut self, ui: &mut UIState, debugger: &mut Debugger, imgui: &mut IMGUI) {
-        styled_write!(imgui.text, imgui.palette.default, "code");
-        let l = imgui.text.close_line();
-        imgui.add(widget!().text(l));
+    fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
+        styled_write!(ui.text, ui.palette.default, "code");
+        let l = ui.text.close_line();
+        ui.add(widget!().text(l));
         /*asdqwe
-    fn update_modal(&mut self, ui: &mut UIState, debugger: &mut Debugger, keys: &mut Vec<Key>) {
+    fn update_modal(&mut self, state: &mut UIState, debugger: &mut Debugger, keys: &mut Vec<Key>) {
         if let Some(d) = &mut self.search_dialog {
             let event = d.update(keys, &debugger.context.settings.keys, &debugger.symbols, None);
             let mut file_to_open = None;
@@ -2698,13 +2698,13 @@ impl WindowContent for CodeWindow {
         });
     }
 
-    fn render_modal(&mut self, ui: &mut UIState, debugger: &mut Debugger, f: &mut Frame, window_area: Rect, screen_area: Rect) {
+    fn render_modal(&mut self, state: &mut UIState, debugger: &mut Debugger, f: &mut Frame, window_area: Rect, screen_area: Rect) {
         if let Some(d) = &mut self.search_dialog {
             ui.loading |= d.render(f, screen_area, "find file", &debugger.context.settings.palette);
         }
     }
 
-    fn cancel_modal(&mut self, ui: &mut UIState, debugger: &mut Debugger) {
+    fn cancel_modal(&mut self, state: &mut UIState, debugger: &mut Debugger) {
         self.search_dialog = None;
     }
 
@@ -2712,12 +2712,12 @@ impl WindowContent for CodeWindow {
         self.file_cache.clear();
     }
 
-    fn get_hints(&self, hints: &mut StyledText, imgui: &mut IMGUI) {
-        styled_write!(hints, imgui.palette.default_dim, "o - open file"); hints.close_line();
-        styled_write!(hints, imgui.palette.default_dim, "C-y - pin/unpin tab"); hints.close_line();
-        styled_write!(hints, imgui.palette.default_dim, "b - toggle breakpoint"); hints.close_line();
-        styled_write!(hints, imgui.palette.default_dim, "B - enable/disable breakpoint"); hints.close_line();
-        styled_write!(hints, imgui.palette.default_dim, ",/. - cycle disasm addrs"); hints.close_line();
+    fn get_hints(&self, hints: &mut StyledText, ui: &mut UI) {
+        styled_write!(hints, ui.palette.default_dim, "o - open file"); hints.close_line();
+        styled_write!(hints, ui.palette.default_dim, "C-y - pin/unpin tab"); hints.close_line();
+        styled_write!(hints, ui.palette.default_dim, "b - toggle breakpoint"); hints.close_line();
+        styled_write!(hints, ui.palette.default_dim, "B - enable/disable breakpoint"); hints.close_line();
+        styled_write!(hints, ui.palette.default_dim, ",/. - cycle disasm addrs"); hints.close_line();
     }
 
     fn has_persistent_state(&self) -> bool {
@@ -2747,7 +2747,7 @@ impl WindowContent for CodeWindow {
         Ok(())
     }
 
-    fn update_and_render(&mut self, ui: &mut UIState, debugger: &mut Debugger, mut keys: Vec<Key>, f: Option<&mut Frame>, mut area: Rect) {
+    fn update_and_render(&mut self, state: &mut UIState, debugger: &mut Debugger, mut keys: Vec<Key>, f: Option<&mut Frame>, mut area: Rect) {
         let suppress_disassembly_autoscroll = ui.should_scroll_source.is_some();
         let switch_to = match mem::take(&mut ui.should_scroll_source) {
             Some((to, false)) => Some(to),
@@ -2791,7 +2791,7 @@ impl WindowContent for CodeWindow {
 
         // (path_in_symbols, line) -> (column, selected, top)
         let mut instruction_pointers: HashMap<(&Path, usize), (usize, bool, bool)> = HashMap::new();
-        for (idx, subframe) in ui.stack.subframes.iter().enumerate() {
+        for (idx, subframe) in state.stack.subframes.iter().enumerate() {
             if let Some(info) = &subframe.line {
                 instruction_pointers.insert((&info.path, info.line.line()), (info.line.column(), idx == ui.selected_subframe, idx == 0));
             }
@@ -2822,7 +2822,7 @@ impl WindowContent for CodeWindow {
         let tab = match self.tabs.get_mut(self.selected_tab) {
             None => return,
             Some(t) => t };
-        let file = Self::find_or_open_file(&mut self.file_cache, &tab.path_in_symbols, &tab.version_in_symbols, debugger, &imgui.palette);
+        let file = Self::find_or_open_file(&mut self.file_cache, &tab.path_in_symbols, &tab.version_in_symbols, debugger, &ui.palette);
         headers += file.header.num_lines() as u16;
 
         let line_num_len = (file.text.num_lines().saturating_add(1) as f64).log10().ceil() as usize;
@@ -2935,7 +2935,7 @@ impl WindowContent for CodeWindow {
                     }
                     if !found {
                         spans.push(Span::raw(" ".to_string().repeat(pos)));
-                        spans.push(Span::styled(" ", imgui.palette.ip_column.apply(imgui.palette.default)));
+                        spans.push(Span::styled(" ", ui.palette.ip_column.apply(ui.palette.default)));
                     }
                 }
 
@@ -2965,15 +2965,15 @@ struct BreakpointsWindow {
     selected_breakpoint: Option<BreakpointId>,
 }
 impl WindowContent for BreakpointsWindow {
-    fn get_hints(&self, hints: &mut StyledText, imgui: &mut IMGUI) {
-        hints.chars.push_str("<del> - delete breakpoint"); hints.close_span(imgui.palette.default_dim); hints.close_line();
-        hints.chars.push_str("B - enable/disable"); hints.close_span(imgui.palette.default_dim); hints.close_line();
+    fn get_hints(&self, hints: &mut StyledText, ui: &mut UI) {
+        hints.chars.push_str("<del> - delete breakpoint"); hints.close_span(ui.palette.default_dim); hints.close_line();
+        hints.chars.push_str("B - enable/disable"); hints.close_span(ui.palette.default_dim); hints.close_line();
     }
 
-    fn build(&mut self, ui: &mut UIState, debugger: &mut Debugger, imgui: &mut IMGUI) {
-        styled_write!(imgui.text, imgui.palette.default, "breakpoints");
-        let l = imgui.text.close_line();
-        imgui.add(widget!().text(l));
+    fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
+        styled_write!(ui.text, ui.palette.default, "breakpoints");
+        let l = ui.text.close_line();
+        ui.add(widget!().text(l));
         /*asdqwe
         let mut hit_breakpoints: Vec<BreakpointId> = Vec::new();
         for (tid, thread) in &debugger.threads {

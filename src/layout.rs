@@ -304,12 +304,12 @@ impl Layout {
     // Wall widgets contain whole cells, while the traced line connects centers of cells; the two cells containing line endpoints are not included in the created widget,
     // they're sticking out into the parent region's wall widgets, where they form junctions (or into corners of the screen).
     // (Why separate wall_masks from wall_widgets? To make junctions work. Why have separate widgets for individual walls instead of one big canvas widget? To make walls draggable and hoverable.)
-    fn build_wall(axis: usize, area: Rect, pos: isize, identity: usize, wall_widgets: &mut Vec<WidgetIdx>, imgui: &mut IMGUI) -> WidgetIdx {
-        let mut w = widget!().fixed_width(1).fixed_height(1).fixed_x(area.x()).fixed_y(area.y()).fill('?', imgui.palette.error);
+    fn build_wall(axis: usize, area: Rect, pos: isize, identity: usize, wall_widgets: &mut Vec<WidgetIdx>, ui: &mut UI) -> WidgetIdx {
+        let mut w = widget!().fixed_width(1).fixed_height(1).fixed_x(area.x()).fixed_y(area.y()).fill('?', ui.palette.error);
         w.axes[1-axis].set_fixed_size(area.size[1-axis]);
         w.axes[axis].rel_pos += pos;
         w.identity = identity;
-        let idx = imgui.add(w);
+        let idx = ui.add(w);
         wall_widgets.push(idx);
         idx                                                                                                                                                                               
     }
@@ -338,11 +338,11 @@ impl Layout {
         }
     }
 
-    pub fn build(&mut self, imgui: &mut IMGUI) {
+    pub fn build(&mut self, ui: &mut UI) {
         self.wall_widgets.clear();
         self.wall_masks.clear();
-        self.root_widget = imgui.cur_parent;
-        for action in imgui.check_keys(&[KeyAction::WindowLeft, KeyAction::WindowRight, KeyAction::WindowDown, KeyAction::WindowUp, KeyAction::Window(0), KeyAction::Window(1), KeyAction::Window(2), KeyAction::Window(3), KeyAction::Window(4), KeyAction::Window(5), KeyAction::Window(6), KeyAction::Window(7), KeyAction::Window(8), KeyAction::Window(9)]) {
+        self.root_widget = ui.cur_parent;
+        for action in ui.check_keys(&[KeyAction::WindowLeft, KeyAction::WindowRight, KeyAction::WindowDown, KeyAction::WindowUp, KeyAction::Window(0), KeyAction::Window(1), KeyAction::Window(2), KeyAction::Window(3), KeyAction::Window(4), KeyAction::Window(5), KeyAction::Window(6), KeyAction::Window(7), KeyAction::Window(8), KeyAction::Window(9)]) {
             match action {
                 KeyAction::Window(n) => self.switch_to_window_with_hotkey_number(n),
                 KeyAction::WindowLeft => self.switch_to_adjacent_window(-1, 0),
@@ -365,8 +365,8 @@ impl Layout {
         // In top-only mode we want the wall to go all the way to the edge of the screen, not to the middle of the first and last cell of the screen ('─', not '╴').
         // But in all-walls mode we want the wall to go to the center of the first and last cell ('╴' + '╷' = '╮' in wall masks).
         // Trick: always build the whole frame, but extend the root rect such that unneeded sides are just off-screen.
-        assert!(imgui.cur().axes[0].flags.contains(AxisFlags::SIZE_KNOWN) && imgui.cur().axes[1].flags.contains(AxisFlags::SIZE_KNOWN));
-        let mut area = Rect {pos: [0, 0], size: [imgui.cur().axes[0].size, imgui.cur().axes[1].size]};
+        assert!(ui.cur().axes[0].flags.contains(AxisFlags::SIZE_KNOWN) && ui.cur().axes[1].flags.contains(AxisFlags::SIZE_KNOWN));
+        let mut area = Rect {pos: [0, 0], size: [ui.cur().axes[0].size, ui.cur().axes[1].size]};
         for axis in 0..2 {
             for side in 0..2 {
                 if self.outer_walls[axis][side] && area.size[axis] > 0 {
@@ -382,12 +382,12 @@ impl Layout {
         for axis in 0..2 {
             for side in 0..2 {
                 let pos = if side == 0 {-1} else {area.size[axis] as isize};
-                let w = Self::build_wall(axis, area, pos, hash(&('o', axis, side)), &mut self.wall_widgets, imgui);
+                let w = Self::build_wall(axis, area, pos, hash(&('o', axis, side)), &mut self.wall_widgets, ui);
                 Self::trace_wall(axis, area, pos, false, &mut self.wall_masks);
                 root.outer_walls[axis][side] = w;
                 // Cover the corners.
                 if axis == 0 {
-                    let w = imgui.get_mut(w);
+                    let w = ui.get_mut(w);
                     w.axes[1-axis].rel_pos -= 1;
                     w.axes[1-axis].size += 2;
                 }
@@ -411,10 +411,10 @@ impl Layout {
                         assert!(ins);
                         assert_eq!(self.windows.get(window_id).region, Some(region_id));
                     }
-                    self.build_leaf(region_id, imgui);
+                    self.build_leaf(region_id, ui);
                 }
                 RegionContent::Split(_) => {
-                    self.build_split(region_id, imgui);
+                    self.build_split(region_id, ui);
                     for &child_id in self.regions.get(region_id).content.as_split().children.iter().rev() {
                         assert_eq!(self.regions.get(child_id).parent, Some(region_id));
                         stack.push(child_id);
@@ -448,9 +448,9 @@ impl Layout {
         // Draw walls: aggregate the information in wall_masks and put chars into wall widgets.
         self.wall_masks.sort_unstable();
         for &idx in &self.wall_widgets {
-            let w = imgui.get(idx);
+            let w = ui.get(idx);
             let x_range = w.axes[Axis::X].get_fixed_range();
-            let start_line = imgui.text.num_lines();
+            let start_line = ui.text.num_lines();
             for y in w.axes[Axis::Y].get_fixed_range() {
                 for x in x_range.clone() {
                     // OR the bit masks for this cell.
@@ -463,13 +463,13 @@ impl Layout {
                     }
 
                     let c = BOX_DRAWING_LUT[mask];
-                    let style = if mask >= 16 {imgui.palette.window_border_active} else {imgui.palette.window_border};
-                    styled_write!(imgui.text, style, "{}", c);
+                    let style = if mask >= 16 {ui.palette.window_border_active} else {ui.palette.window_border};
+                    styled_write!(ui.text, style, "{}", c);
                 }
-                imgui.text.close_line();
+                ui.text.close_line();
             }
-            let end_line = imgui.text.num_lines();
-            imgui.get_mut(idx).draw_text = Some(start_line..end_line);
+            let end_line = ui.text.num_lines();
+            ui.get_mut(idx).draw_text = Some(start_line..end_line);
         }
 
         for (region_id, region) in self.regions.iter() {
@@ -479,23 +479,23 @@ impl Layout {
                     // Draw window title.
                     let wall_above = region.outer_walls[Axis::Y][0];
                     if leaf.tabs.len() == 1 && wall_above.is_valid() {
-                        let w = imgui.get(wall_above);
+                        let w = ui.get(wall_above);
                         assert!(w.axes[Axis::X].flags.contains(AxisFlags::POS_KNOWN));
                         let rel_x = region.area.x() - w.axes[Axis::X].rel_pos;
-                        let style = if is_active {imgui.palette.window_border_active} else {imgui.palette.window_border};
+                        let style = if is_active {ui.palette.window_border_active} else {ui.palette.window_border};
                         let window = self.windows.get(leaf.tabs[0]);
-                        styled_write!(imgui.text, style, "{}", window.title);
+                        styled_write!(ui.text, style, "{}", window.title);
                         if let &Some(n) = &window.hotkey_number {
-                            styled_write!(imgui.text, style, " ");
-                            styled_write!(imgui.text, imgui.palette.hotkey, "{}", n);
+                            styled_write!(ui.text, style, " ");
+                            styled_write!(ui.text, ui.palette.hotkey, "{}", n);
                         }
-                        let l = imgui.text.close_line();
-                        imgui.add(widget!().parent(wall_above).fixed_x(rel_x).width(AutoSize::Text).max_width(region.area.width().saturating_sub(1)).text(l));
+                        let l = ui.text.close_line();
+                        ui.add(widget!().parent(wall_above).fixed_x(rel_x).width(AutoSize::Text).max_width(region.area.width().saturating_sub(1)).text(l));
                     }
                     // Focus active window.
                     if is_active {
-                        with_parent!(imgui, leaf.widget, {
-                            imgui.focus();
+                        with_parent!(ui, leaf.widget, {
+                            ui.focus();
                         });
                     }
                 }
@@ -504,7 +504,7 @@ impl Layout {
         }
     }
 
-    fn build_split(&mut self, region_id: RegionId, imgui: &mut IMGUI) {
+    fn build_split(&mut self, region_id: RegionId, ui: &mut UI) {
         let region = self.regions.get(region_id);
         let split = region.content.as_split();
         assert!(!split.children.is_empty());
@@ -566,14 +566,14 @@ impl Layout {
         let mut resized = false;
         for i in 1..walls.len()-1 {
             let (pos, draggable) = calculate_wall_pos(i, &cumsum);
-            walls[i] = (Self::build_wall(axis, region.area, pos, hash(&('w', region_id, i)), &mut self.wall_widgets, imgui), pos);
+            walls[i] = (Self::build_wall(axis, region.area, pos, hash(&('w', region_id, i)), &mut self.wall_widgets, ui), pos);
 
             if !draggable {
                 continue;
             }
-            with_parent!(imgui, walls[i].0, {
-                imgui.cur_mut().flags.insert(WidgetFlags::HIGHLIGHT_ON_HOVER);
-                if let Some(p) = imgui.check_drag() {
+            with_parent!(ui, walls[i].0, {
+                ui.cur_mut().flags.insert(WidgetFlags::HIGHLIGHT_ON_HOVER);
+                if let Some(p) = ui.check_drag() {
                     let p = p[axis];
                     if p != 0 {
                         let (fixed_left, fixed) = (cumsum[i].0, cumsum.last().unwrap().0);
@@ -607,7 +607,7 @@ impl Layout {
         for i in 1..walls.len()-1 {
             let pos = calculate_wall_pos(i, &cumsum).0;
             walls[i].1 = pos;
-            imgui.get_mut(walls[i].0).axes[axis].rel_pos = region.area.pos[axis] + pos;
+            ui.get_mut(walls[i].0).axes[axis].rel_pos = region.area.pos[axis] + pos;
             Self::trace_wall(axis, region.area, pos, false, &mut self.wall_masks);
         }
 
@@ -629,38 +629,38 @@ impl Layout {
         }
     }
 
-    fn build_leaf(&mut self, region_id: RegionId, imgui: &mut IMGUI) {
+    fn build_leaf(&mut self, region_id: RegionId, ui: &mut UI) {
         let region = self.regions.get_mut(region_id);
         let leaf = region.content.as_leaf_mut();
 
-        leaf.widget = imgui.add(widget!().identity(&('l', region_id)).fixed_rect(region.area));
+        leaf.widget = ui.add(widget!().identity(&('l', region_id)).fixed_rect(region.area));
         let mut content_widget = leaf.widget;
-        with_parent!(imgui, leaf.widget, {
+        with_parent!(ui, leaf.widget, {
             let mut content_area = region.area;
             if leaf.tabs.len() == 1 {
                 leaf.tabs_state.select(0);
             } else if leaf.tabs.len() > 1 {
                 // TODO: Try to embed the tabs in the wall above, like window title, and see if it looks better.
-                imgui.cur_mut().axes[Axis::Y].flags.insert(AxisFlags::STACK);
-                let tabs_widget = imgui.add(widget!().identity(&'t').fixed_height(1));
-                content_widget = imgui.add(widget!().identity(&'w').height(AutoSize::Remainder(1.0)));
-                imgui.layout_children(Axis::Y);
+                ui.cur_mut().axes[Axis::Y].flags.insert(AxisFlags::STACK);
+                let tabs_widget = ui.add(widget!().identity(&'t').fixed_height(1));
+                content_widget = ui.add(widget!().identity(&'w').height(AutoSize::Remainder(1.0)));
+                ui.layout_children(Axis::Y);
                 if content_area.height() > 0 {
                     content_area.size[Axis::Y] -= 1;
                     content_area.pos[Axis::Y] += 1;
                 }
 
-                with_parent!(imgui, content_widget, {
-                    imgui.relative_focus(leaf.widget);
+                with_parent!(ui, content_widget, {
+                    ui.relative_focus(leaf.widget);
                 });
-                with_parent!(imgui, tabs_widget, {
-                    imgui.multifocus();
-                    let mut tabs = Tabs::new(mem::take(&mut leaf.tabs_state), imgui);
+                with_parent!(ui, tabs_widget, {
+                    ui.multifocus();
+                    let mut tabs = Tabs::new(mem::take(&mut leaf.tabs_state), ui);
                     for &window_id in &leaf.tabs {
                         let window = self.windows.get(window_id);
-                        tabs.add(&window.title, &window.title, false, window.hotkey_number.clone(), imgui);
+                        tabs.add(&window.title, &window.title, false, window.hotkey_number.clone(), ui);
                     }
-                    leaf.tabs_state = tabs.finish(imgui);
+                    leaf.tabs_state = tabs.finish(ui);
                 });
             }
 
@@ -671,11 +671,11 @@ impl Layout {
                     window.area = content_area;
                     window.widget = content_widget;
 
-                    if imgui.check_mouse(MouseActions::CLICK_SUBTREE) {
+                    if ui.check_mouse(MouseActions::CLICK_SUBTREE) {
                         self.active_window = Some(window_id);
                     }
                 } else {
-                    window.widget = imgui.add(widget!().parent(self.root_widget).identity(&('u', window_id)).fixed_width(0).fixed_height(0));
+                    window.widget = ui.add(widget!().parent(self.root_widget).identity(&('u', window_id)).fixed_width(0).fixed_height(0));
                 }
             }
         });

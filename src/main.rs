@@ -341,7 +341,7 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, command_line: Option<Vec<S
                 return Ok(());
             }
 
-            schedule_render |= ui.imgui.should_redraw || ui.should_drop_caches;
+            schedule_render |= ui.ui.should_redraw || ui.should_drop_caches;
             if ui.should_drop_caches {
                 debugger.drop_caches()?;
                 ui.drop_caches();

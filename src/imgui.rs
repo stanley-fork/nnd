@@ -116,8 +116,8 @@ pub struct WidgetFlags : u32 {
     const REDRAW_IF_FOCUS_CHANGES = 0x100;
 
     // Equivalent to:
-    //   if imgui.check_mouse(MouseActions::HOVER_SUBTREE) {
-    //       widget.style_adjustment.update(imgui.palette.hovered);
+    //   if ui.check_mouse(MouseActions::HOVER_SUBTREE) {
+    //       widget.style_adjustment.update(ui.palette.hovered);
     //   }
     const HIGHLIGHT_ON_HOVER = 0x200;
 
@@ -154,7 +154,7 @@ pub struct Widget {
     pub axes: [Axis; 2], // X, Y
     pub flags: WidgetFlags,
 
-    pub draw_text: Option<Range<usize>>, // lines in IMGUI.text
+    pub draw_text: Option<Range<usize>>, // lines in UI.text
     line_wrapped_text: Option<Range<usize>>,
 
     // Tree links.
@@ -204,7 +204,7 @@ pub struct Widget {
     pub scroll_bar_drag_offset: isize, // used only by scroll bar widgets
 }
 impl Widget {
-    // Convenience functions to assign some fields, to be used before add()ing the Widget to IMGUI.
+    // Convenience functions to assign some fields, to be used before add()ing the Widget to UI.
     pub fn identity<T: Hash + ?Sized>(mut self, t: &T) -> Self { self.identity = hash::<T>(t); self } // example: identity(("row", row_id))
     pub fn source_line(mut self, l: u32) -> Self { self.source_line = l; self }
     pub fn parent(mut self, parent: WidgetIdx) -> Self { self.parent = parent; self }
@@ -224,7 +224,7 @@ impl Widget {
     pub fn hcenter(mut self) -> Self { self.axes[Axis::X].flags.insert(AxisFlags::CENTER); self }
     pub fn vcenter(mut self) -> Self { self.axes[Axis::Y].flags.insert(AxisFlags::CENTER); self }
     pub fn text_lines(mut self, lines: Range<usize>) -> Self { self.draw_text = Some(lines); self }
-    pub fn text(mut self, line: usize) -> Self { self.draw_text = Some(line..line+1); self } // example: styled_write!(imgui.text, ...); let l = imgui.text.close_line(); Widget::new().text(l);
+    pub fn text(mut self, line: usize) -> Self { self.draw_text = Some(line..line+1); self } // example: styled_write!(ui.text, ...); let l = ui.text.close_line(); Widget::new().text(l);
     pub fn fill(mut self, c: char, s: Style) -> Self { self.draw_fill = Some((c, s)); self }
     pub fn flags(mut self, f: WidgetFlags) -> Self { self.flags.insert(f); self }
     pub fn style_adjustment(mut self, a: StyleAdjustment) -> Self { self.style_adjustment = a; self }
@@ -262,39 +262,39 @@ impl WidgetIdx {
 }
 
 // Usage:
-//   with_parent(imgui, imgui.add(widget!()...), {
+//   with_parent(ui, ui.add(widget!()...), {
 //       ...
 //   })
-// Warning: return/continue/break out of this macro is not allowed, it would bypass the `$imgui.cur_parent = prev_parent` cleanup.
+// Warning: return/continue/break out of this macro is not allowed, it would bypass the `$ui.cur_parent = prev_parent` cleanup.
 //          This isn't checked at compile time and usually causes an assertion failure later.
 #[macro_export]
 macro_rules! with_parent {
-    ($imgui:expr, $parent_expr:expr, {$($code:tt)*}) => {{
+    ($ui:expr, $parent_expr:expr, {$($code:tt)*}) => {{
         let p = $parent_expr;
-        let prev_parent = mem::replace(&mut $imgui.cur_parent, p);
+        let prev_parent = mem::replace(&mut $ui.cur_parent, p);
         let r = {$($code)*};
-        assert!($imgui.cur_parent == p);
-        $imgui.cur_parent = prev_parent;
+        assert!($ui.cur_parent == p);
+        $ui.cur_parent = prev_parent;
         r
     }};
 }
 
 #[macro_export]
 macro_rules! imgui_write {
-    ($imgui:expr, $style:ident, $($arg:tt)*) => {
-        styled_write!($imgui.text, $imgui.palette.$style, $($arg)*)
+    ($ui:expr, $style:ident, $($arg:tt)*) => {
+        styled_write!($ui.text, $ui.palette.$style, $($arg)*)
     };
 }
 #[macro_export]
 macro_rules! imgui_writeln {
-    ($imgui:expr, $style:ident, $($arg:tt)*) => {{
-        styled_write!($imgui.text, $imgui.palette.$style, $($arg)*);
-        $imgui.text.close_line()
+    ($ui:expr, $style:ident, $($arg:tt)*) => {{
+        styled_write!($ui.text, $ui.palette.$style, $($arg)*);
+        $ui.text.close_line()
     }};
 }
 
 #[derive(Default)]
-pub struct IMGUI {
+pub struct UI {
     // These can be changed at any time.
     pub palette: Palette,
     pub key_binds: KeyBinds,
@@ -320,7 +320,7 @@ pub struct IMGUI {
 
     pub frame_idx: usize,
 
-    // By default we add 3 layers as children of root: content, dialog, tooltip. The logic around this is quite separate from the rest of IMGUI and can be moved to something like UIState instead, if needed.
+    // By default we add 3 layers as children of root: content, dialog, tooltip. The logic around this is quite separate from the rest of UI and can be moved to something like UIState instead, if needed.
     // Main content.
     pub content_root: WidgetIdx,
     // At most one dialog window can be present. It's a child of this Widget, drawn over main content, always has focus, is "owned" by some other widget, and disappears if its owner stops requesting it.
@@ -350,7 +350,7 @@ pub struct IMGUI {
 
     pub clipboard: String,
 }
-impl IMGUI {
+impl UI {
     // Returns true if any of the input was significant enough that we should redraw.
     pub fn buffer_input(&mut self, events: &[Event]) -> bool {
         let mut any_significant = false;
@@ -596,7 +596,7 @@ impl IMGUI {
         }        
     }
 
-    // These are convenient, but it's ok to access `tree` directly too (to avoid borrowing the whole IMGUI).
+    // These are convenient, but it's ok to access `tree` directly too (to avoid borrowing the whole UI).
     pub fn get(&self, idx: WidgetIdx) -> &Widget { &self.tree[idx.0] }
     pub fn get_mut(&mut self, idx: WidgetIdx) -> &mut Widget { &mut self.tree[idx.0] }
     pub fn cur(&self) -> &Widget { &self.tree[self.cur_parent.0] }
