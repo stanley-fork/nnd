@@ -280,7 +280,7 @@ macro_rules! with_parent {
 }
 
 #[macro_export]
-macro_rules! imgui_write {
+macro_rules! ui_write {
     ($ui:expr, $style:ident, $($arg:tt)*) => {
         styled_write!($ui.text, $ui.palette.$style, $($arg)*)
     };

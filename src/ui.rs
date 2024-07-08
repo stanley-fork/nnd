@@ -1594,8 +1594,8 @@ impl WindowContent for StatusWindow {
         };
 
         if debugger.target_state != ProcessState::NoProcess {
-            imgui_write!(ui, default_dim, "pid: ");
-            imgui_write!(ui, default, "{}", debugger.pid);
+            ui_write!(ui, default_dim, "pid: ");
+            ui_write!(ui, default, "{}", debugger.pid);
             imgui_writeln!(ui, default_dim, " cpu {:.0}% mem {}", debugger.info.resource_stats.cpu_percentage(), PrettySize(debugger.info.resource_stats.rss_bytes));
         } else {
             imgui_writeln!(ui, default_dim, "pid: none");
