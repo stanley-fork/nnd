@@ -15,12 +15,13 @@ pub fn list_cursor_navigation_with_variable_row_height<F: FnMut(usize, &mut UI) 
     let actions = ui.check_keys(&[KeyAction::CursorUp, KeyAction::CursorDown, KeyAction::PageUp, KeyAction::PageDown, KeyAction::Home, KeyAction::End]);
     let moved = !actions.is_empty();
     if count == 0 {
+        *cursor = 0;
         return moved;
     }
     for action in actions {
         match action {
             KeyAction::CursorUp => *cursor = cursor.saturating_sub(1),
-            KeyAction::CursorDown => *cursor = (*cursor + 1).min(count - 1),
+            KeyAction::CursorDown => *cursor += 1,
             KeyAction::PageDown => {
                 // Take current row's top y coordinate, add viewport height, find the row that covers that y coordinate.
                 let mut offset = viewport_height.saturating_sub(2);
@@ -59,6 +60,7 @@ pub fn list_cursor_navigation_with_variable_row_height<F: FnMut(usize, &mut UI) 
             _ => (),
         }
     }
+    *cursor = (*cursor).min(count - 1);
     moved
 }
 
@@ -257,8 +259,15 @@ impl Column {
 pub struct TableState {
     pub cursor: usize,
     pub scroll: isize,
+    pub scroll_to_cursor: bool,
     // TODO: pub auto_tooltip: bool,
     // TODO: sort_by: Vec<usize>,
+}
+impl TableState {
+    pub fn select(&mut self, cursor: usize) {
+        self.cursor = cursor;
+        self.scroll_to_cursor = true;
+    }
 }
 
 // For columns with auto_width = Text/Children, the width negotiation is a bit complicated:
@@ -272,8 +281,6 @@ pub struct Table {
     pub hide_cursor_if_unfocused: bool,
     pub enable_tooltip: bool,
     columns: Vec<Column>,
-
-    pub scroll_to_cursor: bool,
 
     root: WidgetIdx,
     viewport: WidgetIdx,
@@ -301,7 +308,7 @@ impl Table {
             // Header.
             with_parent!(ui, ui.add(widget!().hstack().fixed_height(1)), {
                 for i in 0..columns.len() {
-                    let l = imgui_writeln!(ui, table_header, "{}", columns[i].title);
+                    let l = ui_writeln!(ui, table_header, "{}", columns[i].title);
                     ui.add(widget!().width(AutoSize::Text).fixed_height(1).text(l));
                 }
             });
@@ -318,7 +325,7 @@ impl Table {
             });
         });
 
-        Self {state, columns, root, viewport, rows_container, scroll_bar, finished_layout: [false; 2], enable_selection_icon: true, hide_cursor_if_unfocused: false, enable_tooltip: true, scroll_to_cursor: false,
+        Self {state, columns, root, viewport, rows_container, scroll_bar, finished_layout: [false; 2], enable_selection_icon: true, hide_cursor_if_unfocused: false, enable_tooltip: true,
               lazy: false, row_idxs: 0..0, total_rows: 0, fixed_row_height: 0}
     }
 
@@ -333,15 +340,14 @@ impl Table {
             if ui.check_mouse(MouseActions::CLICK_SUBTREE) {
                 let y = ui.cur().mouse_pos[1];
                 if y >= 0 && (y as usize) < num_rows * row_height {
-                    self.state.cursor = y as usize / row_height;
-                    self.scroll_to_cursor = true;
+                    self.state.select(y as usize / row_height);
                 }
             }
         });
-        self.scroll_to_cursor |= with_parent!(ui, self.viewport, {
+        self.state.scroll_to_cursor |= with_parent!(ui, self.viewport, {
             list_cursor_navigation(&mut self.state.cursor, num_rows, row_height, ui)
         });
-        let scroll_to = if self.scroll_to_cursor && num_rows > 0 {
+        let scroll_to = if self.state.scroll_to_cursor && num_rows > 0 {
             Some((self.state.cursor*row_height) as isize..((self.state.cursor+1)*row_height) as isize)
         } else {
             None
@@ -350,6 +356,8 @@ impl Table {
             scrolling_navigation(&mut self.state.scroll, scroll_to, self.root, self.scroll_bar, ui)
         });
         self.row_idxs = (y_range.start as usize)/row_height..(y_range.end as usize + row_height - 1)/row_height;
+        self.row_idxs.end = self.row_idxs.end.min(num_rows);
+        self.row_idxs.start = self.row_idxs.start.min(self.row_idxs.end);
         self.row_idxs.clone()
     }
 
@@ -362,8 +370,7 @@ impl Table {
             w.identity = id;
             with_parent!(ui, ui.add(w), {
                 if !self.lazy && ui.check_mouse(MouseActions::CLICK_SUBTREE) {
-                    self.state.cursor = ui.get(self.rows_container).children.len() - 1;
-                    self.scroll_to_cursor = true;
+                    self.state.select(ui.get(self.rows_container).children.len() - 1);
                 }
                 ui.cur_parent
             })
@@ -378,7 +385,7 @@ impl Table {
 
     // Add cell with a single line of text.
     // Usage:
-    //   imgui_writeln!(ui, ...);
+    //   ui_writeln!(ui, ...);
     //   table.text_cell(ui);
     pub fn text_cell(&mut self, ui: &mut UI) -> WidgetIdx {
         let l = ui.text.num_lines() - 1;
@@ -509,10 +516,10 @@ impl Table {
 
         if !self.lazy {
             let num_rows = ui.get(self.rows_container).children.len();
-            self.scroll_to_cursor |= with_parent!(ui, self.viewport, {
+            self.state.scroll_to_cursor |= with_parent!(ui, self.viewport, {
                 list_cursor_navigation_with_variable_row_height(&mut self.state.cursor, num_rows, |i, ui| ui.get(ui.get(self.rows_container).children[i]).axes[Axis::Y].size, ui)
             });
-            let scroll_to = if self.scroll_to_cursor && num_rows > 0 {
+            let scroll_to = if self.state.scroll_to_cursor && num_rows > 0 {
                 let ax = &ui.get(ui.get(self.rows_container).children[self.state.cursor]).axes[Axis::Y];
                 Some(ax.rel_pos..ax.rel_pos + ax.size as isize)
             } else {
@@ -543,6 +550,7 @@ impl Table {
             });
         }
 
+        self.state.scroll_to_cursor = false;
         self.state
     }
 
@@ -669,8 +677,6 @@ impl Tabs {
     }
 
     pub fn finish(mut self, ui: &mut UI) -> TabsState {
-        self.disambiguate_titles(ui);
-
         let keys = ui.check_keys(&[KeyAction::PreviousTab, KeyAction::NextTab]);
         for key in keys {
             match key {
@@ -684,9 +690,23 @@ impl Tabs {
             if self.state.selected >= self.tabs.len() {
                 self.state.select(self.tabs.len() - 1);
             }
-            let adj = ui.palette.selected;
-            ui.get_mut(self.tabs[self.state.selected].0).style_adjustment.update(adj);
+
+            let children = ui.get(self.tabs[self.state.selected].0).children.clone();
+            for c in children {
+                if let Some(lines) = ui.get(c).draw_text.clone() {
+                    for line in lines {
+                        for span_idx in ui.text.get_line(line) {
+                            ui.text.spans[span_idx + 1].1 = ui.palette.tab_title_selected;
+                        }
+                    }
+                }
+            }
+
+            //let adj = ui.palette.selected;
+            //ui.get_mut(self.tabs[self.state.selected].0).style_adjustment.update(adj);
         }
+
+        self.disambiguate_titles(ui);
 
         self.state.hscroll += with_parent!(ui, self.viewport, {
             ui.check_scroll() * ui.key_binds.hscroll_sensitivity
@@ -810,6 +830,17 @@ impl TextInput {
     pub fn new_with_text(text: String) -> Self { Self {cursor: text.len(), mark: text.len(), multiline: false, line_wrap: false, capture_vertical_movement_keys: false, capture_return_key: false, undo: vec![(text.clone(), text.len(), text.len())], text, undo_idx: 0, scroll: 0, hscroll: 0, scroll_to_cursor: true, moved_past_the_end: false, lines: Vec::new(), saved_x: None, viewport_height: 0} }
     pub fn new_multiline(text: String) -> Self { Self {cursor: text.len(), mark: text.len(), multiline: true, line_wrap: true, capture_vertical_movement_keys: true, capture_return_key: false, undo: vec![(text.clone(), text.len(), text.len())], text, undo_idx: 0, scroll: 0, hscroll: 0, scroll_to_cursor: true, moved_past_the_end: false, lines: Vec::new(), saved_x: None, viewport_height: 0} }
 
+    pub fn go_to_end(&mut self) {
+        self.cursor = self.text.len();
+        self.mark = self.cursor;
+        self.scroll_to_cursor = true;
+    }
+    pub fn select_all(&mut self) {
+        self.cursor = self.text.len();
+        self.mark = 0;
+        self.scroll_to_cursor = true;
+    }
+    
     // Returns true if there was any input (or if scroll_to_cursor was set to true from the outside).
     // cur_parent's axes determine scrolling/resizing behavior:
     //  * If AutoSize::Fixed, the viewport size is fixed, and the text is scrollable inside it.
@@ -1504,63 +1535,50 @@ pub struct SearchBar {
     pub editing: bool,
 }
 impl SearchBar {
-/*asdqwe
-    pub fn update(&mut self, keys: &mut Vec<Key>, key_binds: &KeyBindings) -> TextInputEvent {
-        if !self.editing {
-            return TextInputEvent::None;
+    pub fn build(&mut self, left_text: Option<usize>, right_text: Option<usize>, ui: &mut UI) {
+        assert!(self.visible);
+        if self.editing && ui.check_key(KeyAction::Enter) {
+            self.editing = false;
         }
-        let mut ev = self.text.update(keys, key_binds);
-        match ev {
-            TextInputEvent::None => (),
-            TextInputEvent::Done => self.editing = false,
-            TextInputEvent::Cancel => {
-                self.editing = false;
-                self.visible = false;
-            }
-            TextInputEvent::Open => ev = TextInputEvent::None,
+        if self.visible && ui.check_key(KeyAction::Cancel) {
+            self.editing = false;
+            self.visible = false;
+        }
+        if self.editing && !ui.check_focus() {
+            self.editing = false;
         }
         if !self.editing && self.text.text.is_empty() {
             self.visible = false;
         }
-        ev
-    }
-
-    pub fn render(&mut self, left_text: &str, right_text: &str, f: &mut Frame, area: Rect, palette: &Palette) -> Rect {
-        if !self.visible || area.height == 0 {
-            return area;
+        if !self.visible {
+            ui.should_redraw = true;
+            return;
         }
-        let right_text_width = str_width(right_text) as u16;
-        let left_area = Rect {x: area.x, y: area.y, width: area.width.min(str_width(left_text) as u16), height: 1};
-        let right_area = Rect {x: (area.x + area.width).saturating_sub(right_text_width), y: area.y, width: right_text_width, height: 1};
-        let text_area = Rect {x: area.x + left_area.width, y: area.y, width: area.width.saturating_sub(left_area.width).saturating_sub(right_area.width), height: 1};
-        let remaining_area = Rect {x: area.x, y: area.y + 1, width: area.width, height: area.height - 1};
 
-        let paragraph = Paragraph::new(Text {lines: vec![Spans::from(vec![Span::styled(left_text, palette.search_bar_other)])]});
-        f.render_widget(paragraph, left_area);
-        let paragraph = Paragraph::new(Text {lines: vec![Spans::from(vec![Span::styled(right_text, palette.search_bar_other)])]});
-        f.render_widget(paragraph, right_area);
+        ui.cur_mut().axes[Axis::X].flags.insert(AxisFlags::STACK);
+        if let Some(l) = left_text {
+            ui.add(widget!().width(AutoSize::Text).text(l));
+        }
+        let text_widget = ui.add(widget!().identity(&'t').width(AutoSize::Remainder(1.0)));
+        if let Some(l) = right_text {
+            ui.add(widget!().width(AutoSize::Text).text(l));
+        }
+        ui.layout_children(Axis::X);
 
-        if self.editing {
-            self.text.render(f, text_area, palette);
-        } else {
-            let mut spans = vec![Span::styled(&self.text.text, palette.search_bar_query)];
-            if str_width(&self.text.text) < text_area.width as usize {
-                spans.push(Span::styled(format!("{: >0$}", text_area.width as usize + 10), palette.search_bar_query));
+        with_parent!(ui, text_widget, {
+            ui.focus();
+            if self.editing {
+                self.text.build(ui);
+            } else {
+                let l = ui_writeln!(ui, default, "{}", self.text.text);
+                ui.cur_mut().draw_text = Some(l..l+1);
             }
-            let paragraph = Paragraph::new(Text {lines: vec![Spans::from(spans)]});
-            f.render_widget(paragraph, text_area);
-        }
-
-        remaining_area
+        });
     }
 
     pub fn start_editing(&mut self) {
         self.visible = true;
         self.editing = true;
-        self.text.cursor = self.text.text.len();
+        self.text.select_all();
     }
-
-    pub fn height(&self) -> u16 {
-        if self.visible {1} else {0}
-    }*/
 }

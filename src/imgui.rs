@@ -216,8 +216,8 @@ impl Widget {
     pub fn min_height(mut self, s: usize) -> Self { self.axes[Axis::Y].min_size = s; self }
     pub fn max_width(mut self, s: usize) -> Self { self.axes[Axis::X].max_size = s; self }
     pub fn max_height(mut self, s: usize) -> Self { self.axes[Axis::Y].max_size = s; self }
-    pub fn hstack(mut self) -> Self { self.axes[0].flags.insert(AxisFlags::STACK); self }
-    pub fn vstack(mut self) -> Self { self.axes[1].flags.insert(AxisFlags::STACK); self }
+    pub fn hstack(mut self) -> Self { self.axes[0].flags.insert(AxisFlags::STACK); self }  pub fn set_hstack(&mut self) -> &mut Self { self.axes[0].flags.insert(AxisFlags::STACK); self }
+    pub fn vstack(mut self) -> Self { self.axes[1].flags.insert(AxisFlags::STACK); self }  pub fn set_vstack(&mut self) -> &mut Self { self.axes[1].flags.insert(AxisFlags::STACK); self }
     pub fn fixed_x(mut self, x: isize) -> Self { self.axes[Axis::X].rel_pos = x; self.axes[0].flags.insert(AxisFlags::POS_KNOWN); self }
     pub fn fixed_y(mut self, y: isize) -> Self { self.axes[Axis::Y].rel_pos = y; self.axes[1].flags.insert(AxisFlags::POS_KNOWN); self }
     pub fn fixed_rect(mut self, r: Rect) -> Self { for ax in 0..2 { let axis = &mut self.axes[ax]; axis.flags.insert(AxisFlags::POS_KNOWN | AxisFlags::SIZE_KNOWN); axis.rel_pos = r.pos[ax]; axis.size = r.size[ax]; } self }
@@ -286,7 +286,7 @@ macro_rules! ui_write {
     };
 }
 #[macro_export]
-macro_rules! imgui_writeln {
+macro_rules! ui_writeln {
     ($ui:expr, $style:ident, $($arg:tt)*) => {{
         styled_write!($ui.text, $ui.palette.$style, $($arg)*);
         $ui.text.close_line()

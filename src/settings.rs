@@ -68,6 +68,7 @@ pub struct Palette {
 
     pub tab_title: Style,
     pub tab_title_pinned: Style,
+    pub tab_title_selected: Style,
     pub tab_separator: (String, Style),
 
     // fg - left side, bg - right side.
@@ -109,6 +110,9 @@ pub struct Palette {
     pub disas_jump_arrow: Style,
     pub disas_relative_address: Style,
     pub disas_filename: Style,
+
+    pub thread_breakpoint_hit: StyleAdjustment,
+    pub thread_crash: StyleAdjustment,
 }
 impl Default for Palette {
     fn default() -> Self {
@@ -154,6 +158,7 @@ impl Default for Palette {
 
             tab_title: Style {fg: white.darker(), ..D!()},
             tab_title_pinned: Style {fg: white, ..D!()},
+            tab_title_selected: Style {fg: white, bg: Color(40, 40, 40), modifier: Modifier::BOLD, ..D!()},
             tab_separator: (" | ".to_string(), Style {fg: white.darker(), ..D!()}),
 
             placeholder_fill: Some(('.', Style {fg: white.darker(), bg: black, ..D!()})),
@@ -198,6 +203,9 @@ impl Default for Palette {
             disas_jump_arrow: Style {fg: white, ..D!()},
             disas_relative_address: Style {fg: cyan.darker(), ..D!()}, 
             disas_filename: Style {fg: cyan.darker(), ..D!()},
+
+            thread_breakpoint_hit: StyleAdjustment {add_fg: (100, 100, 100), add_bg: (10, 100, 10), ..D!()},
+            thread_crash: StyleAdjustment {add_fg: (100, 100, 100), add_bg: (150, 50, 50), ..D!()},
        }
     }
 }

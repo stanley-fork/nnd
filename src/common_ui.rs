@@ -74,6 +74,7 @@ impl Style {
     pub fn add_modifier(mut self, m: Modifier) -> Self { self.modifier.insert(m); self }
 }
 
+// TODO: Make this general enough to allow inverting colors, use it at least for thread_breakpoint_hit and thread_crash, maybe for highlighting ip and column breakpoints in source code.
 #[derive(Clone, Copy, Default)]
 pub struct StyleAdjustment {
     pub add_fg: (i16, i16, i16),

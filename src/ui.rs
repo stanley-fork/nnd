@@ -253,20 +253,9 @@ impl DebuggerUI {
                     self.should_drop_caches = true;
                 }
 
-                //asdqwe move these to Layout
-                //Some(KeyAction::WindowLeft) => self.layout.switch_to_adjacent_window(-1, 0),
-                //Some(KeyAction::WindowUp) => self.layout.switch_to_adjacent_window(0, -1),
-                //Some(KeyAction::WindowDown) => self.layout.switch_to_adjacent_window(0, 1),
-                //Some(KeyAction::WindowRight) => self.layout.switch_to_adjacent_window(1, 0),
-                //Some(KeyAction::Window(idx)) => self.layout.switch_to_window_with_hotkey_number(*idx),
-                //Some(KeyAction::NextTab) => self.layout.switch_tab_in_active_window(1),
-                //Some(KeyAction::PreviousTab) => self.layout.switch_tab_in_active_window(-1),
-
                 //asdqwe do these in threads and stack windows
                 //Some(KeyAction::PreviousStackFrame) => self.state.should_switch_stack_subframe -= 1,
                 //Some(KeyAction::NextStackFrame) => self.state.should_switch_stack_subframe += 1,
-                //Some(KeyAction::PreviousThread) => self.state.should_switch_thread -= 1,
-                //Some(KeyAction::NextThread) => self.state.should_switch_thread += 1,
 
                 Some(KeyAction::ToggleProfiler) => self.state.profiler_enabled ^= true,
 
@@ -364,7 +353,7 @@ struct RegistersWindow {
 
 impl WindowContent for RegistersWindow {
     fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
-        let l = imgui_writeln!(ui, default, "registers");
+        let l = ui_writeln!(ui, default, "registers");
         ui.add(widget!().text(l));
         /*asdqwe
         let f = match f { Some(f) => f, None => return };
@@ -1585,29 +1574,29 @@ impl WindowContent for StatusWindow {
         let start = ui.text.num_lines();
 
         match debugger.target_state {
-            ProcessState::NoProcess => imgui_writeln!(ui, default_dim, "no process"),
-            ProcessState::Starting => imgui_writeln!(ui, state_other, "starting"),
-            ProcessState::Exiting => imgui_writeln!(ui, state_other, "exiting"),
-            ProcessState::Stepping => imgui_writeln!(ui, state_other, "stepping"),
-            ProcessState::Running => imgui_writeln!(ui, running, "running"),
-            ProcessState::Suspended => imgui_writeln!(ui, suspended, "suspended"),
+            ProcessState::NoProcess => ui_writeln!(ui, default_dim, "no process"),
+            ProcessState::Starting => ui_writeln!(ui, state_other, "starting"),
+            ProcessState::Exiting => ui_writeln!(ui, state_other, "exiting"),
+            ProcessState::Stepping => ui_writeln!(ui, state_other, "stepping"),
+            ProcessState::Running => ui_writeln!(ui, running, "running"),
+            ProcessState::Suspended => ui_writeln!(ui, suspended, "suspended"),
         };
 
         if debugger.target_state != ProcessState::NoProcess {
             ui_write!(ui, default_dim, "pid: ");
             ui_write!(ui, default, "{}", debugger.pid);
-            imgui_writeln!(ui, default_dim, " cpu {:.0}% mem {}", debugger.info.resource_stats.cpu_percentage(), PrettySize(debugger.info.resource_stats.rss_bytes));
+            ui_writeln!(ui, default_dim, " cpu {:.0}% mem {}", debugger.info.resource_stats.cpu_percentage(), PrettySize(debugger.info.resource_stats.rss_bytes));
         } else {
-            imgui_writeln!(ui, default_dim, "pid: none");
+            ui_writeln!(ui, default_dim, "pid: none");
         }
-        imgui_writeln!(ui, default_dim, "nnd pid: {} cpu {:.0}% mem {}", my_pid(), debugger.my_resource_stats.cpu_percentage(), PrettySize(debugger.my_resource_stats.rss_bytes));
+        ui_writeln!(ui, default_dim, "nnd pid: {} cpu {:.0}% mem {}", my_pid(), debugger.my_resource_stats.cpu_percentage(), PrettySize(debugger.my_resource_stats.rss_bytes));
         match &debugger.persistent.path {
-            Ok(p) => imgui_writeln!(ui, default_dim, "{}/", p.display()),
-            Err(e) => imgui_writeln!(ui, error, "{}", e),
+            Ok(p) => ui_writeln!(ui, default_dim, "{}/", p.display()),
+            Err(e) => ui_writeln!(ui, error, "{}", e),
         };
 
         if state.last_error != "" {
-            imgui_writeln!(ui, error, "{}", state.last_error);
+            ui_writeln!(ui, error, "{}", state.last_error);
         }
         ui.text.close_line();
         let end = ui.text.num_lines();
@@ -1623,7 +1612,7 @@ impl WindowContent for StatusWindow {
             let start = ui.text.num_lines();
             for line in &debugger.log.lines.make_contiguous()[log_lines.saturating_sub(space_left)..] {
                 eprintln!("asdqwe line: {}", line);
-                imgui_writeln!(ui, default, "{}", line);
+                ui_writeln!(ui, default, "{}", line);
             }
             let end = ui.text.num_lines();
             ui.cur_mut().draw_text = Some(start..end);
@@ -1685,12 +1674,13 @@ impl WindowContent for BinariesWindow {
         }
 
         let mut table = Table::new(mem::take(&mut self.table_state), ui, vec![Column::new("idx", AutoSize::Fixed(3)), Column::new("name", AutoSize::Remainder(1.0)), Column::new("file", AutoSize::Fixed(PrettySize::MAX_LEN))]);
+        table.hide_cursor_if_unfocused = true;
         for (idx, id) in state.binaries.iter().enumerate() {
             let binary = debugger.symbols.get_if_present(id).unwrap();
             let is_mapped = debugger.info.binaries.contains_key(id);
             table.start_row(hash(id), ui);
 
-            imgui_writeln!(ui, default_dim, "{}", idx + 1);
+            ui_writeln!(ui, default_dim, "{}", idx + 1);
             table.text_cell(ui);
 
             // Path, progress bar, error message.
@@ -1706,7 +1696,7 @@ impl WindowContent for BinariesWindow {
                 let mut indicated_loading = false;
                 if binary.symbols.as_ref().is_err_and(|e| e.is_loading()) {
                     let (progress_ppm, loading_stage) = debugger.symbols.get_progress(id);
-                    let l = imgui_writeln!(ui, default, "{}% ({})", (progress_ppm + 5000) / 10000, loading_stage);
+                    let l = ui_writeln!(ui, default, "{}% ({})", (progress_ppm + 5000) / 10000, loading_stage);
                     let mut w = widget!().height(AutoSize::Text).text(l);
                     w.draw_progress_bar = Some((progress_ppm as f64 / 1e6, ui.palette.progress_bar));
                     ui.add(w);
@@ -1718,7 +1708,7 @@ impl WindowContent for BinariesWindow {
                 let mut print_error = |e: &Error| {
                     if e.is_loading() {
                         if !indicated_loading {
-                            imgui_writeln!(ui, default_dim, "loading");
+                            ui_writeln!(ui, default_dim, "loading");
                             indicated_loading = true;
                         }
                         return;
@@ -1744,9 +1734,9 @@ impl WindowContent for BinariesWindow {
 
             // ELF or unwind error/loading/stats.
             match &binary.elf {
-                Err(e) if e.is_loading() => imgui_writeln!(ui, running, "loading"),
-                Err(e) => imgui_writeln!(ui, error, "error"),
-                Ok(elf) => imgui_writeln!(ui, default_dim, "{}", PrettySize(elf.data().len())),
+                Err(e) if e.is_loading() => ui_writeln!(ui, running, "loading"),
+                Err(e) => ui_writeln!(ui, error, "error"),
+                Ok(elf) => ui_writeln!(ui, default_dim, "{}", PrettySize(elf.data().len())),
             };
             table.text_cell(ui);
         }
@@ -1836,22 +1826,36 @@ struct ThreadsWindow {
 }
 impl WindowContent for ThreadsWindow {
     fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
-        styled_write!(ui.text, ui.palette.default, "threads");
-        let l = ui.text.close_line();
-        ui.add(widget!().text(l));
-        /*asdqwe
-        keys.retain(|key| {
-            if self.filter.bar.editing {
-                return true;
+        ui.cur_mut().set_vstack();
+        if ui.check_key(KeyAction::Find) {
+            self.filter.bar.start_editing();
+        }
+        with_parent!(ui, ui.add(widget!().identity(&'s').fixed_height(if self.filter.bar.visible {1} else {0})), {
+            ui.focus();
+            if self.filter.bar.visible {
+                let l = ui_writeln!(ui, default_dim, "filter: ");
+                self.filter.bar.build(Some(l), None, ui);
             }
-            match debugger.context.settings.keys.map.get(key) {
-                Some(KeyAction::Find) => self.filter.bar.start_editing(),
-                Some(KeyAction::Cancel) => self.filter.bar.visible = false,
-                _ => return true,
-            }
-            false
         });
-        
+        let table_widget = ui.add(widget!().identity(&'t').height(AutoSize::Remainder(1.0)));
+        with_parent!(ui, table_widget, {
+            ui.multifocus();
+        });
+        ui.layout_children(Axis::Y);
+
+        let mut table = with_parent!(ui, table_widget, {
+            Table::new(mem::take(&mut self.table_state), ui, vec![
+                Column::new("idx", AutoSize::Fixed(5)),
+                Column::new("tid", AutoSize::Fixed(10)),
+                Column::new("name", AutoSize::Fixed(15)),
+                Column::new("s", AutoSize::Fixed(1)),
+                Column::new("cpu", AutoSize::Fixed(4)),
+                Column::new("function", AutoSize::Remainder(1.0)),
+                Column::new("addr", AutoSize::Fixed(12)),
+                Column::new("bin", AutoSize::Fixed(3)),
+            ])
+        });
+
         let mut tids: Vec<(usize, usize, pid_t)> = debugger.threads.values().map(|t| (t.idx, t.stop_count, t.tid)).collect();
         tids.sort_by_key(|t| t.0);
         let mut filtered_tids: Vec<pid_t> = self.filter.filter(tids, debugger);
@@ -1879,146 +1883,133 @@ impl WindowContent for ThreadsWindow {
 
         // If selected thread doesn't pass the filter, awkwardly add it to the list anyway, greyed out.
         let mut selected_thread_filtered_out = false;
+        let mut cursor = table.state.cursor;
         if debugger.threads.get(&state.selected_thread).is_some() {
             if let Some(i) = filtered_tids.iter().position(|x| *x == state.selected_thread) {
-                self.scroll.cursor = i;
+                cursor = i;
             } else {
                 selected_thread_filtered_out = true;
                 filtered_tids.push(state.selected_thread);
-                self.scroll.cursor = filtered_tids.len() - 1;
+                cursor = filtered_tids.len() - 1;
             }
         }
 
-        let height = area.height.saturating_sub(1 + self.filter.bar.height());
-        let mut range = self.scroll.update(filtered_tids.len(), height, &mut keys, &debugger.context.settings.keys);
+        // Global hotkeys.
+        with_parent!(ui, ui.content_root, {
+            for key in ui.check_keys(&[KeyAction::PreviousThread, KeyAction::NextThread]) {
+                match key {
+                    KeyAction::PreviousThread => cursor = cursor.saturating_sub(1),
+                    KeyAction::NextThread => cursor += 1,
+                    _ => panic!("huh"),
+                }
+            }
+        });
 
-        state.selected_thread = filtered_tids.get(self.scroll.cursor).copied().unwrap_or(0);
-        if selected_thread_filtered_out && state.selected_thread != *filtered_tids.last().unwrap() {
-            selected_thread_filtered_out = false;
-            filtered_tids.pop();
-            range = self.scroll.range(filtered_tids.len(), height as usize);
+        if cursor != table.state.cursor {
+            table.state.select(cursor);
         }
 
-        let f = match f { Some(f) => f, None => return };
-        let context_temp = debugger.context.clone();
-        let palette = &context_temp.settings.palette;
+        let range = table.lazy(filtered_tids.len(), 1, ui);
 
-        let area = self.filter.bar.render("filter: ", "", f, area, palette);
+        state.selected_thread = filtered_tids.get(table.state.cursor).copied().unwrap_or(0);
+        if selected_thread_filtered_out && state.selected_thread != *filtered_tids.last().unwrap() {
+            ui.should_redraw = true;
+        }
 
-        let tids: Vec<libc::pid_t> = filtered_tids[range.clone()].to_vec();
-        let selected_idx = self.scroll.cursor - range.start;
+        for i in range {
+            let tid = filtered_tids[i];
+            let stack = debugger.get_stack_trace(tid, /* partial */ true);
+            let t = debugger.threads.get(&tid).unwrap();
+            let row_widget = table.start_row(hash(&tid), ui);
+            
+            ui_writeln!(ui, default_dim, "{}", t.idx);
+            table.text_cell(ui);
+            
+            ui_writeln!(ui, default_dim, "{}", t.tid);
+            table.text_cell(ui);
 
-        let rows: Vec<Row> = tids.iter().map(|tid| {
-            let stack = debugger.get_stack_trace(*tid, /* partial */ true);
-            let t = debugger.threads.get(tid).unwrap();
-            let mut cells = vec![
-                Cell::from(format!("{}", t.idx)).style(palette.default_dim),
-                Cell::from(format!("{}", t.tid)).style(palette.default_dim),
-                match t.info.name.clone() {
-                    Ok(name) => Cell::from(name),
-                    Err(e) => Cell::from(format!("{}", e)).style(palette.error),
-                },
-                Cell::from(format!("{}", t.info.resource_stats.state)).style(match t.info.resource_stats.state {
-                    'R' | 'D' => palette.state_in_progress,
-                    'S' | 'T' | 't' => palette.state_suspended,
-                    'Z' | 'X' | 'x' => palette.error,
-                    _ => palette.state_other,
-                }),
-                Cell::from(format!("{:.0}%", t.info.resource_stats.cpu_percentage(debugger.info.resource_stats.period_ns))).style(palette.default_dim),
-            ];
+            let is_filtered_out = selected_thread_filtered_out && tid == state.selected_thread;
+            match t.info.name.clone() {
+                Ok(name) => styled_writeln!(ui.text, if is_filtered_out {ui.palette.default_dim} else {ui.palette.default}, "{}", name),
+                Err(e) => ui_writeln!(ui, error, "{}", e),
+            };
+            table.text_cell(ui);
+
+            let style = match t.info.resource_stats.state {
+                'R' | 'D' => ui.palette.running,
+                'S' | 'T' | 't' => ui.palette.state_suspended,
+                'Z' | 'X' | 'x' => ui.palette.error,
+                _ => ui.palette.state_other,
+            };
+            styled_writeln!(ui.text, style, "{}", t.info.resource_stats.state);
+            table.text_cell(ui);
+
+            ui_writeln!(ui, default_dim, "{:.0}%", t.info.resource_stats.cpu_percentage(debugger.info.resource_stats.period_ns));
+            table.text_cell(ui);
+
             match t.state {
-                ThreadState::Running => cells.extend_from_slice(&[
-                    Cell::from(""),
-                    Cell::from(""),
+                ThreadState::Running => {
                     match &debugger.stepping {
-                        Some(step) if step.tid == *tid => Cell::from(Span::styled("stepping", palette.state_other)),
-                        _ => Cell::from(Span::styled("running", palette.state_in_progress)),
-                    }]),
+                        Some(step) if step.tid == tid => ui_writeln!(ui, state_other, "stepping"),
+                        _ => ui_writeln!(ui, running, "running"),
+                    };
+                    table.text_cell(ui);
+
+                    ui.text.close_line();
+                    table.text_cell(ui);
+                    table.text_cell(ui);
+                }
                 ThreadState::Suspended if !stack.frames.is_empty() => {
                     let f = &stack.frames[0];
-                    let sf = &stack.subframes[0];
-                    cells.extend_from_slice(&[
-                        Cell::from(format!("{:x}", f.addr)).style(palette.default_dim),
-                        if let Some(binary_id) = &f.binary_id {
-                            Cell::from(format!("{}", state.binaries.iter().position(|b| b == binary_id).unwrap() + 1))
-                        } else {
-                            Cell::from("?").style(palette.default_dim)
-                        },
-                        if let Some(function_name) = &sf.function_name {
-                            Cell::from(format!("{}", function_name))
-                        } else {
-                            Cell::from("?").style(palette.default_dim)
-                        }]);
-                }
-                ThreadState::Suspended => cells.extend_from_slice(&[
-                    Cell::from(""),
-                    Cell::from(""),
-                    if let Some(e) = &stack.truncated {
-                        if e.is_loading() {
-                            Cell::from(Span::styled("[loading]", palette.state_in_progress))
-                        } else {
-                            Cell::from(Span::styled(format!("err: {}", e), palette.error_dim))
-                        }
-                    } else {
-                        Cell::from(Span::styled("[empty]", palette.default_dim))
-                    }]),
-            };
+                    match &stack.subframes[0].function_name {
+                        Some(name) => ui_writeln!(ui, function_name, "{}", name),
+                        None => ui_writeln!(ui, default_dim, "?"),
+                    };
+                    table.text_cell(ui);
+                    
+                    ui_writeln!(ui, default_dim, "{:x}", f.addr);
+                    table.text_cell(ui);
 
-            if self.filter.bar.editing {
-                // If no row is selected, tui-rs doesn't reserve horizontal space for highlight_symbol, so the table gets
-                // shifted left and right by 3 characters every time filter editing starts and ends. Unacceptable! Add an empty column to compensate.
-                cells.insert(0, Cell::from(""));
+                    match &f.binary_id {
+                        Some(binary_id) => ui_writeln!(ui, default_dim, "{}", state.binaries.iter().position(|b| b == binary_id).unwrap() + 1),
+                        None => ui_writeln!(ui, default_dim, "?"),
+                    };
+                    table.text_cell(ui);
+                }
+                ThreadState::Suspended => {
+                    match &stack.truncated {
+                        Some(e) if e.is_loading() => ui_writeln!(ui, running, "[loading]"),
+                        Some(e) => ui_writeln!(ui, error, "<{}>", e),
+                        None => ui_writeln!(ui, default_dim, "[empty]"),
+                    };
+                    table.text_cell(ui);
+
+                    ui.text.close_line();
+                    table.text_cell(ui);
+                    table.text_cell(ui);
+                }
             }
-            
-            let mut row = Row::new(cells);
+
             // Highlight threads that got a fatal signal or hit a breakpoint.
+            let mut style_adjustment = StyleAdjustment::default();
             for stop in &t.stop_reasons {
                 match stop {
                     StopReason::Signal(_) => {
-                        row = row.style(palette.error);
+                        style_adjustment = ui.palette.thread_crash;
                         break;
                     }
-                    StopReason::Breakpoint(_) => {
-                        row = row.style(palette.state_suspended);
-                    }
+                    StopReason::Breakpoint(_) => style_adjustment = ui.palette.thread_breakpoint_hit,
                     StopReason::Step => (),
                 }
             }
-            if selected_thread_filtered_out && *tid == state.selected_thread {
-                row = row.style(palette.default_dim);
-            }
-            row
-        }).collect();
+            ui.get_mut(row_widget).style_adjustment.update(style_adjustment);
+        }
 
-        let highlight_symbol = "➤ ";
-        let mut table_state = TableState::default();
-        let mut header: Vec<&'static str> = vec!["idx", "tid", "name", "s", "cpu", "addr", "bin", "function"];
-        let mut widths: Vec<Constraint> = vec![Constraint::Length(5), Constraint::Length(10), Constraint::Length(15), Constraint::Length(1), Constraint::Length(4), Constraint::Length(12), Constraint::Length(3), Constraint::Percentage(100)];
-        if self.filter.bar.editing {
-            header.insert(0, "");
-            widths.insert(0, Constraint::Length(str_width(highlight_symbol) as u16 - 1));
-        } else {
-            table_state.select(Some(selected_idx));
-        }        
-        
-        let table = Table::new(rows)
-            .header(Row::new(header).style(palette.table_header))
-            .widths(&widths)
-            .highlight_style(palette.table_selected_item).highlight_symbol(highlight_symbol);
-        
-        f.render_stateful_widget(table, area, &mut table_state);
+        self.table_state = table.finish(ui);
     }
 
     fn drop_caches(&mut self) {
         self.filter.cached_results.clear();
-    }
-
-    fn update_modal(&mut self, state: &mut UIState, debugger: &mut Debugger, keys: &mut Vec<Key>) {
-        self.filter.bar.update(keys, &debugger.context.settings.keys);
-    }
-
-    fn cancel_modal(&mut self, state: &mut UIState, debugger: &mut Debugger) {
-        self.filter.bar.editing = false;*/
     }
 
     fn get_hints(&self, hints: &mut StyledText, ui: &mut UI) {

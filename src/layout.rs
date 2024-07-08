@@ -633,16 +633,22 @@ impl Layout {
         let region = self.regions.get_mut(region_id);
         let leaf = region.content.as_leaf_mut();
 
-        leaf.widget = ui.add(widget!().identity(&('l', region_id)).fixed_rect(region.area));
+        let mut area = region.area;
+        // (Remove this to put tabs below the wall instead of inside it. May look slightly less confusing, idk.)
+        if leaf.tabs.len() > 1 {
+            area.pos[1] -= 1;
+            area.size[1] += 1;
+        }
+
+        leaf.widget = ui.add(widget!().identity(&('l', region_id)).fixed_rect(area));
         let mut content_widget = leaf.widget;
         with_parent!(ui, leaf.widget, {
-            let mut content_area = region.area;
+            let mut content_area = area;
             if leaf.tabs.len() == 1 {
                 leaf.tabs_state.select(0);
             } else if leaf.tabs.len() > 1 {
-                // TODO: Try to embed the tabs in the wall above, like window title, and see if it looks better.
                 ui.cur_mut().axes[Axis::Y].flags.insert(AxisFlags::STACK);
-                let tabs_widget = ui.add(widget!().identity(&'t').fixed_height(1));
+                let tabs_widget = ui.add(widget!().identity(&'t').fixed_height(1).width(AutoSize::Children).max_width(area.width()));
                 content_widget = ui.add(widget!().identity(&'w').height(AutoSize::Remainder(1.0)));
                 ui.layout_children(Axis::Y);
                 if content_area.height() > 0 {
