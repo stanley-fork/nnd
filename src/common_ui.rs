@@ -158,12 +158,21 @@ pub struct StyledText {
 // styled_write!(out, palette.default_dim, "foo: {}, bar: {}", foo, bar);
 #[macro_export]
 macro_rules! styled_write {
-    ($out:expr, $style:expr, $($arg:tt)*) => (
-        {
-            let _ = write!(($out).chars, $($arg)*);
-            ($out).close_span($style);
-        }
-    );
+    ($out:expr, $style:expr, $($arg:tt)*) => {{
+        use std::fmt::Write as f;
+        let _ = write!(($out).chars, $($arg)*);
+        ($out).close_span($style);
+    }};
+}
+
+#[macro_export]
+macro_rules! styled_writeln {
+    ($out:expr, $style:expr, $($arg:tt)*) => {{
+        use std::fmt::Write as f;
+        let _ = write!(($out).chars, $($arg)*);
+        ($out).close_span($style);
+        ($out).close_line()
+    }};
 }
 
 impl Default for StyledText { fn default() -> Self { Self {chars: String::new(), spans: vec![(0, Style::default())], lines: vec![0]} } }

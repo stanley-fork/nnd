@@ -301,10 +301,8 @@ impl Table {
             // Header.
             with_parent!(imgui, imgui.add(widget!().hstack().fixed_height(1)), {
                 for i in 0..columns.len() {
-                    with_parent!(imgui, imgui.add(widget!().width(AutoSize::Text).fixed_height(1)), {
-                        styled_write!(imgui.text, imgui.palette.table_header, "{}", columns[i].title);
-                        imgui.set_text();
-                    });
+                    let l = imgui_writeln!(imgui, table_header, "{}", columns[i].title);
+                    imgui.add(widget!().width(AutoSize::Text).fixed_height(1).text(l));
                 }
             });
 
@@ -360,7 +358,9 @@ impl Table {
         with_parent!(imgui, self.rows_container, {
             let x = if self.enable_selection_icon {2} else {0}; // excluding the icon from selection highlighting looks slightly better (to me)
             let row_height = if self.lazy {AutoSize::Fixed(self.fixed_row_height)} else {AutoSize::Children};
-            with_parent!(imgui, imgui.add(widget!().identity(&id).hstack().fixed_x(x).height(row_height).fill(' ', imgui.palette.default).highlight_on_hover()), {
+            let mut w = widget!().hstack().fixed_x(x).height(row_height).fill(' ', imgui.palette.default).highlight_on_hover();
+            w.identity = id;
+            with_parent!(imgui, imgui.add(w), {
                 if !self.lazy && imgui.check_mouse(MouseActions::CLICK_SUBTREE) {
                     self.state.cursor = imgui.get(self.rows_container).children.len() - 1;
                     self.scroll_to_cursor = true;
@@ -376,24 +376,31 @@ impl Table {
         }
     }
 
-    // By default the cell's height is set to AutoSize::Text. You may change it.
+    // Add cell with a single line of text.
+    // Usage:
+    //   imgui_writeln!(imgui, ...);
+    //   table.text_cell(imgui);
+    pub fn text_cell(&mut self, imgui: &mut IMGUI) -> WidgetIdx {
+        let l = imgui.text.num_lines() - 1;
+        self.text_cell_lines(l..l+1, imgui)
+    }
+
+    // Add cell with multiple lines of text.
+    pub fn text_cell_lines(&mut self, lines: Range<usize>, imgui: &mut IMGUI) -> WidgetIdx {
+        with_parent!(imgui, self.start_cell(imgui), {
+            imgui.cur_mut().axes[Axis::Y].auto_size = AutoSize::Text;
+            imgui.cur_mut().draw_text = Some(lines);
+            imgui.cur_parent
+        })
+    }
+
+    // Add empty cell inside which you can add arbitrary widgets.
     pub fn start_cell(&mut self, imgui: &mut IMGUI) -> WidgetIdx {
         let w = *imgui.get(self.rows_container).children.last().unwrap();
         let i = imgui.get(w).children.len();
         assert!(i < self.columns.len());
         with_parent!(imgui, w, {
-            imgui.add(widget!().width(self.columns[i].auto_width).height(AutoSize::Text))
-        })
-    }
-
-    // Convenience function for simple single-line text cells.
-    // Usage:
-    //   styled_write!(imgui.text, ...);
-    //   table.text_cell(imgui);
-    pub fn text_cell(&mut self, imgui: &mut IMGUI) -> WidgetIdx {
-        with_parent!(imgui, self.start_cell(imgui), {
-            imgui.set_text();
-            imgui.cur_parent
+            imgui.add(widget!().width(self.columns[i].auto_width).height(AutoSize::Children))
         })
     }
 
@@ -667,9 +674,9 @@ impl Tabs {
         let keys = imgui.check_keys(&[KeyAction::PreviousTab, KeyAction::NextTab]);
         for key in keys {
             match key {
-                KeyAction::PreviousTab => self.state.select(self.state.selected.saturating_sub(1)),
-                KeyAction::NextTab => self.state.select(self.state.selected + 1),
-                _ => panic!("huh"),
+                KeyAction::PreviousTab if !self.tabs.is_empty() => self.state.select((self.state.selected + self.tabs.len() - 1)%self.tabs.len()),
+                KeyAction::NextTab if !self.tabs.is_empty() => self.state.select((self.state.selected + 1)%self.tabs.len()),
+                _ => (),
             }
         }
 

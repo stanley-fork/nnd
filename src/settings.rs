@@ -145,7 +145,7 @@ impl Default for Palette {
             state_suspended: Style {bg: light_green, fg: black, ..D!()},
             state_other: Style {bg: yellow, fg: black, ..D!()},
 
-            selected: StyleAdjustment {add_fg: (20, 20, 20), add_bg: (50, 50, 50), ..D!()},
+            selected: StyleAdjustment {add_fg: (50, 50, 50), add_bg: (50, 50, 50), ..D!()},
             hovered: StyleAdjustment {add_fg: (20, 20, 20), add_bg: (25, 25, 25), ..D!()},
 
             table_header: Style {fg: white.darker(), ..D!()},

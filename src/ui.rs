@@ -2,7 +2,7 @@ use crate::{*, debugger::*, error::*, log::*, symbols::*, symbols_registry::*, u
 use std::{io::{self, Write, BufRead, BufReader, Read}, mem::{self, take}, collections::{HashSet, HashMap, hash_map::Entry}, os::fd::AsRawFd, path, path::{Path, PathBuf}, fs::File, fmt::Write as FmtWrite, borrow::Cow, ops::Range, str, os::unix::ffi::OsStrExt, sync::{Arc}};
 use libc::{self, pid_t};
 
-pub struct UI {
+pub struct DebuggerUI {
     pub terminal: Terminal,
     pub imgui: IMGUI,
     input: InputReader,
@@ -89,7 +89,7 @@ pub enum WindowType {
     Status = 9,
 }
 
-impl UI {
+impl DebuggerUI {
     pub fn new() -> Self {
         let layout = Self::default_layout();
         let imgui = IMGUI::default();
@@ -364,6 +364,8 @@ struct RegistersWindow {
 
 impl WindowContent for RegistersWindow {
     fn build(&mut self, ui: &mut UIState, debugger: &mut Debugger, imgui: &mut IMGUI) {
+        let l = imgui_writeln!(imgui, default, "registers");
+        imgui.add(widget!().text(l));
         /*asdqwe
         let f = match f { Some(f) => f, None => return };
         let palette = &debugger.context.settings.palette;
@@ -585,6 +587,9 @@ impl WatchesWindow {
 
 impl WindowContent for WatchesWindow {
     fn build(&mut self, ui: &mut UIState, debugger: &mut Debugger, imgui: &mut IMGUI) {
+        styled_write!(imgui.text, imgui.palette.default, "{}", if self.is_locals_window {"locals"} else {"watches"});
+        let l = imgui.text.close_line();
+        imgui.add(widget!().text(l));
         /*asdqwe
         if let Some((_, area, _)) = &mut self.text_input {
             *area = Rect::default();
@@ -874,6 +879,9 @@ struct LocationsWindow {
 }
 impl WindowContent for LocationsWindow {
     fn build(&mut self, ui: &mut UIState, debugger: &mut Debugger, imgui: &mut IMGUI) {
+        styled_write!(imgui.text, imgui.palette.default, "locations");
+        let l = imgui.text.close_line();
+        imgui.add(widget!().text(l));
         /*
         let f = match f { Some(f) => f, None => return };
         let palette = &debugger.context.settings.palette;
@@ -1185,6 +1193,9 @@ impl DisassemblyWindow {/*asdqwe
 
 impl WindowContent for DisassemblyWindow {
     fn build(&mut self, ui: &mut UIState, debugger: &mut Debugger, imgui: &mut IMGUI) {
+        styled_write!(imgui.text, imgui.palette.default, "disas");
+        let l = imgui.text.close_line();
+        imgui.add(widget!().text(l));
         /*asdqwe
     fn update_modal(&mut self, ui: &mut UIState, debugger: &mut Debugger, keys: &mut Vec<Key>) {
         if let Some(d) = &mut self.search_dialog {
@@ -1570,46 +1581,53 @@ impl WindowContent for DisassemblyWindow {
 struct StatusWindow {}
 impl WindowContent for StatusWindow {
     fn build(&mut self, ui: &mut UIState, debugger: &mut Debugger, imgui: &mut IMGUI) {
-        /*asdqwe
-        let f = match f { Some(f) => f, None => return };
-        let palette = &debugger.context.settings.palette;
+        imgui.cur_mut().axes[Axis::Y].flags.insert(AxisFlags::STACK);
+        let start = imgui.text.num_lines();
 
-        let mut items: Vec<ListItem> = Vec::new();
-
-        items.push(match debugger.target_state {
-            ProcessState::NoProcess => ListItem::new("no process").style(palette.default_dim),
-            ProcessState::Starting => ListItem::new("starting").style(palette.state_other),
-            ProcessState::Exiting => ListItem::new("exiting").style(palette.state_other),
-            ProcessState::Stepping => ListItem::new("stepping").style(palette.state_other),
-            ProcessState::Running => ListItem::new("running").style(palette.state_in_progress),
-            ProcessState::Suspended => ListItem::new("suspended").style(palette.state_suspended),
-        });
+        match debugger.target_state {
+            ProcessState::NoProcess => imgui_writeln!(imgui, default_dim, "no process"),
+            ProcessState::Starting => imgui_writeln!(imgui, state_other, "starting"),
+            ProcessState::Exiting => imgui_writeln!(imgui, state_other, "exiting"),
+            ProcessState::Stepping => imgui_writeln!(imgui, state_other, "stepping"),
+            ProcessState::Running => imgui_writeln!(imgui, running, "running"),
+            ProcessState::Suspended => imgui_writeln!(imgui, suspended, "suspended"),
+        };
 
         if debugger.target_state != ProcessState::NoProcess {
-            items.push(ListItem::new(Text::from(Spans::from(vec![Span::styled("pid: ", palette.default_dim), Span::raw(format!("{}", debugger.pid)), Span::styled(format!(" cpu {:.0}% mem {}", debugger.info.resource_stats.cpu_percentage(), PrettySize(debugger.info.resource_stats.rss_bytes)), palette.default_dim)]))));
+            imgui_write!(imgui, default_dim, "pid: ");
+            imgui_write!(imgui, default, "{}", debugger.pid);
+            imgui_writeln!(imgui, default_dim, " cpu {:.0}% mem {}", debugger.info.resource_stats.cpu_percentage(), PrettySize(debugger.info.resource_stats.rss_bytes));
         } else {
-            items.push(ListItem::new(Text::from(Spans::from(vec![Span::styled("pid: none", palette.default_dim)]))));
+            imgui_writeln!(imgui, default_dim, "pid: none");
         }
-        items.push(ListItem::new(Text::from(Spans::from(vec![Span::styled(format!("nnd pid: {} cpu {:.0}% mem {}", my_pid(), debugger.my_resource_stats.cpu_percentage(), PrettySize(debugger.my_resource_stats.rss_bytes)), palette.default_dim)]))));
+        imgui_writeln!(imgui, default_dim, "nnd pid: {} cpu {:.0}% mem {}", my_pid(), debugger.my_resource_stats.cpu_percentage(), PrettySize(debugger.my_resource_stats.rss_bytes));
         match &debugger.persistent.path {
-            Ok(p) => items.push(ListItem::new(format!("{}/", p.display())).style(palette.default_dim)),
-            Err(e) => items.push(ListItem::new(format!("{}", e)).style(palette.error)),
-        }
+            Ok(p) => imgui_writeln!(imgui, default_dim, "{}/", p.display()),
+            Err(e) => imgui_writeln!(imgui, error, "{}", e),
+        };
 
         if ui.last_error != "" {
-            items.push(ListItem::new(ui.last_error.clone()).style(palette.status_error));
-            items.push(ListItem::new(" "));
+            imgui_writeln!(imgui, error, "{}", ui.last_error);
         }
+        imgui.text.close_line();
+        let end = imgui.text.num_lines();
 
-        let space_left = (area.height as usize).saturating_sub(2 + items.len());
+        imgui.add(widget!().text_lines(start..end).height(AutoSize::Text));
+        let log_widget = imgui.add(widget!().height(AutoSize::Remainder(1.0)));
+        imgui.layout_children(Axis::Y);
 
-        let log_lines = debugger.log.lines.len();
-        for line in &debugger.log.lines.make_contiguous()[log_lines.saturating_sub(space_left)..] {
-            items.push(ListItem::new(&line[..]));
-        }
-        
-        let list = List::new(items);
-        f.render_widget(list, area);*/
+        with_parent!(imgui, log_widget, {
+            let space_left = imgui.cur().axes[Axis::Y].get_fixed_size();
+            eprintln!("asdqwe space: {}", space_left);
+            let log_lines = debugger.log.lines.len();
+            let start = imgui.text.num_lines();
+            for line in &debugger.log.lines.make_contiguous()[log_lines.saturating_sub(space_left)..] {
+                eprintln!("asdqwe line: {}", line);
+                imgui_writeln!(imgui, default, "{}", line);
+            }
+            let end = imgui.text.num_lines();
+            imgui.cur_mut().draw_text = Some(start..end);
+        });
     }
 }
 
@@ -1617,6 +1635,9 @@ impl WindowContent for StatusWindow {
 struct HintsWindow {}
 impl WindowContent for HintsWindow {
     fn build(&mut self, ui: &mut UIState, debugger: &mut Debugger, imgui: &mut IMGUI) {
+        styled_write!(imgui.text, imgui.palette.default, "frame {}", imgui.frame_idx);
+        let l = imgui.text.close_line();
+        imgui.add(widget!().text(l));
         /*asdqwe
         let f = match f { Some(f) => f, None => return };
         let palette = &debugger.context.settings.palette;
@@ -1654,7 +1675,6 @@ struct BinariesWindow {
 }
 impl WindowContent for BinariesWindow {
     fn build(&mut self, ui: &mut UIState, debugger: &mut Debugger, imgui: &mut IMGUI) {
-        /*asdqwe
         // Listed in order of mmap address, so the main executable is usually first, which is nice.
         ui.binaries = debugger.info.maps.list_binaries();
         // List previously seen unloaded binaries too, because they're visible to file/function open dialogs, especially if there's no debuggee process.
@@ -1664,82 +1684,74 @@ impl WindowContent for BinariesWindow {
             }
         }
 
-        let f = match f { Some(f) => f, None => return };
-        let palette = &debugger.context.settings.palette;
-
-        let range = self.scroll.update_cursorless(ui.binaries.len(), area.height.saturating_sub(1), &mut keys, &debugger.context.settings.keys);
-
-        let mut rows: Vec<Row> = Vec::new();
-        let mut column_widths = [3, 0, 11, 9];
-        column_widths[1] = area.width.saturating_sub(column_widths.iter().sum::<u16>() + column_widths.len() as u16 - 1);
-        for idx in range {
-            let id = &ui.binaries[idx];
+        let mut table = Table::new(mem::take(&mut self.table_state), imgui, vec![Column::new("idx", AutoSize::Fixed(3)), Column::new("name", AutoSize::Remainder(1.0)), Column::new("file", AutoSize::Fixed(PrettySize::MAX_LEN))]);
+        for (idx, id) in ui.binaries.iter().enumerate() {
             let binary = debugger.symbols.get_if_present(id).unwrap();
             let is_mapped = debugger.info.binaries.contains_key(id);
-            let mut cells: Vec<Cell> = vec![
-                Cell::from(format!("{}", idx + 1)).style(palette.default_dim),
-                Cell::from(""),
-                // ELF or unwind error/loading/stats.
-                match &binary.elf {
-                    Err(e) if e.is_loading() => Cell::from(Span::styled("loading", palette.state_in_progress)),
-                    Err(e) => Cell::from(Span::styled("error", palette.error)),
-                    Ok(elf) => Cell::from(format!("{}", PrettySize(elf.data().len()))).style(palette.default_dim),
-                },
-                if binary.unwind.as_ref().is_err_and(|e| e.is_loading()) || binary.symbols.as_ref().is_err_and(|e| e.is_loading()) {
-                    Cell::from(Span::styled("loading", palette.state_in_progress))
-                } else if binary.unwind.is_ok() && binary.symbols.is_ok() {
-                    Cell::from("ok").style(palette.default_dim)
-                } else if binary.unwind.as_ref().map_or_else(|e| e.is_missing_symbols(), |_| true) && binary.symbols.as_ref().map_or_else(|e| e.is_missing_symbols(), |_| true) {
-                    Cell::from(Span::styled("no", palette.warning_dim))
-                } else {
-                    Cell::from(Span::styled("error", palette.error_dim))
-                }];
-            // The wide cell may have multiple lines with progress bar or errors.
-            let mut lines: Vec<Spans> = vec![Spans::from(vec![Span::raw(format!("{}", id.path))])];
-            if binary.symbols.as_ref().is_err_and(|e| e.is_loading()) {
-                ui.loading = true;
-                let (progress_ppm, loading_stage) = debugger.symbols.get_progress(id);
-                let mut text = format!("{}% ({})", progress_ppm / 10000, loading_stage);
-                let wid = column_widths[1] as usize;
-                let len = text.chars().count();
-                if len <= wid {
-                    // Center. Need len strictly > wid for the char_indices() thing below.
-                    let pad = wid + 1 - len;
-                    text.insert_str(0, &" ".to_string().repeat((pad-1)/2));
-                    text.push_str(&" ".to_string().repeat(pad/2+1));
-                    assert!(text.chars().count() == wid + 1);
-                }
-                // Text and progress bar combined. We assume there's no unicode.
-                let bar = wid * progress_ppm.min(1000000) / 1000000;
-                let pos = text.char_indices().skip(bar).next().unwrap().0;
-                lines.push(Spans::from(vec![Span::styled(text[..pos].to_string(), palette.progress_bar_done), Span::styled(text[pos..].to_string(), palette.progress_bar_remaining)]));
-            }
-            if binary.elf.as_ref().is_err_and(|e| !e.is_loading()) {
-                lines.push(Spans::from(vec![Span::styled(format!("{}", binary.elf.as_ref().err().unwrap()), palette.error)]));
-            } else {
-                if binary.unwind.as_ref().is_err_and(|e| !e.is_loading()) {
-                    let e = binary.unwind.as_ref().err().unwrap();
-                    lines.push(Spans::from(vec![Span::styled(format!("{}", e), if e.is_missing_symbols() {palette.default_dim} else {palette.error})]));
-                }
-                if binary.symbols.as_ref().is_err_and(|e| !e.is_loading()) {
-                    let e = binary.symbols.as_ref().err().unwrap();
-                    lines.push(Spans::from(vec![Span::styled(format!("{}", e), if e.is_missing_symbols() {palette.default_dim} else {palette.error})]))
-                }
-            }
-            let h = lines.len();
-            cells[1] = Cell::from(Text {lines});
-            let mut row = Row::new(cells).height(h as u16);
-            if !is_mapped {
-                row = row.style(palette.default_dim);
-            }
-            rows.push(row);
-        }
-        let column_widths: Vec<Constraint> = column_widths.iter().map(|w| Constraint::Length(*w)).collect();
-        let table = Table::new(rows)
-            .header(Row::new(vec!["idx", "name", "file", "symbols"]).style(palette.table_header))
-            .widths(&column_widths);
+            table.start_row(hash(id), imgui);
 
-        f.render_widget(table, area);*/
+            imgui_writeln!(imgui, default_dim, "{}", idx + 1);
+            table.text_cell(imgui);
+
+            // Path, progress bar, error message.
+            with_parent!(imgui, table.start_cell(imgui), {
+                imgui.cur_mut().axes[Axis::Y].flags.insert(AxisFlags::STACK);
+
+                // Path.
+                let style = if is_mapped {imgui.palette.default} else {imgui.palette.default_dim};
+                let l = styled_writeln!(imgui.text, style, "{}", id.path);
+                imgui.add(widget!().height(AutoSize::Text).flags(WidgetFlags::TEXT_TRUNCATION_ALIGN_RIGHT).text(l));
+
+                // Progress bar.
+                let mut indicated_loading = false;
+                if binary.symbols.as_ref().is_err_and(|e| e.is_loading()) {
+                    let (progress_ppm, loading_stage) = debugger.symbols.get_progress(id);
+                    let l = imgui_writeln!(imgui, default, "{}% ({})", (progress_ppm + 5000) / 10000, loading_stage);
+                    let mut w = widget!().height(AutoSize::Text).text(l);
+                    w.draw_progress_bar = Some((progress_ppm as f64 / 1e6, imgui.palette.progress_bar));
+                    imgui.add(w);
+                    indicated_loading = true;
+                }
+
+                // Error.
+                let start = imgui.text.num_lines();
+                let mut print_error = |e: &Error| {
+                    if e.is_loading() {
+                        if !indicated_loading {
+                            imgui_writeln!(imgui, default_dim, "loading");
+                            indicated_loading = true;
+                        }
+                        return;
+                    }
+                    let style = if e.is_missing_symbols() {imgui.palette.default_dim} else {imgui.palette.error};
+                    styled_writeln!(imgui.text, style, "{}", e);
+                };
+                if let Err(e) = &binary.elf {
+                    print_error(e);
+                } else {
+                    if let Err(e) = &binary.unwind {
+                        print_error(e);
+                    }
+                    if let Err(e) = &binary.symbols {
+                        print_error(e);
+                    }
+                }
+                let end = imgui.text.num_lines() - start;
+                if end > start {
+                    imgui.add(widget!().height(AutoSize::Text).text_lines(start..end));
+                }
+            });
+
+            // ELF or unwind error/loading/stats.
+            match &binary.elf {
+                Err(e) if e.is_loading() => imgui_writeln!(imgui, running, "loading"),
+                Err(e) => imgui_writeln!(imgui, error, "error"),
+                Ok(elf) => imgui_writeln!(imgui, default_dim, "{}", PrettySize(elf.data().len())),
+            };
+            table.text_cell(imgui);
+        }
+
+        self.table_state = table.finish(imgui);
     }
 }
 
@@ -1824,6 +1836,9 @@ struct ThreadsWindow {
 }
 impl WindowContent for ThreadsWindow {
     fn build(&mut self, ui: &mut UIState, debugger: &mut Debugger, imgui: &mut IMGUI) {
+        styled_write!(imgui.text, imgui.palette.default, "threads");
+        let l = imgui.text.close_line();
+        imgui.add(widget!().text(l));
         /*asdqwe
         keys.retain(|key| {
             if self.filter.bar.editing {
@@ -2056,6 +2071,9 @@ struct StackWindow {
 impl Default for StackWindow { fn default() -> Self { Self {table_state: TableState::default(), threads: HashMap::new(), seen: (0, StableSubframeIdx::top(), 0), rerequest_scroll: false} } }
 impl WindowContent for StackWindow {
     fn build(&mut self, ui: &mut UIState, debugger: &mut Debugger, imgui: &mut IMGUI) {
+        styled_write!(imgui.text, imgui.palette.default, "stack");
+        let l = imgui.text.close_line();
+        imgui.add(widget!().text(l));
         /*asdqwe
         ui.stack = debugger.get_stack_trace(ui.selected_thread, /* partial */ false);
         let rerequest_scroll = mem::take(&mut self.rerequest_scroll);
@@ -2635,6 +2653,9 @@ impl CodeWindow {
 
 impl WindowContent for CodeWindow {
     fn build(&mut self, ui: &mut UIState, debugger: &mut Debugger, imgui: &mut IMGUI) {
+        styled_write!(imgui.text, imgui.palette.default, "code");
+        let l = imgui.text.close_line();
+        imgui.add(widget!().text(l));
         /*asdqwe
     fn update_modal(&mut self, ui: &mut UIState, debugger: &mut Debugger, keys: &mut Vec<Key>) {
         if let Some(d) = &mut self.search_dialog {
@@ -2950,6 +2971,9 @@ impl WindowContent for BreakpointsWindow {
     }
 
     fn build(&mut self, ui: &mut UIState, debugger: &mut Debugger, imgui: &mut IMGUI) {
+        styled_write!(imgui.text, imgui.palette.default, "breakpoints");
+        let l = imgui.text.close_line();
+        imgui.add(widget!().text(l));
         /*asdqwe
         let mut hit_breakpoints: Vec<BreakpointId> = Vec::new();
         for (tid, thread) in &debugger.threads {

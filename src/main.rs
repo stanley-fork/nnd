@@ -56,7 +56,7 @@ fn parse_arg(args: &mut &[String], long_name: &str, short_name: &str, bool_switc
 
 fn main() {
     precalc_global_constants();
-    std::env::set_var("RUST_BACKTRACE", "full"); // (short stack traces don't work with custom panic handlers for some reason - the __rust_begin_short_backtrace/__rust_end_short_backtrace are missing)
+    std::env::set_var("RUST_BACKTRACE", "short");
 
     let mut settings = Settings::default();
     let mut attach_pid: Option<pid_t> = None;
@@ -233,7 +233,7 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, command_line: Option<Vec<S
 
     // Timer for refreshing resource stats and saving state. TODO: Currently progress bar updates also rely on this. Use animation system instead (after implementing it).
     let periodic_timer = TimerFD::new();
-    periodic_timer.set(1, (context.settings.periodic_timer_seconds * 1e9) as usize);
+    //asdqwe periodic_timer.set(1, (context.settings.periodic_timer_seconds * 1e9) as usize);
 
     epoll.add(STDIN_FILENO, libc::EPOLLIN, STDIN_FILENO as u64)?;
     epoll.add(render_timer.fd, libc::EPOLLIN, render_timer.fd as u64)?;
@@ -252,7 +252,7 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, command_line: Option<Vec<S
     }
     defer! { unsafe { *DEBUGGER_TO_DROP_ON_PANIC.get() = None; } }
 
-    let mut ui = UI::new();
+    let mut ui = DebuggerUI::new();
 
     match PersistentState::load_state(&mut debugger, &mut ui) {
         Ok(()) => (),
@@ -330,6 +330,7 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, command_line: Option<Vec<S
         if render_now {
             assert!(!pending_render);
             let prof = TscScope::new();
+            schedule_render = false;
             //asdqwe schedule_render = debugger.log.prof.iteration_render_start();
 
             ui.update_and_render(&mut debugger)?;

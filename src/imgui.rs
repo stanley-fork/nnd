@@ -21,6 +21,7 @@ impl Default for AutoSize { fn default() -> Self { Self::Parent } }
 impl AutoSize {
     pub fn is_children(&self) -> bool { match self { Self::Children => true, _ => false } }
     pub fn is_remainder(&self) -> bool { match self { Self::Remainder(_) => true, _ => false } }
+    pub fn as_fixed(&self) -> Option<usize> { match self { Self::Fixed(x) => Some(*x), _ => None } }
 }
 
 bitflags! {
@@ -57,6 +58,27 @@ impl Axis {
     pub const X: usize = 0;
     pub const Y: usize = 1;
 
+    pub fn set_fixed_pos(&mut self, rel_pos: isize) {
+        self.flags.insert(AxisFlags::POS_KNOWN);
+        self.rel_pos = rel_pos;
+    }
+    pub fn set_fixed_size(&mut self, size: usize) {
+        self.auto_size = AutoSize::Fixed(size);
+        self.flags.insert(AxisFlags::SIZE_KNOWN);
+        self.size = size;
+    }
+    pub fn get_fixed_size(&self) -> usize {
+        assert!(self.flags.contains(AxisFlags::SIZE_KNOWN));
+        self.size
+    }
+    pub fn get_fixed_pos(&self) -> isize {
+        assert!(self.flags.contains(AxisFlags::POS_KNOWN));
+        self.rel_pos
+    }
+    pub fn get_fixed_range(&self) -> Range<isize> {
+        let p = self.get_fixed_pos();
+        p..p+self.get_fixed_size() as isize
+    }
     pub fn reset_size(&mut self) {
         self.flags.remove(AxisFlags::SIZE_KNOWN);
     }
@@ -257,6 +279,20 @@ macro_rules! with_parent {
     }};
 }
 
+#[macro_export]
+macro_rules! imgui_write {
+    ($imgui:expr, $style:ident, $($arg:tt)*) => {
+        styled_write!($imgui.text, $imgui.palette.$style, $($arg)*)
+    };
+}
+#[macro_export]
+macro_rules! imgui_writeln {
+    ($imgui:expr, $style:ident, $($arg:tt)*) => {{
+        styled_write!($imgui.text, $imgui.palette.$style, $($arg)*);
+        $imgui.text.close_line()
+    }};
+}
+
 #[derive(Default)]
 pub struct IMGUI {
     // These can be changed at any time.
@@ -435,10 +471,10 @@ impl IMGUI {
                 // Allow adding floating widgets after doing layout.
                 continue;
             }
-            assert!(!parent.axes[ax].auto_size.is_children() || !parent.axes[ax].flags.contains(AxisFlags::SIZE_KNOWN), "tried to add child to a widget whose size depends on children, after calculating its size");
+            assert!(!parent.axes[ax].auto_size.is_children() || !parent.axes[ax].flags.contains(AxisFlags::SIZE_KNOWN), "tried to add child (line {}) to a widget (line {}) whose size depends on children, after calculating its size", w.source_line, parent.source_line);
             if parent.children.len() > 1 {
                 let prev_sibling = &self.tree[parent.children[parent.children.len() - 2].0];
-                assert!(!prev_sibling.axes[ax].auto_size.is_remainder() || !prev_sibling.axes[ax].flags.contains(AxisFlags::SIZE_KNOWN), "tried to add sibling of a widget whose size depends on siblings, after calculating its size");
+                assert!(!prev_sibling.axes[ax].auto_size.is_remainder() || !prev_sibling.axes[ax].flags.contains(AxisFlags::SIZE_KNOWN), "tried to add sibling (line {}) of a widget (line {}) whose size depends on siblings, after calculating its size", w.source_line, prev_sibling.source_line);
             }
         }
 
@@ -448,7 +484,7 @@ impl IMGUI {
             if !axis.flags.contains(AxisFlags::SIZE_KNOWN) {
                 match &axis.auto_size {
                     AutoSize::Fixed(_) => { Self::try_calculate_simple_size(&mut w, ax, &mut self.text, &self.palette); }
-                    AutoSize::Text => (), // text is often assigned by set_text(), after add()
+                    AutoSize::Text => (), // text is often assigned later, after add()
                     AutoSize::Parent if parent.axes[ax].flags.contains(AxisFlags::SIZE_KNOWN) => { axis.size = parent.axes[ax].size.max(axis.min_size).min(axis.max_size); axis.flags.insert(AxisFlags::SIZE_KNOWN); }
                     AutoSize::Remainder(_) if axis.flags.contains(AxisFlags::STACK) && (axis.min_size != 0 || axis.max_size != usize::MAX) => panic!("min_size/max_size with AutoSize::Remainder is not supported"),
                     AutoSize::Children | AutoSize::Remainder(_) | AutoSize::Parent => (),
@@ -560,18 +596,11 @@ impl IMGUI {
         }        
     }
 
-    pub fn get(&self, idx: WidgetIdx) -> &Widget {
-        &self.tree[idx.0]
-    }
-    pub fn get_mut(&mut self, idx: WidgetIdx) -> &mut Widget {
-        &mut self.tree[idx.0]
-    }
-    pub fn cur(&self) -> &Widget {
-        &self.tree[self.cur_parent.0]
-    }
-    pub fn cur_mut(&mut self) -> &mut Widget {
-        &mut self.tree[self.cur_parent.0]
-    }
+    // These are convenient, but it's ok to access `tree` directly too (to avoid borrowing the whole IMGUI).
+    pub fn get(&self, idx: WidgetIdx) -> &Widget { &self.tree[idx.0] }
+    pub fn get_mut(&mut self, idx: WidgetIdx) -> &mut Widget { &mut self.tree[idx.0] }
+    pub fn cur(&self) -> &Widget { &self.tree[self.cur_parent.0] }
+    pub fn cur_mut(&mut self) -> &mut Widget { &mut self.tree[self.cur_parent.0] }
 
     // Calculate size if auto_size is Fixed, Text, or Children, i.e. doesn't depend on parent. If size was already calculated, returns it. Otherwise panics.
     // Traverses part of the subtree as (if children have auto_size = Children too).
@@ -628,25 +657,6 @@ impl IMGUI {
     }
 
     // Convenience functions.
-
-    // Close the unclosed line from self.text, assign that line as cur_parent's text to draw, and calculate cur_parent's size if AutoSize::Text.
-    // Usage:
-    // with_parent(imgui, ..., {
-    //     styled_write!(imgui.text, ...);
-    //     imgui.set_text();
-    // });
-    pub fn set_text(&mut self) {
-        let i = self.text.close_line();
-        let w = &mut self.tree[self.cur_parent.0];
-        w.draw_text = Some(i..i+1);
-        for ax in 0..2 {
-            let axis = &mut w.axes[ax];
-            match axis.auto_size {
-                AutoSize::Text => { Self::try_calculate_simple_size(w, ax, &mut self.text, &self.palette); }
-                _ => (),
-            }
-        }
-    }
 
     // Requests input for cur_parent for next frame, returns input that was requested on previous frame.
     // Multiple such calls for different keys can coexist on the same Widget; each call will return only the actions that it requested.

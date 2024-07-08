@@ -9,6 +9,15 @@ pub struct Layout {
     // Which walls surrounding the whole UI to draw. [axis][-/+]
     // The top ([1][0]) is strongly recommended, otherwise there's nowhere to put titles of single-window regions.
     pub outer_walls: [[bool; 2]; 2],
+
+    // Assigned on every frame.
+    root_widget: WidgetIdx,
+    wall_widgets: Vec<WidgetIdx>,
+    // Information used for deciding which of the Box Drawing unicode characters (https://en.wikipedia.org/wiki/Box_Drawing)
+    // to draw where. Screen coordinates -> bitset describing styles for the 4 cardinal directions (left, right, up, down):
+    //  * bits 0-3 - which lines to draw,
+    //  * bits 4-7 - which lines are bold.
+    wall_masks: Vec<([isize; 2], usize)>,
 }
 
 pub type WindowId = Id;
@@ -79,7 +88,9 @@ impl Layout {
     pub fn new() -> Layout {
         let mut regions: Pool<Region> = Pool::new();
         let root = regions.add(Region {parent: None, area: Rect::default(), content: RegionContent::Leaf(RegionLeaf::default()), relative_size: 1000000, outer_walls: [[WidgetIdx::invalid(); 2]; 2]}).0;
-        Layout {windows: Pool::new(), active_window: None, regions, root, outer_walls: [[false, false], [true, false]]}
+        //asdqwe let outer_walls = [[false, false], [true, false]];
+        let outer_walls = [[true, true], [true, true]];
+        Layout {windows: Pool::new(), active_window: None, regions, root, outer_walls, root_widget: WidgetIdx::invalid(), wall_masks: Vec::new(), wall_widgets: Vec::new()}
     }
 
     pub fn split(&mut self, region_id: RegionId, axis: usize, walls: Vec<f64>) -> Vec<RegionId> {
@@ -98,30 +109,32 @@ impl Layout {
 
         let parent = region.parent.take();
         let relative_size = region.relative_size;
-        let new_region = self.regions.add(Region {parent: parent.clone(), content: RegionContent::Split(RegionSplit {axis, children: Vec::new()}), relative_size, area: Rect::default(), outer_walls: [[WidgetIdx::invalid(); 2]; 2]}).0;
+        let new_region_id = self.regions.add(Region {parent: parent.clone(), content: RegionContent::Split(RegionSplit {axis, children: Vec::new()}), relative_size, area: Rect::default(), outer_walls: [[WidgetIdx::invalid(); 2]; 2]}).0;
 
         let mut children = vec![region_id];
         let denominator = 1000000.0;
         for i in 0..walls.len() {
             let end = if i + 1 < walls.len() {walls[i+1]} else {1.0};
             let relative_size = (((end - walls[i]) * denominator) as usize).max(1);
-            children.push(self.regions.add(Region {parent: Some(new_region), content: RegionContent::Leaf(RegionLeaf {tabs: Vec::new(), tabs_state: TabsState::default(), widget: WidgetIdx::invalid()}), relative_size, area: Rect::default(), outer_walls: [[WidgetIdx::invalid(); 2]; 2]}).0);
+            children.push(self.regions.add(Region {parent: Some(new_region_id), content: RegionContent::Leaf(RegionLeaf {tabs: Vec::new(), tabs_state: TabsState::default(), widget: WidgetIdx::invalid()}), relative_size, area: Rect::default(), outer_walls: [[WidgetIdx::invalid(); 2]; 2]}).0);
         }
+        let new_region = self.regions.get_mut(new_region_id);
+        new_region.content.as_split_mut().children = children.clone();
+
         let region = self.regions.get_mut(region_id);
+        region.parent = Some(new_region_id);
         region.relative_size = ((walls[0] * denominator) as usize).max(1);
-        region.content.as_split_mut().children = children.clone();
-        region.parent = Some(new_region);
 
         match parent {
-            None => self.root = new_region,
+            None => self.root = new_region_id,
             Some(parent_id) => {
                 let parent_split = self.regions.get_mut(parent_id).content.as_split_mut();
                 let i = parent_split.children.iter().position(|x| x == &region_id).unwrap();
-                parent_split.children[i] = new_region;
+                parent_split.children[i] = new_region_id;
             }
         }
 
-        self.simplify_splits(new_region);
+        self.simplify_splits(new_region_id);
 
         children
     }
@@ -258,9 +271,9 @@ impl Layout {
         // Then find a window containing that point.
         let point = match (dx, dy) {
             (-1, 0) => [a.x() - 2, a.y() + a.height() as isize / 2],
-            (1, 0) => [a.right() + 2, a.y() + a.height() as isize / 2],
-            (0, -1) => [a.x() + a.width() as isize / 2, a.y() - 2],
-            (0, 1) => [a.x() + a.width() as isize / 2, a.bottom() - 2],
+            (1, 0) => [a.right() + 1, a.y() + a.height() as isize / 2],
+            (0, -1) => [a.x() + a.width() as isize / 2, a.y() - 3],
+            (0, 1) => [a.x() + a.width() as isize / 2, a.bottom() + 2],
             _ => panic!("unexpected args to switch_to_adjacent_window"),
         };
         if let Some(id) = self.window_at_point(point) {
@@ -276,48 +289,112 @@ impl Layout {
 
     pub fn switch_to_window_with_hotkey_number(&mut self, number: usize) {
         for (id, win) in self.windows.iter() {
-            if win.hotkey_number == Some(number) {
+            if win.hotkey_number == Some(number) && win.region.is_some() {
                 self.active_window = Some(id);
+                let leaf = self.regions.get_mut(win.region.clone().unwrap()).content.as_leaf_mut();
+                let i = leaf.tabs.iter().position(|w| w == &id).unwrap();
+                leaf.tabs_state.select(i);
                 return;
             }
         }
     }
 
-    // (this function is considering leaving this codebase to pursue a career in politics)
-    fn build_wall(axis: usize, area: Rect, pos: isize, identity: usize, imgui: &mut IMGUI) -> WidgetIdx {
-        let mut w = widget!().fixed_width(0).fixed_height(0).fixed_x(0).fixed_y(0);
+    // build_wall() makes a widget for inner wall that splits `area` along the given axis (so the wall itself is perpendicular to this axis).
+    // trace_wall() records the corresponding wall in wall_masks (which determines which characters end up in the wall widgets later).
+    // Wall widgets contain whole cells, while the traced line connects centers of cells; the two cells containing line endpoints are not included in the created widget,
+    // they're sticking out into the parent region's wall widgets, where they form junctions (or into corners of the screen).
+    // (Why separate wall_masks from wall_widgets? To make junctions work. Why have separate widgets for individual walls instead of one big canvas widget? To make walls draggable and hoverable.)
+    fn build_wall(axis: usize, area: Rect, pos: isize, identity: usize, wall_widgets: &mut Vec<WidgetIdx>, imgui: &mut IMGUI) -> WidgetIdx {
+        let mut w = widget!().fixed_width(1).fixed_height(1).fixed_x(area.x()).fixed_y(area.y()).fill('?', imgui.palette.error);
+        w.axes[1-axis].set_fixed_size(area.size[1-axis]);
+        w.axes[axis].rel_pos += pos;
         w.identity = identity;
-        match axis {
-            Axis::X => w = w.fill('│', imgui.palette.window_border).fixed_width(1).fixed_height(area.height()).fixed_x(area.x() + pos).fixed_y(area.y()),
-            Axis::Y => w = w.fill('─', imgui.palette.window_border).fixed_height(1).fixed_width(area.width()).fixed_y(area.y() + pos).fixed_x(area.x()),
-            _ => panic!("huh"),
+        let idx = imgui.add(w);
+        wall_widgets.push(idx);
+        idx                                                                                                                                                                               
+    }
+    fn trace_wall(axis: usize, area: Rect, pos: isize, bold: bool, wall_masks: &mut Vec<([isize; 2], usize)>) {
+        let len = area.size[1-axis];
+        let mut p = area.pos;
+        p[axis] += pos;
+
+        let base = if bold {4} else {0};
+        let mask = match axis {
+            Axis::Y => {
+                wall_masks.push(([p[0] - 1, p[1]], 2 << base));
+                wall_masks.push(([p[0] + len as isize, p[1]], 1 << base));
+                3 << base
+            }
+            _ => {
+                wall_masks.push(([p[0], p[1] - 1], 8 << base));
+                wall_masks.push(([p[0], p[1] + len as isize], 4 << base));
+                12 << base
+            }
+        };
+        for i in 0..len {
+            let mut pp = p;
+            pp[1-axis] += i as isize;
+            wall_masks.push((pp, mask));
         }
-        imgui.add(w)
     }
 
     pub fn build(&mut self, imgui: &mut IMGUI) {
-        //asdqwe handle window switching keys
+        self.wall_widgets.clear();
+        self.wall_masks.clear();
+        self.root_widget = imgui.cur_parent;
+        for action in imgui.check_keys(&[KeyAction::WindowLeft, KeyAction::WindowRight, KeyAction::WindowDown, KeyAction::WindowUp, KeyAction::Window(0), KeyAction::Window(1), KeyAction::Window(2), KeyAction::Window(3), KeyAction::Window(4), KeyAction::Window(5), KeyAction::Window(6), KeyAction::Window(7), KeyAction::Window(8), KeyAction::Window(9)]) {
+            match action {
+                KeyAction::Window(n) => self.switch_to_window_with_hotkey_number(n),
+                KeyAction::WindowLeft => self.switch_to_adjacent_window(-1, 0),
+                KeyAction::WindowRight => self.switch_to_adjacent_window(1, 0),
+                KeyAction::WindowUp => self.switch_to_adjacent_window(0, -1),
+                KeyAction::WindowDown => self.switch_to_adjacent_window(0, 1),
+                _ => panic!("huh"),
+            }
+        }
 
-        let root = self.regions.get_mut(self.root);
-        root.clear_layout();
-        root.area = imgui.cur().get_rect_assume_fixed();
+        for (_, win) in self.windows.iter_mut() {
+            win.clear_layout();
+        }
+        for (_, region) in self.regions.iter_mut() {
+            region.clear_layout();
+        }
 
-        // Build outer walls if needed.
+        // Build walls along the edges of the screen if needed.
+        // There's a subtlety about corners. Consider the top wall when all 4 walls are enabled vs when only the top wall is enabled.
+        // In top-only mode we want the wall to go all the way to the edge of the screen, not to the middle of the first and last cell of the screen ('─', not '╴').
+        // But in all-walls mode we want the wall to go to the center of the first and last cell ('╴' + '╷' = '╮' in wall masks).
+        // Trick: always build the whole frame, but extend the root rect such that unneeded sides are just off-screen.
+        assert!(imgui.cur().axes[0].flags.contains(AxisFlags::SIZE_KNOWN) && imgui.cur().axes[1].flags.contains(AxisFlags::SIZE_KNOWN));
+        let mut area = Rect {pos: [0, 0], size: [imgui.cur().axes[0].size, imgui.cur().axes[1].size]};
         for axis in 0..2 {
             for side in 0..2 {
-                if !self.outer_walls[axis][side] || root.area.size[axis] == 0 {
-                    continue;
+                if self.outer_walls[axis][side] && area.size[axis] > 0 {
+                    area.size[axis] -= 1;
+                    if side == 0 {
+                        area.pos[axis] += 1;
+                    }
                 }
-                let w = Self::build_wall(axis, root.area, if side == 0 {0} else {root.area.end(axis)-1}, hash(&('o', axis, side)), imgui);
+            }
+        }
+        let root = self.regions.get_mut(self.root);
+        root.area = area;
+        for axis in 0..2 {
+            for side in 0..2 {
+                let pos = if side == 0 {-1} else {area.size[axis] as isize};
+                let w = Self::build_wall(axis, area, pos, hash(&('o', axis, side)), &mut self.wall_widgets, imgui);
+                Self::trace_wall(axis, area, pos, false, &mut self.wall_masks);
                 root.outer_walls[axis][side] = w;
-                root.area.size[axis] -= 1;
-                if side == 0 {
-                    root.area.pos[axis] += 1;
+                // Cover the corners.
+                if axis == 0 {
+                    let w = imgui.get_mut(w);
+                    w.axes[1-axis].rel_pos -= 1;
+                    w.axes[1-axis].size += 2;
                 }
             }
         }
 
-        // Do layout and build walls.
+        // Do layout and build inner walls.
         let mut stack = vec![self.root];
         let mut visited_regions: HashSet<RegionId> = HashSet::new();
         let mut visited_windows: HashSet<WindowId> = HashSet::new();
@@ -356,7 +433,75 @@ impl Layout {
 
         self.activate_any_visible_window_if_none_active();
 
-        //asdqwe draw window titles, fuse two-sided junctions, overdraw active window outline, add window widgets, reorder leaf widgets to put the active on last
+        // Trace bold border around active region.
+        if let &Some(window_id) = &self.active_window {
+            let window = self.windows.get(window_id);
+            let region = self.regions.get(window.region.clone().unwrap());
+            for axis in 0..2 {
+                for side in 0..2 {
+                    let pos = if side == 0 {-1} else {region.area.size[axis] as isize};
+                    let w = Self::trace_wall(axis, region.area, pos, true, &mut self.wall_masks);
+                }
+            }
+        }
+
+        // Draw walls: aggregate the information in wall_masks and put chars into wall widgets.
+        self.wall_masks.sort_unstable();
+        for &idx in &self.wall_widgets {
+            let w = imgui.get(idx);
+            let x_range = w.axes[Axis::X].get_fixed_range();
+            let start_line = imgui.text.num_lines();
+            for y in w.axes[Axis::Y].get_fixed_range() {
+                for x in x_range.clone() {
+                    // OR the bit masks for this cell.
+                    let pos = [x, y];
+                    let mut i = self.wall_masks.partition_point(|(p, _)| p < &pos);
+                    let mut mask = 0usize;
+                    while i < self.wall_masks.len() && self.wall_masks[i].0 == pos {
+                        mask |= self.wall_masks[i].1;
+                        i += 1;
+                    }
+
+                    let c = BOX_DRAWING_LUT[mask];
+                    let style = if mask >= 16 {imgui.palette.window_border_active} else {imgui.palette.window_border};
+                    styled_write!(imgui.text, style, "{}", c);
+                }
+                imgui.text.close_line();
+            }
+            let end_line = imgui.text.num_lines();
+            imgui.get_mut(idx).draw_text = Some(start_line..end_line);
+        }
+
+        for (region_id, region) in self.regions.iter() {
+            match &region.content {
+                RegionContent::Leaf(leaf) => {
+                    let is_active = self.active_window.is_some() && leaf.tabs.get(leaf.tabs_state.selected) == self.active_window.as_ref();
+                    // Draw window title.
+                    let wall_above = region.outer_walls[Axis::Y][0];
+                    if leaf.tabs.len() == 1 && wall_above.is_valid() {
+                        let w = imgui.get(wall_above);
+                        assert!(w.axes[Axis::X].flags.contains(AxisFlags::POS_KNOWN));
+                        let rel_x = region.area.x() - w.axes[Axis::X].rel_pos;
+                        let style = if is_active {imgui.palette.window_border_active} else {imgui.palette.window_border};
+                        let window = self.windows.get(leaf.tabs[0]);
+                        styled_write!(imgui.text, style, "{}", window.title);
+                        if let &Some(n) = &window.hotkey_number {
+                            styled_write!(imgui.text, style, " ");
+                            styled_write!(imgui.text, imgui.palette.hotkey, "{}", n);
+                        }
+                        let l = imgui.text.close_line();
+                        imgui.add(widget!().parent(wall_above).fixed_x(rel_x).width(AutoSize::Text).max_width(region.area.width().saturating_sub(1)).text(l));
+                    }
+                    // Focus active window.
+                    if is_active {
+                        with_parent!(imgui, leaf.widget, {
+                            imgui.focus();
+                        });
+                    }
+                }
+                RegionContent::Split(_) => (),
+            }
+        }
     }
 
     fn build_split(&mut self, region_id: RegionId, imgui: &mut IMGUI) {
@@ -394,9 +539,10 @@ impl Layout {
                 } else {
                     s.1 += size;
                 }
-                if i + 1 < children.len() {
+                if i > 0 {
                     s.0 += 1; // wall
                 }
+                res.push(s);
             }
             res
         };
@@ -420,7 +566,7 @@ impl Layout {
         let mut resized = false;
         for i in 1..walls.len()-1 {
             let (pos, draggable) = calculate_wall_pos(i, &cumsum);
-            walls[i] = (Self::build_wall(axis, region.area, pos, hash(&('w', region_id, i)), imgui), pos);
+            walls[i] = (Self::build_wall(axis, region.area, pos, hash(&('w', region_id, i)), &mut self.wall_widgets, imgui), pos);
 
             if !draggable {
                 continue;
@@ -457,12 +603,12 @@ impl Layout {
                 }
             });
         }
-        if resized { // move the wall widgets if we adjusted children sizes
-            for i in 1..walls.len()-1 {
-                let pos = calculate_wall_pos(i, &cumsum).0;
-                walls[i].1 = pos;
-                imgui.get_mut(walls[i].0).axes[axis].rel_pos = region.area.pos[axis] + pos;
-            }
+        // Move wall widgets into final positions and add the lines.
+        for i in 1..walls.len()-1 {
+            let pos = calculate_wall_pos(i, &cumsum).0;
+            walls[i].1 = pos;
+            imgui.get_mut(walls[i].0).axes[axis].rel_pos = region.area.pos[axis] + pos;
+            Self::trace_wall(axis, region.area, pos, false, &mut self.wall_masks);
         }
 
         // Propagate information to children.
@@ -475,14 +621,12 @@ impl Layout {
             }
 
             child.area = region_area;
-            child.area.pos[axis] = walls[i].1 + 1;
+            child.area.pos[axis] += walls[i].1 + 1;
             child.area.size[axis] = (walls[i+1].1 - walls[i].1 - 1).max(0) as usize;
 
             child.outer_walls = outer_walls.clone();
             child.outer_walls[axis] = [walls[i].0, walls[i+1].0];
         }
-
-        //asdqwe add junctions
     }
 
     fn build_leaf(&mut self, region_id: RegionId, imgui: &mut IMGUI) {
@@ -496,6 +640,7 @@ impl Layout {
             if leaf.tabs.len() == 1 {
                 leaf.tabs_state.select(0);
             } else if leaf.tabs.len() > 1 {
+                // TODO: Try to embed the tabs in the wall above, like window title, and see if it looks better.
                 imgui.cur_mut().axes[Axis::Y].flags.insert(AxisFlags::STACK);
                 let tabs_widget = imgui.add(widget!().identity(&'t').fixed_height(1));
                 content_widget = imgui.add(widget!().identity(&'w').height(AutoSize::Remainder(1.0)));
@@ -530,9 +675,33 @@ impl Layout {
                         self.active_window = Some(window_id);
                     }
                 } else {
-                    window.widget = imgui.add(widget!().identity(&('u', window_id)).fixed_width(0).fixed_height(0));
+                    window.widget = imgui.add(widget!().parent(self.root_widget).identity(&('u', window_id)).fixed_width(0).fixed_height(0));
                 }
             }
         });
     }
 }
+
+// Bitmask -> char.
+// Bits 0-3 - which of the 4 directions are single lines (left, right, up, down).
+// Bits 4-7 - which of the present directions are altered. Single line gets altered into bold single line. Non-single-line gets altered to double line.
+// Unicode has all 3^4 = 81 combinations of regular and bold lines, but only some combinations with double lines, and no combinations of double+bold lines.
+// This table has '?' for combinations that don't have a character in the Box Drawing unicode block.
+const BOX_DRAWING_LUT: [char; 256] = [
+    /* ' ' */ ' ', '╴', '╶', '─', '╵', '┘', '└', '┴', '╷', '┐', '┌', '┬', '│', '┤', '├', '┼',
+    /* '╸' */ '?', '╸', '?', '╾', '╛', '┙', '?', '┵', '╕', '┑', '?', '┭', '╡', '┥', '?', '┽',
+    /* '╺' */ '?', '?', '╺', '╼', '╘', '?', '┕', '┶', '╒', '?', '┍', '┮', '╞', '?', '┝', '┾',
+    /* '━' */ '═', '?', '?', '━', '╧', '?', '?', '┷', '╤', '?', '?', '┯', '╪', '?', '?', '┿',
+    /* '╹' */ '?', '╜', '╙', '╨', '╹', '┚', '┖', '┸', '?', '?', '?', '?', '╿', '┦', '┞', '╀',
+    /* '┛' */ '╝', '?', '?', '?', '?', '┛', '?', '┹', '?', '?', '?', '?', '?', '┩', '?', '╃',
+    /* '┗' */ '╚', '?', '?', '?', '?', '?', '┗', '┺', '?', '?', '?', '?', '?', '?', '┡', '╄',
+    /* '┻' */ '╩', '?', '?', '?', '?', '?', '?', '┻', '?', '?', '?', '?', '?', '?', '?', '╇',
+    /* '╻' */ '?', '╖', '╓', '╥', '?', '?', '?', '?', '╻', '┒', '┎', '┰', '╽', '┧', '┟', '╁',
+    /* '┓' */ '╗', '?', '?', '?', '?', '?', '?', '?', '?', '┓', '?', '┱', '?', '┪', '?', '╅',
+    /* '┏' */ '╔', '?', '?', '?', '?', '?', '?', '?', '?', '?', '┏', '┲', '?', '?', '┢', '╆',
+    /* '┳' */ '╦', '?', '?', '?', '?', '?', '?', '?', '?', '?', '?', '┳', '?', '?', '?', '╈',
+    /* '┃' */ '║', '╢', '╟', '╫', '?', '?', '?', '?', '?', '?', '?', '?', '┃', '┨', '┠', '╂',
+    /* '┫' */ '╣', '?', '?', '?', '?', '?', '?', '?', '?', '?', '?', '?', '?', '┫', '?', '╉',
+    /* '┣' */ '╠', '?', '?', '?', '?', '?', '?', '?', '?', '?', '?', '?', '?', '?', '┣', '╊',
+    /* '╋' */ '╬', '?', '?', '?', '?', '?', '?', '?', '?', '?', '?', '?', '?', '?', '?', '╋',
+];

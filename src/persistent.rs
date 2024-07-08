@@ -73,7 +73,7 @@ impl PersistentState {
         Self {path: Err(err), dir: None, lock: None, state_hash: 0, save_failures: 0, log_file_path: None, original_stderr_fd}
     }
 
-    pub fn try_to_save_state_if_changed(debugger: &mut Debugger, ui: &mut UI) {
+    pub fn try_to_save_state_if_changed(debugger: &mut Debugger, ui: &mut DebuggerUI) {
         match Self::save_state_if_changed(debugger, ui) {
             Ok(()) => (),
             Err(e) => {
@@ -86,7 +86,7 @@ impl PersistentState {
         }
     }
 
-    fn save_state_if_changed(debugger: &mut Debugger, ui: &mut UI) -> Result<()> {
+    fn save_state_if_changed(debugger: &mut Debugger, ui: &mut DebuggerUI) -> Result<()> {
         if debugger.persistent.dir.is_none() {
             return Ok(());
         }
@@ -118,7 +118,7 @@ impl PersistentState {
         Ok(())
     }
 
-    pub fn load_state(debugger: &mut Debugger, ui: &mut UI) -> Result<()> {
+    pub fn load_state(debugger: &mut Debugger, ui: &mut DebuggerUI) -> Result<()> {
         if debugger.persistent.dir.is_none() {
             return Ok(());
         }
