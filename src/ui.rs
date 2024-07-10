@@ -1,6 +1,7 @@
 use crate::{*, debugger::*, error::*, log::*, symbols::*, symbols_registry::*, util::*, registers::*, procfs::*, unwind::*, disassembly::*, pool::*, layout::*, settings::*, context::*, types::*, expr::*, widgets::*, search::*, arena::*, interp::*, imgui::*, common_ui::*, terminal::*};
 use std::{io::{self, Write, BufRead, BufReader, Read}, mem::{self, take}, collections::{HashSet, HashMap, hash_map::Entry}, os::fd::AsRawFd, path, path::{Path, PathBuf}, fs::File, fmt::Write as FmtWrite, borrow::Cow, ops::Range, str, os::unix::ffi::OsStrExt, sync::{Arc}};
 use libc::{self, pid_t};
+use rand::random;
 
 pub struct DebuggerUI {
     pub terminal: Terminal,
@@ -49,8 +50,9 @@ struct SourceScrollTarget {
 
 struct DisassemblyScrollTarget {
     binary_id: BinaryId,
+    symbols_identity: usize,
     function_idx: usize,
-    addr: usize,
+    static_pseudo_addr: usize,
     subfunction_level: u16,
 }
 
@@ -253,10 +255,6 @@ impl DebuggerUI {
                     self.should_drop_caches = true;
                 }
 
-                //asdqwe do these in threads and stack windows
-                //Some(KeyAction::PreviousStackFrame) => self.state.should_switch_stack_subframe -= 1,
-                //Some(KeyAction::NextStackFrame) => self.state.should_switch_stack_subframe += 1,
-
                 Some(KeyAction::ToggleProfiler) => self.state.profiler_enabled ^= true,
 
                 _ => (),
@@ -360,7 +358,7 @@ impl WindowContent for RegistersWindow {
         let palette = &debugger.context.settings.palette;
 
         let mut rows: Vec<Row> = Vec::new();
-        if let Some(frame) = state.stack.frames.get(ui.selected_frame) {
+        if let Some(frame) = state.stack.frames.get(state.selected_frame) {
             let regs = &frame.regs;
             for reg in RegisterIdx::all() {
                 if let Ok((v, dubious)) = regs.get_int(*reg) {
@@ -457,7 +455,7 @@ impl WatchesWindow {
     }
 
     fn eval_locals(&mut self, context: &EvalContext) {
-        let (dwarf_context, function) = match self.eval_state.make_local_dwarf_eval_context(context, context.selected_subframe) {
+        let (dwarf_context, _) = match self.eval_state.make_local_dwarf_eval_context(context, context.selected_subframe) {
             Ok(x) => x,
             Err(e) => {
                 self.tree.add(ValueTreeNode {value: Err(e), ..Default::default()});
@@ -470,8 +468,7 @@ impl WatchesWindow {
         let static_pseudo_addr = dwarf_context.addr_map.dynamic_to_static(pseudo_addr);
 
         let mut idxs_per_name: HashMap<&str, usize> = HashMap::new();
-        let subfunction = &subframe.subfunction.as_ref().unwrap().0;
-        for v in symbols.local_variables_in_subfunction(subfunction, function.shard_idx()) {
+        for v in drarf_context.local_variables {
             if !v.range().contains(&(static_pseudo_addr)) {
                 continue;
             }
@@ -947,6 +944,10 @@ impl LocationsWindow {/*asdqwe
     }*/
 }
 
+// Identifying information about a function, suitable for writing to the save file.
+// We want both more specific and less specific information here.
+// Less specific (e.g. name) to be likely to find the function if the binary changed a little.
+// Specific (e.g. address) to be able to find the exactly correct function if the binary hasn't changed.
 struct DisassemblyFunctionLocator {
     binary_id: BinaryId,
     mangled_name: Vec<u8>,
@@ -954,80 +955,71 @@ struct DisassemblyFunctionLocator {
     addr: FunctionAddr,
 }
 
-enum DisassemblyTabStatus {
-    Function {locator: DisassemblyFunctionLocator, function_idx: usize},
-    // Tab info was loaded from save file, and we didn't look up the corresponding function in symbols yet.
-    Unresolved {locator: DisassemblyFunctionLocator, cached_error: Option<Error>},
-    // Couldn't find function for current address.
-    Err(Error),
-}
-impl DisassemblyTabStatus {
-    fn is_err(&self) -> bool { match self { Self::Err(_) => true, _ => false } }
-}
-
+#[derive(Default)]
 struct DisassemblyTab {
     title: String,
-    status: DisassemblyTabStatus,
+    identity: usize,
+
+    // Cases:
+    //  * locator is None, error is Some - couldn't find function for current address; this is a tab for the error message about that,
+    //  * locator is Some, error is Some - couldn't find function, but may try again later (drop_caches() unsets error),
+    //  * locator is Some, error is None, cached_function_idx is None - didn't try finding the function yet (loaded from save file) or the Symbols was deloaded,
+    //  * locator is Some, error is None, cached_function_idx is Some - found the function is Symbols.
+    // The symbols_identity needs to be re-checked before using the function_idx, in case Symbols gets reloaded for the same BinaryId (which invalidates function_idx due to nondeterminism).
+    locator: Option<DisassemblyFunctionLocator>,
+    error: Option<Error>,
+    cached_function_idx: Option<(/*symbols_identity*/ usize, /*function_idx*/ usize)>,
 
     selected_subfunction_level: u16,
-    pinned: bool,
-    //asdqwe scroll, hscroll, cursor
-}
-impl Default for DisassemblyTab {
-    fn default() -> Self { Self {status: DisassemblyTabStatus::Err(error!(Internal, "uninitialized")), title: String::new(), selected_subfunction_level: u16::MAX, pinned: false} }
+    ephemeral: bool,
+
+    area_state: AreaState,
 }
 
 struct DisassemblyWindow {
     tabs: Vec<DisassemblyTab>,
-    cache: HashMap<(BinaryId, usize), Disassembly>,
+    cache: HashMap<(/*symbols_identity*/ usize, /*function_idx*/ usize), Disassembly>,
     tabs_state: TabsState,
     search_dialog: Option<SearchDialog>,
-    source_scrolled_to: Option<(BinaryId, /*function_idx*/ usize, /*disas_line*/ usize, /*selected_subfunction_level*/ u16)>,
+    source_scrolled_to: Option<(/*symbols_identity*/ usize, /*function_idx*/ usize, /*disas_line*/ usize, /*selected_subfunction_level*/ u16)>,
 }
 
 impl Default for DisassemblyWindow { fn default() -> Self { Self {tabs: Vec::new(), cache: HashMap::new(), tabs_state: TabsState::default(), search_dialog: None, source_scrolled_to: None} } }
 
-//asdqwe (A lot of tab management code is copy-pasted from CodeWindow. Would be nice to deduplicate it, but it's not obvious what's a good way to do it.)
-impl DisassemblyWindow {/*asdqwe
+impl DisassemblyWindow {
     fn open_function(&mut self, target: Result<DisassemblyScrollTarget>, debugger: &Debugger) -> Result<()> {
         let target = match target {
             Ok(x) => x,
             Err(e) => {
-                self.tabs.push(DisassemblyTab {status: DisassemblyTabStatus::Err(e), title: "[unknown]".to_string(), ..Default::default()});
-                self.selected_tab = self.tabs.len() - 1;
+                self.tabs.push(DisassemblyTab {identity: random(), error: Some(e), title: "[unknown]".to_string(), ephemeral: true, ..Default::default()});
+                self.tabs_state.select(self.tabs.len() - 1);
                 return Ok(());
             }
         };
-        let mut found = false;
         for i in 0..self.tabs.len() {
-            self.resolve_function_for_tab(i, debugger);
-            match &self.tabs[i].status {
-                DisassemblyTabStatus::Function {locator, function_idx: f, ..} if locator.binary_id == target.binary_id && *f == target.function_idx => {
-                    self.selected_tab = i;
-                    found = true;
-                    break;
+            if let Some((binary, function_idx)) = self.resolve_function_for_tab(i, debugger) {
+                if binary.id == target.binary_id && function_idx == target.function_idx && binary.symbols.as_ref().unwrap().identity == target.symbols_identity {
+                    self.tabs_state.select(i);
+                    return Ok(());
                 }
-                _ => (),
             }
         }
-        if !found {
-            let binary = match debugger.info.binaries.get(&target.binary_id) {
-                Some(x) => x,
-                None => return err!(ProcessState, "binary not mapped"),
-            };
-            let symbols = binary.symbols.as_ref_clone_error()?;
-            let function = &symbols.functions[target.function_idx];
-            let demangled_name = function.demangle_name();
-            let title = Self::make_title(&demangled_name);
-            self.tabs.push(DisassemblyTab {status: DisassemblyTabStatus::Function {locator: DisassemblyFunctionLocator {binary_id: target.binary_id, mangled_name: function.mangled_name().to_owned(), addr: function.addr, demangled_name}, function_idx: target.function_idx}, title, ..Default::default()});
-            self.selected_tab = self.tabs.len() - 1;
-        }
+
+        let binary = Self::find_binary(&target.binary_id, debugger)?;
+        let symbols = binary.symbols.as_ref_clone_error()?;
+        let function = &symbols.functions[target.function_idx];
+        let demangled_name = function.demangle_name();
+        let title = Self::make_title(&demangled_name);
+        self.tabs.push(DisassemblyTab {
+            identity: random(), locator: Some(DisassemblyFunctionLocator {binary_id: binary.id.clone(), mangled_name: function.mangled_name().to_owned(), addr: function.addr, demangled_name}),
+            cached_function_idx: Some((symbols.identity, target.function_idx)), title, ephemeral: true, ..Default::default()});
+        self.tabs_state.select(self.tabs.len() - 1);
+
         Ok(())
     }
 
     fn make_title(demangled_name: &str) -> String {
-        let limit = 30;
-        if demangled_name.len() <= limit {
+        if demangled_name.len() <= 30 {
             return demangled_name.to_string();
         }
         // Some crude approximation of removing namespaces and parent classes.
@@ -1061,52 +1053,87 @@ impl DisassemblyWindow {/*asdqwe
         r
     }
 
-    fn resolve_function_for_tab(&mut self, tab_idx: usize, debugger: &Debugger) {
-        match &mut self.tabs[tab_idx].status {
-            DisassemblyTabStatus::Unresolved {locator, cached_error} if cached_error.is_none() => {
-                let (binary_id, binary) = match debugger.info.binaries.iter().find(|(id, _)| id.matches_incomplete(&locator.binary_id)) {
-                    Some(x) => x,
-                    None => {*cached_error = Some(error!(NoFunction, "binary not mapped: {}", locator.binary_id.path)); return;}
-                };
-                let symbols = match binary.symbols.as_ref() {
-                    Ok(x) => x,
-                    Err(e) => {*cached_error = Some(e.clone()); return;}
-                };
-                let function_idx = match symbols.find_nearest_function(&locator.mangled_name, locator.addr) {
-                    Some(x) => x,
-                    None => {*cached_error = Some(error!(NoFunction, "function not found: {}", locator.demangled_name)); return;}
-                };
-                let function = &symbols.functions[function_idx];
-                let locator = DisassemblyFunctionLocator {binary_id: binary_id.clone(), mangled_name: function.mangled_name().to_vec(), demangled_name: function.demangle_name(), addr: function.addr};
-                self.tabs[tab_idx].status = DisassemblyTabStatus::Function {locator, function_idx};
-            }
-            _ => (),
+    fn find_binary<'a>(binary_id: &BinaryId, debugger: &'a Debugger) -> Result<&'a BinaryInfo> {
+        Ok(if let Some(binary) = debugger.info.binaries.get(binary_id) {
+            binary
+        } else if let Some(binary) = debugger.symbols.get_if_present(binary_id) {
+            binary
+        } else if let Some((_, binary)) = debugger.info.binaries.iter().find(|(id, _)| id.matches_incomplete(binary_id)) {
+            binary
+        } else if let Some((_, binary)) = debugger.info.binaries.iter().find(|(id, _)| id.matches_incomplete(binary_id)) {
+            binary
+        } else {
+            return err!(NoFunction, "binary not mapped: {}", binary_id.path);
+        })
+    }
+    
+    fn resolve_function_for_tab<'a>(&mut self, tab_idx: usize, debugger: &'a Debugger) -> Option<(&'a BinaryInfo, /*function_idx*/ usize)> {
+        let tab = &mut self.tabs[tab_idx];
+        if tab.error.is_some() {
+            return None;
         }
+        let locator = match &mut tab.locator {
+            None => return None,
+            Some(x) => x };
+
+        // If binary is mapped, get BinaryInfo from debugger.info, where it has AddrMap. Otherwise take it from SymbolsLoader, and disassembly will show static addresses.
+        let binary = match Self::find_binary(&locator.binary_id, debugger) {
+            Err(e) => {
+                tab.error = Some(e);
+                return None;
+            }
+            Ok(x) => x };
+        locator.binary_id = binary.id.clone();
+
+        let symbols = match binary.symbols.as_ref() {
+            Ok(x) => x,
+            Err(e) => {
+                tab.error = Some(e.clone());
+                return None;
+            }
+        };
+
+        if let &Some((symbols_identity, function_idx)) = &tab.cached_function_idx {
+            if symbols_identity == symbols.identity {
+                return Some((binary, function_idx));
+            }
+            tab.cached_function_idx = None;
+        }
+
+        let function_idx = match symbols.find_nearest_function(&locator.mangled_name, locator.addr) {
+            Some(x) => x,
+            None => {
+                tab.error = Some(error!(NoFunction, "function not found: {}", locator.demangled_name));
+                return None;
+            }
+        };
+
+        let function = &symbols.functions[function_idx];
+        locator.mangled_name = function.mangled_name().to_vec();
+        locator.demangled_name = function.demangle_name();
+        locator.addr = function.addr;
+
+        Some((binary, function_idx))
     }
 
-    fn find_or_disassemble_function<'a>(cache: &'a mut HashMap<(BinaryId, usize), Disassembly>, binary_id: BinaryId, function_idx: usize, debugger: &Debugger) -> &'a Disassembly {
-        cache.entry((binary_id.clone(), function_idx)).or_insert_with(|| {
+    fn find_or_disassemble_function<'a>(cache: &'a mut HashMap<(usize, usize), Disassembly>, binary: &BinaryInfo, function_idx: usize, palette: &Palette) -> &'a Disassembly {
+        cache.entry((binary.symbols.as_ref().unwrap().identity, function_idx)).or_insert_with(|| {
             // Would be nice to also support disassembling arbitrary memory, regardless of functions or binaries. E.g. for JIT-generated code.
-            match Self::disassemble_function(&binary_id, function_idx, debugger) {
+            match Self::disassemble_function(binary, function_idx, palette) {
                 Ok(d) => d,
-                Err(e) => Disassembly::new().with_error(e, &debugger.context.settings.palette),
+                Err(e) => Disassembly::new().with_error(e, palette),
             }
         })
     }
 
     // Would be nice to also support disassembling arbitrary memory, regardless of functions or binaries. E.g. for JIT-generated code.
-    fn disassemble_function(binary_id: &BinaryId, function_idx: usize, debugger: &Debugger) -> Result<Disassembly> {
-        let palette = &debugger.context.settings.palette;
-        let binary = match debugger.info.binaries.get(binary_id) {
-            Some(x) => x,
-            None => return err!(ProcessState, "binary not mapped"),
-        };
-        let symbols = binary.symbols.clone()?;
+    fn disassemble_function(binary: &BinaryInfo, function_idx: usize, palette: &Palette) -> Result<Disassembly> {
+        let symbols = binary.symbols.as_ref().unwrap();
         let ranges = symbols.function_addr_ranges(function_idx);
         let function = &symbols.functions[function_idx];
 
         let mut prelude = StyledText::default();
-        styled_write!(prelude, palette.default_dim, "{}", binary_id.path);
+        styled_write!(prelude, palette.default_dim, "{}", binary.id.path);
         prelude.close_line();
         match function.debug_info_offset() {
             Some(off) => styled_write!(prelude, palette.default_dim, "dwarf offset: 0x{:x}", off.0),
@@ -1117,77 +1144,60 @@ impl DisassemblyWindow {/*asdqwe
         // TODO: Print declaration site. Scroll code window to it when selected.
         // TODO: Print number of inlined call sites. Allow setting breakpoint on it.
 
-        Ok(disassemble_function(function_idx, ranges, Some(symbols.as_ref()), &binary.addr_map, &debugger.memory, prelude, &debugger.context.settings.palette))
+        Ok(disassemble_function(function_idx, ranges, Some(symbols.as_ref()), None, prelude, palette))
     }
 
     fn close_error_tab(&mut self) -> Option<usize> {
         if self.tabs.is_empty() {
             return None;
         }
-        let i = match self.tabs.iter().position(|t| match &t.status {DisassemblyTabStatus::Err(_) => true, _ => false}) {
-            None => return Some(self.selected_tab),
-            Some(x) => x,
-        };
-        self.tabs.remove(i);
-        if self.selected_tab == i {
-            self.selected_tab = 0;
-            return None;
+        if let Some(i) = self.tabs.iter().position(|t| t.locator.is_none()) {
+            self.tabs.remove(i);
+            if self.tabs_state.selected == i {
+                return None;
+            }
+            self.tabs_state.closed(i);
+            Some(self.tabs_state.selected)
+        } else {
+            None
         }
-        if self.selected_tab > i {
-            self.selected_tab -= 1;
-        }
-        Some(self.selected_tab)
     }
 
-    fn garbage_collect(&mut self) { // (copied from CodeWindow)
-        let unpinned_tabs = self.tabs.iter().filter(|t| !t.pinned).count();
-        if unpinned_tabs > 1 {
-            let mut j = 0usize;
-            for i in 0..self.tabs.len() {
-                if self.tabs[i].pinned || j == self.selected_tab {
-                    self.tabs.swap(i, j);
-                    j += 1;
-                } else if j < self.selected_tab {
-                    self.selected_tab -= 1;
-                }
-            }
-            self.tabs.truncate(j);
-        }
-
+    fn evict_cache(&mut self) {
         if self.cache.len().saturating_sub(self.tabs.len()) > 100 {
-            let mut in_use: HashSet<(BinaryId, usize)> = HashSet::new();
+            let mut in_use: HashSet<(usize, usize)> = HashSet::new();
             for t in &self.tabs {
-                match &t.status {
-                    DisassemblyTabStatus::Function {locator, function_idx, ..} => {in_use.insert((locator.binary_id.clone(), *function_idx));}
-                    _ => (),
+                if let Some(x) = t.cached_function_idx.clone() {
+                    in_use.insert(x);
                 }
             }
             let mut i = 0;
-            self.cache.retain(
-                |k, _|
+            self.cache.retain(|k, _| {
                 if in_use.contains(k) {
                     true
                 } else {
                     i += 1;
                     i % 2 == 0
                 }
-            );
+            });
         }
     }
 
-    fn switch_tab(&mut self, delta: isize) {
-        self.selected_tab = (self.selected_tab as isize + delta).rem_euclid(self.tabs.len().max(1) as isize) as usize;
-    }*/
-}
-
-impl WindowContent for DisassemblyWindow {
-    fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
-        styled_write!(ui.text, ui.palette.default, "disas");
-        let l = ui.text.close_line();
-        ui.add(widget!().text(l));
-        /*asdqwe
-    fn update_modal(&mut self, state: &mut UIState, debugger: &mut Debugger, keys: &mut Vec<Key>) {
-        if let Some(d) = &mut self.search_dialog {
+    fn build_search_dialog(&mut self, create: bool, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
+        let dialog_widget = match ui.check_dialog(create) {
+            None => {
+                self.search_dialog = None;
+                return;
+            }
+            Some(x) => x };
+        if self.search_dialog.is_none() {
+            //asdqwe self.search_dialog = Some(SearchDialog::new(Arc::new(FunctionSearcher), debugger.context.clone()));
+        }
+        let d = self.search_dialog.as_mut().unwrap();
+        with_parent!(ui, dialog_widget, {
+            let l = ui_writeln!(ui, default, "hello world");
+            ui.add(widget!().text(l));
+            /*
             let event = d.update(keys, &debugger.context.settings.keys, &debugger.symbols, Some(debugger.info.binaries.keys().cloned().collect()));
             let mut function_to_open = None;
             match event {
@@ -1208,95 +1218,40 @@ impl WindowContent for DisassemblyWindow {
             if self.search_dialog.is_some() {
                 return;
             }
-        }
 
-        keys.retain(|key| {
-            match debugger.context.settings.keys.map.get(key) {
-                Some(KeyAction::NextTab) => self.switch_tab(1),
-                Some(KeyAction::PreviousTab) => self.switch_tab(-1),
-                Some(KeyAction::PinTab) => if !self.tabs.is_empty() {
-                    let t = &mut self.tabs[self.selected_tab];
-                    if !t.status.is_err() || t.pinned {
-                        t.pinned ^= true;
+            ui.loading |= d.render(f, screen_area, "find function (by mangled name)", &debugger.context.settings.palette);
+             */
+
+            if ui.check_key(KeyAction::Cancel) {
+                ui.close_dialog();
+            }
+        });
+    }
+}
+
+impl WindowContent for DisassemblyWindow {
+    fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
+        // First do things that may open or close tabs.
+
+        let mut open_dialog = false;
+        for action in ui.check_keys(&[KeyAction::Open, KeyAction::CloseTab]) {
+            match action {
+                KeyAction::Open if self.search_dialog.is_none() => {
+                    open_dialog = true;
+                }
+                KeyAction::CloseTab if self.tabs.get(self.tabs_state.selected).is_some() => {
+                    let tab = &mut self.tabs[self.tabs_state.selected];
+                    if tab.ephemeral {
+                        tab.ephemeral = false;
+                    } else {
+                        self.tabs.remove(self.tabs_state.selected);
                     }
                 }
-                _ => return true,
-            }
-            false
-        });
-    }
-
-    fn render_modal(&mut self, state: &mut UIState, debugger: &mut Debugger, f: &mut Frame, window_area: Rect, screen_area: Rect) {
-        if let Some(d) = &mut self.search_dialog {
-            ui.loading |= d.render(f, screen_area, "find function (by mangled name)", &debugger.context.settings.palette);
-        }
-    }
-
-    fn cancel_modal(&mut self, state: &mut UIState, debugger: &mut Debugger) {
-        self.search_dialog = None;
-    }
-
-    fn get_hints(&self, hints: &mut StyledText, ui: &mut UI) {
-        hints.chars.push_str("o - find function"); hints.close_span(ui.palette.default_dim); hints.close_line();
-        hints.chars.push_str("C-y - pin/unpin tab"); hints.close_span(ui.palette.default_dim); hints.close_line();
-        hints.chars.push_str(",/. - select level"); hints.close_span(ui.palette.default_dim); hints.close_line();
-        // TODO: hints.chars.push_str("b - toggle breakpoint"); hints.close_span(ui.palette.default_dim); hints.close_line();
-    }
-
-    fn has_persistent_state(&self) -> bool {
-        true
-    }
-    fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {
-        for (idx, tab) in self.tabs.iter().enumerate() {
-            let locator = match &tab.status {
-                DisassemblyTabStatus::Function {locator, ..} => locator,
-                DisassemblyTabStatus::Unresolved {locator, ..} => locator,
-                DisassemblyTabStatus::Err(_) => continue,
-            };
-            out.write_u8(if idx == self.selected_tab {2} else {1})?;
-            locator.binary_id.save_state_incomplete(out)?;
-            out.write_slice(&locator.mangled_name)?;
-            out.write_str(&locator.demangled_name)?; // can't just demangle on load because we don't know the language (alernatively we could save the language here)
-            out.write_usize(locator.addr.0)?;
-            tab.scroll.save_state(out)?;
-            out.write_u16(tab.selected_subfunction_level)?;
-            out.write_u16(tab.hscroll)?;
-            out.write_u8(tab.pinned as u8)?;
-        }
-        out.write_u8(0)?;
-        Ok(())
-    }
-    fn load_state(&mut self, inp: &mut &[u8]) -> Result<()> {
-        loop {
-            let select_this_tab = match inp.read_u8()? {
-                0 => break,
-                2 => true,
-                _ => false,
-            };
-            let locator = DisassemblyFunctionLocator {binary_id: BinaryId::load_state_incomplete(inp)?, mangled_name: inp.read_slice()?, demangled_name: inp.read_str()?, addr: FunctionAddr(inp.read_usize()?)};
-            let title = Self::make_title(&locator.demangled_name);
-            self.tabs.push(DisassemblyTab {title, status: DisassemblyTabStatus::Unresolved {locator, cached_error: None}, scroll: Scroll::load_state(inp)?, selected_subfunction_level: inp.read_u16()?, hscroll: inp.read_u16()?, pinned: inp.read_u8()? != 0});
-            if select_this_tab {
-                self.selected_tab = self.tabs.len() - 1;
+                _ => (),
             }
         }
-        // TODO: Prevent scrolling code window before first input.
-        Ok(())
-    }
 
-    fn update_and_render(&mut self, state: &mut UIState, debugger: &mut Debugger, mut keys: Vec<Key>, f: Option<&mut Frame>, mut area: Rect) {
-        state.selected_addr = state.stack.frames.get(state.selected_frame).and_then(|f| {
-            let sf = &state.stack.subframes[f.subframes.end-1];
-            match (&f.binary_id, &sf.function) {
-                (Some(b), Ok((_, function_idx))) => Some((b.clone(), *function_idx, f.pseudo_addr)),
-                _ => None,
-            }
-        });
-
-        let f = match f {
-            Some(f) => f,
-            None => return,
-        };
+        self.build_search_dialog(open_dialog, state, debugger, ui);
 
         let mut scroll_to_addr: Option<(usize, u16)> = None;
         let suppress_code_autoscroll = state.should_scroll_disassembly.is_some();
@@ -1308,7 +1263,7 @@ impl WindowContent for DisassemblyWindow {
 
             if let Ok(target) = &target {
                 if tab_to_restore.is_none() {
-                    scroll_to_addr = Some((target.addr, target.subfunction_level));
+                    scroll_to_addr = Some((target.static_pseudo_addr, target.subfunction_level));
                 } else {
                     // (Not ideal that we don't scroll when the tab is not selected, but meh.)
                 }
@@ -1317,170 +1272,146 @@ impl WindowContent for DisassemblyWindow {
             self.open_function(target, debugger).unwrap();
 
             if let Some(i) = tab_to_restore {
-                self.selected_tab = i;
+                self.tabs_state.selected = i;
             }
         }
 
-        if self.search_dialog.is_some() {
-            keys.clear();
+        close_excess_ephemeral_tabs(&mut self.tabs, &mut self.tabs_state, |t| t.ephemeral);
+        self.evict_cache();
+
+        // Now the set of tabs is final.
+
+        ui.cur_mut().set_vstack();
+        with_parent!(ui, ui.add(widget!().fixed_height(1)), {
+            ui.focus();
+            let mut tabs = Tabs::new(mem::take(&mut self.tabs_state), ui);
+            for tab in &self.tabs {
+                let full_title = match &tab.locator {
+                    Some(locator) => locator.demangled_name.clone(),
+                    None => String::new(),
+                };
+                tabs.add(Tab {identity: tab.identity, short_title: tab.title.clone(), full_title, ephemeral: tab.ephemeral, ..Default::default()}, ui);
+            }
+            self.tabs_state = tabs.finish(ui);
+        });
+        let content_root = ui.add(widget!().height(AutoSize::Remainder(1.0)).vstack());
+        with_parent!(ui, content_root, {
+            ui.multifocus();
+        });
+        ui.layout_children(Axis::Y);
+
+        // Now the selected tab is final.
+
+        // (We'll reassign it below if there's no error.)
+        state.selected_addr = state.stack.frames.get(state.selected_frame).and_then(|f| {
+            let sf = &state.stack.subframes[f.subframes.end-1];
+            match (&f.binary_id, &sf.function_idx) {
+                (Some(b), Ok(function_idx)) => Some((b.clone(), *function_idx, f.pseudo_addr)),
+                _ => None,
+            }
+        });
+
+        let tab = match self.tabs.get_mut(self.tabs_state.selected) {
+            None => return,
+            Some(x) => x };
+
+        let start = ui.text.num_lines();
+        if let Some(locator) = &tab.locator {
+            ui_writeln!(ui, function_name, "{}", locator.demangled_name);
         }
 
-        self.garbage_collect();
+        let r = self.resolve_function_for_tab(self.tabs_state.selected, debugger);
+        let tab = self.tabs.get_mut(self.tabs_state.selected).unwrap();
+        let (binary, function_idx) = match r {
+            None => {
+                ui_writeln!(ui, error, "{}", tab.error.as_ref().unwrap());
+                let end = ui.text.num_lines();
+                with_parent!(ui, content_root, {
+                    // Horizontally scrollable error message.
+                    build_biscrollable_area(start..end, [0, 0], &mut tab.area_state, ui);
+                });
+                return;
+            }
+            Some(x) => x };
 
-        if self.tabs.is_empty() {
-            return;
+        let disas = Self::find_or_disassemble_function(&mut self.cache, binary, function_idx, &ui.palette);
+
+        if let Some((static_pseudo_addr, subfunction_level)) = scroll_to_addr {
+            if let Some(line) = disas.static_pseudo_addr_to_line(static_pseudo_addr) {
+                tab.selected_subfunction_level = subfunction_level;
+                tab.area_state.select(line);
+            }
         }
 
-        keys.retain(|key| {
-            match debugger.context.settings.keys.map.get(key) {
-                Some(KeyAction::Open) => {
-                    self.search_dialog = Some(SearchDialog::new(Arc::new(FunctionSearcher), debugger.context.clone()));
-                    self.update_modal(ui, debugger, &mut Vec::new()); // kick off initial search with empty query
+        let rel_addr_digits = (((disas.max_abs_relative_addr as f64 + 1.0).log2() / 4.0).ceil() as usize).max(1); // how many hex digits to use in the "<+1abc>" things
+        let prefix_width = 2 + 2 + 12 + rel_addr_digits+4 + 2 + 1; // ip, breakpoint, addr, rel_addr, jump_indicator, space
+
+        let end = ui.text.num_lines();
+        let (content, visible_y) = with_parent!(ui, content_root, {
+            build_biscrollable_area(start..end, [prefix_width + disas.widest_line, disas.lines.len()], &mut tab.area_state, ui)
+        });
+
+        // Now the cursor position is final.
+
+        let symbols = binary.symbols.as_ref().unwrap();
+        let function = &symbols.functions[function_idx];
+        assert_eq!(disas.symbols_shard, Some(function.shard_idx()));
+        let symbols_shard = &symbols.shards[function.shard_idx()];
+
+        let mut selected_subfunction_idx: Option<usize> = None;
+        let mut source_line: Option<SourceScrollTarget> = None;
+
+        if let Some(disas_line) = disas.lines.get(tab.area_state.cursor) {
+            let has_addr = disas_line.static_addr != 0 && disas_line.static_addr != usize::MAX;
+            if has_addr {
+                state.selected_addr = Some((binary.id.clone(), function_idx, binary.addr_map.static_to_dynamic(disas_line.static_addr)));
+            }
+
+            for action in ui.check_keys(&[KeyAction::ToggleBreakpoint, KeyAction::PreviousMatch, KeyAction::NextMatch]) {
+                match action {
+                    KeyAction::ToggleBreakpoint if has_addr => {
+                        // TODO: Instruction breakpoints. Probably store static addr + binary id, not dynamic addr. But make it work without requiring Symbols, just based on mmaps.
+                    }
+                    KeyAction::PreviousMatch => tab.selected_subfunction_level = tab.selected_subfunction_level.min(disas_line.subfunction_level).saturating_sub(1),
+                    KeyAction::NextMatch => {
+                        tab.selected_subfunction_level = tab.selected_subfunction_level.saturating_add(1);
+                        if tab.selected_subfunction_level >= disas_line.subfunction_level {
+                            tab.selected_subfunction_level = u16::MAX;
+                        }
+                    }
+                    _ => (),
                 }
-                _ => return true
             }
-            false
-        });
 
-        let palette = &debugger.context.settings.palette;
-        let mut header = StyledText::default();
-        let mut disas: Option<(BinaryId, usize, &Disassembly)> = None;
-        self.resolve_function_for_tab(self.selected_tab, debugger);
-        let indent = "";
-        styled_write!(header, ui.palette.default, "{}", indent);
-        match &self.tabs[self.selected_tab].status {
-            DisassemblyTabStatus::Err(e) => {
-                styled_write!(header, palette.error, "{}", e);
+            let mut source_line_info = disas_line.leaf_line.clone();
+            if let &Some(mut sf_idx) = &disas_line.subfunction {
+                while symbols_shard.subfunctions[sf_idx].level > tab.selected_subfunction_level + 1 {
+                    sf_idx = symbols_shard.subfunctions[sf_idx].parent;
+                }
+                if symbols_shard.subfunctions[sf_idx].level == tab.selected_subfunction_level + 1 {
+                    selected_subfunction_idx = Some(sf_idx);
+                    source_line_info = Some(symbols_shard.subfunctions[sf_idx].call_line.clone());
+                }
             }
-            DisassemblyTabStatus::Unresolved {locator, cached_error} => {
-                styled_write!(header, palette.default_dim, "{}", locator.demangled_name);
-                header.close_line();
-                styled_write!(header, ui.palette.default, "{}", indent);
-                styled_write!(header, palette.error, "couldn't find function: {}", cached_error.as_ref().unwrap());
-            }
-            DisassemblyTabStatus::Function {locator, function_idx} => {
-                styled_write!(header, palette.function_name, "{}", locator.demangled_name);
-                disas = Some((locator.binary_id.clone(), *function_idx, Self::find_or_disassemble_function(&mut self.cache, locator.binary_id.clone(), *function_idx, debugger)));
+            if let Some(line) = source_line_info {
+                let file = &symbols.files[line.file_idx().unwrap()];
+                source_line = Some(SourceScrollTarget {path: file.path.to_owned(), version: file.version.clone(), line: line.line()});
             }
         }
-        header.close_line();
 
-        let width = area.width.saturating_sub(2);
-        let widest_line = header.widest_line().max(disas.as_ref().map_or(0, |(_, _, d)| d.widest_line));
-        let tab = &mut self.tabs[self.selected_tab];
-        let mut toggle_breakpoint = false;
-        let mut subfunction_level_delta = 0isize;
-        keys.retain(|key| {
-            match debugger.context.settings.keys.map.get(key) {
-                Some(KeyAction::CursorRight) => tab.hscroll = tab.hscroll.saturating_add(width),
-                Some(KeyAction::CursorLeft) => tab.hscroll = tab.hscroll.saturating_sub(width),
-                Some(KeyAction::ToggleBreakpoint) => toggle_breakpoint ^= true,
-                Some(KeyAction::PreviousMatch) => subfunction_level_delta -= 1,
-                Some(KeyAction::NextMatch) => subfunction_level_delta += 1,
-                _ => return true
-            }
-            false
-        });
-        tab.hscroll = tab.hscroll.min(widest_line.saturating_sub(width as usize).try_into().unwrap_or(u16::MAX));
-
-        if area.height > 0 {
-            let mut a = area;
-            a.height = 1;
-            let tabs = Tabs::new(self.tabs.iter().map(
-                |t| Spans::from(vec![
-                    if t.pinned {
-                        Span::styled("📌 ".to_string() + &t.title, palette.tab_title_active)
-                    } else {
-                        Span::styled(t.title.clone(), palette.tab_title)
-                    }])).collect())
-                .select(self.selected_tab).highlight_style(palette.tab_title_selected);
-            f.render_widget(tabs, a);
-
-            area.y += 1;
-            area.height -= 1;
-        }
-        let tab = &mut self.tabs[self.selected_tab];
-
-        {
-            let mut a = area;
-            a.height = a.height.min(header.num_lines() as u16);
-            let paragraph = Paragraph::new(Text {lines: header.to_lines()}).scroll((0, tab.hscroll));
-            f.render_widget(paragraph, a);
-
-            area.y += a.height;
-            area.height -= a.height;
-        }
-
-        if let Some((binary_id, function_idx, disas)) = disas {
-            let mut lines: Vec<Spans> = Vec::new();
-
-            if toggle_breakpoint {
-                // TODO: disassembly breakpoints
-            }
-            
-            let mut ip_lines: Vec<(usize, /*selected*/ bool)> = Vec::new();
-            for (idx, frame) in state.stack.frames.iter().enumerate() {
-                if let Some(line) = disas.pseudo_addr_to_line(frame.pseudo_addr) {
+        let mut ip_lines: Vec<(usize, /*selected*/ bool)> = Vec::new();
+        for (idx, frame) in state.stack.frames.iter().enumerate() {
+            if frame.binary_id == Some(binary.id) {
+                let static_pseudo_addr = frame.pseudo_addr.wrapping_sub(frame.addr_static_to_dynamic);
+                if let Some(line) = disas.pseudo_addr_to_line(static_pseudo_addr) {
                     ip_lines.push((line, idx == state.selected_frame));
                 }
             }
-            ip_lines.sort_unstable_by_key(|k| (k.0, !k.1));
+        }
+        ip_lines.sort_unstable_by_key(|k| (k.0, !k.1));
 
-            let range = if let Some((addr, subfunction_level)) = scroll_to_addr {
-                tab.hscroll = 0;
-                tab.selected_subfunction_level = subfunction_level;
-                tab.scroll.set(disas.text.num_lines(), area.height, disas.pseudo_addr_to_line(addr).unwrap_or(0))
-            } else {
-                tab.scroll.update(disas.text.num_lines(), area.height, &mut keys, &debugger.context.settings.keys)
-            };
-
-            let mut selected_subfunction_idx: Option<usize> = None;
-            let mut source_line: Option<SourceScrollTarget> = None;
-            let mut symbols_shard: Option<&SymbolsShard> = None;
-
-            if let Some(disas_line) = disas.lines.get(tab.scroll.cursor) {
-                if disas_line.addr != 0 && disas_line.addr != usize::MAX {
-                    state.selected_addr = Some((binary_id.clone(), function_idx, disas_line.addr));
-                }
-
-                if let Some(binary) = debugger.info.binaries.get(&binary_id) {
-                    if let Ok(symbols) = &binary.symbols {
-                        let function = &symbols.functions[function_idx];
-                        let shard = &symbols.shards[function.shard_idx()];
-                        symbols_shard = Some(shard);
-                        assert!(disas.symbols_shard == Some((symbols as &Symbols as *const Symbols, function.shard_idx())));
-
-                        let max_level = disas_line.subfunction.map_or(0isize, |i| shard.subfunctions[i].level as isize);
-                        let x = tab.selected_subfunction_level as isize;
-                        if subfunction_level_delta != 0 {
-                            tab.selected_subfunction_level = if subfunction_level_delta < 0 {
-                                (x.min(max_level + 1) + subfunction_level_delta).max(1) as u16
-                            } else if x + subfunction_level_delta > max_level {
-                                u16::MAX
-                            } else {
-                                (x + subfunction_level_delta).min(u16::MAX as isize) as u16
-                            };
-                        }
-                        tab.selected_subfunction_level = tab.selected_subfunction_level.max(1);
-
-                        let mut source_line_info = disas_line.leaf_line.clone();
-                        if let &Some(mut sf_idx) = &disas_line.subfunction {
-                            while shard.subfunctions[sf_idx].level > tab.selected_subfunction_level {
-                                sf_idx = shard.subfunctions[sf_idx].parent;
-                            }
-                            if shard.subfunctions[sf_idx].level == tab.selected_subfunction_level {
-                                selected_subfunction_idx = Some(sf_idx);
-                                source_line_info = Some(shard.subfunctions[sf_idx].call_line.clone());
-                            }
-                        }
-                        if let Some(line) = source_line_info {
-                            let file = &symbols.files[line.file_idx().unwrap()];
-                            source_line = Some(SourceScrollTarget {path: file.path.to_owned(), version: file.version.clone(), line: line.line()});
-                        }
-                    }
-                }
-            }
-
+        with_parent!(ui, content, {
+            /* asdqwe
             let key = (binary_id.clone(), function_idx, tab.scroll.cursor, tab.selected_subfunction_level);
             if !suppress_code_autoscroll && self.source_scrolled_to.as_ref() != Some(&key) {
                 self.source_scrolled_to = Some(key);
@@ -1553,17 +1484,88 @@ impl WindowContent for DisassemblyWindow {
 
             f.render_widget(paragraph, area);
         }
+asdqwe;
+        }*/
+        });
+    }
+
+    fn get_hints(&self, hints: &mut StyledText, ui: &mut UI) {
+        hints.chars.push_str("o - find function"); hints.close_span(ui.palette.default_dim); hints.close_line();
+        hints.chars.push_str("C-y - close/pin tab"); hints.close_span(ui.palette.default_dim); hints.close_line();
+        hints.chars.push_str(",/. - select level"); hints.close_span(ui.palette.default_dim); hints.close_line();
+        // TODO: hints.chars.push_str("b - toggle breakpoint"); hints.close_span(ui.palette.default_dim); hints.close_line();
+    }
+
+    fn has_persistent_state(&self) -> bool {
+        true
+    }
+    fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {
+        /*asdqwe
+        for (idx, tab) in self.tabs.iter().enumerate() {
+            let locator = match &tab.status {
+                DisassemblyTabStatus::Function {locator, ..} => locator,
+                DisassemblyTabStatus::Unresolved {locator, ..} => locator,
+                DisassemblyTabStatus::Err(_) => continue,
+            };
+            out.write_u8(if idx == self.selected_tab {2} else {1})?;
+            locator.binary_id.save_state_incomplete(out)?;
+            out.write_slice(&locator.mangled_name)?;
+            out.write_str(&locator.demangled_name)?; // can't just demangle on load because we don't know the language (alernatively we could save the language here)
+            out.write_usize(locator.addr.0)?;
+            tab.scroll.save_state(out)?;
+            out.write_u16(tab.selected_subfunction_level)?;
+            out.write_u16(tab.hscroll)?;
+            out.write_u8(tab.pinned as u8)?;
+        }
+        out.write_u8(0)?;*/
+        Ok(())
+    }
+    fn load_state(&mut self, inp: &mut &[u8]) -> Result<()> {
+        /*asdqwe
+        loop {
+            let select_this_tab = match inp.read_u8()? {
+                0 => break,
+                2 => true,
+                _ => false,
+            };
+            let locator = DisassemblyFunctionLocator {binary_id: BinaryId::load_state_incomplete(inp)?, mangled_name: inp.read_slice()?, demangled_name: inp.read_str()?, addr: FunctionAddr(inp.read_usize()?)};
+            let title = Self::make_title(&locator.demangled_name);
+            self.tabs.push(DisassemblyTab {identity: random(), title, status: DisassemblyTabStatus::Unresolved {locator, cached_error: None}, scroll: Scroll::load_state(inp)?, selected_subfunction_level: inp.read_u16()?, hscroll: inp.read_u16()?, pinned: inp.read_u8()? != 0});
+            if select_this_tab {
+                self.selected_tab = self.tabs.len() - 1;
+            }
+        }*/
+        // TODO: Prevent scrolling code window before first input.
+        Ok(())
     }
 
     fn drop_caches(&mut self) {
         self.cache.clear();
         for tab in &mut self.tabs {
-            match &mut tab.status {
-                DisassemblyTabStatus::Unresolved {cached_error, ..} => *cached_error = None,
-                _ => (),
+            if tab.locator.is_some() {
+                tab.error = None;
+                tab.cached_function_idx = None;
             }
-        }*/
+        }
     }
+}
+
+fn close_excess_ephemeral_tabs<T, F: FnMut(&T) -> bool>(tabs: &mut Vec<T>, tabs_state: &mut TabsState, mut is_ephemeral: F) {
+    let ephemeral_tabs = tabs.iter().filter(|t| is_ephemeral(t)).count();
+    if ephemeral_tabs <= 1 {
+        return;
+    }
+    let mut i = 0;
+    tabs.retain(|t| {
+        let r = if is_ephemeral(t) && i != tabs_state.selected {
+            tabs_state.closed(i);
+            false
+        } else {
+            true
+        };
+        i += 1;
+        r
+    });
 }
 
 #[derive(Default)]
@@ -1571,17 +1573,19 @@ struct StatusWindow {}
 impl WindowContent for StatusWindow {
     fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
         ui.cur_mut().axes[Axis::Y].flags.insert(AxisFlags::STACK);
-        let start = ui.text.num_lines();
 
-        match debugger.target_state {
+        let l = match debugger.target_state {
             ProcessState::NoProcess => ui_writeln!(ui, default_dim, "no process"),
             ProcessState::Starting => ui_writeln!(ui, state_other, "starting"),
             ProcessState::Exiting => ui_writeln!(ui, state_other, "exiting"),
             ProcessState::Stepping => ui_writeln!(ui, state_other, "stepping"),
-            ProcessState::Running => ui_writeln!(ui, running, "running"),
-            ProcessState::Suspended => ui_writeln!(ui, suspended, "suspended"),
+            ProcessState::Running => ui_writeln!(ui, state_running, "running"),
+            ProcessState::Suspended => ui_writeln!(ui, state_suspended, "suspended"),
         };
+        let style = ui.text.spans.last().clone().unwrap().1;
+        ui.add(widget!().height(AutoSize::Text).text(l).fill(' ', style));
 
+        let start = ui.text.num_lines();
         if debugger.target_state != ProcessState::NoProcess {
             ui_write!(ui, default_dim, "pid: ");
             ui_write!(ui, default, "{}", debugger.pid);
@@ -1607,11 +1611,9 @@ impl WindowContent for StatusWindow {
 
         with_parent!(ui, log_widget, {
             let space_left = ui.cur().axes[Axis::Y].get_fixed_size();
-            eprintln!("asdqwe space: {}", space_left);
             let log_lines = debugger.log.lines.len();
             let start = ui.text.num_lines();
             for line in &debugger.log.lines.make_contiguous()[log_lines.saturating_sub(space_left)..] {
-                eprintln!("asdqwe line: {}", line);
                 ui_writeln!(ui, default, "{}", line);
             }
             let end = ui.text.num_lines();
@@ -1800,8 +1802,8 @@ impl ThreadsFilter {
         // This is very primitive right now, but I'm not sure in which direction to take it to be most useful.
         let stack = debugger.get_stack_trace(tid, false);
         for subframe in &stack.subframes {
-            if let Some(f) = &subframe.function_name {
-                if f.find(query).is_some() {
+            if subframe.function_idx.is_ok() {
+                if subframe.function_name.find(query).is_some() {
                     return true;
                 }
             }
@@ -1937,7 +1939,7 @@ impl WindowContent for ThreadsWindow {
 
             let style = match t.info.resource_stats.state {
                 'R' | 'D' => ui.palette.running,
-                'S' | 'T' | 't' => ui.palette.state_suspended,
+                'S' | 'T' | 't' => ui.palette.suspended,
                 'Z' | 'X' | 'x' => ui.palette.error,
                 _ => ui.palette.state_other,
             };
@@ -1951,7 +1953,7 @@ impl WindowContent for ThreadsWindow {
                 ThreadState::Running => {
                     match &debugger.stepping {
                         Some(step) if step.tid == tid => ui_writeln!(ui, state_other, "stepping"),
-                        _ => ui_writeln!(ui, running, "running"),
+                        _ => ui_writeln!(ui, state_running, "running"),
                     };
                     table.text_cell(ui);
 
@@ -1961,10 +1963,12 @@ impl WindowContent for ThreadsWindow {
                 }
                 ThreadState::Suspended if !stack.frames.is_empty() => {
                     let f = &stack.frames[0];
-                    match &stack.subframes[0].function_name {
-                        Some(name) => ui_writeln!(ui, function_name, "{}", name),
-                        None => ui_writeln!(ui, default_dim, "?"),
-                    };
+                    let sf = &stack.subframes[0];
+                    if sf.function_idx.is_ok() {
+                        ui_writeln!(ui, function_name, "{}", sf.function_name);
+                    } else {
+                        ui_writeln!(ui, default_dim, "?");
+                    }
                     table.text_cell(ui);
                     
                     ui_writeln!(ui, default_dim, "{:x}", f.addr);
@@ -2062,71 +2066,159 @@ struct StackWindow {
 impl Default for StackWindow { fn default() -> Self { Self {table_state: TableState::default(), threads: HashMap::new(), seen: (0, StableSubframeIdx::top(), 0), rerequest_scroll: false} } }
 impl WindowContent for StackWindow {
     fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
-        styled_write!(ui.text, ui.palette.default, "stack");
-        let l = ui.text.close_line();
-        ui.add(widget!().text(l));
-        /*asdqwe
         state.stack = debugger.get_stack_trace(state.selected_thread, /* partial */ false);
         let rerequest_scroll = mem::take(&mut self.rerequest_scroll);
 
-        let header_height = 1usize;
-        let height = area.height.saturating_sub(header_height as u16) / 2;
-        let locked = false; // TODO: assign this after implementing window locking
-
         assert_eq!(state.stack.frames.is_empty(), state.stack.subframes.is_empty());
-        let num_rows = state.stack.subframes.len() + state.stack.truncated.is_some() as usize; // add a fake row for error message if the stack is truncated
+        let num_rows = state.stack.subframes.len();
+        let locked = false; // TODO: window locking
+
+        // Behaviors that we're trying to implement here:
+        //  * when switching threads back and forth without resuming the process, remember per-thread selected frame and auto-switch to that,
+        //  * if a thread was resumed and stopped (e.g. a step or a breakpoint hit), switch to the top frame
+        //     - even if the stack didn't change,
+        //     - even if the thread was running for a very short time and no build() call happened during that,
+        //     - even if the thread wasn't selected while it was running,
+        //     - but if the stack window is locked, don't switch; keep the same position relative to the bottom of the stack,
+        //  * when switching thread or stack frame, scroll the source and disassembly windows even if address didn't change (e.g. the same breakpoint was hit twice in a row)
+        //     - including the switch-to-top case from above, even if top was already selected,
+        //     - including the case when e.g. up-arrow key was pressed when already at the top of the stack (useful if the stack has only one frame),
+        //  * if symbols loading completed and stack frames got expanded into multiple subframes of inlined functions, keep focus on the same frame,
+        //  * when symbols loading completes, retry scrolling the source and disassembly windows, but only if they're currently showing an error (to avoid yanking valid file the user is looking at),
+        //  * if the stack window is locked, and the process was stopped and resumed, and current frame's address changed, scroll the source and disassembly (if address didn't change, don't scroll).
+
+        if !state.stack.frames.is_empty() {
+            let deb_thr = debugger.threads.get(&state.selected_thread).unwrap();
+            let stop_count = deb_thr.stop_count;
+
+            let thr = self.threads.entry(state.selected_thread).or_insert((0, StableSubframeIdx::top()));
+            if thr.0 == stop_count || locked {
+                self.table_state.cursor = thr.1.subframe_idx(&state.stack);
+            } else {
+                self.table_state.select(deb_thr.subframe_to_select.unwrap_or(0));
+            }
+            thr.0 = stop_count;
+        }
+
+        // Global hotkeys.
+        with_parent!(ui, ui.content_root, {
+            for action in ui.check_keys(&[KeyAction::PreviousStackFrame, KeyAction::NextStackFrame]) {
+                match action {
+                    KeyAction::PreviousStackFrame => self.table_state.select(self.table_state.cursor.saturating_sub(1)),
+                    KeyAction::NextStackFrame => self.table_state.select(self.table_state.cursor + 1),
+                    _ => panic!("huh"),
+                }
+            }
+        });
+
+        let mut table = Table::new(mem::take(&mut self.table_state), ui, vec![
+            Column::new("idx", AutoSize::Fixed(3)),
+            Column::new("location", AutoSize::Remainder(1.0)),
+            Column::new("address", AutoSize::Fixed(12)),
+            Column::new("bin", AutoSize::Fixed(3)),
+        ]);
+
+        let write_stack_truncated_error = |e: &Error, ui: &mut UI| -> usize {
+            if e.is_usage() || e.is_loading() {
+                ui_writeln!(ui, default_dim, "{}", e)
+            } else {
+                ui_writeln!(ui, error, "stack truncated: {}", e)
+            }
+        };
+        for (idx, subframe) in state.stack.subframes.iter().enumerate() {
+            table.start_row(idx, ui);
+            let frame = &state.stack.frames[subframe.frame_idx];
+
+            ui_writeln!(ui, default_dim, "{}", idx);
+            table.text_cell(ui);
+
+            with_parent!(ui, table.start_cell(ui), {
+                ui.cur_mut().set_vstack();
+
+                let (l, align_right) = match &subframe.function_idx {
+                    Ok(_) => (ui_writeln!(ui, function_name, "{}", subframe.function_name), false),
+                    Err(e) => (ui_writeln!(ui, error, "{}", e), false),
+                };
+                ui.add(widget!().height(AutoSize::Text).text(l).flags(if align_right {WidgetFlags::TEXT_TRUNCATION_ALIGN_RIGHT} else {WidgetFlags::empty()}));
+
+                if let Some(info) = &subframe.line {
+                    let name = info.path.as_os_str().to_string_lossy();
+                    ui_write!(ui, filename, "{}", name);
+                } else {
+                    ui_write!(ui, default_dim, "?");
+                }
+                if let Some(info) = &subframe.line {
+                    if info.line.line() != 0 {
+                        ui_write!(ui, line_number, ":{}", info.line.line());
+                        if info.line.column() != 0 {
+                            ui_write!(ui, column_number, ":{}", info.line.column());
+                        }
+                    }
+                }
+                let l = ui.text.close_line();
+                ui.add(widget!().height(AutoSize::Text).text(l).flags(WidgetFlags::TEXT_TRUNCATION_ALIGN_RIGHT));
+
+                if idx + 1 == state.stack.subframes.len() {
+                    if let Some(e) = &state.stack.truncated {
+                        let l = write_stack_truncated_error(e, ui);
+                        ui.add(widget!().height(AutoSize::Text).text(l));
+                    }
+                }
+            });
+
+            let is_inlined = idx != frame.subframes.end-1;
+            if is_inlined {
+                ui.text.close_line();
+            } else {
+                ui_writeln!(ui, default_dim, "{:x}", frame.addr);
+            }
+            table.text_cell(ui);
+
+            if is_inlined {
+                ui.text.close_line();
+            } else if let Some(b) = &frame.binary_id {
+                ui_writeln!(ui, default_dim, "{}", state.binaries.iter().position(|x| x == b).unwrap() + 1);
+            } else {
+                ui_writeln!(ui, default_dim, "?");
+            }
+            table.text_cell(ui);
+        }
+        if state.stack.subframes.is_empty() {
+            if let Some(e) = &state.stack.truncated {
+                table.start_row(0, ui);
+                ui.text.close_line();
+                table.text_cell(ui);
+
+                write_stack_truncated_error(e, ui);
+                table.text_cell(ui);
+
+                ui.text.close_line();
+                table.text_cell(ui);
+                table.text_cell(ui);
+            }
+        }
+
+        self.table_state = table.finish(ui);
+        let mut scroll_source_and_disassembly = self.table_state.did_scroll_to_cursor;
 
         if state.stack.frames.is_empty() {
             state.selected_frame = 0;
             state.selected_subframe = 0;
         } else {
-            // Behaviors that we're trying to implement here:
-            //  * when switching threads back and forth without resuming the process, remember per-thread selected frame and auto-switch to that,
-            //  * if a thread was resumed and stopped (e.g. a step or a breakpoint hit), switch to the top frame
-            //     - even if the stack didn't change,
-            //     - even if the thread was running for a very short time and no update_and_render() call happened during that,
-            //     - even if the thread wasn't selected while it was running,
-            //     - but if the stack window is locked, don't switch; keep the same position relative to the bottom of the stack,
-            //  * when switching thread or stack frame, scroll the source and disassembly windows even if address didn't change (e.g. the same breakpoint was hit twice in a row)
-            //     - including the switch-to-top case from above, even if top was already selected,
-            //     - including the case when e.g. up-arrow key was pressed when already at the top of the stack (useful if the stack has only one frame),
-            //  * if symbols loading completed and stack frames got expanded into multiple subframes of inlined functions, keep focus on the same frame,
-            //  * when symbols loading completes, retry scrolling the source and disassembly windows, but only if they're currently showing an error (to avoid yanking valid file the user is looking at),
-            //  * if the stack window is locked, and the process was stopped and resumed, and current frame's address changed, scroll the source and disassembly (if address didn't change, don't scroll).
-
-            let deb_thr = debugger.threads.get(&state.selected_thread).unwrap();
-            let stop_count = deb_thr.stop_count;
-            let mut switch_to_subframe: Option<usize> = None;
-            let mut scroll_source_and_disassembly = false;
-
-            let thr = self.threads.entry(state.selected_thread).or_insert((0, StableSubframeIdx::top()));
-            if thr.0 == stop_count || locked {
-                self.scroll.cursor = thr.1.subframe_idx(&state.stack);
-                scroll_source_and_disassembly |= self.scroll.update_detect_movement(num_rows, height, &mut keys, &debugger.context.settings.keys).1;
-            } else {
-                switch_to_subframe = Some(deb_thr.subframe_to_select.unwrap_or(0));
-            }
-            thr.0 = stop_count;
-
-            if let Some(i) = switch_to_subframe {
-                self.scroll.set(num_rows, height, i);
-                scroll_source_and_disassembly = true;
-            }
-
-            self.scroll.cursor = self.scroll.cursor.min(state.stack.subframes.len() - 1); // move the cursor away from the fake row (but allow initially placing it there, just to scroll to it)
-            state.selected_subframe = self.scroll.cursor;
+            state.selected_subframe = self.table_state.cursor;
             let subframe = &state.stack.subframes[state.selected_subframe];
             state.selected_frame = subframe.frame_idx;
             let frame = &state.stack.frames[subframe.frame_idx];
+            let thr = self.threads.entry(state.selected_thread).or_insert((0, StableSubframeIdx::top()));
             thr.1 = StableSubframeIdx::new(&state.stack, state.selected_subframe);
 
             let cur = (state.selected_thread, thr.1, frame.addr);
             scroll_source_and_disassembly |= cur != self.seen;
             if scroll_source_and_disassembly || rerequest_scroll {
-                ui.should_scroll_source = Some((subframe.line.as_ref().map(|line| SourceScrollTarget {path: line.path.clone(), version: line.version.clone(), line: line.line.line()}), !scroll_source_and_disassembly));
-                ui.should_scroll_disassembly = Some((match &state.stack.subframes[frame.subframes.end - 1].function {
-                    Ok((_, function_idx)) => Ok(DisassemblyScrollTarget {binary_id: frame.binary_id.clone().unwrap(), function_idx: *function_idx, addr: frame.pseudo_addr,
-                                                                         subfunction_level: if ui.selected_subframe == frame.subframes.start {u16::MAX} else {(frame.subframes.end - ui.selected_subframe) as u16}}),
+                state.should_scroll_source = Some((subframe.line.as_ref().map(|line| SourceScrollTarget {path: line.path.clone(), version: line.version.clone(), line: line.line.line()}), !scroll_source_and_disassembly));
+                state.should_scroll_disassembly = Some((match &state.stack.subframes[frame.subframes.end - 1].function_idx {
+                    &Ok(function_idx) => Ok(DisassemblyScrollTarget {binary_id: frame.binary_id.clone().unwrap(), symbols_identity: frame.symbols_identity, function_idx, static_pseudo_addr: frame.pseudo_addr.wrapping_sub(frame.addr_static_to_dynamic),
+                                                                         subfunction_level: if state.selected_subframe == frame.subframes.start {u16::MAX} else {(frame.subframes.end - state.selected_subframe) as u16}}),
                     Err(e) => Err(e.clone()),
                 }, !scroll_source_and_disassembly));
             }
@@ -2136,85 +2228,6 @@ impl WindowContent for StackWindow {
         if self.threads.len() > debugger.threads.len() * 2 {
             self.threads.retain(|tid, _| { debugger.threads.contains_key(tid) });
         }
-
-        let f = match f { Some(f) => f, None => return };
-        let palette = &debugger.context.settings.palette;
-
-        let mut range = self.scroll.range(num_rows, height as usize);
-        range.end = num_rows.min(range.end + 1); // each row takes 2 lines, so there may be a half-row at the end - render it too
-
-        let mut table_state = TableState::default();
-        table_state.select(Some(self.scroll.cursor - range.start));
-
-        let mut rows: Vec<Row> = Vec::new();
-        for idx in range {
-            if idx < state.stack.subframes.len() {
-                let subframe = &state.stack.subframes[idx];
-                let frame = &state.stack.frames[subframe.frame_idx];
-                let func_spans = vec![
-                    if let Some(n) = &subframe.function_name {
-                        Span::raw(format!("{}", n))
-                    } else if let Err(e) = &subframe.function {
-                        Span::styled(format!("{}", e), palette.error)
-                    } else {
-                        Span::styled("?", palette.default_dim)
-                    }];
-                let mut line_spans = vec![
-                    if let Some(info) = &subframe.line {
-                        let name = info.path.as_os_str().to_string_lossy();
-                        Span::styled(format!("{}", name), palette.filename)
-                    } else {
-                        Span::styled("?", palette.filename.add_modifier(Modifier::DIM))
-                    }];
-                if let Some(info) = &subframe.line {
-                    if info.line.line() != 0 {
-                        line_spans.push(Span::styled(format!(":{}", info.line.line()), palette.location_line_number));
-                        if info.line.column() != 0 {
-                            line_spans.push(Span::styled(format!(":{}", info.line.column()), palette.location_column_number));
-                        }
-                    }
-                }
-                let idx_spans = vec![Span::styled(format!("{}", idx), palette.default_dim)];
-
-                let is_inlined = idx != frame.subframes.end-1;
-
-                let mut row = Row::new(vec![
-                    Cell::from(Spans::from(idx_spans)),
-                    Cell::from(if is_inlined {String::new()} else {format!("{:x}", frame.addr)}).style(palette.default_dim),
-                    if is_inlined {
-                        Cell::from("")
-                    } else if let Some(b) = &frame.binary_id {
-                        Cell::from(format!("{}", ui.binaries.iter().position(|x| x == b).unwrap() + 1))
-                    } else {
-                        Cell::from("?")
-                    }.style(palette.default_dim),
-                    Cell::from(Text {lines: vec![Spans::from(func_spans), Spans::from(line_spans)]}),
-                ]);
-                // The table widget doesn't show partial rows, so if the height is odd we have to manually set last row's height to 1 instead of 2.
-                if header_height + rows.len() * 2 + 1 < area.height as usize {
-                    row = row.height(2);
-                }
-                rows.push(row);
-            } else {
-                let e = state.stack.truncated.as_ref().unwrap();
-                rows.push(Row::new(vec![
-                    Cell::from(""),
-                    Cell::from(""),
-                    Cell::from(""),
-                    if e.is_usage() || e.is_loading() {
-                        Cell::from(Text {lines: vec![Spans::from(Span::styled(format!("{}", e), palette.default_dim)), Spans::default()]})
-                    } else {
-                        Cell::from(Text {lines: vec![Spans::from(Span::styled(format!("stack truncated: {}", e), palette.error)), Spans::default()]})
-                    }
-                ]));
-            }
-        }
-        let table = Table::new(rows)
-            .header(Row::new(vec![Text::from("idx"), Text::from("address"), Text::from("bin"), Text {lines: vec![Spans::from("location"), Spans::from(Span::styled("line", palette.filename))]}]).style(palette.table_header).height(/* tried 2, but it looks worse */ 1))
-            .widths(&[Constraint::Length(3), Constraint::Length(12), Constraint::Length(3), Constraint::Percentage(90)])
-            .highlight_style(palette.table_selected_item).highlight_symbol("➤ ");
-
-        f.render_stateful_widget(table, area, &mut table_state);*/
     }
 
     fn drop_caches(&mut self) {
@@ -2635,7 +2648,7 @@ impl CodeWindow {
                 None => closest_idx,
             };
 
-            ui.should_scroll_disassembly = Some((Ok(DisassemblyScrollTarget {binary_id: binary_id.clone(), function_idx: addrs[idx].0, addr: addrs[idx].2, subfunction_level: addrs[idx].1.saturating_add(1)}), false));
+            state.should_scroll_disassembly = Some((Ok(DisassemblyScrollTarget {binary_id: binary_id.clone(), function_idx: addrs[idx].0, addr: addrs[idx].2, subfunction_level: addrs[idx].1.saturating_add(1)}), false));
 
             break;
         }
@@ -2739,8 +2752,8 @@ impl WindowContent for CodeWindow {
     }
 
     fn update_and_render(&mut self, state: &mut UIState, debugger: &mut Debugger, mut keys: Vec<Key>, f: Option<&mut Frame>, mut area: Rect) {
-        let suppress_disassembly_autoscroll = ui.should_scroll_source.is_some();
-        let switch_to = match mem::take(&mut ui.should_scroll_source) {
+        let suppress_disassembly_autoscroll = state.should_scroll_source.is_some();
+        let switch_to = match mem::take(&mut state.should_scroll_source) {
             Some((to, false)) => Some(to),
             Some((to, true)) if self.tabs.is_empty() || self.tabs[self.selected_tab].path_in_symbols.as_os_str().is_empty() => Some(to),
             _ => None,
@@ -2784,7 +2797,7 @@ impl WindowContent for CodeWindow {
         let mut instruction_pointers: HashMap<(&Path, usize), (usize, bool, bool)> = HashMap::new();
         for (idx, subframe) in state.stack.subframes.iter().enumerate() {
             if let Some(info) = &subframe.line {
-                instruction_pointers.insert((&info.path, info.line.line()), (info.line.column(), idx == ui.selected_subframe, idx == 0));
+                instruction_pointers.insert((&info.path, info.line.line()), (info.line.column(), idx == state.selected_subframe, idx == 0));
             }
         }
 
@@ -3019,7 +3032,7 @@ impl WindowContent for BreakpointsWindow {
         if moved && !breakpoints.is_empty() {
             match &debugger.breakpoints.get(breakpoints[self.scroll.cursor]).on {
                 BreakpointOn::Line(on) => {
-                    ui.should_scroll_source = Some((Some(SourceScrollTarget {path: on.path.clone(), version: on.file_version.clone(), line: on.line}), false));
+                    state.should_scroll_source = Some((Some(SourceScrollTarget {path: on.path.clone(), version: on.file_version.clone(), line: on.line}), false));
                 }
             }
         }

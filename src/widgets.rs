@@ -1,5 +1,5 @@
 use crate::{*, search::*, pool::*, symbols_registry::*, util::*, error::*, procfs::*, settings::*, context::*, imgui::*, common_ui::*, terminal::*};
-use std::{io, ops::Range, sync::Arc, fmt::Write as fmtWrite, mem};
+use std::{io, ops::Range, sync::Arc, fmt::Write as fmtWrite, mem, collections::HashSet};
 
 // React to keys like up/down/pageup/pagedown/home/end by moving `cursor`, within range [0, count).
 // `cur_parent` is the "viewport" widget; its height should be known (for handling PageUp/PageDown keys); it needs to be focused for the input to work.
@@ -187,7 +187,7 @@ pub fn hscrolling_navigation(hscroll: &mut isize, ui: &mut UI) {
     let viewport_width = w.axes[Axis::X].size;
     let content_width = ui.calculate_size(w.children[0], Axis::X);
 
-    // Scroll by viewport width-2 with each key press, the 2 to fit the HSCROLL_INDICATOR_ARROWS.
+    // Scroll by viewport width-2 with each key press, the 2 to fit the HSCROLL_INDICATOR_*.
     let step = viewport_width.saturating_sub(2).max(1) as isize;
     for action in ui.check_keys(&[KeyAction::CursorLeft, KeyAction::CursorRight]) {
         match action {
@@ -260,6 +260,7 @@ pub struct TableState {
     pub cursor: usize,
     pub scroll: isize,
     pub scroll_to_cursor: bool,
+    pub did_scroll_to_cursor: bool, // whether the latest finish() had a reason to auto-scroll (because of keyboard input or mouse click or because scroll_to_cursor was set from outside).
     // TODO: pub auto_tooltip: bool,
     // TODO: sort_by: Vec<usize>,
 }
@@ -267,6 +268,10 @@ impl TableState {
     pub fn select(&mut self, cursor: usize) {
         self.cursor = cursor;
         self.scroll_to_cursor = true;
+    }
+    pub fn select_if_changed(&mut self, cursor: usize) {
+        self.scroll_to_cursor |= cursor != self.cursor;
+        self.cursor = cursor;
     }
 }
 
@@ -288,6 +293,7 @@ pub struct Table {
     scroll_bar: WidgetIdx,
 
     finished_layout: [bool; 2], // horizontal, vertical
+    seen_row_ids: HashSet<usize>,
 
     // Lazy mode.
     lazy: bool,
@@ -326,7 +332,7 @@ impl Table {
         });
 
         Self {state, columns, root, viewport, rows_container, scroll_bar, finished_layout: [false; 2], enable_selection_icon: true, hide_cursor_if_unfocused: false, enable_tooltip: true,
-              lazy: false, row_idxs: 0..0, total_rows: 0, fixed_row_height: 0}
+              lazy: false, row_idxs: 0..0, total_rows: 0, fixed_row_height: 0, seen_row_ids: HashSet::new()}
     }
 
     // Switches the table into "lazy mode": input is processed and vertical layout is determined right here, before rows are created, so that only visible rows have to be created.
@@ -344,8 +350,8 @@ impl Table {
                 }
             }
         });
-        self.state.scroll_to_cursor |= with_parent!(ui, self.viewport, {
-            list_cursor_navigation(&mut self.state.cursor, num_rows, row_height, ui)
+        with_parent!(ui, self.viewport, {
+            self.state.scroll_to_cursor |= list_cursor_navigation(&mut self.state.cursor, num_rows, row_height, ui)
         });
         let scroll_to = if self.state.scroll_to_cursor && num_rows > 0 {
             Some((self.state.cursor*row_height) as isize..((self.state.cursor+1)*row_height) as isize)
@@ -363,11 +369,13 @@ impl Table {
 
     pub fn start_row(&mut self, id: usize, ui: &mut UI) -> WidgetIdx {
         self.finish_row(ui);
+        let ins = self.seen_row_ids.insert(id);
+        assert!(ins);
+
         with_parent!(ui, self.rows_container, {
             let x = if self.enable_selection_icon {2} else {0}; // excluding the icon from selection highlighting looks slightly better (to me)
             let row_height = if self.lazy {AutoSize::Fixed(self.fixed_row_height)} else {AutoSize::Children};
-            let mut w = widget!().hstack().fixed_x(x).height(row_height).fill(' ', ui.palette.default).highlight_on_hover();
-            w.identity = id;
+            let w = widget!().identity(&id).hstack().fixed_x(x).height(row_height).fill(' ', ui.palette.default).highlight_on_hover();
             with_parent!(ui, ui.add(w), {
                 if !self.lazy && ui.check_mouse(MouseActions::CLICK_SUBTREE) {
                     self.state.select(ui.get(self.rows_container).children.len() - 1);
@@ -506,6 +514,7 @@ impl Table {
         });
     }
 
+    #[must_use]
     pub fn finish(mut self, ui: &mut UI) -> TableState {
         if !self.finished_layout[0] {
             self.finish_horizontal_layout(ui);
@@ -516,8 +525,8 @@ impl Table {
 
         if !self.lazy {
             let num_rows = ui.get(self.rows_container).children.len();
-            self.state.scroll_to_cursor |= with_parent!(ui, self.viewport, {
-                list_cursor_navigation_with_variable_row_height(&mut self.state.cursor, num_rows, |i, ui| ui.get(ui.get(self.rows_container).children[i]).axes[Axis::Y].size, ui)
+            with_parent!(ui, self.viewport, {
+                self.state.scroll_to_cursor |= list_cursor_navigation_with_variable_row_height(&mut self.state.cursor, num_rows, |i, ui| ui.get(ui.get(self.rows_container).children[i]).axes[Axis::Y].size, ui)
             });
             let scroll_to = if self.state.scroll_to_cursor && num_rows > 0 {
                 let ax = &ui.get(ui.get(self.rows_container).children[self.state.cursor]).axes[Axis::Y];
@@ -542,7 +551,7 @@ impl Table {
                 if self.enable_selection_icon {
                     let y = row.axes[Axis::Y].rel_pos;
                     with_parent!(ui, self.rows_container, {
-                        ui.add(widget!().fixed_width(1).fixed_x(0).fixed_height(1).fixed_y(y).fill('➤', ui.palette.default));
+                        ui.add(widget!().identity(&'>').fixed_width(1).fixed_x(0).fixed_height(1).fixed_y(y).fill('➤', ui.palette.default));
                     });
                 }
 
@@ -550,7 +559,7 @@ impl Table {
             });
         }
 
-        self.state.scroll_to_cursor = false;
+        self.state.did_scroll_to_cursor = mem::take(&mut self.state.scroll_to_cursor);
         self.state
     }
 
@@ -622,91 +631,109 @@ impl TabsState {
         self.selected = tab_idx;
         self.scroll_to_selected_tab = true;
     }
+    // Call when a tab is closed.
+    pub fn closed(&mut self, tab_idx: usize) {
+        if self.selected > tab_idx {
+            self.selected -= 1;
+        }
+        self.scroll_to_selected_tab = true;
+    }
+}
+
+#[derive(Default)]
+pub struct Tab {
+    pub identity: usize,
+    pub short_title: String,
+    pub full_title: String,
+    pub ephemeral: bool,
+    pub hotkey_number: Option<usize>,
+
+    // (These shouldn't be used from the outside, they're public only to make Default work, to avoid the annoying "builder pattern".)
+    pub idx: usize,
+    pub widget: WidgetIdx,
+    pub separator_widget: WidgetIdx,
+    pub disambiguation_suffix: String,
 }
 
 pub struct Tabs {
-    tabs: Vec<(WidgetIdx, /*short_title_idx*/ usize, /*full_title_idx*/ usize)>,
-    state: TabsState,
+    pub tabs: Vec<Tab>,
+    pub state: TabsState,
+    pub custom_styles: Option<(/*selected*/ Style, /*ephemeral*/ (String, Style), /*deselected*/ Style, /*separator*/ (String, Style))>,
     viewport: WidgetIdx,
     content: WidgetIdx,
 }
 impl Tabs {
     pub fn new(state: TabsState, ui: &mut UI) -> Self {
-        let content = ui.add(widget!().width(AutoSize::Children).fixed_height(1).flags(WidgetFlags::HSCROLL_INDICATOR_ARROWS).hstack());
-        Self {tabs: Vec::new(), state, viewport: ui.cur_parent, content}
+        let content = ui.add(widget!().width(AutoSize::Children).fixed_height(1).flags(WidgetFlags::HSCROLL_INDICATOR_LEFT | WidgetFlags::HSCROLL_INDICATOR_RIGHT).hstack());
+        Self {tabs: Vec::new(), state, viewport: ui.cur_parent, content, custom_styles: None}
     }
 
-    pub fn add(&mut self, full_title: &str, short_title: &str, pinned: bool, hotkey_number: Option<usize>, ui: &mut UI) {
+    pub fn add(&mut self, mut tab: Tab, ui: &mut UI) {
+        tab.idx = self.tabs.len();
+        if tab.identity == 0 {
+            tab.identity = tab.idx;
+        }
         with_parent!(ui, self.content, {
-            if self.tabs.is_empty() {
-                styled_write!(ui.text, ui.palette.tab_separator.1, " ");
-            } else {
-                styled_write!(ui.text, ui.palette.tab_separator.1, "{}", ui.palette.tab_separator.0);
-            }
-            let l = ui.text.close_line();
-            ui.add(widget!().width(AutoSize::Text).text(l));
+            tab.separator_widget = ui.add(widget!().width(AutoSize::Text));
+            tab.widget = ui.add(widget!().identity(&('t', tab.identity)).width(AutoSize::Text).max_width(35).highlight_on_hover());
 
-            with_parent!(ui, ui.add(widget!().identity(&(full_title, self.tabs.len())).width(AutoSize::Children).hstack().highlight_on_hover()), {
+            with_parent!(ui, tab.widget, {
                 if ui.check_mouse(MouseActions::CLICK) {
-                    self.state.select(self.tabs.len());
+                    self.state.select(tab.idx);
                 }
-
-                let style = if pinned {
-                    styled_write!(ui.text, ui.palette.tab_title_pinned, "📌 ");
-                    let l = ui.text.close_line();
-                    ui.add(widget!().width(AutoSize::Text).text(l));
-                    ui.palette.tab_title_pinned
-                } else {
-                    ui.palette.tab_title
-                };
-
-                styled_write!(ui.text, style, "{}", short_title);
-                if let Some(n) = hotkey_number {
-                    styled_write!(ui.text, style, " ");
-                    styled_write!(ui.text, ui.palette.hotkey, "{}", n);
-                }
-                let short_title_line = ui.text.close_line();
-                styled_write!(ui.text, style, "{}", full_title);
-                let full_title_line = ui.text.close_line();
-
-                ui.add(widget!().width(AutoSize::Text).max_width(35).text(short_title_line));
-
-                self.tabs.push((ui.cur_parent, short_title_line, full_title_line));
             });
         });
+        
+        self.tabs.push(tab);
     }
 
+    #[must_use]
     pub fn finish(mut self, ui: &mut UI) -> TabsState {
-        let keys = ui.check_keys(&[KeyAction::PreviousTab, KeyAction::NextTab]);
-        for key in keys {
-            match key {
-                KeyAction::PreviousTab if !self.tabs.is_empty() => self.state.select((self.state.selected + self.tabs.len() - 1)%self.tabs.len()),
-                KeyAction::NextTab if !self.tabs.is_empty() => self.state.select((self.state.selected + 1)%self.tabs.len()),
-                _ => (),
-            }
-        }
+        self.disambiguate_titles(ui);
 
-        if !self.tabs.is_empty() {
-            if self.state.selected >= self.tabs.len() {
-                self.state.select(self.tabs.len() - 1);
-            }
-
-            let children = ui.get(self.tabs[self.state.selected].0).children.clone();
-            for c in children {
-                if let Some(lines) = ui.get(c).draw_text.clone() {
-                    for line in lines {
-                        for span_idx in ui.text.get_line(line) {
-                            ui.text.spans[span_idx + 1].1 = ui.palette.tab_title_selected;
-                        }
-                    }
+        self.state.selected = self.state.selected.min(self.tabs.len().saturating_sub(1));
+        for key in ui.check_keys(&[KeyAction::PreviousTab, KeyAction::NextTab]) {
+            if !self.tabs.is_empty() {
+                match key {
+                    KeyAction::PreviousTab => self.state.select((self.state.selected + self.tabs.len() - 1)%self.tabs.len()),
+                    KeyAction::NextTab => self.state.select((self.state.selected + 1)%self.tabs.len()),
+                    _ => panic!("huh"),
                 }
             }
-
-            //let adj = ui.palette.selected;
-            //ui.get_mut(self.tabs[self.state.selected].0).style_adjustment.update(adj);
         }
 
-        self.disambiguate_titles(ui);
+        let (selected, ephemeral, deselected, separator) = match self.custom_styles.clone() {
+            Some(x) => x,
+            None => (ui.palette.tab_selected, ui.palette.tab_ephemeral.clone(), ui.palette.tab_deselected, ui.palette.tab_separator.clone()),
+        };
+
+        let padding_line = styled_writeln!(ui.text, separator.1, " ");
+        for (i, tab) in self.tabs.iter().enumerate() {
+            let l = if i == 0 {padding_line} else {styled_writeln!(ui.text, separator.1, "{}", separator.0)};
+            ui.get_mut(tab.separator_widget).draw_text = Some(l..l+1);
+
+            let style = match (i == self.state.selected, tab.ephemeral) {
+                (true, _) => selected,
+                (false, true) => ephemeral.1,
+                (false, false) => deselected,
+            };
+
+            if tab.ephemeral {
+                styled_write!(ui.text, style, "{}", ephemeral.0);
+            }
+            styled_write!(ui.text, style, "{}", tab.short_title);
+            if !tab.disambiguation_suffix.is_empty() {
+                styled_write!(ui.text, style, "{}", tab.disambiguation_suffix);
+            }
+            if let &Some(n) = &tab.hotkey_number {
+                styled_write!(ui.text, style, " ");
+                styled_write!(ui.text, ui.palette.hotkey.apply(style), "{}", n);
+            }
+            let l = ui.text.close_line();
+
+            ui.get_mut(tab.widget).draw_text = Some(l..l+1);
+        }
+        ui.add(widget!().parent(self.content).text(padding_line).width(AutoSize::Text));
 
         self.state.hscroll += with_parent!(ui, self.viewport, {
             ui.check_scroll() * ui.key_binds.hscroll_sensitivity
@@ -716,8 +743,8 @@ impl Tabs {
         with_parent!(ui, self.content, {
             ui.layout_children(Axis::X);
             if mem::take(&mut self.state.scroll_to_selected_tab) && !self.tabs.is_empty() {
-                let w = ui.get(self.tabs[self.state.selected].0);
-                scroll_to_range(&mut self.state.hscroll, w.axes[Axis::X].rel_pos..w.axes[Axis::X].rel_pos + w.axes[Axis::X].size as isize, viewport_width);
+                let w = ui.get(self.tabs[self.state.selected].widget);
+                scroll_to_range(&mut self.state.hscroll, w.axes[Axis::X].get_fixed_range(), viewport_width);
             }
         });
         self.state.hscroll = self.state.hscroll.min(content_width as isize - viewport_width as isize).max(0);
@@ -728,48 +755,39 @@ impl Tabs {
     }
 
     fn disambiguate_titles(&mut self, ui: &mut UI) {
-        let mut tabs = self.tabs.clone();
-        tabs.sort_by_key(|t| ui.text.get_line_str(t.1));
+        let mut sorted_tabs: Vec<(usize, &Tab)> = self.tabs.iter().enumerate().collect();
+        sorted_tabs.sort_by_key(|(i, t)| &t.short_title);
+        let mut res: Vec<(usize, String)> = Vec::new();
         let mut start = 0;
-        while start < tabs.len() {
+        while start < sorted_tabs.len() {
             let mut end = start + 1;
-            let short_title = ui.text.get_line_str(tabs[start].1);
-            while end < tabs.len() && ui.text.get_line_str(tabs[end].1) == short_title {
+            let short_title = &sorted_tabs[start].1.short_title;
+            while end < sorted_tabs.len() && &sorted_tabs[end].1.short_title == short_title {
                 end += 1;
             }
-            if end > start + 1 {
-                let full_title = ui.text.get_line_str(tabs[start].2);
-                let (mut common_prefix, mut common_suffix) = (full_title.len(), full_title.len());
-                for i in start+1..end {
-                    let t = ui.text.get_line_str(tabs[i].2);
-                    common_prefix = longest_common_prefix(&full_title[..common_prefix], t);
-                    common_suffix = longest_common_suffix(&full_title[full_title.len()-common_suffix..], t);
-                }
-                for (i, &(widget_idx, _, full_title_idx)) in tabs[start..end].iter().enumerate() {
-                    with_parent!(ui, widget_idx, {
-                        styled_write!(ui.text, ui.palette.tab_title, " [");
-                        let l = ui.text.close_line();
-                        ui.add(widget!().width(AutoSize::Text).text(l));
-
-                        let mut range = ui.text.get_line_char_range(full_title_idx);
-                        if common_prefix + common_suffix < range.len() {
-                            range.start += common_prefix;
-                            range.end -= common_suffix;
-                            unsafe {ui.text.chars.as_mut_vec().extend_from_within(range)};
-                            ui.text.close_span(ui.palette.tab_title);
-                        } else {
-                            styled_write!(ui.text, ui.palette.tab_title, "{}", i - start + 1);
-                        }
-                        let l = ui.text.close_line();
-                        ui.add(widget!().width(AutoSize::Text).max_width(35).text(l));
-
-                        styled_write!(ui.text, ui.palette.tab_title, "]");
-                        let l = ui.text.close_line();
-                        ui.add(widget!().width(AutoSize::Text).text(l));
-                    });
-                }
+            if end == start + 1 {
+                start += 1;
+                continue;
             }
-            start = end;
+
+            let full_title = &sorted_tabs[start].1.full_title;
+            let (mut common_prefix, mut common_suffix) = (full_title.len(), full_title.len());
+            for i in start+1..end {
+                let t = &sorted_tabs[i].1.full_title;
+                common_prefix = longest_common_prefix(&full_title[..common_prefix], t);
+                common_suffix = longest_common_suffix(&full_title[full_title.len()-common_suffix..], t);
+            }
+            for (i, &(idx, tab)) in sorted_tabs[start..end].iter().enumerate() {
+                let suffix = if common_prefix + common_suffix < tab.full_title.len() {
+                    format!(" [{}]", &tab.full_title[common_prefix..tab.full_title.len()-common_suffix])
+                } else {
+                    format!(" [#{}]", i + 1)
+                };
+                res.push((idx, suffix));
+            }
+        }
+        for (idx, suffix) in res {
+            self.tabs[idx].disambiguation_suffix = suffix;
         }
     }
 }
@@ -883,7 +901,7 @@ impl TextInput {
             scroll_bar = ui.add(widget!().fixed_width(1).fixed_height(0));
         };
 
-        let content_widget = ui.add(widget!().parent(viewport_widget).height(AutoSize::Text).width(AutoSize::Text).fixed_x(0).flags(WidgetFlags::HSCROLL_INDICATOR_ARROWS));
+        let content_widget = ui.add(widget!().parent(viewport_widget).height(AutoSize::Text).width(AutoSize::Text).fixed_x(0).flags(WidgetFlags::HSCROLL_INDICATOR_LEFT | WidgetFlags::HSCROLL_INDICATOR_RIGHT));
 
         self.update(content_widget, ui);
         with_parent!(ui, viewport_widget, {
@@ -1581,4 +1599,92 @@ impl SearchBar {
         self.editing = true;
         self.text.select_all();
     }
+}
+
+#[derive(Default)]
+pub struct AreaState {
+    pub cursor: usize,
+    pub scroll: isize,
+
+    pub hcursor: usize,
+    pub hscroll: isize,
+
+    pub scroll_to_cursor: bool,
+
+    // These can be used for horizontal cursor in code window.
+    pub cursor_extra_height: usize,
+    pub no_auto_hscroll: bool, // auto prevents clearing of scroll_to_cursor (so that the caller can use it to do their own auto-hscroll)
+}
+impl AreaState {
+    pub fn select(&mut self, cursor: usize) {
+        self.cursor = cursor;
+        self.hcursor = 0;
+        self.scroll_to_cursor = true;
+    }
+}
+
+// Makes the tree of widgets used by code and disassembly windows (simplified):
+//  +-cur_parent-----------------------------+
+//  | +-hscrollable---------+ +-vscrollbar-+ |
+//  | | header text         | |            | |
+//  | | +-vscrollable-----+ | |            | |
+//  | | | content         | | |            | |
+//  | | +-----------------+ | |            | |
+//  | +---------------------+ +------------+ |
+//  +----------------------------------------+
+//
+// Moves cursor by arrow keys and clicks (using CLICK rather than CLICK_SUBTREE, so the caller may intercept it).
+// Returns content widget and its visible Y range. Remember to put HSCROLL_INDICATOR_RIGHT flag on each widget inside `content`.
+pub fn build_biscrollable_area(header_lines: Range<usize>, mut content_size: [usize; 2], state: &mut AreaState, ui: &mut UI) -> (WidgetIdx, Range<isize>) {
+    content_size[Axis::X] = content_size[Axis::X].max(ui.text.widest_line(header_lines.clone()));
+
+    ui.cur_mut().set_hstack();
+    let hscroll_viewport = ui.add(widget!().width(AutoSize::Remainder(1.0)));
+    let scroll_bar = ui.add(widget!().fixed_width(1));
+    ui.layout_children(Axis::X);
+
+    let hscroll_content = ui.add(widget!().parent(hscroll_viewport).fixed_width(content_size[Axis::X]).vstack().flags(WidgetFlags::HSCROLL_INDICATOR_LEFT));
+    let vscroll_viewport;
+    with_parent!(ui, hscroll_content, {
+        ui.add(widget!().text_lines(header_lines).height(AutoSize::Text).flags(WidgetFlags::HSCROLL_INDICATOR_RIGHT));
+        vscroll_viewport = ui.add(widget!().height(AutoSize::Remainder(1.0)));
+        ui.layout_children(Axis::Y);
+    });
+
+    let vscroll_content = ui.add(widget!().parent(vscroll_viewport).fixed_height(content_size[Axis::Y] + state.cursor_extra_height));
+    with_parent!(ui, vscroll_content, {
+        if ui.check_mouse(MouseActions::CLICK) {
+            let y = ui.cur().mouse_pos[Axis::Y];
+            if y >= 0 && (y as usize) < content_size[Axis::Y] + state.cursor_extra_height {
+                let mut i = y as usize;
+                if i > state.cursor + state.cursor_extra_height {
+                    i -= state.cursor_extra_height;
+                } else if i > state.cursor {
+                    i = state.cursor;
+                }
+                state.select(i);
+            }
+        }
+    });
+
+    let visible_y;
+    let root = ui.cur_parent;
+    with_parent!(ui, vscroll_viewport, {
+        ui.focus();
+        state.scroll_to_cursor |= list_cursor_navigation(&mut state.cursor, content_size[Axis::Y], 1, ui);
+        let scroll_to = if state.scroll_to_cursor {Some(state.cursor as isize .. (state.cursor + state.cursor_extra_height) as isize + 1)} else {None};
+        visible_y = scrolling_navigation(&mut state.scroll, scroll_to, root, scroll_bar, ui);
+    });
+
+    if !state.no_auto_hscroll {
+        if state.scroll_to_cursor {
+            scroll_to_range(&mut state.hscroll, state.hcursor as isize .. state.hcursor as isize + 1, content_size[Axis::X]);
+        }
+        with_parent!(ui, hscroll_viewport, {
+            hscrolling_navigation(&mut state.hscroll, ui);
+        });
+        state.scroll_to_cursor = false;
+    }
+
+    (vscroll_content, visible_y)
 }

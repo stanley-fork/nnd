@@ -971,7 +971,7 @@ impl Debugger {
         //
         // Here we should be careful to ensure that:
         //  * Instruction-level step-into always works, even if both unwind and symbols are missing.
-        //  * Instruction-level step-over and step-out work even if symbols are missing (but require unwind).
+        //  * Instruction-level step-over and step-out work even if symbols are missing (but unwind is required).
 
         // Overview of the cases:
         //  * Into && by_instructions - single-instruction step, i.e. PTRACE_SINGLESTEP
@@ -1046,9 +1046,13 @@ impl Debugger {
 
             assert!(!by_instructions);
 
-            let function = &stack.subframes[frame.subframes.end - 1].function.as_ref_clone_error()?.0;
+            let function_idx = stack.subframes[frame.subframes.end - 1].function_idx.clone()?;
             let binary = self.info.binaries.get(frame.binary_id.as_ref().unwrap()).unwrap();
-            let symbols = binary.symbols.as_ref_clone_error().unwrap();
+            let symbols = binary.symbols.as_ref_clone_error()?;
+            if symbols.identity != frame.symbols_identity {
+                return err!(Internal, "symbols were reloaded after generating backtrace");
+            }
+            let function = &symbols.functions[function_idx];
             let static_pseudo_addr = binary.addr_map.dynamic_to_static(frame.pseudo_addr);
             let mut static_addr_ranges: Vec<Range<usize>> = Vec::new();
 
@@ -1056,7 +1060,7 @@ impl Debugger {
             let subfunctions = &symbols.shards[function.shard_idx()].subfunctions;
             if kind == StepKind::Out {
                 step.internal_kind = StepKind::Over;
-                let subfunction_idx = subframe.subfunction.as_ref().unwrap().1;
+                let subfunction_idx = subframe.subfunction_idx.clone().unwrap();
                 for r in symbols.subfunction_ranges_at_level(frame.subframes.end - 1 - subframe_idx, function) {
                     if r.subfunction_idx == subfunction_idx {
                         static_addr_ranges.push(r.range.clone());
@@ -1066,7 +1070,7 @@ impl Debugger {
             }
             if kind == StepKind::Over && frame.subframes.end - subframe_idx < function.num_levels() {
                 let subfunc_ranges = symbols.subfunction_ranges_at_level(frame.subframes.end - subframe_idx, function);
-                let parent_idx = subframe.subfunction.as_ref().unwrap().1;
+                let parent_idx = subframe.subfunction_idx.clone().unwrap();
                 if let Some(start_line) = &subframe.line {
                     for r in subfunc_ranges {
                         let l = &subfunctions[r.subfunction_idx].call_line;
@@ -1075,7 +1079,7 @@ impl Debugger {
                         }
                     }
                 } else if subframe_idx > frame.subframes.start {
-                    let child_idx = stack.subframes[subframe_idx - 1].subfunction.as_ref().unwrap().1;
+                    let child_idx = stack.subframes[subframe_idx - 1].subfunction_idx.clone().unwrap();
                     for r in subfunc_ranges {
                         if r.subfunction_idx == child_idx {
                             static_addr_ranges.push(r.range.clone());
@@ -1373,7 +1377,7 @@ impl Debugger {
             }
             let addr = regs.get_int(RegisterIdx::Rip).unwrap().0 as usize;
             let pseudo_addr = if idx == 0 {addr} else {addr - 1};
-            stack.subframes.push(StackSubframe {frame_idx: stack.frames.len(), function: err!(MissingSymbols, "unwind failed"), ..Default::default()});
+            stack.subframes.push(StackSubframe {frame_idx: stack.frames.len(), function_idx: err!(MissingSymbols, "unwind failed"), ..Default::default()});
             stack.frames.push(StackFrame {addr, pseudo_addr, regs: regs.clone(), subframes: stack.subframes.len()-1..stack.subframes.len(), .. Default::default()});
             let frame = &mut stack.frames.last_mut().unwrap();
 
@@ -1381,6 +1385,7 @@ impl Debugger {
             // But for now we just stop if we can't find the binary (may be a problem for JIT-generated code) or .eh_frame section in it.
             let (_, static_addr, binary, _) = self.addr_to_binary(pseudo_addr)?;
             frame.binary_id = Some(binary.id.clone());
+            frame.addr_static_to_dynamic = binary.addr_map.static_to_dynamic(static_addr).wrapping_sub(static_addr);
 
             // This populates CFA "register", so needs to happen before symbolizing the frame (because frame_base expression might use CFA).
             let unwind = binary.unwind.as_ref_clone_error()?;
@@ -1415,7 +1420,7 @@ impl Debugger {
             None => return Ok(()) };
         let unit = symbols.find_unit(debug_info_offset)?;
         let no_frame_base = err!(Dwarf, "frame base depends on itself");
-        let context = DwarfEvalContext {memory: &self.memory, symbols: Some(symbols), addr_map: &binary.addr_map, encoding: unit.unit.header.encoding(), unit: Some(unit), regs: Some(&frame.regs), frame_base: &no_frame_base};
+        let context = DwarfEvalContext {memory: &self.memory, symbols: Some(symbols), addr_map: &binary.addr_map, encoding: unit.unit.header.encoding(), unit: Some(unit), regs: Some(&frame.regs), frame_base: &no_frame_base, local_variables: &[]};
         for v in symbols.local_variables_in_subfunction(root_subfunction, function.shard_idx()) {
             if !v.flags().contains(LocalVariableFlags::FRAME_BASE) {
                 // Frame bases are always first in the list.
@@ -1450,21 +1455,30 @@ impl Debugger {
         let symbols = match binary.symbols.as_ref_clone_error() {
             Ok(s) => s,
             Err(e) => {
-                subframes.last_mut().unwrap().function = Err(e);
+                subframes.last_mut().unwrap().function_idx = Err(e);
                 return;
             }
         };
+        frame.symbols_identity = symbols.identity;
+
+        let make_file_line_info = |line: LineInfo| -> FileLineInfo {
+            let file = &symbols.files[line.file_idx().unwrap()];
+            FileLineInfo {line, filename: file.filename.to_owned(), path: file.path.to_owned(), version: file.version.clone()}
+        };
+        
         match symbols.addr_to_function(static_addr) {
-            Err(e) => subframes.last_mut().unwrap().function = Err(e.clone()),
+            Err(e) => subframes.last_mut().unwrap().function_idx = Err(e.clone()),
             Ok((function, function_idx)) => {
-                subframes.last_mut().unwrap().function = Ok((function.clone(), function_idx));
+                let sf = subframes.last_mut().unwrap();
+                sf.function_idx = Ok(function_idx);
+                sf.function_name = function.demangle_name();
                 if let Some((root_subfunction, root_subfunction_idx)) = symbols.root_subfunction(function) {
-                    subframes.last_mut().unwrap().subfunction = Some((root_subfunction.clone(), root_subfunction_idx));
+                    sf.subfunction_idx = Some(root_subfunction_idx);
 
                     match self.calculate_frame_base(frame, static_addr, binary, symbols, function, root_subfunction) {
                         Ok(()) => (),
                         Err(e) => frame.frame_base = Err(e) }
-                    
+
                     for level in 1..function.num_levels() {
                         let ranges = symbols.subfunction_ranges_at_level(level, function);
                         let i = ranges.partition_point(|r| r.range.end <= static_addr);
@@ -1473,7 +1487,20 @@ impl Debugger {
                         }
                         let subfunction_idx = ranges[i].subfunction_idx;
                         let subfunction = &symbols.shards[function.shard_idx()].subfunctions[subfunction_idx];
-                        subframes.push(StackSubframe {frame_idx, subfunction: Some((subfunction.clone(), subfunction_idx)), ..Default::default()});
+
+                        if subfunction.call_line.file_idx().is_some() {
+                            subframes.last_mut().unwrap().line = Some(make_file_line_info(subfunction.call_line.clone()));
+                        }
+
+                        let mut callee_name = String::new();
+                        let callee_idx = if subfunction.callee_idx == usize::MAX {
+                            err!(Dwarf, "missing inline call info")
+                        } else {
+                            callee_name = symbols.functions[subfunction.callee_idx].demangle_name();
+                            Ok(subfunction.callee_idx)
+                        };
+
+                        subframes.push(StackSubframe {frame_idx, subfunction_idx: Some(subfunction_idx), function_idx: callee_idx, function_name: callee_name, ..Default::default()});
                         frame.subframes.end += 1;
                     }
                     subframes[frame.subframes.clone()].reverse();
@@ -1481,34 +1508,8 @@ impl Debugger {
             }
         }
 
-        for i in frame.subframes.clone() {
-            let mut line: Option<LineInfo> = None;
-            if i == frame.subframes.start {
-                line = symbols.find_line(static_addr);
-            } else if let Some((s, _)) = &subframes[i-1].subfunction {
-                if s.call_line.file_idx().is_some() {
-                    line = Some(s.call_line.clone());
-                }
-            }
-            if let Some(line) = line {
-                let file = &symbols.files[line.file_idx().unwrap()];
-                subframes[i].line = Some(FileLineInfo {line, filename: file.filename.to_owned(), path: file.path.to_owned(), version: file.version.clone()});
-            }
-
-            let sf = &mut subframes[i];
-            if i + 1 < frame.subframes.end {
-                let function_idx = sf.subfunction.as_ref().unwrap().0.callee_idx;
-                sf.function = if function_idx == usize::MAX {
-                    err!(Dwarf, "missing inline call info")
-                } else {
-                    Ok((symbols.functions[function_idx].clone(), function_idx))
-                }
-            }
-            if let Ok((f, _)) = &sf.function {
-                sf.function_name = Some(f.demangle_name());
-            } else {
-                sf.function_name = None;
-            }
+        if let Some(line) = symbols.find_line(static_addr) {
+            subframes[frame.subframes.start].line = Some(make_file_line_info(line));
         }
     }
 

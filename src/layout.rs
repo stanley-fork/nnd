@@ -11,6 +11,7 @@ pub struct Layout {
     pub outer_walls: [[bool; 2]; 2],
 
     // Assigned on every frame.
+    active_leaf: RegionId,
     root_widget: WidgetIdx,
     wall_widgets: Vec<WidgetIdx>,
     // Information used for deciding which of the Box Drawing unicode characters (https://en.wikipedia.org/wiki/Box_Drawing)
@@ -55,7 +56,7 @@ pub struct Region {
     pub outer_walls: [[WidgetIdx; 2]; 2], // [axis][-/+]
 }
 impl Region {
-    fn clear_layout(&mut self) { self.area = Rect::default(); self.outer_walls = [[WidgetIdx::invalid(); 2]; 2]; match &mut self.content { RegionContent::Leaf(leaf) => leaf.widget = WidgetIdx::invalid(), _ => () } }
+    fn clear_layout(&mut self) { self.area = Rect::default(); self.outer_walls = [[WidgetIdx::invalid(); 2]; 2]; match &mut self.content { RegionContent::Leaf(leaf) => (leaf.tabs_widget, leaf.content_widget) = (WidgetIdx::invalid(), WidgetIdx::invalid()), _ => () } }
 }
 
 pub struct RegionSplit {
@@ -69,7 +70,8 @@ pub struct RegionLeaf {
     pub tabs_state: TabsState,
 
     // Assigned on every frame.
-    pub widget: WidgetIdx,
+    pub tabs_widget: WidgetIdx,
+    pub content_widget: WidgetIdx,
 }
 
 pub enum RegionContent {
@@ -78,6 +80,7 @@ pub enum RegionContent {
 }
 
 impl RegionContent {
+    pub fn is_leaf(&self) -> bool { match self { RegionContent::Leaf(_) => true, _ => false }  }
     pub fn as_split(&self) -> &RegionSplit { match self { RegionContent::Split(x) => x, RegionContent::Leaf(_) => panic!("not a split"), } }
     pub fn as_leaf(&self) -> &RegionLeaf { match self { RegionContent::Leaf(x) => x, RegionContent::Split(_) => panic!("not a leaf"), } }
     pub fn as_leaf_mut(&mut self) -> &mut RegionLeaf { match self { RegionContent::Leaf(x) => x, RegionContent::Split(_) => panic!("not a leaf"), } }
@@ -88,9 +91,9 @@ impl Layout {
     pub fn new() -> Layout {
         let mut regions: Pool<Region> = Pool::new();
         let root = regions.add(Region {parent: None, area: Rect::default(), content: RegionContent::Leaf(RegionLeaf::default()), relative_size: 1000000, outer_walls: [[WidgetIdx::invalid(); 2]; 2]}).0;
-        //asdqwe let outer_walls = [[false, false], [true, false]];
-        let outer_walls = [[true, true], [true, true]];
-        Layout {windows: Pool::new(), active_window: None, regions, root, outer_walls, root_widget: WidgetIdx::invalid(), wall_masks: Vec::new(), wall_widgets: Vec::new()}
+        let outer_walls = [[true, true], [true, true]]; // all walls along the edge of the screen
+        // let outer_walls = [[false, false], [true, false]]; // only the top wall
+        Layout {windows: Pool::new(), active_window: None, regions, root, outer_walls, root_widget: WidgetIdx::invalid(), wall_masks: Vec::new(), wall_widgets: Vec::new(), active_leaf: RegionId::default()}
     }
 
     pub fn split(&mut self, region_id: RegionId, axis: usize, walls: Vec<f64>) -> Vec<RegionId> {
@@ -116,7 +119,7 @@ impl Layout {
         for i in 0..walls.len() {
             let end = if i + 1 < walls.len() {walls[i+1]} else {1.0};
             let relative_size = (((end - walls[i]) * denominator) as usize).max(1);
-            children.push(self.regions.add(Region {parent: Some(new_region_id), content: RegionContent::Leaf(RegionLeaf {tabs: Vec::new(), tabs_state: TabsState::default(), widget: WidgetIdx::invalid()}), relative_size, area: Rect::default(), outer_walls: [[WidgetIdx::invalid(); 2]; 2]}).0);
+            children.push(self.regions.add(Region {parent: Some(new_region_id), content: RegionContent::Leaf(RegionLeaf {tabs: Vec::new(), tabs_state: TabsState::default(), tabs_widget: WidgetIdx::invalid(), content_widget: WidgetIdx::invalid()}), relative_size, area: Rect::default(), outer_walls: [[WidgetIdx::invalid(); 2]; 2]}).0);
         }
         let new_region = self.regions.get_mut(new_region_id);
         new_region.content.as_split_mut().children = children.clone();
@@ -228,74 +231,29 @@ impl Layout {
         v
     }
 
-    pub fn activate_any_visible_window_if_none_active(&mut self) -> bool {
-        if let &Some(id) = &self.active_window {
-            let win = self.windows.get(id);
-            if win.visible {
-                return true;
-            }
-            if let &Some(region_id) = &win.region {
-                let region = self.regions.get(region_id);
-                for &w in &region.content.as_leaf().tabs {
-                    if self.windows.get(w).visible {
-                        self.active_window = Some(w);
-                        return true;
-                    }
-                }
-            }
-        }
-        for (id, win) in self.windows.iter() {
-            if win.visible {
-                self.active_window = Some(id);
-                return true;
-            }
-        }
-        false
-    }
-
-    pub fn window_at_point(&self, p: [isize; 2]) -> Option<WindowId> {
-        for (id, win) in self.windows.iter() {
-            if win.area.contains(p.clone()) {
+    pub fn leaf_at_point(&self, p: [isize; 2]) -> Option<WindowId> {
+        for (id, region) in self.regions.iter() {
+            if region.content.is_leaf() && region.area.contains(p.clone()) {
                 return Some(id);
             }
         }
         None
     }
 
-    pub fn switch_to_adjacent_window(&mut self, dx: isize, dy: isize) {
-        if !self.activate_any_visible_window_if_none_active() {
-            return;
-        }
-        let a = self.windows.get(self.active_window.unwrap()).area.clone();
+    pub fn switch_to_adjacent_leaf(&mut self, axis: usize, side: usize) {
         // Take a point just to the left/right/up/down of the rect, next to the middle of the corresponding edge.
         // Then find a window containing that point.
-        let point = match (dx, dy) {
-            (-1, 0) => [a.x() - 2, a.y() + a.height() as isize / 2],
-            (1, 0) => [a.right() + 1, a.y() + a.height() as isize / 2],
-            (0, -1) => [a.x() + a.width() as isize / 2, a.y() - 3],
-            (0, 1) => [a.x() + a.width() as isize / 2, a.bottom() + 2],
-            _ => panic!("unexpected args to switch_to_adjacent_window"),
-        };
-        if let Some(id) = self.window_at_point(point) {
-            self.active_window = Some(id);
+        let area = self.regions.get(self.active_leaf).area.clone();
+        let mut p = area.center();
+        p[axis] = if side == 0 {area.pos[axis] - 2} else {area.end(axis) + 1};
+        if let Some(id) = self.leaf_at_point(p) {
+            self.active_leaf = id;
             return;
         }
         // Maybe point landed on a wall. Nudge it in perpendicular direction and try again.
-        let point = [point[0] + dy, point[1] - dx];
-        if let Some(id) = self.window_at_point(point) {
-            self.active_window = Some(id);
-        }        
-    }
-
-    pub fn switch_to_window_with_hotkey_number(&mut self, number: usize) {
-        for (id, win) in self.windows.iter() {
-            if win.hotkey_number == Some(number) && win.region.is_some() {
-                self.active_window = Some(id);
-                let leaf = self.regions.get_mut(win.region.clone().unwrap()).content.as_leaf_mut();
-                let i = leaf.tabs.iter().position(|w| w == &id).unwrap();
-                leaf.tabs_state.select(i);
-                return;
-            }
+        p[1-axis] += 1;
+        if let Some(id) = self.leaf_at_point(p) {
+            self.active_leaf = id;
         }
     }
 
@@ -339,20 +297,57 @@ impl Layout {
     }
 
     pub fn build(&mut self, ui: &mut UI) {
-        self.wall_widgets.clear();
-        self.wall_masks.clear();
-        self.root_widget = ui.cur_parent;
-        for action in ui.check_keys(&[KeyAction::WindowLeft, KeyAction::WindowRight, KeyAction::WindowDown, KeyAction::WindowUp, KeyAction::Window(0), KeyAction::Window(1), KeyAction::Window(2), KeyAction::Window(3), KeyAction::Window(4), KeyAction::Window(5), KeyAction::Window(6), KeyAction::Window(7), KeyAction::Window(8), KeyAction::Window(9)]) {
+        // Maybe change active_window.
+        let mut switched_window = false;
+        for action in ui.check_keys(&[KeyAction::Window(0), KeyAction::Window(1), KeyAction::Window(2), KeyAction::Window(3), KeyAction::Window(4), KeyAction::Window(5), KeyAction::Window(6), KeyAction::Window(7), KeyAction::Window(8), KeyAction::Window(9)]) {
             match action {
-                KeyAction::Window(n) => self.switch_to_window_with_hotkey_number(n),
-                KeyAction::WindowLeft => self.switch_to_adjacent_window(-1, 0),
-                KeyAction::WindowRight => self.switch_to_adjacent_window(1, 0),
-                KeyAction::WindowUp => self.switch_to_adjacent_window(0, -1),
-                KeyAction::WindowDown => self.switch_to_adjacent_window(0, 1),
+                KeyAction::Window(n) => if let Some((id, _)) = self.windows.iter().find(|(_, win)| win.region.is_some() && win.hotkey_number == Some(n)) {
+                    self.active_window = Some(id);
+                    switched_window = true;
+                }
                 _ => panic!("huh"),
             }
         }
 
+        // User of Layout mostly cares about windows and not regions, so we have public active_region field.
+        // But the build() procedure mostly cares about regions and not windows.
+        // So we map active_window to active_leaf here, then map it back near the end of build().
+        let mut found = false;
+        if let &Some(window_id) = &self.active_window {
+            let win = self.windows.get(window_id);
+            if let &Some(region_id) = &win.region {
+                let leaf = self.regions.get_mut(region_id).content.as_leaf_mut();
+                let i = leaf.tabs.iter().position(|w| w == &window_id).unwrap();
+                leaf.tabs_state.selected = i;
+                leaf.tabs_state.scroll_to_selected_tab |= switched_window;
+                self.active_leaf = region_id;
+                found = true;
+            }
+        }
+        if !found {
+            for (id, region) in self.regions.iter() {
+                if region.content.is_leaf() {
+                    self.active_leaf = id;
+                    found = true;
+                }
+            }
+            assert!(found);
+        }
+
+        // Maybe change active leaf.
+        for action in ui.check_keys(&[KeyAction::WindowLeft, KeyAction::WindowRight, KeyAction::WindowDown, KeyAction::WindowUp]) {
+            match action {
+                KeyAction::WindowLeft => self.switch_to_adjacent_leaf(Axis::X, 0),
+                KeyAction::WindowRight => self.switch_to_adjacent_leaf(Axis::X, 1),
+                KeyAction::WindowUp => self.switch_to_adjacent_leaf(Axis::Y, 0),
+                KeyAction::WindowDown => self.switch_to_adjacent_leaf(Axis::Y, 1),
+                _ => panic!("huh"),
+            }
+        }
+
+        self.root_widget = ui.cur_parent;
+        self.wall_widgets.clear();
+        self.wall_masks.clear();
         for (_, win) in self.windows.iter_mut() {
             win.clear_layout();
         }
@@ -361,12 +356,12 @@ impl Layout {
         }
 
         // Build walls along the edges of the screen if needed.
+        //
         // There's a subtlety about corners. Consider the top wall when all 4 walls are enabled vs when only the top wall is enabled.
         // In top-only mode we want the wall to go all the way to the edge of the screen, not to the middle of the first and last cell of the screen ('─', not '╴').
-        // But in all-walls mode we want the wall to go to the center of the first and last cell ('╴' + '╷' = '╮' in wall masks).
+        // But in all-walls mode we want the wall to go to the center of the first and last cell ('╴' + '╷' = '┐', not '─' + '│' = '┼').
         // Trick: always build the whole frame, but extend the root rect such that unneeded sides are just off-screen.
-        assert!(ui.cur().axes[0].flags.contains(AxisFlags::SIZE_KNOWN) && ui.cur().axes[1].flags.contains(AxisFlags::SIZE_KNOWN));
-        let mut area = Rect {pos: [0, 0], size: [ui.cur().axes[0].size, ui.cur().axes[1].size]};
+        let mut area = Rect {pos: [0, 0], size: [ui.cur().axes[0].get_fixed_size(), ui.cur().axes[1].get_fixed_size()]};
         for axis in 0..2 {
             for side in 0..2 {
                 if self.outer_walls[axis][side] && area.size[axis] > 0 {
@@ -394,24 +389,39 @@ impl Layout {
             }
         }
 
-        // Do layout and build inner walls.
+        // Do layout, build inner walls, make container widgets for leaf regions.
+        // After this, all areas and active_leaf are final, but active window is not (tab switch may happen later).
         let mut stack = vec![self.root];
         let mut visited_regions: HashSet<RegionId> = HashSet::new();
         let mut visited_windows: HashSet<WindowId> = HashSet::new();
         while let Some(region_id) = stack.pop() {
             let ins = visited_regions.insert(region_id);
             assert!(ins);
-            let region = self.regions.get(region_id);
+            let region = self.regions.get_mut(region_id);
             let area = region.area;
 
-            match &region.content {
+            match &mut region.content {
                 RegionContent::Leaf(leaf) => {
                     for &window_id in &leaf.tabs {
                         let ins = visited_windows.insert(window_id);
                         assert!(ins);
                         assert_eq!(self.windows.get(window_id).region, Some(region_id));
                     }
-                    self.build_leaf(region_id, ui);
+
+                    // Tabs widget, also acting as window title, overlaps the wall above this region. Make its width match the tabs width, to leave some length of draggable wall. That's why we can't put table_widget and content_widget inside a container widget.
+                    // Create these two widgets early to be able to switch active_leaf on click before we drew the bold frame around it.
+                    leaf.tabs_widget = ui.add(widget!().identity(&('t', region_id)).fixed_height(1).width(AutoSize::Children).max_width(region.area.width().saturating_sub(1)).fixed_x(region.area.x()).fixed_y(region.area.y() - 1));
+                    leaf.content_widget = ui.add(widget!().identity(&('w', region_id)).fixed_rect(region.area));
+                    with_parent!(ui, leaf.tabs_widget, {
+                        if ui.check_mouse(MouseActions::CLICK_SUBTREE) {
+                            self.active_leaf = region_id;
+                        }
+                    });
+                    with_parent!(ui, leaf.content_widget, {
+                        if ui.check_mouse(MouseActions::CLICK_SUBTREE) {
+                            self.active_leaf = region_id;
+                        }
+                    });
                 }
                 RegionContent::Split(_) => {
                     self.build_split(region_id, ui);
@@ -431,17 +441,12 @@ impl Layout {
             assert!(visited_windows.contains(&id));
         }
 
-        self.activate_any_visible_window_if_none_active();
-
         // Trace bold border around active region.
-        if let &Some(window_id) = &self.active_window {
-            let window = self.windows.get(window_id);
-            let region = self.regions.get(window.region.clone().unwrap());
-            for axis in 0..2 {
-                for side in 0..2 {
-                    let pos = if side == 0 {-1} else {region.area.size[axis] as isize};
-                    let w = Self::trace_wall(axis, region.area, pos, true, &mut self.wall_masks);
-                }
+        let area = self.regions.get(self.active_leaf).area;
+        for axis in 0..2 {
+            for side in 0..2 {
+                let pos = if side == 0 {-1} else {area.size[axis] as isize};
+                let w = Self::trace_wall(axis, area, pos, true, &mut self.wall_masks);
             }
         }
 
@@ -472,34 +477,60 @@ impl Layout {
             ui.get_mut(idx).draw_text = Some(start_line..end_line);
         }
 
-        for (region_id, region) in self.regions.iter() {
-            match &region.content {
-                RegionContent::Leaf(leaf) => {
-                    let is_active = self.active_window.is_some() && leaf.tabs.get(leaf.tabs_state.selected) == self.active_window.as_ref();
-                    // Draw window title.
-                    let wall_above = region.outer_walls[Axis::Y][0];
-                    if leaf.tabs.len() == 1 && wall_above.is_valid() {
-                        let w = ui.get(wall_above);
-                        assert!(w.axes[Axis::X].flags.contains(AxisFlags::POS_KNOWN));
-                        let rel_x = region.area.x() - w.axes[Axis::X].rel_pos;
-                        let style = if is_active {ui.palette.window_border_active} else {ui.palette.window_border};
-                        let window = self.windows.get(leaf.tabs[0]);
-                        styled_write!(ui.text, style, "{}", window.title);
-                        if let &Some(n) = &window.hotkey_number {
-                            styled_write!(ui.text, style, " ");
-                            styled_write!(ui.text, ui.palette.hotkey, "{}", n);
-                        }
-                        let l = ui.text.close_line();
-                        ui.add(widget!().parent(wall_above).fixed_x(rel_x).width(AutoSize::Text).max_width(region.area.width().saturating_sub(1)).text(l));
-                    }
-                    // Focus active window.
-                    if is_active {
-                        with_parent!(ui, leaf.widget, {
-                            ui.focus();
-                        });
-                    }
+        // Build tabs (aka window titles) for leaf regions, assign active_window.
+        self.active_window = None;
+        for (region_id, region) in self.regions.iter_mut() {
+            if !region.content.is_leaf() {
+                continue;
+            }
+            let leaf = region.content.as_leaf_mut();
+            let is_active = self.active_leaf == region_id;
+
+            with_parent!(ui, leaf.content_widget, {
+                if is_active {
+                    // Focus window content before region title tabs, so that the window can intercept tab switching keys if it wants.
+                    ui.multifocus();
                 }
-                RegionContent::Split(_) => (),
+            });
+
+            with_parent!(ui, leaf.tabs_widget, {
+                if is_active {
+                    ui.focus();
+                }
+
+                let mut tabs = Tabs::new(mem::take(&mut leaf.tabs_state), ui);
+                let style = if is_active {ui.palette.window_title_active} else {ui.palette.window_title_selected};
+                tabs.custom_styles = Some((style, (String::new(), ui.palette.window_title_deselected), ui.palette.window_title_deselected, ui.palette.window_title_separator.clone()));
+                for &window_id in &leaf.tabs {
+                    let win = self.windows.get(window_id);
+                    tabs.add(Tab {identity: hash(&window_id), short_title: win.title.clone(), hotkey_number: win.hotkey_number.clone(), ..D!()}, ui);
+                }
+                leaf.tabs_state = tabs.finish(ui);
+            });
+
+            for (i, &window_id) in leaf.tabs.iter().enumerate() {
+                let win = self.windows.get_mut(window_id);
+                if i == leaf.tabs_state.selected {
+                    win.visible = true;
+                    win.area = region.area;
+                    win.widget = leaf.content_widget;
+                    if is_active {
+                        self.active_window = Some(window_id);
+                    }
+                } else {
+                    win.widget = ui.add(widget!().identity(&('u', window_id)).fixed_rect(Rect::default()));
+                }
+            }
+        }
+
+        if self.active_window.is_none() {
+            assert!(self.regions.get(self.active_leaf).content.as_leaf().tabs.is_empty());
+            for (id, win) in self.windows.iter() {
+                if win.visible {
+                    self.active_window = Some(id);
+                    ui.should_redraw = true;
+                    break;
+                }
             }
         }
     }
@@ -627,64 +658,6 @@ impl Layout {
             child.outer_walls = outer_walls.clone();
             child.outer_walls[axis] = [walls[i].0, walls[i+1].0];
         }
-    }
-
-    fn build_leaf(&mut self, region_id: RegionId, ui: &mut UI) {
-        let region = self.regions.get_mut(region_id);
-        let leaf = region.content.as_leaf_mut();
-
-        let mut area = region.area;
-        // (Remove this to put tabs below the wall instead of inside it. May look slightly less confusing, idk.)
-        if leaf.tabs.len() > 1 {
-            area.pos[1] -= 1;
-            area.size[1] += 1;
-        }
-
-        leaf.widget = ui.add(widget!().identity(&('l', region_id)).fixed_rect(area));
-        let mut content_widget = leaf.widget;
-        with_parent!(ui, leaf.widget, {
-            let mut content_area = area;
-            if leaf.tabs.len() == 1 {
-                leaf.tabs_state.select(0);
-            } else if leaf.tabs.len() > 1 {
-                ui.cur_mut().axes[Axis::Y].flags.insert(AxisFlags::STACK);
-                let tabs_widget = ui.add(widget!().identity(&'t').fixed_height(1).width(AutoSize::Children).max_width(area.width()));
-                content_widget = ui.add(widget!().identity(&'w').height(AutoSize::Remainder(1.0)));
-                ui.layout_children(Axis::Y);
-                if content_area.height() > 0 {
-                    content_area.size[Axis::Y] -= 1;
-                    content_area.pos[Axis::Y] += 1;
-                }
-
-                with_parent!(ui, content_widget, {
-                    ui.relative_focus(leaf.widget);
-                });
-                with_parent!(ui, tabs_widget, {
-                    ui.multifocus();
-                    let mut tabs = Tabs::new(mem::take(&mut leaf.tabs_state), ui);
-                    for &window_id in &leaf.tabs {
-                        let window = self.windows.get(window_id);
-                        tabs.add(&window.title, &window.title, false, window.hotkey_number.clone(), ui);
-                    }
-                    leaf.tabs_state = tabs.finish(ui);
-                });
-            }
-
-            for (i, &window_id) in leaf.tabs.iter().enumerate() {
-                let window = self.windows.get_mut(window_id);
-                if i == leaf.tabs_state.selected {
-                    window.visible = true;
-                    window.area = content_area;
-                    window.widget = content_widget;
-
-                    if ui.check_mouse(MouseActions::CLICK_SUBTREE) {
-                        self.active_window = Some(window_id);
-                    }
-                } else {
-                    window.widget = ui.add(widget!().parent(self.root_widget).identity(&('u', window_id)).fixed_width(0).fixed_height(0));
-                }
-            }
-        });
     }
 }
 

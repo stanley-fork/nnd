@@ -346,20 +346,29 @@ impl EvalState {
         let subframe = &context.stack.subframes[selected_subframe];
         let selected_frame = subframe.frame_idx;
         let frame = &context.stack.frames[selected_frame];
-        let function = &context.stack.subframes[frame.subframes.end-1].function.as_ref_clone_error()?.0;
+        let function_idx = context.stack.subframes[frame.subframes.end-1].function_idx.clone()?;
         let binary_id = match frame.binary_id.as_ref() {
             None => return err!(ProcessState, "no binary for address {:x}", frame.pseudo_addr),
             Some(b) => b,
         };
-        if subframe.subfunction.is_none() {
-            return err!(Dwarf, "function has no debug info");
-        }
+        let subfunction_idx = match &subframe.subfunction_idx {
+            None => return err!(Dwarf, "function has no debug info"),
+            Some(x) => *x,
+        };
         let binary = context.process_info.binaries.get(binary_id).unwrap();
         let symbols = binary.symbols.as_ref_clone_error()?;
+        if symbols.identity != frame.symbols_identity {
+            return err!(Internal, "symbols were reloaded after generating backtrace");
+        }
+        let function = &symbols.functions[function_idx];
         let unit = match function.debug_info_offset() {
             None => return err!(ProcessState, "function has no debug info"),
             Some(off) => symbols.find_unit(off)? };
-        let context = DwarfEvalContext {memory: context.memory, symbols: Some(symbols), addr_map: &binary.addr_map, encoding: unit.unit.header.encoding(), unit: Some(unit), regs: Some(&frame.regs), frame_base: &frame.frame_base};
+        let shard_idx = function.shard_idx();
+        let subfunction = &symbols.shards[shard_idx].subfunctions[subfunction_idx];
+        let local_variables = symbols.local_variables_in_subfunction(subfunction, shard_idx);
+
+        let context = DwarfEvalContext {memory: context.memory, symbols: Some(symbols), addr_map: &binary.addr_map, encoding: unit.unit.header.encoding(), unit: Some(unit), regs: Some(&frame.regs), frame_base: &frame.frame_base, local_variables};
         Ok((context, function))
     }
 
@@ -412,13 +421,11 @@ impl EvalState {
     }
 
     fn get_local_variable(&mut self, context: &EvalContext, name: &str, subframe_idx: usize, only_type: bool) -> Result<Value> {
-        let (dwarf_context, function) = self.make_local_dwarf_eval_context(context, subframe_idx)?;
-        let symbols = dwarf_context.symbols.unwrap();
+        let (dwarf_context, _) = self.make_local_dwarf_eval_context(context, subframe_idx)?;
         let subframe = &context.stack.subframes[subframe_idx];
         let pseudo_addr = context.stack.frames[subframe.frame_idx].pseudo_addr;
         let static_pseudo_addr = dwarf_context.addr_map.dynamic_to_static(pseudo_addr);
-        let subfunction = &subframe.subfunction.as_ref().unwrap().0;
-        for v in symbols.local_variables_in_subfunction(subfunction, function.shard_idx()) {
+        for v in dwarf_context.local_variables {
             if !v.range().contains(&(static_pseudo_addr)) || unsafe {v.name()} != name {
                 continue;
             }
@@ -938,6 +945,8 @@ pub struct DwarfEvalContext<'a> {
     // Stack frame. Not required for global variables.
     pub regs: Option<&'a Registers>,
     pub frame_base: &'a Result<(usize, /*dubious*/ bool)>,
+
+    pub local_variables: &'a [LocalVariable],
 }
 
 pub fn eval_dwarf_expression(expression: Expression<SliceType>, context: &DwarfEvalContext) -> Result<(AddrOrValueBlob, /*dubious*/ bool)> {

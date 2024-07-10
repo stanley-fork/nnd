@@ -34,21 +34,26 @@ pub struct StackFrame {
     pub regs: Registers,
     pub frame_base: Result<(usize, /*dubious*/ bool)>, // result of the DW_AT_frame_base expression
 
+    // If we found a mapped binary corresponding to this address, these two are set.
     pub binary_id: Option<BinaryId>,
+    pub addr_static_to_dynamic: usize,
+    // If we had a loaded Symbols for that Binary, this is set. Always present if any of this frame's subframes have function_idx, subfunction_idx, or line.
+    pub symbols_identity: usize,
+
     // Indices in StackTrace.subframes, from innermost to outermost inlined functions. Last one represents the frame. Not empty.
     pub subframes: Range<usize>,
 }
-impl Default for StackFrame { fn default() -> Self { Self {addr: 0, pseudo_addr: 0, regs: Registers::default(), frame_base: err!(Dwarf, "no frame base"), binary_id: None, subframes: 0..0} } }
+impl Default for StackFrame { fn default() -> Self { Self {addr: 0, pseudo_addr: 0, regs: Registers::default(), frame_base: err!(Dwarf, "no frame base"), binary_id: None, addr_static_to_dynamic: 0, symbols_identity: 0, subframes: 0..0} } }
 
 #[derive(Clone)]
 pub struct StackSubframe {
     pub frame_idx: usize,
-    pub subfunction: Option<(Subfunction, /*subfunction_idx*/ usize)>,
-    pub function: Result<(FunctionInfo, /*function_idx*/ usize)>,
-    pub function_name: Option<String>, // demangled
+    pub function_idx: Result<usize>,
+    pub function_name: String, // demangled, present iff function_idx is present
+    pub subfunction_idx: Option<usize>,
     pub line: Option<FileLineInfo>,
 }
-impl Default for StackSubframe { fn default() -> Self { Self {frame_idx: 0, subfunction: None, function: err!(Internal, "not symbolized"), function_name: None, line: None} } }
+impl Default for StackSubframe { fn default() -> Self { Self {frame_idx: 0, subfunction_idx: None, function_idx: err!(Internal, "not symbolized"), function_name: String::new(), line: None} } }
 
 #[derive(Clone)]
 pub struct StackTrace {
@@ -67,12 +72,13 @@ impl StackTrace {
         let cfa = match frame.regs.get_int(RegisterIdx::Cfa) {
             Ok((c, _)) => c,
             Err(_) => return 0 };
-        if let Some((_, i)) = subframe.subfunction.as_ref() {
-            hash(&(cfa, *i, 0usize))
-        } else if let Ok((_, i)) = subframe.function.as_ref() {
-            hash(&(cfa, *i, 1usize))
+        let frame_identity = cfa as usize ^ frame.symbols_identity;
+        if let Some(i) = subframe.subfunction_idx.as_ref() {
+            hash(&(frame_identity, *i, 0usize))
+        } else if let Ok(i) = subframe.function_idx.as_ref() {
+            hash(&(frame_identity, *i, 1usize))
         } else {
-            hash(&(cfa, 0usize, 2usize))
+            hash(&(frame_identity, 0usize, 2usize))
         }
     }
 }
@@ -286,7 +292,7 @@ impl UnwindInfo {
 }
 
 fn eval_dwarf_expression_as_u64(expression: Expression<SliceType>, encoding: Encoding, regs: &Registers, memory: &MemReader, addr_map: &AddrMap, skip_final_dereference: bool) -> Result<(u64, /* dubious */ bool)> {
-    let (val, dubious) = eval_dwarf_expression(expression, &DwarfEvalContext {encoding, memory, symbols: None, unit: None, addr_map, regs: Some(regs), frame_base: &err!(Dwarf, "no frame base")})?;
+    let (val, dubious) = eval_dwarf_expression(expression, &DwarfEvalContext {encoding, memory, symbols: None, unit: None, addr_map, regs: Some(regs), frame_base: &err!(Dwarf, "no frame base"), local_variables: &[]})?;
     let val = if skip_final_dereference {
         // I'm probably misunderstanding something, but the meaning of gimli::read::Location::Address seems to be different between CFA/frame-base vs registers/variables.
         // In CFA and frame base, we treat Location::Address the same as Location::Value, presumably because the "value" of CFA/frame-base is an "address", so no dereference is needed.

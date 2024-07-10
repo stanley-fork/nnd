@@ -3,6 +3,7 @@ use std::{cmp, str, mem, rc::Rc, fs::File, path::{Path, PathBuf}, sync::atomic::
 use memmap2::Mmap;
 use gimli::*;
 use bitflags::*;
+use rand::random;
 use std::ops::Range;
 
 // Data structures for the program information: functions, variables, struct fields, etc.
@@ -122,6 +123,7 @@ pub struct SymbolsShard {
 pub struct Symbols {
     pub elf: Arc<ElfFile>,
     pub debuglink_elf: Option<ElfFile>,
+    pub identity: usize, // randomly generated identifier of this specific Symbols instance; changes if we reload the symbols even for the exact same binary (to reflect the fact that Symbols loading is not deterministic, e.g. functions may end up in different shards)
 
     // .debug_info, .debug_line, etc - sections describing things in the source code (functions, line numbers, structs and their fields, etc) and how they map to address ranges.
     // If some or all sections are missing, we treat them as empty, and no special handling is needed because empty sections parse as valid DWARF debug info with 0 units.
@@ -961,7 +963,7 @@ impl SymbolsLoader {
 
         prepare_time_per_stage_ns[0] = start_time.elapsed().as_nanos() as usize;
         Ok(SymbolsLoader {
-            num_shards: shards.len(), sym: Symbols {elf, debuglink_elf, dwarf, units, files: Vec::new(), file_paths: StringTable::new(), path_to_used_file: HashMap::new(), functions: Vec::new(), shards: Vec::new(), builtin_types: BuiltinTypes::invalid(), base_types: Vec::new(), vtables: Vec::new(), code_addr_range},
+            num_shards: shards.len(), sym: Symbols {elf, debuglink_elf, identity: random(), dwarf, units, files: Vec::new(), file_paths: StringTable::new(), path_to_used_file: HashMap::new(), functions: Vec::new(), shards: Vec::new(), builtin_types: BuiltinTypes::invalid(), base_types: Vec::new(), vtables: Vec::new(), code_addr_range},
             shards: shards.into_iter().map(|s| SyncUnsafeCell::new(CachePadded::new(s))).collect(), die_to_function_shards: (0..num_shards).map(|_| SyncUnsafeCell::new(CachePadded::new(Vec::new()))).collect(), types: types_loader, strtab_symtab, status, progress_per_stage,
             prepare_time_per_stage_ns, run_time_per_stage_ns, shard_progress_ppm: (0..num_shards).map(|_| CachePadded::new(AtomicUsize::new(0))).collect(), stage: 0, types_before_dedup: 0, type_offsets: 0, type_offset_maps_bytes: 0, type_dedup_maps_bytes: 0})
     }

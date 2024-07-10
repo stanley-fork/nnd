@@ -4,6 +4,9 @@ use iced_x86::*;
 
 pub const MAX_X86_INSTRUCTION_BYTES: usize = 15;
 
+// Disassembled function - a sequence of lines.
+// For each line, a prefix is formatted by the UI on the fly (with some dynamic elements), a suffix is pre-formatted (in `text`).
+//
 // Example:
 //  text                                                        DisassemblyLineKind       leaf_line   subfunction_idx
 //
@@ -28,25 +31,42 @@ pub const MAX_X86_INSTRUCTION_BYTES: usize = 15;
 
 pub struct Disassembly {
     pub text: StyledText,
-    pub lines: Vec<DisassemblyLineInfo>,
-    pub error: Option<Error>, // also baked into `text`
+    pub lines: Vec<DisassemblyLineInfo>, // parallel to `text` lines
+    pub error: Option<Error>, // also baked into `lines`
+
+    pub max_abs_relative_addr: usize,
+    pub indent_width: usize,
     pub widest_line: usize,
 
-    pub symbols_shard: Option<(*const Symbols, usize)>, // for an assert
+    // Don't want to hold an Arc<Symbols> here, we look it up in SymbolsRegistry every frame. This shard_idx is just to assert that we found the correct one (so `subfunction` indices will match).
+    pub symbols_shard: Option<usize>,
 }
 
 // Information about one line of text in the disassembly listing.
 pub struct DisassemblyLineInfo {
     pub kind: DisassemblyLineKind,
-    // Address of the current or next instruction. For Intro: 0. For Error: usize::MAX.
-    pub addr: usize,
+
+    //  7ffff7c91043 < +13>  ↓ ┆jne near _+100h
+    //  ^^^^^^^^^^^^   ^^^   ^  ^^^^^^^^^^^^^^^
+    // static_addr     |     | |     `text`
+    //     relative_addr     | |
+    //          jump_indicator |
+    //         subfunction_level
+
+    // Address of the current or next instruction. For Intro: 0. For Error: usize::MAX. Binary-searchable. Should be rendered only for DisassemblyLineKind::Instruction.
+    pub static_addr: usize,
+
+    pub relative_addr: isize,
+    pub jump_indicator: char,
+    pub jump_target: Option<usize>,
+
     // Line number for the current or previous LeafLineNumber or InlinedCallLineNumber.
     pub leaf_line: Option<LineInfo>,
-    // Innermost subfunction containing this line, consistent with indentation. For InlinedCallLineNumber and InlinedCallFunctionName: the *parent* subfunction (if any).
+    // Innermost inlined function containing this line. For InlinedCallLineNumber and InlinedCallFunctionName: the *parent* subfunction (if any). Level always >= 1.
     pub subfunction: Option<usize>,
-    // Which of the spans of this line contains indentation characters ("┆┆┆...") and nothing else. Used for highlighting selected subfunction level.
-    pub indent_span_idx: usize,
+    pub subfunction_level: u16, // `subfunction` level, 0 if None; indentation level
 }
+impl Default for DisassemblyLineInfo { fn default() -> Self { Self {kind: DisassemblyLineKind::Error, static_addr: 0, relative_addr: 0, jump_indicator: ' ', jump_target: None, subfunction_level: 0, leaf_line: None, subfunction: None} } }
 
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub enum DisassemblyLineKind {
@@ -60,11 +80,11 @@ pub enum DisassemblyLineKind {
 }
 
 impl Disassembly {
-    pub fn new() -> Self { Self {text: StyledText::default(), lines: Vec::new(), error: None, widest_line: 0, symbols_shard: None} }
-    
-    pub fn addr_to_line(&self, addr: usize) -> Option<usize> {
-        let idx = self.lines.partition_point(|l| l.addr <= addr);
-        if idx > 0 && self.lines[idx-1].addr == addr && self.lines[idx-1].kind == DisassemblyLineKind::Instruction {
+    pub fn new() -> Self { Self {text: StyledText::default(), lines: Vec::new(), error: None, max_abs_relative_addr: 0, indent_width: 1, widest_line: 0, symbols_shard: None} }
+
+    pub fn static_addr_to_line(&self, static_addr: usize) -> Option<usize> {
+        let idx = self.lines.partition_point(|l| l.static_addr <= static_addr);
+        if idx > 0 && self.lines[idx-1].static_addr == static_addr && self.lines[idx-1].kind == DisassemblyLineKind::Instruction {
             Some(idx-1)
         } else {
             None
@@ -72,12 +92,12 @@ impl Disassembly {
     }
 
     // If pseudo_addr is in between instructions, round down to the previous instruction.
-    pub fn pseudo_addr_to_line(&self, pseudo_addr: usize) -> Option<usize> {
-        let idx = self.lines.partition_point(|l| l.addr <= pseudo_addr);
+    pub fn static_pseudo_addr_to_line(&self, static_pseudo_addr: usize) -> Option<usize> {
+        let idx = self.lines.partition_point(|l| l.static_addr <= static_pseudo_addr);
         if idx == 0 { return None; }
         let l = &self.lines[idx-1];
         // (Would be better to compare to function addr ranges instead of the MAX_X86_INSTRUCTION_BYTES guesswork.)
-        if l.kind == DisassemblyLineKind::Instruction && l.addr + MAX_X86_INSTRUCTION_BYTES > pseudo_addr {
+        if l.kind == DisassemblyLineKind::Instruction && l.static_addr + MAX_X86_INSTRUCTION_BYTES > static_pseudo_addr {
             Some(idx-1)
         } else {
             None
@@ -86,16 +106,18 @@ impl Disassembly {
 
     pub fn with_error(mut self, e: Error, palette: &Palette) -> Self {
         assert!(self.error.is_none());
-        styled_write!(self.text, palette.error, "{}", e);
-        self.text.close_line();
-        self.lines.push(DisassemblyLineInfo {kind: DisassemblyLineKind::Error, addr: usize::MAX, leaf_line: None, subfunction: None, indent_span_idx: 0});
+        styled_writeln!(self.text, palette.error, "{}", e);
+        self.lines.push(DisassemblyLineInfo {kind: DisassemblyLineKind::Error, static_addr: usize::MAX, ..Default::default()});
         self.error = Some(e);
         self.finish()
     }
-    
+
     pub fn finish(mut self) -> Self {
         assert_eq!(self.text.num_lines(), self.lines.len());
-        self.widest_line = self.text.widest_line(0..self.text.num_lines());
+        for i in 0..self.lines.len() {
+            self.widest_line = self.widest_line.max(self.lines[i].subfunction_level as usize * self.indent_width + str_width(self.text.get_line_str(i)));
+            self.max_abs_relative_addr = self.max_abs_relative_addr.max(self.lines[i].relative_addr.abs() as usize);
+        }
         self
     }
 }
@@ -124,44 +146,41 @@ impl<'a> FormatterOutput for StyledFormatter<'a> {
 
 struct Resolver<'a> {
     symbols: Option<&'a Symbols>,
-    addr_to_static: usize,
     current_function: core::ops::Range<usize>,
 }
 
 impl<'a> SymbolResolver for Resolver<'a> {
-    fn symbol(&mut self, _: &Instruction, _operand: u32, _instruction_operand: Option<u32>, addr: u64, _address_size: u32) -> Option<SymbolResult<'a>> {
-        let addr = addr as usize;
-        if self.current_function.contains(&addr) {
+    fn symbol(&mut self, _: &Instruction, _operand: u32, _instruction_operand: Option<u32>, static_addr: u64, _address_size: u32) -> Option<SymbolResult<'a>> {
+        let static_addr = static_addr as usize;
+        if self.current_function.contains(&static_addr) {
             // Make jumps inside current function easier to read: "_+42h" instead of "__futex_abstimed_wait_cancelable64+42h".
             return Some(SymbolResult {address: self.current_function.start as u64, text: SymResTextInfo::new("_", FormatterTextKind::Function), flags: SymbolFlags::NONE, symbol_size: Some(MemorySize::UInt64)});
         }
 
         if let Some(symbols) = &self.symbols {
-            let static_addr = addr.wrapping_add(self.addr_to_static);
             if let Ok((f, _)) = symbols.addr_to_function(static_addr) {
                 let name = f.demangle_name();
                 let text = SymResString::String(name);
-                return Some(SymbolResult {address: f.addr.addr().unwrap().wrapping_sub(self.addr_to_static) as u64, text: SymResTextInfo::Text(SymResTextPart {text, color: FormatterTextKind::Function}), flags: SymbolFlags::NONE, symbol_size: Some(MemorySize::UInt64)});
+                return Some(SymbolResult {address: f.addr.addr().unwrap() as u64, text: SymResTextInfo::Text(SymResTextPart {text, color: FormatterTextKind::Function}), flags: SymbolFlags::NONE, symbol_size: Some(MemorySize::UInt64)});
             }
         }
         None
     }
 }
 
-pub fn disassemble_function(function_idx: usize, mut static_addr_ranges: Vec<Range<usize>>, symbols: Option<&Symbols>, addr_map: &AddrMap, memory: &MemReader, intro: StyledText, palette: &Palette) -> Disassembly {
+pub fn disassemble_function(function_idx: usize, mut static_addr_ranges: Vec<Range<usize>>, symbols: Option<&Symbols>, code: Option<&[u8]>, intro: StyledText, palette: &Palette) -> Disassembly {
     clean_up_ranges(&mut static_addr_ranges);
 
-    let mut res = Disassembly {text: intro, lines: Vec::new(), error: None, widest_line: 0, symbols_shard: None};
-    let addr_to_static = addr_map.dynamic_to_static(0);
+    let mut res = Disassembly {text: intro, lines: Vec::new(), error: None, max_abs_relative_addr: 0, indent_width: 1, widest_line: 0, symbols_shard: None};
     let mut subfunc_ranges: Vec<&[SubfunctionPcRange]> = Vec::new();
 
     while res.lines.len() < res.text.num_lines() {
-        res.lines.push(DisassemblyLineInfo {kind: DisassemblyLineKind::Intro, addr: 0, leaf_line: None, subfunction: None, indent_span_idx: 0});
+        res.lines.push(DisassemblyLineInfo {kind: DisassemblyLineKind::Intro, static_addr: 0, ..Default::default()});
     }
 
     if let Some(symbols) = &symbols {
         let function = &symbols.functions[function_idx];
-        res.symbols_shard = Some((symbols as &Symbols as *const Symbols, function.shard_idx()));
+        res.symbols_shard = Some(function.shard_idx());
         subfunc_ranges = (1..function.num_levels()).map(|i| symbols.subfunction_ranges_at_level(i, function)).collect();
     }
 
@@ -170,23 +189,18 @@ pub fn disassemble_function(function_idx: usize, mut static_addr_ranges: Vec<Ran
             return res.with_error(error!(Sanity, "{} MB to disassemble, suspiciously much", static_addr_range.len() / 1_000_000), palette);
         }
 
-        let mut buf: Vec<u8> = Vec::new();
-        let code: &[u8] = if let Some(symbols) = &symbols {
+        let code: &[u8] = if let Some(code) = code.clone() {
+            assert_eq!(static_addr_ranges.len(), 1);
+            code
+        } else if let Some(symbols) = &symbols {
             // Read the machine code from file rather than memory so that it doesn't show our breakpoint instructions.
             match symbols.elf.addr_range_to_offset_range(static_addr_range.start, static_addr_range.end) {
                 None => return res.with_error(error!(Dwarf, "function address range out of bounds of executable: {:x}-{:x}", static_addr_range.start, static_addr_range.end), palette),
                 Some((start, end)) => &symbols.elf.data()[start..end],
             }
         } else {
-            buf.resize(static_addr_range.len(), 0);
-            match memory.read(addr_map.static_to_dynamic(static_addr_range.start), &mut buf) {
-                Ok(()) => (),
-                Err(e) => return res.with_error(e, palette),
-            }
-            &buf
+            panic!("huh");
         };
-
-        let addr = addr_map.static_to_dynamic(static_addr_range.start);
 
         if addr_range_idx != 0 {
             res.text.close_line();
@@ -194,19 +208,16 @@ pub fn disassemble_function(function_idx: usize, mut static_addr_ranges: Vec<Ran
             res.text.close_line();
             res.text.close_line();
             for i in 0..3 {
-                res.lines.push(DisassemblyLineInfo {kind: DisassemblyLineKind::Separator, addr, leaf_line: None, subfunction: None, indent_span_idx: 0});
+                res.lines.push(DisassemblyLineInfo {kind: DisassemblyLineKind::Separator, static_addr: static_addr_range.start, ..Default::default()});
             }
         }
 
-        let rel_addr_len = ((code.len() as f64).log2() / 4.0).ceil() as usize + 1; // how many hex digits to use in the "<+1abc>" things
-        let prelude_width = 12 + 4 + rel_addr_len + 3;
-
-        let resolver = Resolver {symbols: symbols.clone(), addr_to_static, current_function: addr..addr+code.len()};
+        let resolver = Resolver {symbols: symbols.clone(), current_function: static_addr_range.clone()};
         // NasmFormatter wants to own the symbol resolver for some reason. (Probably it would be too inconvenient or inefficient to have lifetime argument all throughout the formatter implementation.)
         // We trust that the SymbolResolver reference isn't retained after the formatter is destroyed, so it should be ok to fudge the lifetime here.
         let resolver: Resolver<'static> = unsafe { std::mem::transmute(resolver) };
 
-        let mut decoder = Decoder::with_ip(64, code, addr as u64, DecoderOptions::NONE);
+        let mut decoder = Decoder::with_ip(64, code, static_addr_range.start as u64, DecoderOptions::NONE);
         let mut formatter = NasmFormatter::with_options(Some(Box::new(resolver)), None);
 
         let mut line_iter = if let Some(symbols) = &symbols {
@@ -225,23 +236,20 @@ pub fn disassemble_function(function_idx: usize, mut static_addr_ranges: Vec<Ran
             decoder.decode_out(&mut instruction);
 
             if let Some(l) = res.lines.last() {
-                assert!(instruction.ip() as usize >= l.addr); // can be == because the "-----[...]" separator above is assigned to address of the first instruction after it
+                assert!(instruction.ip() as usize >= l.static_addr); // can be == because the "-----[...]" separator above is assigned to address of the first instruction after it
             }
-            let static_addr = addr_map.dynamic_to_static(instruction.ip() as usize);
-            let mut indent = String::new();
+            let static_addr = instruction.ip() as usize;
+            let mut subfunction_level = 0u16;
             let mut cur_subfunction: Option<usize> = None;
 
             if let &Some(symbols) = &symbols {
-                let write_line_number = |line: LineInfo, kind: DisassemblyLineKind, res: &mut Disassembly, indent: &str, leaf_line: &mut Option<LineInfo>, subfunction: Option<usize>| {
+                let write_line_number = |line: LineInfo, kind: DisassemblyLineKind, res: &mut Disassembly, subfunction_level: u16, leaf_line: &mut Option<LineInfo>, subfunction: Option<usize>| {
                     let file = match line.file_idx() {
                         None => return,
                         Some(f) => f };
                     *leaf_line = Some(line.clone());
                     let file = &symbols.files[file];
                     let name = file.filename.as_os_str().to_string_lossy();
-                    styled_write!(res.text, palette.default_dim, "{: <1$}", "", prelude_width);
-                    let indent_span_idx = res.text.spans.len() - *res.text.lines.last().unwrap();
-                    styled_write!(res.text, palette.default_dim, "{}", indent);
                     styled_write!(res.text, palette.disas_filename, "{}", name);
                     if line.line() != 0 {
                         styled_write!(res.text, palette.line_number, ":{}", line.line());
@@ -250,20 +258,22 @@ pub fn disassemble_function(function_idx: usize, mut static_addr_ranges: Vec<Ran
                         }
                     }
                     res.text.close_line();
-                    res.lines.push(DisassemblyLineInfo {kind, addr: instruction.ip() as usize, leaf_line: leaf_line.clone(), subfunction, indent_span_idx});
+                    res.lines.push(DisassemblyLineInfo {kind, static_addr, subfunction_level, leaf_line: leaf_line.clone(), subfunction, ..Default::default()});
                 };
 
                 // Add inlined function calls information: function names, call line numbers, and indentation.
                 let function = &symbols.functions[function_idx];
-                for (level_minus_one, r) in subfunc_ranges.iter_mut().enumerate() {
+                for r in subfunc_ranges.iter_mut() {
                     while !r.is_empty() && r[0].range.end <= static_addr {
                         *r = &r[1..];
                     }
                     if r.is_empty() || r[0].range.start > static_addr {
                         break;
                     }
+                    cur_subfunction = Some(r[0].subfunction_idx);
                     let subfunction = &symbols.shards[function.shard_idx()].subfunctions[r[0].subfunction_idx];
-                    assert!(subfunction.level as usize == level_minus_one + 1);
+                    subfunction_level += 1;
+                    assert!(subfunction.level == subfunction_level);
                     if r[0].range.start > prev_static_addr {
                         let callee_name = if subfunction.callee_idx == usize::MAX {
                             "?".to_string()
@@ -271,58 +281,50 @@ pub fn disassemble_function(function_idx: usize, mut static_addr_ranges: Vec<Ran
                             symbols.functions[subfunction.callee_idx].demangle_name()
                         };
 
-                        write_line_number(subfunction.call_line.clone(), DisassemblyLineKind::InlinedCallLineNumber, &mut res, &indent, &mut cur_leaf_line, cur_subfunction.clone());
+                        write_line_number(subfunction.call_line.clone(), DisassemblyLineKind::InlinedCallLineNumber, &mut res, subfunction_level, &mut cur_leaf_line, cur_subfunction.clone());
 
-                        styled_write!(res.text, palette.default_dim, "{: <1$}", "", prelude_width);
-                        let indent_span_idx = res.text.spans.len() - *res.text.lines.last().unwrap();
-                        styled_write!(res.text, palette.default_dim, "{}", indent);
                         styled_write!(res.text, palette.default_dim, "{}", callee_name);
                         res.text.close_line();
-                        res.lines.push(DisassemblyLineInfo {kind: DisassemblyLineKind::InlinedFunctionName, addr: instruction.ip() as usize, leaf_line: cur_leaf_line.clone(), subfunction: cur_subfunction.clone(), indent_span_idx});
+                        res.lines.push(DisassemblyLineInfo {kind: DisassemblyLineKind::InlinedFunctionName, static_addr, subfunction_level, leaf_line: cur_leaf_line.clone(), subfunction: cur_subfunction.clone(), ..Default::default()});
                     }
-                    cur_subfunction = Some(r[0].subfunction_idx);
-                    indent.push('┆');
                 }
 
                 // Add line number information.
                 while let Some(line) = line_iter.as_mut().unwrap().next_if(|line| line.addr() <= static_addr) {
-                    write_line_number(line, DisassemblyLineKind::LeafLineNumber, &mut res, &indent, &mut cur_leaf_line, cur_subfunction.clone());
+                    write_line_number(line, DisassemblyLineKind::LeafLineNumber, &mut res, subfunction_level, &mut cur_leaf_line, cur_subfunction.clone());
                 }
             }
 
             prev_static_addr = static_addr;
 
-            // Write the actual asm instruction.
-
-            styled_write!(res.text, palette.default_dim, "{:012x} ", instruction.ip());
-            styled_write!(res.text, palette.disas_relative_address, "<{: >+1$x}> ", instruction.ip() as usize - addr, rel_addr_len);
-
-            let jump_arrow = match instruction.flow_control() {
-                FlowControl::Next => " ",
-                FlowControl::Return => "←",
-                FlowControl::Call | FlowControl::IndirectCall => "→",
-                FlowControl::Interrupt | FlowControl::XbeginXabortXend | FlowControl::Exception => "!",
+            let mut jump_target: Option<usize> = None;
+            let jump_indicator = match instruction.flow_control() {
+                FlowControl::Next => ' ',
+                FlowControl::Return => '←',
+                FlowControl::Call | FlowControl::IndirectCall => '→',
+                FlowControl::Interrupt | FlowControl::XbeginXabortXend | FlowControl::Exception => '!',
                 FlowControl::UnconditionalBranch | FlowControl::IndirectBranch | FlowControl::ConditionalBranch => {
                     let target_known = instruction.flow_control() != FlowControl::IndirectBranch && match instruction.op0_kind() {
                         iced_x86::OpKind::NearBranch16 | iced_x86::OpKind::NearBranch32 | iced_x86::OpKind::NearBranch64 => true,
                         _ => false };
                     if !target_known {
-                        "↕"
-                    } else if instruction.near_branch_target() > instruction.ip() {
-                        "↓"
+                        '↕'
                     } else {
-                        "↑"
+                        jump_target = Some(instruction.near_branch_target() as usize);
+                        if instruction.near_branch_target() > instruction.ip() {
+                            '↓'
+                        } else {
+                            '↑'
+                        }
                     }
                 }
             };
-            styled_write!(res.text, palette.disas_jump_arrow, " {} ", jump_arrow);
-            let indent_span_idx = res.text.spans.len() - *res.text.lines.last().unwrap();
-            styled_write!(res.text, palette.default_dim, "{}", indent);
 
+            // Finally write the actual asm instruction.
             formatter.format(&instruction, &mut StyledFormatter {palette, text: &mut res.text});
 
             res.text.close_line();
-            res.lines.push(DisassemblyLineInfo {kind: DisassemblyLineKind::Instruction, addr: instruction.ip() as usize, leaf_line: cur_leaf_line.clone(), subfunction: cur_subfunction.clone(), indent_span_idx});
+            res.lines.push(DisassemblyLineInfo {kind: DisassemblyLineKind::Instruction, static_addr, relative_addr: static_addr as isize - static_addr_range.start as isize, subfunction_level, jump_indicator, jump_target, leaf_line: cur_leaf_line.clone(), subfunction: cur_subfunction.clone()});
         }
     }
     res.finish()

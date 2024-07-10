@@ -91,38 +91,52 @@ pub struct WidgetFlags : u32 {
     const TEXT_TRUNCATION_INDICATOR_DISABLE = 0x1;
     // If the text doesn't fit horizontally, keep a suffix rather than a prefix, and put the "…" at the start. If the text is not truncated, it's aligned left.
     const TEXT_TRUNCATION_ALIGN_RIGHT = 0x2;
-    // Disables text truncation indicator and enables an oddly specific behavior instead:
-    // assume that the "contents" of this Widget cover the X range [0, right x coordinate of the last child, or width of draw_text if there are no children];
-    // if part of this range is cut off by ancestors (e.g. hscroll area viewport), render a '<'/'>'-like symbols there, meant to show that horizontal scrolling is available.
-    // This Widget itself is usually wider than its "contents". (Why not put a flag on the child instead, to avoid the awkward logic for content width?
-    // Because that wouldn't show a left arrow when scrolled past the end of that child.)
-    const HSCROLL_INDICATOR_ARROWS = 0x4;
-    const LINE_WRAP = 0x8;
+    const LINE_WRAP = 0x4;
+
+    // These two flags are for drawing left/right arrows to the left and right of each line of text (or other content) to indicate that the text is cut off and horizontal scrolling is available.
+    // Draws a corresponding arrow when the corresponding edge of this widget is clipped off by ancestor widgets.
+    // For widgets with draw_text, HSCROLL_INDICATOR_RIGHT applies to each line individually, showing arrow only if the line is clipped (i.e. using line width instead of widget width).
+    //
+    // These flags are separate because they often should be applied to different widgets.
+    // HSCROLL_INDICATOR_LEFT widget's rect should touch the right edge of the hscrollable area content rect; otherwise the arrow will be incorrectly missing if the viewport is
+    // fully to the right of this widget (the widget is fully clipped, so there's nowhere to draw the arrow).
+    // Symmetrically, HSCROLL_INDICATOR_RIGHT should be applied to widget with X position = 0.
+    // Example widget tree:
+    //   hscroll viewport
+    //     hscroll content (width=100)  <-- put HSCROLL_INDICATOR_LEFT here
+    //       line1 (width=42, hstack)   <-- put HSCROLL_INDICATOR_RIGHT here
+    //         prefix widget
+    //         suffix widget
+    //       line2 (width=100)          <-- put HSCROLL_INDICATOR_RIGHT here
+    // (In this example, we can't put HSCROLL_INDICATOR_RIGHT on "hscroll content" because it doesn't "know" that line1 is shorter than 100.
+    //  And we can't put HSCROLL_INDICATOR_LEFT on "line1" because it'll fail to show the left arrow if hscroll offset is >= 42, when line1 is fully off-screen.)
+    const HSCROLL_INDICATOR_LEFT = 0x8;
+    const HSCROLL_INDICATOR_RIGHT = 0x10;
 
     // StyleAdjstment won't be inherited from ancestors. E.g. for drawing text input box with standard background in a panel with tinted background.
-    const RESET_STYLE_ADJUSTMENT = 0x10;
+    const RESET_STYLE_ADJUSTMENT = 0x20;
 
     // If any part of this rect is visible (i.e. not clipped by parents' rects), trigger a redraw. May be useful for speculative hiding of elements,
     // but currently unused because I made everything non-speculative instead.
-    const REDRAW_IF_VISIBLE = 0x20;
+    const REDRAW_IF_VISIBLE = 0x40;
 
     // Any simple character key presses (no modifier keys, no special keys like tab or enter) are captured by this Widget as if they were in capture_keys.
     // Doesn't include text navigation keys like arrow keys, home/end, etc; they should be requested through capture_keys as usual.
-    const CAPTURE_TEXT_INPUT_KEYS = 0x40;
+    const CAPTURE_TEXT_INPUT_KEYS = 0x80;
     // Capture all keys that reach this Widget (i.e. if this widget is focused and keys are not captured by focused descendants first).
-    const CAPTURE_ALL_KEYS = 0x80;
+    const CAPTURE_ALL_KEYS = 0x100;
 
     // Trigger redraw is this Widget gets focused or unfocused.
-    const REDRAW_IF_FOCUS_CHANGES = 0x100;
+    const REDRAW_IF_FOCUS_CHANGES = 0x200;
 
     // Equivalent to:
     //   if ui.check_mouse(MouseActions::HOVER_SUBTREE) {
     //       widget.style_adjustment.update(ui.palette.hovered);
     //   }
-    const HIGHLIGHT_ON_HOVER = 0x200;
+    const HIGHLIGHT_ON_HOVER = 0x400;
 
     // This widget's identity won't be hashed into children identities. Instead, the nearest ancestor without this flag will be hashed. As if this widget didn't exist and its children were its parent's children.
-    const SKIP_IDENTITY = 0x400;
+    const SKIP_IDENTITY = 0x800;
 }}
 
 bitflags! {
@@ -748,6 +762,7 @@ impl UI {
         }
         let idx = self.cur_parent;
         Some(with_parent!(self, self.tooltip_root, {
+            // TODO: Add margins or draw a box.
             let mut w = widget!().width(AutoSize::Children).height(AutoSize::Children).fill(' ', self.palette.default);
             w.position_next_to = Some(idx);
             w.style_adjustment = self.palette.tooltip;
@@ -952,30 +967,35 @@ impl UI {
                 }
             }
 
-            if w.flags.contains(WidgetFlags::HSCROLL_INDICATOR_ARROWS) {
-                let content_width = if let Some(idx) = w.children.last() {
-                    (self.tree[idx.0].axes[Axis::X].rel_pos + self.tree[idx.0].axes[Axis::X].size as isize).max(0)
-                } else if let Some(r) = w.draw_text.clone() {
-                    self.text.widest_line(r) as isize
-                } else {
-                    0
-                };
-                if rect.x() + content_width > clip.right() && clip.width() > 0 {
-                    let wid = str_width(&self.palette.hscroll_indicator.1);
-                    for y in clip.y()..clip.bottom() {
-                        screen.put_text(&self.palette.hscroll_indicator.1, style_adjustment.apply(self.palette.hscroll_indicator.2), clip.right() - wid as isize, y, clip);
-                    }
-                    clip.size[0] -= wid;
-                }
-                if clip.x() > rect.x() && rect.width() > 0 {
-                    let wid = str_width(&self.palette.hscroll_indicator.0);
+            if w.flags.contains(WidgetFlags::HSCROLL_INDICATOR_LEFT) {
+                show_horizontal_text_truncation_indicator = false;
+                if clip.x() > rect.x() && clip.width() > 0 {
                     for y in clip.y()..clip.bottom() {
                         screen.put_text(&self.palette.hscroll_indicator.0, style_adjustment.apply(self.palette.hscroll_indicator.2), clip.x(), y, clip);
                     }
+                    let wid = str_width(&self.palette.hscroll_indicator.0).min(clip.width());
                     clip.pos[0] += wid as isize;
                     clip.size[0] -= wid;
                 }
+            }
+            if w.flags.contains(WidgetFlags::HSCROLL_INDICATOR_RIGHT) {
                 show_horizontal_text_truncation_indicator = false;
+                if rect.right() > clip.right() && clip.width() > 0 {
+                    let wid = str_width(&self.palette.hscroll_indicator.1);
+                    let mut new_clip = clip;
+                    new_clip.size[0] = new_clip.size[0].saturating_sub(wid);
+                    for y in clip.y()..clip.bottom() {
+                        if let Some(lines) = &w.draw_text {
+                            let line_idx = lines.start + (y - rect.y()) as usize;
+                            let line_width = if line_idx < lines.end {str_width(self.text.get_line_str(line_idx))} else {0};
+                            if rect.x() + line_width as isize <= new_clip.right() {
+                                continue;
+                            }
+                        }
+                        screen.put_text(&self.palette.hscroll_indicator.1, style_adjustment.apply(self.palette.hscroll_indicator.2), clip.right() - wid as isize, y, clip);
+                    }
+                    clip = new_clip;
+                }
             }
 
             if let Some((c, style)) = w.draw_fill.clone() {
@@ -1041,7 +1061,7 @@ impl UI {
                         indicate_horizontal_truncation = false;
                     }
 
-                    for span_idx in self.text.get_line(line_idx) {
+                    for span_idx in spans {
                         let (s, style) = self.text.get_span(span_idx);
                         x = screen.put_text(s, style_adjustment.apply(style), x, y, clip);
                         if x > clip.right() {

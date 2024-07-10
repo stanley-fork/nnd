@@ -45,7 +45,7 @@ pub struct Palette {
     pub type_name: Style,
     pub field_name: Style,
     pub keyword: Style,
-    pub hotkey: Style,
+    pub hotkey: StyleAdjustment,
 
     pub state_running: Style,
     pub state_suspended: Style,
@@ -66,9 +66,9 @@ pub struct Palette {
     pub table_header: Style,
     pub striped_table: StyleAdjustment,
 
-    pub tab_title: Style,
-    pub tab_title_pinned: Style,
-    pub tab_title_selected: Style,
+    pub tab_selected: Style,
+    pub tab_ephemeral: (String, Style),
+    pub tab_deselected: Style,
     pub tab_separator: (String, Style),
 
     // fg - left side, bg - right side.
@@ -87,6 +87,10 @@ pub struct Palette {
 
     pub window_border: Style,
     pub window_border_active: Style,
+    pub window_title_active: Style,
+    pub window_title_selected: Style,
+    pub window_title_deselected: Style,
+    pub window_title_separator: (String, Style),
 
     pub value: Style,
     pub value_misc: Style,
@@ -143,7 +147,7 @@ impl Default for Palette {
             type_name: Style {fg: white, ..D!()},
             field_name: Style {fg: white, ..D!()},
             keyword: Style {fg: white, ..D!()},
-            hotkey: Style {fg: white, modifier: Modifier::UNDERLINED, ..D!()},
+            hotkey: StyleAdjustment {add_modifier: Modifier::UNDERLINED, ..D!()},
 
             state_running: Style {bg: blue, fg: black, ..D!()},
             state_suspended: Style {bg: light_green, fg: black, ..D!()},
@@ -156,9 +160,9 @@ impl Default for Palette {
             //striped_table: StyleAdjustment {add_fg: (0, 0, 0), add_bg: (20, 20, 20), ..D!()},
             striped_table: StyleAdjustment::default(),
 
-            tab_title: Style {fg: white.darker(), ..D!()},
-            tab_title_pinned: Style {fg: white, ..D!()},
-            tab_title_selected: Style {fg: white, bg: Color(40, 40, 40), modifier: Modifier::BOLD, ..D!()},
+            tab_selected: Style {fg: white, bg: Color(40, 40, 40), modifier: Modifier::BOLD, ..D!()},
+            tab_ephemeral: ("∗".to_string(), Style {fg: white, ..D!()}),
+            tab_deselected: Style {fg: white.darker(), ..D!()},
             tab_separator: (" | ".to_string(), Style {fg: white.darker(), ..D!()}),
 
             placeholder_fill: Some(('.', Style {fg: white.darker(), bg: black, ..D!()})),
@@ -180,6 +184,10 @@ impl Default for Palette {
 
             window_border: Style {fg: white.darker(), ..D!()},
             window_border_active: Style {fg: white, modifier: Modifier::BOLD, ..D!()},
+            window_title_active: Style {fg: white, bg: Color(30, 30, 30), modifier: Modifier::BOLD, ..D!()},
+            window_title_selected: Style {fg: white, bg: Color(30, 30, 30), ..D!()},
+            window_title_deselected: Style {fg: white.darker(), ..D!()},
+            window_title_separator: (" | ".to_string(), Style {fg: white.darker(), ..D!()}),
 
             value: Style {fg: white, ..D!()},
             value_misc: Style {fg: white.darker(), ..D!()},
@@ -249,7 +257,7 @@ pub enum KeyAction {
 
     NextTab,
     PreviousTab,
-    PinTab,
+    CloseTab,
     NextStackFrame,
     PreviousStackFrame,
     NextThread,
@@ -360,7 +368,7 @@ impl Default for KeyBinds {
                 // (Ctrl+tab and ctrl+shift+tab are unrepresentable in ansi escape codes.)
                 (Key::Char('t').ctrl(), KeyAction::NextTab),
                 (Key::Char('b').ctrl(), KeyAction::PreviousTab),
-                (Key::Char('y').ctrl(), KeyAction::PinTab),
+                (Key::Char('y').ctrl(), KeyAction::CloseTab),
                 (Key::Char(']').plain(), KeyAction::NextStackFrame),
                 (Key::Char('[').plain(), KeyAction::PreviousStackFrame),
                 (Key::Char('}').plain(), KeyAction::NextThread),
