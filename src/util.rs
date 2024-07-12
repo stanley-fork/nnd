@@ -22,20 +22,17 @@ pub fn tgkill(pid: pid_t, tid: pid_t, sig: i32) -> Result<i32> {
     Ok(ret)
 }
 
-pub unsafe fn ptrace(request: i32, pid: pid_t, addr: u64, data: u64, prof: Option<&mut Profiling>) -> Result<i64> {
-    let timer = TscScope::new();
+pub unsafe fn ptrace(request: i32, pid: pid_t, addr: u64, data: u64, prof: &mut ProfileBucket) -> Result<i64> {
     (*libc::__errno_location()) = 0;
-    let r = libc::ptrace(request, pid, addr, data);
+    let r = profile_syscall!(prof, {
+        libc::ptrace(request, pid, addr, data)
+    });
     //eprintln!("trace: ptrace({}, {}, 0x{:x}, 0x{:x}) -> 0x{:x}", ptrace_request_name(request), pid, addr, data, r);
     if r == -1 {
         if (*libc::__errno_location()) != 0 {
             return errno_err!("ptrace({}) failed", request);
         }
         assert!([libc::PTRACE_PEEKDATA, libc::PTRACE_PEEKSIGINFO, libc::PTRACE_PEEKTEXT, libc::PTRACE_PEEKUSER].contains(&request));
-    }
-    if let Some(p) = prof {
-        p.syscall_count += 1;
-        p.syscall_tsc += timer.finish();
     }
     Ok(r)
 }
@@ -300,15 +297,25 @@ macro_rules! defer { ($($t:tt)*) => { let _guard = ScopeGuard::new(|| { $($t)* }
 pub struct PrettyCount(pub usize);
 impl fmt::Display for PrettyCount {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let x = self.0;
-        if x < 1000 {                          write!(f, "{}", x) }
-        else if x < 1000_000 {                 write!(f, "{:.3} K", x as f64 / 1e3) }
-        else if x < 1000_000_000 {             write!(f, "{:.3} M", x as f64 / 1e6) }
-        else if x < 1000_000_000_000 {         write!(f, "{:.3} G", x as f64 / 1e9) }
-        else if x < 1000_000_000_000_000 {     write!(f, "{:.3} T", x as f64 / 1e12) }
-        else if x < 1000_000_000_000_000_000 { write!(f, "{:.3} P", x as f64 / 1e15) }
-        else {                                 write!(f, "{:.3} E", x as f64 / 1e15) }
+        let (den, name) = match self.0 {
+            x if x < 1000 => return write!(f, "{}", x),
+            x if x < 1000_000 => (1000, "K"),
+            x if x < 1000_000_000 => (1000_000, "M"),
+            x if x < 1000_000_000_000usize => (1000_000_000, "G"),  
+            x if x < 1000_000_000_000_000usize => (1000_000_000_000, "T"),
+            x if x < 1000_000_000_000_000_000usize => (1000_000_000_000_000, "P"),
+            _ => (1000_000_000_000_000_000usize, "E"),
+        };
+        // Use at most 4 digits.
+        match self.0 as f64 / den as f64 {
+            x if x < 9.995 - 1e-12 => write!(f, "{:.2} {}", x, name), // e.g. 1.23
+            x if x < 99.95 - 1e-12 => write!(f, "{:.1} {}", x, name), // e.g. 12.3
+            x                      => write!(f, "{:.0} {}", x, name), // e.g. 1000
+        }
     }
+}
+impl PrettyCount {
+    pub const MAX_LEN: usize = 6;
 }
 
 // Prints byte sizes with a few digits of precision and B/KiB/MiB/GiB/TiB suffix, e.g. "42 B", "12.4 KiB".
@@ -335,6 +342,32 @@ impl fmt::Display for PrettySize {
 }
 impl PrettySize {
     pub const MAX_LEN: usize = 8;
+}
+
+pub struct PrettyDuration(pub f64); // seconds
+impl fmt::Display for PrettyDuration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (den, name) = match self.0 {
+            x if x < 1e-9 => (1e-12, "ps"),
+            x if x < 1e-6 => (1e-9, "ns"),
+            x if x < 1e-3 => (1e-6, "us"),
+            x if x < 1e0 => (1e-3, "ms"),
+            x if x < 3600.0 => (1e0, "s"),
+            x if x < 3600.0 * 24.0 => (3600.0, "h"),
+            x if x < 3600.0 * 24.0 * 7.0 => (3600.0 * 24.0, "d"),
+            x if x < 3600.0 * 24.0 * 7.0 * 9999.0 => (3600.0 * 24.0 * 7.0, "w"),
+            _ => return write!(f, ">180 y"),
+        };
+        // Use at most 4 digits.
+        match self.0 as f64 / den as f64 {
+            x if x < 9.995 - 1e-12 => write!(f, "{:.2} {}", x, name), // e.g. 1.23
+            x if x < 99.95 - 1e-12 => write!(f, "{:.1} {}", x, name), // e.g. 12.3
+            x                      => write!(f, "{:.0} {}", x, name), // e.g. 1023
+        }
+    }
+}
+impl PrettyDuration {
+    pub const MAX_LEN: usize = 7;
 }
 
 #[derive(Ord, Eq)]
@@ -555,4 +588,18 @@ macro_rules! D {
     () => {
         Default::default()
     };
+}
+
+pub trait SetMinMax {
+    fn set_min(&mut self, other: Self);
+    fn set_max(&mut self, other: Self);
+}
+
+impl<T: Ord+Copy> SetMinMax for T {
+    fn set_min(&mut self, other: Self) {
+        *self = std::cmp::min(*self, other);
+    }
+    fn set_max(&mut self, other: Self) {
+        *self = std::cmp::max(*self, other);
+    }
 }

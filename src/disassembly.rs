@@ -171,7 +171,7 @@ impl<'a> SymbolResolver for Resolver<'a> {
 pub fn disassemble_function(function_idx: usize, mut static_addr_ranges: Vec<Range<usize>>, symbols: Option<&Symbols>, code: Option<&[u8]>, intro: StyledText, palette: &Palette) -> Disassembly {
     clean_up_ranges(&mut static_addr_ranges);
 
-    let mut res = Disassembly {text: intro, lines: Vec::new(), error: None, max_abs_relative_addr: 0, indent_width: 1, widest_line: 0, symbols_shard: None};
+    let mut res = Disassembly {text: intro, lines: Vec::new(), error: None, max_abs_relative_addr: 0, indent_width: str_width(&palette.tree_indent.0), widest_line: 0, symbols_shard: None};
     let mut subfunc_ranges: Vec<&[SubfunctionPcRange]> = Vec::new();
 
     while res.lines.len() < res.text.num_lines() {

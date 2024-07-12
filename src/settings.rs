@@ -6,7 +6,11 @@ pub struct Settings {
     pub stop_on_initial_exec: bool,
     pub fps: f64,
     pub max_threads: usize,
-    // How often to refresh resource stats (cpu and memory usage) and save state to file (watches, breakpoints, etc). (State is also saved on clean exit, but not on panic or crash.)
+    // We currently use one timer for a few periodic tasks:
+    //  * refreshing resource stats (cpu and memory usage) for each thread and total,
+    //  * saving state to file (watches, breakpoints, etc) if changed (state is also saved on clean exit, but not on panic or crash),
+    //  * rendering progress bar movement, // TODO: use animation system instead (after implementing animation system)
+    //  * rotating profiling time series buckets.
     pub periodic_timer_seconds: f64,
     pub mouse_mode: MouseMode,
 
@@ -83,7 +87,8 @@ pub struct Palette {
     pub text_input: Style,
     pub text_input_selected: Style,
 
-    pub tree_indent: Style,
+    pub tree_indent: (String, Style),
+    pub tree_indent_selected: (String, Style),
 
     pub window_border: Style,
     pub window_border_active: Style,
@@ -140,6 +145,7 @@ impl Default for Palette {
 
             running: Style {fg: blue, ..D!()},
             suspended: Style {fg: light_green, ..D!()},
+
             function_name: Style {fg: white, ..D!()},
             filename: Style {fg: cyan, ..D!()},
             line_number: Style {fg: green, ..D!()},
@@ -180,7 +186,8 @@ impl Default for Palette {
             text_input: Style {fg: white, ..D!()},
             text_input_selected: Style {fg: white, bg: blue, ..D!()},
 
-            tree_indent: Style {fg: white.darker(), ..D!()},
+            tree_indent: ("┆".to_string(), Style {fg: white.darker(), ..D!()}),
+            tree_indent_selected: ("┇".to_string(), Style {fg: white, ..D!()}),
 
             window_border: Style {fg: white.darker(), ..D!()},
             window_border_active: Style {fg: white, modifier: Modifier::BOLD, ..D!()},
@@ -267,7 +274,7 @@ pub enum KeyAction {
 
     Open,
     ToggleBreakpoint,
-    ToggleBreakpointEnabledness,
+    DisableBreakpoint,
     Find,
 
     DuplicateRow,
@@ -312,88 +319,95 @@ impl KeyBinds {
         res
     }
 
-    fn init(&mut self) {
-        for (key, action) in &self.key_to_action {
-            self.action_to_keys.entry(action.clone()).or_default().push(key.clone());
+    pub fn action_to_key_name(&self, action: KeyAction) -> String {
+        match self.action_to_keys.get(&action) {
+            None => "<unbound>".to_string(),
+            Some(v) if v.is_empty() => "<unbound>".to_string(),
+            Some(v) => format!("{}", v[0]),
         }
+    }
+
+    fn new(key_to_action: &[(KeyEx, KeyAction)], text_input_key_to_action: &[(KeyEx, KeyAction)]) ->  Self {
+        let mut r = KeyBinds {key_to_action: key_to_action.iter().cloned().collect(), text_input_key_to_action: text_input_key_to_action.iter().cloned().collect(), action_to_keys: HashMap::new(), vscroll_sensitivity: 1, hscroll_sensitivity: 10};
+        // Order somewhat matters here: if there are multiple keys for the same action, we show only the first one in the hints window.
+        // So here we add keys in the same order in which the keys were specified in the input, not in HashMap iteration order.
+        for (key, action) in key_to_action {
+            r.action_to_keys.entry(*action).or_default().push(*key);
+        }
+        r
     }
 }
 impl Default for KeyBinds {
     fn default() -> Self {
-        let mut res = Self {
-            vscroll_sensitivity: 1, hscroll_sensitivity: 10, key_to_action: HashMap::from([
-                (Key::Char('q').plain(), KeyAction::Quit),
-                (Key::Char('r').plain(), KeyAction::Run),
-                (Key::Char('c').plain(), KeyAction::Continue),
-                (Key::Char('C').plain(), KeyAction::Suspend),
-                (Key::Char('c').ctrl(), KeyAction::Suspend),
-                (Key::Char('k').plain(), KeyAction::Kill),
-                (Key::Char('w').ctrl(), KeyAction::WindowUp),
-                (Key::Char('s').ctrl(), KeyAction::WindowDown),
-                (Key::Char('a').ctrl(), KeyAction::WindowLeft),
-                (Key::Char('d').ctrl(), KeyAction::WindowRight),
-                (Key::Char('0').plain(), KeyAction::Window(0)),
-                (Key::Char('1').plain(), KeyAction::Window(1)),
-                (Key::Char('2').plain(), KeyAction::Window(2)),
-                (Key::Char('3').plain(), KeyAction::Window(3)),
-                (Key::Char('4').plain(), KeyAction::Window(4)),
-                (Key::Char('5').plain(), KeyAction::Window(5)),
-                (Key::Char('6').plain(), KeyAction::Window(6)),
-                (Key::Char('7').plain(), KeyAction::Window(7)),
-                (Key::Char('8').plain(), KeyAction::Window(8)),
-                (Key::Char('9').plain(), KeyAction::Window(9)),
-                (Key::Up.plain(), KeyAction::CursorUp),
-                (Key::Down.plain(), KeyAction::CursorDown),
-                (Key::Left.plain(), KeyAction::CursorLeft),
-                (Key::Right.plain(), KeyAction::CursorRight),
-                (Key::Char('\n').plain(), KeyAction::Enter),
-                (Key::Delete.plain(), KeyAction::DeleteRow),
-                (Key::Backspace.plain(), KeyAction::DeleteRow),
-                (Key::Escape.plain(), KeyAction::Cancel),
-                (Key::Char('g').ctrl(), KeyAction::Cancel),
-                (Key::PageUp.plain(), KeyAction::PageUp),
-                (Key::Char('v').alt(), KeyAction::PageUp),
-                (Key::PageDown.plain(), KeyAction::PageDown),
-                (Key::Char('v').ctrl(), KeyAction::PageDown),
-                (Key::Home.plain(), KeyAction::Home),
-                (Key::End.plain(), KeyAction::End),
-                (Key::Char('i').ctrl(), KeyAction::Tooltip),
-                (Key::Char('s').plain(), KeyAction::StepIntoLine),
-                (Key::Char('S').plain(), KeyAction::StepIntoInstruction),
-                (Key::Char('n').plain(), KeyAction::StepOverLine),
-                (Key::Char('m').plain(), KeyAction::StepOverColumn),
-                (Key::Char('N').plain(), KeyAction::StepOverInstruction),
-                (Key::Char('f').plain(), KeyAction::StepOut),
-                (Key::Char('F').plain(), KeyAction::StepOutNoInline),
-                // (Ctrl+tab and ctrl+shift+tab are unrepresentable in ansi escape codes.)
-                (Key::Char('t').ctrl(), KeyAction::NextTab),
-                (Key::Char('b').ctrl(), KeyAction::PreviousTab),
-                (Key::Char('y').ctrl(), KeyAction::CloseTab),
-                (Key::Char(']').plain(), KeyAction::NextStackFrame),
-                (Key::Char('[').plain(), KeyAction::PreviousStackFrame),
-                (Key::Char('}').plain(), KeyAction::NextThread),
-                (Key::Char('{').plain(), KeyAction::PreviousThread),
-                (Key::Char('.').plain(), KeyAction::NextMatch),
-                (Key::Char(',').plain(), KeyAction::PreviousMatch),
-                (Key::Char('o').plain(), KeyAction::Open),
-                (Key::Char('b').plain(), KeyAction::ToggleBreakpoint),
-                (Key::Char('B').plain(), KeyAction::ToggleBreakpointEnabledness),
-                (Key::Char('/').plain(), KeyAction::Find),
-                (Key::Char('d').plain(), KeyAction::DuplicateRow),
-                (Key::Char('l').ctrl(), KeyAction::DropCaches),
-                (Key::Char('p').ctrl(), KeyAction::ToggleProfiler),
-            ]),
-            text_input_key_to_action: HashMap::from([
-                (Key::Char('7').ctrl(), KeyAction::Undo), // ctrl+/ is indistinguishable from ctrl+7
-                (Key::Char('_').alt(), KeyAction::Redo),
-                (Key::Char('y').ctrl(), KeyAction::Paste),
-                (Key::Char('c').ctrl(), KeyAction::Copy),
-                (Key::Char('x').ctrl(), KeyAction::Cut),
-                (Key::Char('v').ctrl(), KeyAction::Paste),
-                (Key::Char('\n').alt(), KeyAction::NewLine),
-            ]),
-            action_to_keys: HashMap::new()};
-        res.init();
-        res
+        Self::new(&[
+            (Key::Char('q').plain(), KeyAction::Quit),
+            (Key::Char('r').plain(), KeyAction::Run),
+            (Key::Char('c').plain(), KeyAction::Continue),
+            (Key::Char('C').plain(), KeyAction::Suspend),
+            (Key::Char('c').ctrl(), KeyAction::Suspend),
+            (Key::Char('k').plain(), KeyAction::Kill),
+            (Key::Up.alt(), KeyAction::WindowUp),
+            (Key::Down.alt(), KeyAction::WindowDown),
+            (Key::Left.alt(), KeyAction::WindowLeft),
+            (Key::Right.alt(), KeyAction::WindowRight),
+            (Key::Char('0').plain(), KeyAction::Window(0)),
+            (Key::Char('1').plain(), KeyAction::Window(1)),
+            (Key::Char('2').plain(), KeyAction::Window(2)),
+            (Key::Char('3').plain(), KeyAction::Window(3)),
+            (Key::Char('4').plain(), KeyAction::Window(4)),
+            (Key::Char('5').plain(), KeyAction::Window(5)),
+            (Key::Char('6').plain(), KeyAction::Window(6)),
+            (Key::Char('7').plain(), KeyAction::Window(7)),
+            (Key::Char('8').plain(), KeyAction::Window(8)),
+            (Key::Char('9').plain(), KeyAction::Window(9)),
+            (Key::Up.plain(), KeyAction::CursorUp),
+            (Key::Down.plain(), KeyAction::CursorDown),
+            (Key::Left.plain(), KeyAction::CursorLeft),
+            (Key::Right.plain(), KeyAction::CursorRight),
+            (Key::Char('\n').plain(), KeyAction::Enter),
+            (Key::Delete.plain(), KeyAction::DeleteRow),
+            (Key::Backspace.plain(), KeyAction::DeleteRow),
+            (Key::Escape.plain(), KeyAction::Cancel),
+            (Key::Char('g').ctrl(), KeyAction::Cancel),
+            (Key::PageUp.plain(), KeyAction::PageUp),
+            (Key::Char('v').alt(), KeyAction::PageUp),
+            (Key::PageDown.plain(), KeyAction::PageDown),
+            (Key::Char('v').ctrl(), KeyAction::PageDown),
+            (Key::Home.plain(), KeyAction::Home),
+            (Key::End.plain(), KeyAction::End),
+            (Key::Char('i').ctrl(), KeyAction::Tooltip),
+            (Key::Char('s').plain(), KeyAction::StepIntoLine),
+            (Key::Char('S').plain(), KeyAction::StepIntoInstruction),
+            (Key::Char('n').plain(), KeyAction::StepOverLine),
+            (Key::Char('m').plain(), KeyAction::StepOverColumn),
+            (Key::Char('N').plain(), KeyAction::StepOverInstruction),
+            (Key::Char('f').plain(), KeyAction::StepOut),
+            (Key::Char('F').plain(), KeyAction::StepOutNoInline),
+            // (Ctrl+tab and ctrl+shift+tab are unrepresentable in ansi escape codes.)
+            (Key::Char('t').ctrl(), KeyAction::NextTab),
+            (Key::Char('b').ctrl(), KeyAction::PreviousTab),
+            (Key::Char('w').ctrl(), KeyAction::CloseTab),
+            (Key::Char(']').plain(), KeyAction::NextStackFrame),
+            (Key::Char('[').plain(), KeyAction::PreviousStackFrame),
+            (Key::Char('}').plain(), KeyAction::NextThread),
+            (Key::Char('{').plain(), KeyAction::PreviousThread),
+            (Key::Char('.').plain(), KeyAction::NextMatch),
+            (Key::Char(',').plain(), KeyAction::PreviousMatch),
+            (Key::Char('o').plain(), KeyAction::Open),
+            (Key::Char('b').plain(), KeyAction::ToggleBreakpoint),
+            (Key::Char('B').plain(), KeyAction::DisableBreakpoint),
+            (Key::Char('/').plain(), KeyAction::Find),
+            (Key::Char('d').plain(), KeyAction::DuplicateRow),
+            (Key::Char('l').ctrl(), KeyAction::DropCaches),
+            (Key::Char('p').ctrl(), KeyAction::ToggleProfiler),
+        ], &[
+            (Key::Char('7').ctrl(), KeyAction::Undo), // ctrl+/ is indistinguishable from ctrl+7
+            (Key::Char('_').alt(), KeyAction::Redo),
+            (Key::Char('y').ctrl(), KeyAction::Paste),
+            (Key::Char('c').ctrl(), KeyAction::Copy),
+            (Key::Char('x').ctrl(), KeyAction::Cut),
+            (Key::Char('v').ctrl(), KeyAction::Paste),
+            (Key::Char('\n').alt(), KeyAction::NewLine),
+        ])
     }
 }

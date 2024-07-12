@@ -1,6 +1,8 @@
 use crate::{*, ui::*, widgets::*, pool::*, settings::*, imgui::*, common_ui::*, util::*};
 use std::{mem, collections::HashSet, hash::{Hash, Hasher}, ops::Range};
 
+// TODO: Drag and drop windows.
+// TODO: Save state.
 pub struct Layout {
     pub windows: Pool<Window>,
     pub active_window: Option<WindowId>,
@@ -229,6 +231,15 @@ impl Layout {
         let mut v: Vec<(WindowId, &mut Window)> = self.windows.iter_mut().collect();
         v.sort_by_key(|(id, w)| w.type_);
         v
+    }
+
+    pub fn any_window_by_type(&self, t: WindowType) -> Option<WindowId> {
+        for (id, win) in self.windows.iter() {
+            if win.type_ == t {
+                return Some(id);
+            }
+        }
+        None
     }
 
     pub fn leaf_at_point(&self, p: [isize; 2]) -> Option<WindowId> {

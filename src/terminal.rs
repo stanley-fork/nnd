@@ -1,5 +1,5 @@
-use crate::{*, common_ui::*, error::*};
-use std::{result, io, mem, sync::atomic::{AtomicBool, Ordering}, cell::UnsafeCell, io::Write, str};
+use crate::{*, common_ui::*, error::*, log::*};
+use std::{result, io, mem, sync::atomic::{AtomicBool, Ordering}, cell::UnsafeCell, io::Write, str, str::FromStr, fmt, fmt::{Display, Formatter}};
 use bitflags::*;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -121,9 +121,11 @@ impl ScreenBuffer {
     }
 }
 
-fn terminal_size() -> Result<(/*rows*/ u16, /*columns*/ u16)> {
+fn terminal_size(prof: &mut ProfileBucket) -> Result<(/*rows*/ u16, /*columns*/ u16)> {
     let mut s: libc::winsize = unsafe {mem::zeroed()};
-    let r = unsafe {libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut s as *mut _)};
+    let r = profile_syscall!(prof, {
+        unsafe {libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut s as *mut _)}
+    });
     if r != 0 {
         return errno_err!("ioctl(STDOUT, TIOCGWINSZ) failed");
     }
@@ -133,7 +135,7 @@ fn terminal_size() -> Result<(/*rows*/ u16, /*columns*/ u16)> {
 // Some ANSI escape codes.
 const CURSOR_BLINKING_BLOCK: &'static str = "\x1B[\x31 q";
 const CURSOR_BLINKING_BAR: &'static str = "\x1B[\x35 q";
-const CURSOR_HIDE: &'static str = "\x1B[?25l";
+pub const CURSOR_HIDE: &'static str = "\x1B[?25l";
 const CURSOR_SHOW: &'static str = "\x1B[?25h";
 const SCREEN_ALTERNATE: &'static str = "\x1B[?1049h";
 const SCREEN_MAIN: &'static str = "\x1B[?1049l";
@@ -208,8 +210,8 @@ pub struct Terminal {
 impl Terminal {
     pub fn new() -> Self { Self {prev_buffer: ScreenBuffer::default(), temp_buffer: ScreenBuffer::default()} }
 
-    pub fn start_frame(&mut self, style: Style) -> Result<ScreenBuffer> {
-        let (rows, columns) = terminal_size()?;
+    pub fn start_frame(&mut self, style: Style, prof: &mut ProfileBucket) -> Result<ScreenBuffer> {
+        let (rows, columns) = terminal_size(prof)?;
         let mut b = mem::take(&mut self.temp_buffer);
         b.resize_and_clear(columns as usize, rows as usize, style);
         Ok(b)
@@ -311,9 +313,11 @@ impl Terminal {
         commands
     }
 
-    pub fn present(&mut self, buffer: ScreenBuffer, commands: Vec<u8>) -> Result<()> {
-        io::stdout().write_all(&commands)?;
-        io::stdout().flush()?;
+    pub fn present(&mut self, buffer: ScreenBuffer, commands: Vec<u8>, prof: &mut ProfileBucket) -> Result<()> {
+        profile_syscall!(prof, {
+            io::stdout().write_all(&commands)?;
+            io::stdout().flush()?;
+        });
 
         self.temp_buffer = mem::replace(&mut self.prev_buffer, buffer);
         Ok(())
@@ -366,11 +370,123 @@ impl Key {
         }
     }
 }
+impl Display for Key {
+    fn fmt(&self, f: &mut Formatter<'_>) -> result::Result<(), fmt::Error> {
+        let s = match *self {
+            Key::Left => "left",
+            Key::Right => "right",
+            Key::Up => "up",
+            Key::Down => "down",
+            Key::Insert => "ins",
+            Key::Delete => "del",
+            Key::Home => "home",
+            Key::End => "end",
+            Key::PageUp => "pageup",
+            Key::PageDown => "pagedown",
+            Key::Backspace => "backspace",
+            Key::Escape => "esc",
+            Key::F(n) => return write!(f, "F{}", n),
+            Key::Char('\n') => "enter",
+            Key::Char('\t') => "tab",
+            Key::Char(' ') => "space",
+            Key::Char('\\') => "\\\\", //////// ////////////////
+            Key::Char(c) if c.is_ascii() && !c.is_ascii_control() => return write!(f, "{}", c), 
+            Key::Char(c) => return write!(f, "\\x{:02x}", c as u32),
+        };
+        write!(f, "{}", s)
+    }
+}
+impl FromStr for Key {
+    type Err = ();
+    fn from_str(s: &str) -> result::Result<Self, ()> {
+        // If one character, return that character (without checking if it's printable etc).
+        let mut it = s.chars();
+        let c = match it.next() {
+            None => return Err(()),
+            Some(x) => x };
+        if it.next().is_none() {
+            return Ok(Key::Char(c));
+        }
+
+        if !s.is_ascii() {
+            return Err(());
+        }
+
+        Ok(match s {
+            "left" => Key::Left,
+            "right" => Key::Right,
+            "up" => Key::Up,
+            "down" => Key::Down,
+            "ins" => Key::Insert,
+            "del" => Key::Delete,
+            "home" => Key::Home,
+            "end" => Key::End,
+            "pageup" => Key::PageUp,
+            "pagedown" => Key::PageDown,
+            "backspace" => Key::Backspace,
+            "esc" => Key::Escape,
+            "enter" => Key::Char('\n'),
+            "tab" => Key::Char('\t'),
+            "space" => Key::Char(' '),
+            s if s.starts_with("F") => match s[1..].parse::<u8>() {
+                Err(_) => return Err(()),
+                Ok(n) => Key::F(n),
+            }
+            s if s.starts_with("\\x") => match u32::from_str_radix(&s[2..], 16) {
+                Err(_) => return Err(()),
+                Ok(n) => match char::try_from(n) {
+                    Err(_) => return Err(()),
+                    Ok(c) => Key::Char(c),
+                }
+            }
+            _ => return Err(()),
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct KeyEx {
     pub key: Key,
     pub mods: ModKeys,
+}
+impl Display for KeyEx {
+    fn fmt(&self, f: &mut Formatter<'_>) -> result::Result<(), fmt::Error> {
+        if self.mods.contains(ModKeys::CTRL) {
+            write!(f, "C-")?;
+        }
+        if self.mods.contains(ModKeys::ALT) {
+            write!(f, "M-")?;
+        }
+        if self.mods.contains(ModKeys::SHIFT) {
+            write!(f, "S-")?;
+        }
+        if self.mods.contains(ModKeys::ANY) {
+            write!(f, "?-")?;
+        }
+        write!(f, "{}", self.key)
+    }
+}
+impl FromStr for KeyEx {
+    type Err = ();
+    fn from_str(mut s: &str) -> result::Result<Self, ()> {
+        let mut mods = ModKeys::empty();
+        loop {
+            if s.starts_with("C-") {
+                if mods.contains(ModKeys::CTRL) { return Err(()); }
+                mods.insert(ModKeys::CTRL);
+            } else if s.starts_with("M-") {
+                if mods.contains(ModKeys::ALT) { return Err(()); }
+                mods.insert(ModKeys::ALT);
+            } else if s.starts_with("S-") {
+                if mods.contains(ModKeys::SHIFT) { return Err(()); }
+                mods.insert(ModKeys::SHIFT);
+            } else {
+                break;
+            }
+            s = &s[2..];
+        }
+        Ok(KeyEx {key: s.parse()?, mods})
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -421,6 +537,9 @@ pub enum Event {
     FocusIn,
     FocusOut,
 }
+impl Event {
+    pub fn is_key(&self) -> bool { match self { Self::Key(_) => true, _ => false } }
+}
 
 pub struct InputReader {
     start: usize,
@@ -429,9 +548,9 @@ pub struct InputReader {
 }
 impl InputReader {
     pub fn new() -> Self { Self {start: 0, end: 0, buf: [0; 128]} }
-    
+
     // Reads readily available input from stdin, doesn't block.
-    pub fn read(&mut self, out: &mut Vec<Event>) -> Result<usize> {
+    pub fn read(&mut self, out: &mut Vec<Event>, prof: &mut ProfileBucket) -> Result<usize> {
         let mut bytes_read = 0usize;
         loop {
             if self.start * 2 > self.buf.len() {
@@ -440,7 +559,7 @@ impl InputReader {
                 self.start = 0;
             }
             assert!(self.end < self.buf.len()); // true as long as escape sequences are shorter than buf.len()/2, which they should be
-            let n = Self::read_bytes(&mut self.buf[self.end..])?;
+            let n = Self::read_bytes(&mut self.buf[self.end..], prof)?;
             if n == 0 {
                 return Ok(bytes_read);
             }
@@ -462,10 +581,12 @@ impl InputReader {
         }
     }
 
-    fn read_bytes(buf: &mut [u8]) -> Result<usize> {
+    fn read_bytes(buf: &mut [u8], prof: &mut ProfileBucket) -> Result<usize> {
         loop { // retry EINTR
             let mut pfd = libc::pollfd {fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0};
-            let r = unsafe {libc::poll(&mut pfd as *mut libc::pollfd, 1, 0)};
+            let r = profile_syscall!(prof, {
+                unsafe {libc::poll(&mut pfd as *mut libc::pollfd, 1, 0)}
+            });
             if r < 0 {
                 let e = io::Error::last_os_error();
                 if e.kind() == io::ErrorKind::Interrupted {
@@ -477,7 +598,9 @@ impl InputReader {
                 return Ok(0);
             }
 
-            let r = unsafe {libc::read(libc::STDIN_FILENO, buf.as_ptr() as *mut libc::c_void, buf.len())};
+            let r = profile_syscall!(prof, {
+                unsafe {libc::read(libc::STDIN_FILENO, buf.as_ptr() as *mut libc::c_void, buf.len())}
+            });
             if r < 0 {
                 let e = io::Error::last_os_error();
                 if e.kind() == io::ErrorKind::Interrupted {

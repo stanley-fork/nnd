@@ -96,130 +96,107 @@ impl Drop for ProfileScope {
 pub struct TscScope {
     start: u64,
 }
-
 impl TscScope {
     pub fn new() -> Self {
         Self {start: rdtsc()}
     }
 
-    pub fn finish(&self) -> u64 {
-        rdtsc() - self.start
+    pub fn restart(&mut self) -> u64 {
+        let t = rdtsc();
+        t - mem::replace(&mut self.start, t)
+    }
+
+    pub fn finish(mut self) -> u64 {
+        self.restart()
     }
 }
 
-// TODO: Rework this, draw graphs instead.
-pub struct Profiling {
+pub struct TscScopeExcludingSyscalls {
+    scope: TscScope,
+    prev_syscall_tsc: u64,
+}
+impl TscScopeExcludingSyscalls {
+    pub fn new(prof: &ProfileBucket) -> Self { Self {scope: TscScope::new(), prev_syscall_tsc: prof.syscall_tsc} }
+
+    pub fn restart(&mut self, prof: &ProfileBucket) -> u64 {
+        let t = prof.syscall_tsc;
+        self.scope.restart().saturating_sub(t - mem::replace(&mut self.prev_syscall_tsc, t))
+    }
+    pub fn finish(mut self, prof: &ProfileBucket) -> u64 {
+        self.restart(prof)
+    }
+}
+
+pub struct ProfileBucket {
+    // Currently not all syscalls are instrumented, only the few ones that are likely to be frequent in practice (especially syscalls that happen for each thread or for each ptrace event).
     pub syscall_count: usize,
     pub syscall_tsc: u64,
-    pub debugger_event_count: usize,
-    pub terminal_tsc: u64,
+    pub debugger_count: usize,
+    pub debugger_tsc: u64,
+    pub ui_max_tsc: u64,
+    pub other_tsc: u64,
 
-    // Debugger often receives many ptrace events in quick succession, e.g. one event per thread when stopping all threads.
-    // They might take multiple epoll iterations to arrive. We group those iterations to report the whole burst of activity as one item.
-    // A burst starts with a debugger event (iteration_debugger()) and ends when two consecutive renders had no debugger events in between.
-    // To detect the end of a burst, we request an additional re-render whenever there were debugger events between two consecutive renders,
-    // i.e. we render an additional frame at the end of each burst, which is also useful for showing the profiling information about the burst.
-    // (Maybe we should disable this extra rendering when profiler is not shown.)
-    burst_tsc: u64,
-    burst_syscall_count: usize,
-    burst_syscall_tsc: u64,
-    burst_event_count: usize,
-    burst_iterations: usize,
-    had_debugger_events_since_last_render: bool,
+    //asdqwe assign and render
+    pub ui_build_max_tsc: u64,
+    pub ui_render_max_tsc: u64,
+    pub ui_fill_max_tsc: u64,
+    pub ui_input_bytes: usize,
+    pub ui_output_bytes: usize,
 
-    start_time: Instant,
-    start_tsc: u64,
-    ms_per_tsc: Option<f64>,
+    pub s_per_tsc: f64,
 
-    history: VecDeque<StyledText>,
+    pub start_tsc: u64,
+    pub start_time: Instant,
+    pub end_tsc: u64,
+    pub end_time: Instant,
+}
+impl ProfileBucket {
+    pub fn new(start_time: Instant, start_tsc: u64) -> Self {
+        let mut r = ProfileBucket::invalid();
+        r.start_time = start_time;
+        r.start_tsc = start_tsc;
+        r
+    }
+
+    pub fn invalid() -> Self { Self {start_time: unsafe {mem::zeroed()}, start_tsc: 0, syscall_count: 0, syscall_tsc: 0, debugger_count: 0, debugger_tsc: 0, ui_max_tsc: 0, s_per_tsc: 0.0, end_tsc: 0, end_time: unsafe {mem::zeroed()}, other_tsc: 0, ui_build_max_tsc: 0, ui_render_max_tsc: 0, ui_fill_max_tsc: 0, ui_input_bytes: 0, ui_output_bytes: 0} }
+
+    pub fn finish(&mut self, end_time: Instant, end_tsc: u64) {
+        assert!(self.start_tsc != 0);
+        // It's probably in principle possible for rdtsc to decrease or stay the same. But if it fails to increase over periodic_timer period (currently 250ms by default) then for sure something's broken (possibly the cpu).
+        assert!(end_tsc > self.start_tsc);
+        self.end_tsc = end_tsc;
+        self.end_time = end_time;
+        self.s_per_tsc = (end_time - self.start_time).as_secs_f64() / (end_tsc - self.start_tsc) as f64;
+    }
+}
+
+pub struct Profiling {
+    pub buckets: VecDeque<ProfileBucket>,
+    pub bucket: ProfileBucket,
 }
 impl Profiling {
-    pub fn new() -> Self { Self {syscall_count: 0, syscall_tsc: 0, debugger_event_count: 0, terminal_tsc: 0, burst_tsc: 0, burst_syscall_count: 0, burst_syscall_tsc: 0, burst_event_count: 0, burst_iterations: 0, had_debugger_events_since_last_render: false, start_time: Instant::now(), start_tsc: rdtsc(), history: VecDeque::new(), ms_per_tsc: None} }
-/*asdqwe
-    pub fn format_summary(&mut self, out: &mut StyledText, width: usize) {
-        while self.history.len() > MAX_LINES {
-            self.history.pop_front();
-        }
-        for t in self.history.iter().rev() {
-            let w = str_width(&t.chars) + 1;
-            if w <= width && out.unclosed_line_width() + w > width {
-                out.close_line();
-            }
-            styled_write!(out, Style::default(), " ");
-            out.append_to_unclosed_line(t);
-        }
-        out.close_line();
-    }
+    pub fn new() -> Self { Self {buckets: VecDeque::new(), bucket: ProfileBucket::new(Instant::now(), rdtsc())} }
 
-    pub fn iteration_render_start(&mut self) -> /*should_render_again*/ bool {
-        if mem::take(&mut self.had_debugger_events_since_last_render) {
-            return true;
-        }
-        if self.burst_iterations == 0 {
-            return false;
-        }
-        let ms_per_tsc = self.get_ms_per_tsc();
-        let event_ms = (mem::take(&mut self.burst_tsc) - self.burst_syscall_tsc) as f64 * ms_per_tsc;
-        let syscall_ms = mem::take(&mut self.burst_syscall_tsc) as f64 * ms_per_tsc;
-        let mut out = StyledText::new();
-        styled_write!(out, Style::default().fg(Color::Magenta), "d:");
-        styled_write!(out, Style::default(), "{:.0}", event_ms);
-        styled_write!(out, Style::default().add_modifier(Modifier::DIM), "/{}/{}:", mem::take(&mut self.burst_event_count), mem::take(&mut self.burst_iterations));
-        styled_write!(out, Style::default(), "{:.0}", syscall_ms);
-        styled_write!(out, Style::default().add_modifier(Modifier::DIM), "/{}", mem::take(&mut self.burst_syscall_count));
-        self.history.push_back(out);
-        false
-    }
-    pub fn iteration_render_end(&mut self, tsc: u64) {
-        let ms_per_tsc = self.get_ms_per_tsc();
-        let render_ms = (tsc - self.terminal_tsc) as f64 * ms_per_tsc;
-        let terminal_ms = self.terminal_tsc as f64 * ms_per_tsc;
-        let mut out = StyledText::new();
-        styled_write!(out, Style::default().fg(Color::Green), "r:");
-        styled_write!(out, Style::default(), "{:.0}", render_ms);
-        styled_write!(out, Style::default().add_modifier(Modifier::DIM), ":");
-        styled_write!(out, Style::default(), "{:.0}", terminal_ms);
-        self.history.push_back(out);
-        self.clear_iteration_counters();
-    }
-    pub fn iteration_debugger(&mut self, tsc: u64) {
-        self.burst_tsc += tsc;
-        self.burst_syscall_count += self.syscall_count;
-        self.burst_syscall_tsc += self.syscall_tsc;
-        self.burst_event_count += self.debugger_event_count;
-        self.burst_iterations += 1;
-        self.had_debugger_events_since_last_render = true;
-        self.clear_iteration_counters();
-    }
-    pub fn iteration_other(&mut self, tsc: u64) {
-        let ms = tsc as f64 * self.get_ms_per_tsc();
-        if ms < 10.0 {
-            return;
-        }
-        let mut out = StyledText::new();
-        styled_write!(out, Style::default().fg(Color::Cyan), "o:");
-        styled_write!(out, Style::default(), "{:.0}", ms);
-        self.history.push_back(out);
-        self.clear_iteration_counters();
-    }
+    pub fn advance_bucket(&mut self) {
+        let time = Instant::now();
+        let tsc = rdtsc();
+        self.bucket.finish(time, tsc);
+        let new_bucket = ProfileBucket::new(time, tsc);
+        self.buckets.push_back(mem::replace(&mut self.bucket, new_bucket));
 
-    fn clear_iteration_counters(&mut self) {
-        (self.syscall_count, self.syscall_tsc, self.debugger_event_count, self.terminal_tsc) = (0, 0, 0, 0);
+        while self.buckets.len() > 1000 {
+            self.buckets.pop_front();
+        }
     }
-*/
-    fn get_ms_per_tsc(&mut self) -> f64 {
-        if let Some(x) = &self.ms_per_tsc {
-            return *x;
-        }
-        let tsc = rdtsc() - self.start_tsc;
-        if tsc == 0 {
-            return 0.0;
-        }
-        let ms = self.start_time.elapsed().as_secs_f64() * 1000.0;
-        let x = ms / tsc as f64;
-        if ms > 1000.0 {
-            self.ms_per_tsc = Some(x);
-        }
-        x
-    }
+}
+
+#[macro_export]
+macro_rules! profile_syscall {
+    ($prof:expr, {$($code:tt)*}) => {{
+        let timer = TscScope::new();
+        let r = {$($code)*};
+        $prof.syscall_count += 1;
+        $prof.syscall_tsc += timer.finish();
+        r
+    }};
 }

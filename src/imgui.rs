@@ -1,4 +1,4 @@
-use crate::{*, common_ui::*, terminal::*, settings::*, util::*};
+use crate::{*, common_ui::*, terminal::*, settings::*, util::*, log::*};
 use std::{mem, ops::Range, collections::HashMap, time::{Instant, Duration}, hash::Hash};
 use bitflags::*;
 
@@ -244,10 +244,10 @@ impl Widget {
     pub fn style_adjustment(mut self, a: StyleAdjustment) -> Self { self.style_adjustment = a; self }
     pub fn highlight_on_hover(mut self) -> Self { self.flags.insert(WidgetFlags::HIGHLIGHT_ON_HOVER); self }
 
-    pub fn get_rect_assume_fixed(&self) -> Rect {
-        assert!(self.axes[0].flags.contains(AxisFlags::POS_KNOWN | AxisFlags::SIZE_KNOWN) && self.axes[1].flags.contains(AxisFlags::POS_KNOWN | AxisFlags::SIZE_KNOWN));
-        Rect {pos: [self.axes[Axis::X].rel_pos, self.axes[Axis::Y].rel_pos], size: [self.axes[Axis::X].size, self.axes[Axis::Y].size]}
-    }
+    // These assert that the corresponding size/position is already calculated.
+    pub fn get_fixed_width(&self) -> usize { self.axes[Axis::X].get_fixed_size() }
+    pub fn get_fixed_height(&self) -> usize { self.axes[Axis::Y].get_fixed_size() }
+    pub fn get_fixed_rect(&self) -> Rect { Rect {pos: [self.axes[Axis::X].get_fixed_pos(), self.axes[Axis::Y].get_fixed_pos()], size: [self.axes[Axis::X].get_fixed_size(), self.axes[Axis::Y].get_fixed_size()]} }
 
     // Copy and clear all fields related to being already part of the tree. The resulting Widget can be add()ed to the tree.
     pub fn make_questionable_copy(&self) -> Self {
@@ -321,7 +321,7 @@ pub struct UI {
     //  disassembly window to scroll (to the corresponding line), and vice versa.)
     pub should_redraw: bool,
     pub should_show_cursor: Option<[isize; 2]>,
-    pub prof_render_duration: Duration, // how much of the last end_build() was spent in render()
+    pub prof_render_tsc: u64, // how long render() took during the latest end_build() call
     // TODO: Animation system.
 
     // Current frame that's being built.
@@ -346,7 +346,7 @@ pub struct UI {
 
     // Previous frame.
 
-    prev_tree: Vec<Widget>,
+    pub prev_tree: Vec<Widget>,
     prev_map: HashMap<usize, WidgetIdx>,
     prev_root: WidgetIdx,
     prev_focus_chain: Vec<WidgetIdx>,
@@ -444,9 +444,9 @@ impl UI {
         self.layout_subtree(self.root, Axis::X);
         self.layout_subtree(self.root, Axis::Y);
 
-        let start_time = Instant::now();
+        let timer = TscScope::new();
         self.render(screen);
-        self.prof_render_duration = Instant::now() - start_time;
+        self.prof_render_tsc = timer.finish();
 
         mem::swap(&mut self.tree, &mut self.prev_tree);
         self.prev_root = self.root;
@@ -788,8 +788,8 @@ impl UI {
             match &axis.auto_size {
                 _ if axis.flags.contains(AxisFlags::SIZE_KNOWN) => (),
                 AutoSize::Fixed(_) | AutoSize::Text => { Self::try_calculate_simple_size(w, ax, &mut self.text, &self.palette); }
-                AutoSize::Parent => assert!(all, "can't calculate size early because it depends on parent"),
-                AutoSize::Remainder(_) => assert!(all, "can't calculate size early because it depends on siblings"),
+                AutoSize::Parent => assert!(all, "can't calculate widget (line {}) size early because it depends on parent", w.source_line),
+                AutoSize::Remainder(_) => assert!(all, "can't calculate widget (line {}) size early because it depends on siblings", w.source_line),
                 AutoSize::Children => {
                     let mut size = 0usize;
                     let w = &self.tree[idx.0];
@@ -815,7 +815,6 @@ impl UI {
     fn try_calculate_simple_size(w: &mut Widget, ax: usize, text: &mut StyledText, palette: &Palette) -> bool {
         let size = match w.axes[ax].auto_size {
             AutoSize::Fixed(s) => s,
-            AutoSize::Text if ax == Axis::X && !w.draw_text.as_ref().is_some_and(|r| !r.is_empty()) => panic!("widget on line {} has width is AutoSize::Text, but no lines in draw_text", w.source_line),
             AutoSize::Text if ax == Axis::X => text.widest_line(w.draw_text.clone().unwrap()), // text width
             AutoSize::Text if !w.flags.contains(WidgetFlags::LINE_WRAP) => w.draw_text.as_ref().unwrap().len(), // height without line wrap
             AutoSize::Text if w.axes[0].flags.contains(AxisFlags::SIZE_KNOWN) => Self::get_line_wrapped_text(w, text, palette).len(), // height with line wrap
@@ -1219,6 +1218,7 @@ impl UI {
     fn find_widget_at_cursor(&self, cursor: [isize; 2]) -> WidgetIdx {
         let mut stack: Vec<WidgetIdx> = vec![self.prev_root];
         let mut res = WidgetIdx::invalid();
+        // DFS in the same order in which we render, and take the last interactable widget under the cursor.
         while let Some(idx) = stack.pop() {
             let w = &self.prev_tree[idx.0];
             if cursor[0] < w.axes[0].abs_pos || cursor[1] < w.axes[1].abs_pos || cursor[0] >= w.axes[0].abs_pos + w.axes[0].size as isize || cursor[1] >= w.axes[1].abs_pos + w.axes[1].size as isize {

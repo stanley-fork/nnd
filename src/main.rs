@@ -94,6 +94,12 @@ fn main() {
                     process::exit(1);
                 }
             };
+        } else if let Some(_) = parse_arg(&mut args, "--echo-input", "", true) {
+            match run_input_echo_tool() {
+                Ok(()) => (),
+                Err(e) => eprintln!("error: {}", e),
+            }
+            return;
         } else if print_help_chapter(&args[0], &all_args[0]) {
             process::exit(0);
         } else {
@@ -231,9 +237,9 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, command_line: Option<Vec<S
     let render_timer = TimerFD::new();
     // for fixed fps, do this here: render_timer.set(1, frame_ns), and remove other render_timer.set(...) calls
 
-    // Timer for refreshing resource stats and saving state. TODO: Currently progress bar updates also rely on this. Use animation system instead (after implementing it).
+    // Timer for various periodic tasks.
     let periodic_timer = TimerFD::new();
-    //asdqwe periodic_timer.set(1, (context.settings.periodic_timer_seconds * 1e9) as usize);
+    periodic_timer.set(1, (context.settings.periodic_timer_seconds * 1e9) as usize);
 
     epoll.add(STDIN_FILENO, libc::EPOLLIN, STDIN_FILENO as u64)?;
     epoll.add(render_timer.fd, libc::EPOLLIN, render_timer.fd as u64)?;
@@ -280,22 +286,23 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, command_line: Option<Vec<S
         let mut schedule_render = false;
         for event in &events[..n] {
             let fd = event.u64 as i32;
-            let prof = TscScope::new();
+            let mut prof = TscScopeExcludingSyscalls::new(&debugger.prof.bucket);
             schedule_render = true;
             if fd == signal_pipes_read[libc::SIGCHLD as usize] {
                 drain_signal_pipe(fd);
                 let drop_caches = debugger.process_events()?;
+                debugger.prof.bucket.debugger_tsc += prof.restart(&debugger.prof.bucket);
                 if drop_caches {
                     debugger.drop_caches()?;
                     ui.drop_caches();
+                    debugger.prof.bucket.other_tsc += prof.finish(&debugger.prof.bucket);
                 }
-                //asdqwe debugger.log.prof.iteration_debugger(prof.finish());
             } else if fd == signal_pipes_read[libc::SIGWINCH as usize] {
                 drain_signal_pipe(fd);
             } else if fd == misc_wakeup_fd.fd {
                 misc_wakeup_fd.read();
             } else if fd == STDIN_FILENO {
-                let significant = ui.buffer_input()?;
+                let significant = ui.buffer_input(&mut debugger.prof.bucket)?;
                 if !significant {
                     schedule_render = false;
                 } else if !pending_render {
@@ -316,12 +323,13 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, command_line: Option<Vec<S
                     debugger.drop_caches()?;
                     ui.drop_caches();
                 }
-                //asdqwe debugger.log.prof.iteration_other(prof.finish());
+                debugger.prof.bucket.other_tsc += prof.finish(&debugger.prof.bucket);
             } else if fd == periodic_timer.fd {
                 periodic_timer.read();
                 debugger.refresh_resource_stats();
                 PersistentState::try_to_save_state_if_changed(&mut debugger, &mut ui);
-                //asdqwe debugger.log.prof.iteration_other(prof.finish());
+                debugger.prof.bucket.other_tsc += prof.finish(&debugger.prof.bucket);
+                debugger.prof.advance_bucket();
             } else {
                 return err!(Internal, "epoll returned unexpected data: {}", fd);
             }
@@ -329,9 +337,7 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, command_line: Option<Vec<S
 
         if render_now {
             assert!(!pending_render);
-            let prof = TscScope::new();
             schedule_render = false;
-            //asdqwe schedule_render = debugger.log.prof.iteration_render_start();
 
             ui.update_and_render(&mut debugger)?;
 
@@ -343,10 +349,11 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, command_line: Option<Vec<S
 
             schedule_render |= ui.ui.should_redraw || ui.should_drop_caches;
             if ui.should_drop_caches {
+                let prof = TscScopeExcludingSyscalls::new(&debugger.prof.bucket);
                 debugger.drop_caches()?;
                 ui.drop_caches();
+                debugger.prof.bucket.other_tsc += prof.finish(&debugger.prof.bucket);
             }
-            //asdqwe debugger.log.prof.iteration_render_end(prof.finish());
         }
 
         if schedule_render && !pending_render {

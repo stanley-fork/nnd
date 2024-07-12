@@ -1,3 +1,4 @@
+use key chords instead of ctrl+wasd, use ctrl+w for closing tab
 investigate crash in to_investigate
 fix empty symbols loading stage name near the end
 make u8 always be non-ambiguous non-char

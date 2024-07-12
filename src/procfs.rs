@@ -1,4 +1,4 @@
-use crate::{*, error::*, elf::*, util::*};
+use crate::{*, error::*, elf::*, util::*, log::*};
 use std::io::{BufReader, BufRead};
 use std::{fs, fs::File, os::fd::{OwnedFd, AsRawFd}, str::FromStr, ops::Range, cmp::Ordering, collections::HashSet};
 use bitflags::*;
@@ -351,8 +351,11 @@ pub struct ProcStat {
     pub rss: usize, // in pages
 }
 impl ProcStat {
-    pub fn parse(path: &str) -> Result<ProcStat> {
+    pub fn parse(path: &str, prof: &mut ProfileBucket) -> Result<ProcStat> {
+        let timer = TscScope::new();
         let line = std::fs::read_to_string(path)?;
+        prof.syscall_count += 1;
+        prof.syscall_tsc += timer.finish();
 
         // We panic if parsing fails. The data comes from the kernel, not from a real file, so it should always be valid.
 

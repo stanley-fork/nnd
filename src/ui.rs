@@ -1,5 +1,5 @@
 use crate::{*, debugger::*, error::*, log::*, symbols::*, symbols_registry::*, util::*, registers::*, procfs::*, unwind::*, disassembly::*, pool::*, layout::*, settings::*, context::*, types::*, expr::*, widgets::*, search::*, arena::*, interp::*, imgui::*, common_ui::*, terminal::*};
-use std::{io::{self, Write, BufRead, BufReader, Read}, mem::{self, take}, collections::{HashSet, HashMap, hash_map::Entry}, os::fd::AsRawFd, path, path::{Path, PathBuf}, fs::File, fmt::Write as FmtWrite, borrow::Cow, ops::Range, str, os::unix::ffi::OsStrExt, sync::{Arc}};
+use std::{io::{self, Write, BufRead, BufReader, Read}, mem::{self, take}, collections::{HashSet, HashMap, hash_map::Entry}, os::fd::AsRawFd, path, path::{Path, PathBuf}, fs::File, fmt::Write as FmtWrite, borrow::Cow, ops::Range, str, os::unix::ffi::OsStrExt, sync::{Arc}, time::Duration};
 use libc::{self, pid_t};
 use rand::random;
 
@@ -18,7 +18,7 @@ pub struct DebuggerUI {
 #[derive(Default)]
 pub struct UIState {
     last_error: String, // reset on next key press
-    hints: [StyledText; 2], // 2 columns
+    key_hints: Vec<KeyHint>,
     profiler_enabled: bool,
 
     selected_thread: pid_t,
@@ -42,6 +42,17 @@ pub struct UIState {
     should_scroll_disassembly: Option<(Result<DisassemblyScrollTarget>, /*only_if_on_error_tab*/ bool)>,
 }
 
+#[derive(Default)]
+pub struct KeyHint {
+    pub key_ranges: Vec<[KeyAction; 2]>,
+    pub hint: &'static str,
+}
+impl KeyHint {
+    fn key(key: KeyAction, hint: &'static str) -> Self { Self {key_ranges: vec![[key, key]], hint} }
+    fn keys(keys: &[KeyAction], hint: &'static str) -> Self { Self {key_ranges: keys.iter().map(|k| [*k, *k]).collect(), hint} }
+    fn ranges(ranges: &[[KeyAction; 2]], hint: &'static str) -> Self { Self {key_ranges: ranges.iter().cloned().collect(), hint} }
+}
+
 struct SourceScrollTarget {
     path: PathBuf,
     version: FileVersionInfo,
@@ -62,7 +73,7 @@ pub trait WindowContent {
     // Called after some symbols finished loading, or if the user requested a redraw.
     fn drop_caches(&mut self) {}
 
-    fn get_hints(&self, hints: &mut StyledText, ui: &mut UI) {}
+    fn get_key_hints(&self, out: &mut Vec<KeyHint>) {}
 
     fn has_persistent_state(&self) -> bool {false}
     fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {panic!("unreachable")}
@@ -85,19 +96,22 @@ pub enum WindowType {
 
     Locations = 6,
     Watches = 7,
+    Hints = 8,
 
-    Other = 8,
+    Other = 9,
 
-    Status = 9,
+    Status = 10,
 }
 
 impl DebuggerUI {
     pub fn new() -> Self {
-        let layout = Self::default_layout();
         let ui = UI::default();
+        let mut state = UIState::default();
+        state.profiler_enabled = true;
+        let layout = Self::default_layout(&state);
         // TODO: Load keys and colors from config file(s), do hot-reloading (for experimenting with colors quickly).
 
-        Self {terminal: Terminal::new(), input: InputReader::new(), layout, ui, state: UIState::default(), should_drop_caches: false, should_quit: false}
+        Self {terminal: Terminal::new(), input: InputReader::new(), layout, ui, state, should_drop_caches: false, should_quit: false}
     }
 
     pub fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {
@@ -130,7 +144,7 @@ impl DebuggerUI {
         Ok(())
     }
 
-    fn default_layout() -> Layout {
+    fn default_layout(state: &UIState) -> Layout {
         // +---------+-------+-------------+
         // |  hints  |       |  binaries   |
         // |         |       | breakpoints |
@@ -149,13 +163,9 @@ impl DebuggerUI {
         let cols = layout.split(layout.root, Axis::X, vec![0.3, 0.75]);
 
         let rows = layout.split(cols[0], Axis::Y, vec![0.3, 0.4]);
-        let hints_window = layout.new_window(Some(rows[0]), WindowType::Other, true, "cheat sheet".to_string(), Box::new(HintsWindow::default()));
-        layout.set_fixed_size(hints_window, Axis::Y, 8);
+        let hints_window = layout.new_window(Some(rows[0]), WindowType::Hints, true, "cheat sheet".to_string(), Box::new(HintsWindow::default()));
         let status_window = layout.new_window(Some(rows[1]), WindowType::Status, true, "status".to_string(), Box::new(StatusWindow::default()));
         layout.set_fixed_size(status_window, Axis::Y, 7);
-        let mut w = WatchesWindow::default();
-        w.is_locals_window = true;
-        let locals_window = layout.new_window(Some(rows[2]), WindowType::Watches, true, "locals".to_string(), Box::new(w));
         let watches_window = layout.new_window(Some(rows[2]), WindowType::Watches, true, "watches".to_string(), Box::new(WatchesWindow::default()));
         layout.new_window(Some(rows[2]), WindowType::Watches, true, "registers".to_string(), Box::new(RegistersWindow::default()));
         layout.new_window(Some(rows[2]), WindowType::Locations, true, "locations".to_string(), Box::new(LocationsWindow::default()));
@@ -170,7 +180,6 @@ impl DebuggerUI {
         let stack_window = layout.new_window(Some(rows[1]), WindowType::Stack, true, "stack".to_string(), Box::new(StackWindow::default()));
         let threads_window = layout.new_window(Some(rows[2]), WindowType::Threads, true, "threads".to_string(), Box::new(ThreadsWindow::default()));
 
-        layout.set_hotkey_number(locals_window, 0);
         layout.set_hotkey_number(watches_window, 1);
         layout.set_hotkey_number(disassembly_window, 2);
         layout.set_hotkey_number(code_window, 3);
@@ -183,9 +192,10 @@ impl DebuggerUI {
         layout
     }
 
-    pub fn buffer_input(&mut self) -> Result<bool> {
+    pub fn buffer_input(&mut self, prof: &mut ProfileBucket) -> Result<bool> {
         let mut evs: Vec<Event> = Vec::new();
-        self.input.read(&mut evs)?;
+        let bytes = self.input.read(&mut evs, prof)?;
+        prof.ui_input_bytes += bytes;
 
         let mut significant = false;
         for e in &evs {
@@ -203,7 +213,10 @@ impl DebuggerUI {
     }
 
     pub fn update_and_render(&mut self, debugger: &mut Debugger) -> Result<()> {
-        let mut buffer = self.terminal.start_frame(self.ui.palette.default)?;
+        let mut timer = TscScopeExcludingSyscalls::new(&debugger.prof.bucket);
+        let mut buffer = self.terminal.start_frame(self.ui.palette.default, &mut debugger.prof.bucket)?;
+        let fill_tsc = timer.restart(&debugger.prof.bucket);
+
         self.ui.start_build(buffer.width, buffer.height);
 
         self.build(debugger)?;
@@ -213,9 +226,18 @@ impl DebuggerUI {
         }
 
         self.ui.end_build(&mut buffer);
+        let build_tsc = timer.restart(&debugger.prof.bucket) - self.ui.prof_render_tsc;
 
         let commands = self.terminal.prepare_command_buffer(&buffer, self.ui.should_show_cursor.clone());
-        self.terminal.present(buffer, commands)?;
+        debugger.prof.bucket.ui_output_bytes += commands.len();
+        self.terminal.present(buffer, commands, &mut debugger.prof.bucket)?;
+        let fill_tsc = fill_tsc + timer.finish(&debugger.prof.bucket);
+
+        debugger.prof.bucket.ui_build_max_tsc.set_max(build_tsc);
+        debugger.prof.bucket.ui_render_max_tsc.set_max(self.ui.prof_render_tsc);
+        debugger.prof.bucket.ui_fill_max_tsc.set_max(fill_tsc);
+        debugger.prof.bucket.ui_max_tsc.set_max(build_tsc + self.ui.prof_render_tsc + fill_tsc);
+
         Ok(())
     }
 
@@ -261,46 +283,59 @@ impl DebuggerUI {
             }
         }
 
-        // Hints window content. Keep it brief, there's not much space.
-        let mut hints = [StyledText::default(), StyledText::default()];
-        if debugger.target_state == ProcessState::NoProcess {
-            styled_write!(hints[0], self.ui.palette.default_dim, "q - quit"); hints[0].close_line();
-        } else if debugger.mode == RunMode::Attach {
-            styled_write!(hints[0], self.ui.palette.default_dim, "q - detach and quit"); hints[0].close_line();
-        } else {
-            styled_write!(hints[0], self.ui.palette.default_dim, "q - kill and quit"); hints[0].close_line();
+        // Special treatment for hints/profiler window. Maybe we should just make them different windows instead.
+        if let Some(id) = self.layout.any_window_by_type(WindowType::Hints) {
+            let w = self.layout.windows.get_mut(id);
+            if self.state.profiler_enabled {
+                w.fixed_size[Axis::Y] = None;
+                w.title = "profiler".to_string();
+            } else {
+                w.fixed_size[Axis::Y] = Some(HintsWindow::NORMAL_HEIGHT);
+                w.title = "controls".to_string();
+            }
         }
-        styled_write!(hints[1], self.ui.palette.default_dim, "[0-9]/C-wasd - switch window"); hints[1].close_line();
-        styled_write!(hints[1], self.ui.palette.default_dim, "C-t/C-b - switch tab"); hints[1].close_line();
+
+        // Draw lines around windows, determine which window is active.
+        self.layout.build(&mut self.ui);
+
+        // Hints window content. Keep it brief, there's not much space.
+        let mut hints = Vec::new();
+        if debugger.target_state == ProcessState::NoProcess {
+            hints.push(KeyHint::key(KeyAction::Quit, "quit"));
+        } else if debugger.mode == RunMode::Attach {
+            hints.push(KeyHint::key(KeyAction::Quit, "detach and quit"));
+        } else {
+            hints.push(KeyHint::key(KeyAction::Quit, "kill and quit"));
+        }
+        hints.push(KeyHint::ranges(&[[KeyAction::Window(0), KeyAction::Window(9)], [KeyAction::WindowLeft, KeyAction::WindowDown]], "switch window"));
+        hints.push(KeyHint::keys(&[KeyAction::NextTab, KeyAction::PreviousTab], "switch tab"));
         match debugger.target_state {
-            ProcessState::Running | ProcessState::Stepping => {
-                styled_write!(hints[0], self.ui.palette.default_dim, "C - suspend"); hints[0].close_line();
-            }
-            ProcessState::Suspended => {
-                styled_write!(hints[0], self.ui.palette.default_dim, "]/[/}}/{{ - switch frame/thread"); hints[0].close_line();
-                styled_write!(hints[0], self.ui.palette.default_dim, "c - continue"); hints[0].close_line();
-                styled_write!(hints[0], self.ui.palette.default_dim, "s/n/f - step into/over/out"); hints[0].close_line();
-                styled_write!(hints[0], self.ui.palette.default_dim, "m - step over column"); hints[0].close_line();
-                styled_write!(hints[0], self.ui.palette.default_dim, "S/N - step into/over instruction"); hints[0].close_line();
-            }
-            ProcessState::NoProcess if debugger.mode == RunMode::Run => {
-                styled_write!(hints[0], self.ui.palette.default_dim, "r - start"); hints[0].close_line();
-            }
+            ProcessState::Running => hints.push(
+                KeyHint::key(KeyAction::Suspend, "suspend")),
+            ProcessState::Stepping => hints.extend([
+                KeyHint::key(KeyAction::Suspend, "suspend"),
+                KeyHint::key(KeyAction::Continue, "continue")]),
+            ProcessState::Suspended => hints.extend([
+                KeyHint::keys(&[KeyAction::PreviousStackFrame, KeyAction::NextStackFrame, KeyAction::PreviousThread, KeyAction::NextThread], "switch frame/thread"),
+                KeyHint::key(KeyAction::Continue, "continue"),
+                KeyHint::keys(&[KeyAction::StepIntoLine, KeyAction::StepOverLine, KeyAction::StepOut, KeyAction::StepOverColumn], "step into/over/out/column"),
+                KeyHint::keys(&[KeyAction::StepIntoInstruction, KeyAction::StepOverInstruction], "step into/over instruction")]),
+            ProcessState::NoProcess if debugger.mode == RunMode::Run => hints.push(
+                KeyHint::key(KeyAction::Run, "start")),
             _ => (),
         }
         if debugger.mode == RunMode::Run && debugger.target_state != ProcessState::NoProcess {
-            styled_write!(hints[0], self.ui.palette.default_dim, "k - kill"); hints[0].close_line();
+            hints.push(KeyHint::key(KeyAction::Kill, "kill"));
         }
         if let &Some(id) = &self.layout.active_window {
             if let Some(w) = self.layout.windows.try_get(id) {
-                hints[1].close_line();
-                w.content.get_hints(&mut hints[1], &mut self.ui);
+                hints.push(KeyHint::keys(&[], "")); // spacer
+                w.content.get_key_hints(&mut hints);
             }
         }
-        self.state.hints = hints;
+        self.state.key_hints = hints;
 
         // Build windows.
-        self.layout.build(&mut self.ui);
         for (_, win) in self.layout.sorted_windows_mut() {
             with_parent!(self.ui, win.widget, {
                 win.content.build(&mut self.state, debugger, &mut self.ui);
@@ -379,10 +414,16 @@ impl WindowContent for RegistersWindow {
         f.render_widget(table, area);*/
      }
 }
-
 /*asdqwe
+#[derive(Clone, Copy)]
+struct ValueTreeNodeIdx(usize);
+impl ValueTreeNodeIdx {
+    fn invalid() -> Self { Self(usize::MAX) }
+    fn is_valid(self) -> bool { self.0 != usize::MAX }
+}
+
 struct ValueTreeNode {
-    name: &'static str, // points into Symbols, or into ValueTree, or static
+    name: Range<usize>, // lines in ValueTree's `text`
     value: Result<Value>,
     dubious: bool,
 
@@ -391,27 +432,42 @@ struct ValueTreeNode {
     identity: usize,
 
     depth: usize,
-    parent: usize,
+    parent: ValueTreeNodeIdx,
 
-    // How to render this node if it's [collapsed, expanded]. None if not (lazily) calculated yet.
-    formatted_line: [Option<usize>; 2],
-    expandable: Option<bool>, // populated together with either element of formatted_line
-    children: Range<usize>, // populated together with formatted_line[1]
-    //line_wrapped: Option</*lines_idxs*/ Range<usize>>,
+    // These are populated lazily.
+    formatted_line: [Option<Range<usize>>; 3], // collapsed, expanded, line-wrapped; ranges in ValueTree's `text`
+    has_children: Option<bool>, // populated together with either element of formatted_line
+    children: Option<Range<ValueTreeNodeIdx>>, // populated together with formatted_line[1]
 }
-impl Default for ValueTreeNode { fn default() -> Self { Self {name: "", value: err!(Internal, "if you're seeing this, there's a bug"), dubious: false, identity: 0, depth: 0, parent: usize::MAX, formatted_line: [None, None], expandable: None, children: 0..0} } }
+impl Default for ValueTreeNode { fn default() -> Self { Self {name: "", value: err!(Internal, "if you're seeing this, there's a bug"), dubious: false, identity: 0, depth: 0, parent: ValueTreeNodeIdx::invalid(), formatted_line: [None; 2], has_children: None, children: None} } }
 
+// An element of depth-first traversal of tree nodes, descending only into expanded ones. The cursor stands on one of these.
+#[derive(Clone, Default)]
+struct ValueTreeRow {
+    node: ValueTreeNodeIdx,
+    expanded: bool,
+
+    widget: WidgetIdx, // invalid() if we didn't create it yet
+    // Information needed to create the widget.
+    parent_widget: WidgetIdx,
+    rel_y: isize,
+    indent_built: bool,
+    // If false, widget for this row should be created by build_tree(). Otherwise widget may be created later, after layout and visibility check.
+    deferred: bool,
+}
+
+#[derive(Default)]
 struct ValueTree {
     nodes: Vec<ValueTreeNode>,
+    roots: Vec<ValueTreeNodeIdx>, // (so it's technically a forest, but ValueTree sounds nicer, and you can always imagine an implicit root node that has these "root" nodes as children)
     text: StyledText,
+    rows: Vec<ValueTreeRow>, // if empty, we should repopulate it
     arena: Arena,
-    roots: Vec<usize>, // (so it's technically a forest, but ValueTree sounds nicer, and you can always imagine an implicit root node that has these "root" nodes as children)
 }
 impl ValueTree {
-    fn new() -> Self { Self {nodes: Vec::new(), text: StyledText::default(), arena: Arena::new(), roots: Vec::new()} }
-    fn clear(&mut self) { *self = Self::new(); }
+    fn clear(&mut self) { *self = Self::default(); }
 
-    fn add(&mut self, mut node: ValueTreeNode) -> usize {
+    fn add(&mut self, mut node: ValueTreeNode) -> ValueTreeNodeIdx {
         assert!(node.depth == 0);
         if node.parent != usize::MAX {
             let parent = &self.nodes[node.parent];
@@ -421,40 +477,49 @@ impl ValueTree {
             self.roots.push(self.nodes.len());
         }
         self.nodes.push(node);
-        self.nodes.len() - 1
+        ValueTreeNodeIdx(self.nodes.len() - 1)
     }
 }*/
 
 #[derive(Default)]
-struct WatchesWindow {
-    is_locals_window: bool,
-    next_watch_id: usize,
+struct WatchesWindow {/*asdqwe
+    tree: ValueTree,
+    expanded_nodes: HashSet<usize>,
+
+    cursor_path: Vec<usize>,
+    cursor_idx: usize,
+    scroll: isize,
+    scroll_to_cursor: bool,
+
+    // Layout information. We do layout and line wrapping manually to avoid creating widgets for invisible rows.
+    name_width: usize,
+    value_width: usize,
+    row_height_limit: usize,
+    indent_width: usize,
+    max_indent: usize,
 
     // When this changes, we recalculate everything.
     seen: (/*thread*/ pid_t, /*selected_subframe*/ usize, /*stop_count*/ usize),
 
+    next_watch_id: usize,
     expressions: Vec<(/*identity*/ usize, String)>, // watch expressions; parallel to tree.roots
-    text_input: Option<(/*identity*/ usize, Rect, TextInput)>, // if editing watch expression
-/*asdqwe
-    eval_state: EvalState,
+    text_input: Option<(/*identity*/ usize, TextInput)>, // if editing watch expression
+    text_input_built: bool,
 
-    tree: ValueTree,
-    expanded_nodes: HashSet<usize>,
-    cursor_path: Vec<usize>,
-
-    scroll: Scroll,
-    lines: Vec<(/*node_idx*/ usize, /*expanded*/ bool)>, // line index -> tree node */
+    eval_state: EvalState,*/
 }
-
-impl WatchesWindow {
-/*asdqwe
+impl WatchesWindow {/*asdqwe
     fn clear_tree(&mut self) {
-        self.lines.clear();
         self.tree.clear();
         self.eval_state.clear();
     }
 
-    fn eval_locals(&mut self, context: &EvalContext) {
+    fn eval_locals(&mut self, context: &EvalContext, root_idx: ValueTreeNodeIdx) {
+        let root = &mut self.tree.nodes[root_idx.0];
+        root.has_children = Some(true);
+        root.children = Some(0..0);
+        /*
+        asdqwe;
         let (dwarf_context, _) = match self.eval_state.make_local_dwarf_eval_context(context, context.selected_subframe) {
             Ok(x) => x,
             Err(e) => {
@@ -479,24 +544,43 @@ impl WatchesWindow {
             let name = unsafe {v.name()};
             let idx_per_name = *idxs_per_name.entry(name).and_modify(|x| *x += 1).or_insert(1) - 1;
             self.tree.add(ValueTreeNode {name, value: value.map(|val| Value {val, type_: v.type_, flags: ValueFlags::empty()}), dubious, identity: hash(&(name, idx_per_name)), ..Default::default()});
-        }
+        }*/
     }
 
-    fn eval_watches(&mut self, context: &EvalContext) {
-        for (identity, expr) in &self.expressions {
-            let (value, dubious) = if expr.is_empty() {
-                (err!(ValueTreePlaceholder, ""), false)
+    fn eval_registers(&mut self, context: EvalContext, root_idx: ValueTreeNodeIdx) {
+        let root = &mut self.tree.nodes[root_idx.0];
+        root.has_children = Some(true);
+        root.children = Some(0..0);
+        //asdqwe
+    }
+
+    fn eval_watches(&mut self, context: &EvalContext, ui: &mut UI) {
+        for &(identity, ref expr) in &self.expressions {
+            styled_write!(self.tree.text, ui.palette.default, "{}", expr);
+            let l = text.close_line();
+            let name = self.tree.text.split_by_newline_character(l, None);
+            let root_idx = self.tree.add(ValueTreeNode {name, identity, ..D!()});
+            let root = &mut self.tree.nodes[root_idx.0];
+
+            if expr.is_empty() {
+                root.has_children = Some(false);
+            } else if expr == "<locals>" {
+                self.eval_locals(context, root);
+            } else if expr == "<registers>" {
+                self.eval_registers(context, root);
             } else {
                 match eval_watch_expression(expr, &mut self.eval_state, context) {
-                    Ok((val, dub)) => (Ok(val), dub),
-                    Err(e) => (Err(e), false),
+                    Ok((val, dub)) => {
+                        root.value = val;
+                        root.dubious = dub;
+                    }
+                    Err(e) => root.value = Err(e),
                 }
-            };
-            let name = self.tree.arena.add_str(expr);
-            self.tree.add(ValueTreeNode {name, value, dubious, identity: *identity, ..Default::default()});
+            }
         }
     }
-
+*/
+    /*asdqwe
     fn populate_lines(&mut self, context: Option<&EvalContext>, palette: &Palette) {
         self.lines.clear();
         let mut max_cursor_match = 0usize;
@@ -572,7 +656,21 @@ impl WatchesWindow {
 }
 
 impl WindowContent for WatchesWindow {
-    fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
+    fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {/*asdqwe
+        // Plan:
+        //  1. Handle expand/collapse/edit-start/edit-stop inputs using last frame rows and tree.
+        //  2. Recalculate the tree if needed.
+        //  3. Build widget tree and rows list.
+        //     For nodes whose height isn't known asdqwe
+        //     For nodes that affect layout of other nodes (expanded nodes, text input node) the widgets are created immediately.
+        //     For other nodes, widget creation is deferred to a later stage, after layout, to avoid building invisible nodes.
+        //     Locate cursor (map cursor_path to cursor_idx). Build TextInput, close it on focus loss.
+        //  4. layout_subtree(). Now we know the heights and coordinates of all rows.
+        //  5. Cursor navigation.
+        //  6. Scrolling navigation. Now we know which rows are visible.
+        //  7. Build the visible rows and the selected row.
+        //  8. Focus and highlight selected row.
+
         styled_write!(ui.text, ui.palette.default, "{}", if self.is_locals_window {"locals"} else {"watches"});
         let l = ui.text.close_line();
         ui.add(widget!().text(l));
@@ -831,7 +929,7 @@ impl WindowContent for WatchesWindow {
         self.text_input = None;
     }
 
-    fn get_hints(&self, hints: &mut StyledText, ui: &mut UI) {
+    fn get_key_hints(&self, out: &mut Vec<KeyHint>) {}
         styled_write!(hints, ui.palette.default_dim, "ret - edit"); hints.close_line();
         styled_write!(hints, ui.palette.default_dim, "d - duplicate"); hints.close_line();
         styled_write!(hints, ui.palette.default_dim, "backspace - delete"); hints.close_line();
@@ -855,7 +953,7 @@ impl WindowContent for WatchesWindow {
             self.expressions.push((id, expr));
         }
         Ok(())
-    }*/
+    }*/ */
     }
 }
 
@@ -959,6 +1057,7 @@ struct DisassemblyFunctionLocator {
 struct DisassemblyTab {
     title: String,
     identity: usize,
+    ephemeral: bool,
 
     // Cases:
     //  * locator is None, error is Some - couldn't find function for current address; this is a tab for the error message about that,
@@ -970,8 +1069,10 @@ struct DisassemblyTab {
     error: Option<Error>,
     cached_function_idx: Option<(/*symbols_identity*/ usize, /*function_idx*/ usize)>,
 
+    // When moving cursor through disassembly, we automatically scroll source code to the corresponding line.
+    // But if the cursor is inside some inlined functions, which of them do we scroll to? This depth number determines that.
+    // This indentation level is highlighted.
     selected_subfunction_level: u16,
-    ephemeral: bool,
 
     area_state: AreaState,
 }
@@ -1012,7 +1113,7 @@ impl DisassemblyWindow {
         let title = Self::make_title(&demangled_name);
         self.tabs.push(DisassemblyTab {
             identity: random(), locator: Some(DisassemblyFunctionLocator {binary_id: binary.id.clone(), mangled_name: function.mangled_name().to_owned(), addr: function.addr, demangled_name}),
-            cached_function_idx: Some((symbols.identity, target.function_idx)), title, ephemeral: true, ..Default::default()});
+            cached_function_idx: Some((symbols.identity, target.function_idx)), title, ephemeral: true, selected_subfunction_level: u16::MAX, ..Default::default()});
         self.tabs_state.select(self.tabs.len() - 1);
 
         Ok(())
@@ -1117,13 +1218,25 @@ impl DisassemblyWindow {
     }
 
     fn find_or_disassemble_function<'a>(cache: &'a mut HashMap<(usize, usize), Disassembly>, binary: &BinaryInfo, function_idx: usize, palette: &Palette) -> &'a Disassembly {
-        cache.entry((binary.symbols.as_ref().unwrap().identity, function_idx)).or_insert_with(|| {
-            // Would be nice to also support disassembling arbitrary memory, regardless of functions or binaries. E.g. for JIT-generated code.
-            match Self::disassemble_function(binary, function_idx, palette) {
-                Ok(d) => d,
-                Err(e) => Disassembly::new().with_error(e, palette),
+        let indent_width = str_width(&palette.tree_indent.0);
+        let e = cache.entry((binary.symbols.as_ref().unwrap().identity, function_idx));
+        match e {
+            Entry::Occupied(o) if o.get().indent_width == indent_width => o.into_mut(),
+            _ => {
+                // Would be nice to also support disassembling arbitrary memory, regardless of functions or binaries. E.g. for JIT-generated code.
+                let d = match Self::disassemble_function(binary, function_idx, palette) {
+                    Ok(d) => d,
+                    Err(e) => Disassembly::new().with_error(e, palette),
+                };
+                match e {
+                    Entry::Occupied(mut o) => {
+                        *o.get_mut() = d;
+                        o.into_mut()
+                    }
+                    Entry::Vacant(v) => v.insert(d),
+                }
             }
-        })
+        }
     }
 
     // Would be nice to also support disassembling arbitrary memory, regardless of functions or binaries. E.g. for JIT-generated code.
@@ -1157,10 +1270,8 @@ impl DisassemblyWindow {
                 return None;
             }
             self.tabs_state.closed(i);
-            Some(self.tabs_state.selected)
-        } else {
-            None
         }
+        Some(self.tabs_state.selected)
     }
 
     fn evict_cache(&mut self) {
@@ -1184,48 +1295,28 @@ impl DisassemblyWindow {
     }
 
     fn build_search_dialog(&mut self, create: bool, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
-        let dialog_widget = match ui.check_dialog(create) {
+        let dialog_widget = match make_dialog_frame(create, AutoSize::Remainder(0.75), AutoSize::Remainder(0.83), ui.palette.dialog, ui.palette.function_name, "find function (by mangled name)", ui) {
             None => {
                 self.search_dialog = None;
                 return;
             }
             Some(x) => x };
-        if self.search_dialog.is_none() {
-            //asdqwe self.search_dialog = Some(SearchDialog::new(Arc::new(FunctionSearcher), debugger.context.clone()));
-        }
-        let d = self.search_dialog.as_mut().unwrap();
+
+        let d = self.search_dialog.get_or_insert_with(|| SearchDialog::new(Arc::new(FunctionSearcher), debugger.context.clone()));
         with_parent!(ui, dialog_widget, {
-            let l = ui_writeln!(ui, default, "hello world");
-            ui.add(widget!().text(l));
-            /*
-            let event = d.update(keys, &debugger.context.settings.keys, &debugger.symbols, Some(debugger.info.binaries.keys().cloned().collect()));
-            let mut function_to_open = None;
-            match event {
-                SearchDialogEvent::None => (),
-                SearchDialogEvent::Cancel => self.search_dialog = None,
-                SearchDialogEvent::Open(res) => function_to_open = Some(res),
-                SearchDialogEvent::Done(res) => {
-                    function_to_open = Some(res);
-                    self.search_dialog = None;
-                }
-            }
-            if let Some(res) = function_to_open {
-                match self.open_function(Ok(DisassemblyScrollTarget {binary_id: res.binary, function_idx: res.id, addr: 0, subfunction_level: u16::MAX}), debugger) {
-                    Ok(()) => self.tabs[self.selected_tab].pinned = true,
-                    Err(e) => log!(debugger.log, "{}", e),
-                }
-            }
-            if self.search_dialog.is_some() {
-                return;
-            }
-
-            ui.loading |= d.render(f, screen_area, "find function (by mangled name)", &debugger.context.settings.palette);
-             */
-
-            if ui.check_key(KeyAction::Cancel) {
-                ui.close_dialog();
-            }
+            d.build(&debugger.symbols, Some(debugger.info.binaries.keys().cloned().collect()), ui);
         });
+
+        if d.should_close_dialog {
+            ui.close_dialog();
+        }
+
+        if let Some(res) = mem::take(&mut d.should_open_document) {
+            match self.open_function(Ok(DisassemblyScrollTarget {binary_id: res.binary, symbols_identity: res.symbols.identity, function_idx: res.id, static_pseudo_addr: 0, subfunction_level: u16::MAX}), debugger) {
+                Ok(()) => self.tabs[self.tabs_state.selected].ephemeral = false,
+                Err(e) => log!(debugger.log, "{}", e),
+            }
+        }
     }
 }
 
@@ -1294,7 +1385,7 @@ impl WindowContent for DisassemblyWindow {
             }
             self.tabs_state = tabs.finish(ui);
         });
-        let content_root = ui.add(widget!().height(AutoSize::Remainder(1.0)).vstack());
+        let content_root = ui.add(widget!().height(AutoSize::Remainder(1.0)));
         with_parent!(ui, content_root, {
             ui.multifocus();
         });
@@ -1328,7 +1419,7 @@ impl WindowContent for DisassemblyWindow {
                 let end = ui.text.num_lines();
                 with_parent!(ui, content_root, {
                     // Horizontally scrollable error message.
-                    build_biscrollable_area(start..end, [0, 0], &mut tab.area_state, ui);
+                    build_biscrollable_area_with_header(start..end, [0, 0], &mut tab.area_state, ui);
                 });
                 return;
             }
@@ -1344,11 +1435,11 @@ impl WindowContent for DisassemblyWindow {
         }
 
         let rel_addr_digits = (((disas.max_abs_relative_addr as f64 + 1.0).log2() / 4.0).ceil() as usize).max(1); // how many hex digits to use in the "<+1abc>" things
-        let prefix_width = 2 + 2 + 12 + rel_addr_digits+4 + 2 + 1; // ip, breakpoint, addr, rel_addr, jump_indicator, space
+        let prefix_width = 2 + 2 + 12+1 + rel_addr_digits+4 + 2 + 1; // ip, breakpoint, addr, rel_addr, jump_indicator, space
 
         let end = ui.text.num_lines();
         let (content, visible_y) = with_parent!(ui, content_root, {
-            build_biscrollable_area(start..end, [prefix_width + disas.widest_line, disas.lines.len()], &mut tab.area_state, ui)
+            build_biscrollable_area_with_header(start..end, [prefix_width + disas.widest_line, disas.lines.len()], &mut tab.area_state, ui)
         });
 
         // Now the cursor position is final.
@@ -1372,10 +1463,10 @@ impl WindowContent for DisassemblyWindow {
                     KeyAction::ToggleBreakpoint if has_addr => {
                         // TODO: Instruction breakpoints. Probably store static addr + binary id, not dynamic addr. But make it work without requiring Symbols, just based on mmaps.
                     }
-                    KeyAction::PreviousMatch => tab.selected_subfunction_level = tab.selected_subfunction_level.min(disas_line.subfunction_level).saturating_sub(1),
+                    KeyAction::PreviousMatch => tab.selected_subfunction_level = tab.selected_subfunction_level.saturating_sub(1).min(disas_line.subfunction_level),
                     KeyAction::NextMatch => {
                         tab.selected_subfunction_level = tab.selected_subfunction_level.saturating_add(1);
-                        if tab.selected_subfunction_level >= disas_line.subfunction_level {
+                        if tab.selected_subfunction_level > disas_line.subfunction_level {
                             tab.selected_subfunction_level = u16::MAX;
                         }
                     }
@@ -1385,10 +1476,10 @@ impl WindowContent for DisassemblyWindow {
 
             let mut source_line_info = disas_line.leaf_line.clone();
             if let &Some(mut sf_idx) = &disas_line.subfunction {
-                while symbols_shard.subfunctions[sf_idx].level > tab.selected_subfunction_level + 1 {
+                while symbols_shard.subfunctions[sf_idx].level > tab.selected_subfunction_level {
                     sf_idx = symbols_shard.subfunctions[sf_idx].parent;
                 }
-                if symbols_shard.subfunctions[sf_idx].level == tab.selected_subfunction_level + 1 {
+                if symbols_shard.subfunctions[sf_idx].level == tab.selected_subfunction_level {
                     selected_subfunction_idx = Some(sf_idx);
                     source_line_info = Some(symbols_shard.subfunctions[sf_idx].call_line.clone());
                 }
@@ -1398,12 +1489,20 @@ impl WindowContent for DisassemblyWindow {
                 source_line = Some(SourceScrollTarget {path: file.path.to_owned(), version: file.version.clone(), line: line.line()});
             }
         }
+        let key = (symbols.identity, function_idx, tab.area_state.cursor, tab.selected_subfunction_level);
+        if !suppress_code_autoscroll && self.source_scrolled_to.as_ref() != Some(&key) {
+            self.source_scrolled_to = Some(key);
+            if let Some(target) = source_line {
+                state.should_scroll_source = Some((Some(target), false));
+                ui.should_redraw = true;
+            }
+        }
 
         let mut ip_lines: Vec<(usize, /*selected*/ bool)> = Vec::new();
         for (idx, frame) in state.stack.frames.iter().enumerate() {
-            if frame.binary_id == Some(binary.id) {
+            if frame.binary_id.as_ref() == Some(&binary.id) {
                 let static_pseudo_addr = frame.pseudo_addr.wrapping_sub(frame.addr_static_to_dynamic);
-                if let Some(line) = disas.pseudo_addr_to_line(static_pseudo_addr) {
+                if let Some(line) = disas.static_pseudo_addr_to_line(static_pseudo_addr) {
                     ip_lines.push((line, idx == state.selected_frame));
                 }
             }
@@ -1411,117 +1510,144 @@ impl WindowContent for DisassemblyWindow {
         ip_lines.sort_unstable_by_key(|k| (k.0, !k.1));
 
         with_parent!(ui, content, {
-            /* asdqwe
-            let key = (binary_id.clone(), function_idx, tab.scroll.cursor, tab.selected_subfunction_level);
-            if !suppress_code_autoscroll && self.source_scrolled_to.as_ref() != Some(&key) {
-                self.source_scrolled_to = Some(key);
-                if let Some(target) = source_line {
-                    state.should_scroll_source = Some((Some(target), false));
-                    ui.should_redraw = true;
+            let line_range = visible_y.start.max(0) as usize .. (visible_y.end.max(0) as usize).min(disas.lines.len());
+            for i in line_range.clone() {
+                let line = &disas.lines[i];
+
+                if line.kind == DisassemblyLineKind::Instruction {
+                    let addr = binary.addr_map.static_to_dynamic(line.static_addr);
+
+                    // (Comparing line number instead of address because the "instruction pointer" pseudoaddress may be in between instructions.)
+                    let ip_idx = ip_lines.partition_point(|x| x.0 < i);
+                    if ip_idx == ip_lines.len() || ip_lines[ip_idx].0 != i {
+                        ui_write!(ui, default, "  ");
+                    } else if ip_lines[ip_idx].1 {
+                        ui_write!(ui, instruction_pointer, "⮕ ");
+                    } else {
+                        ui_write!(ui, additional_instruction_pointer, "⮕ ");
+                    }
+
+                    let loc_idx = debugger.breakpoint_locations.partition_point(|loc| loc.addr < addr);
+                    let mut marker = "  ";
+                    if line.kind == DisassemblyLineKind::Instruction && loc_idx < debugger.breakpoint_locations.len() {
+                        let loc = &debugger.breakpoint_locations[loc_idx];
+                        if loc.addr == addr && loc.breakpoints.iter().any(|b| match b { BreakpointRef::Id {..} => true, BreakpointRef::Step(_) => false }) {
+                            marker = if loc.active { "● " } else { "○ " }
+                        }
+                    }
+                    ui_write!(ui, secondary_breakpoint, "{}", marker);
+
+                    ui_write!(ui, default_dim, "{:012x} ", addr);
+                    ui_write!(ui, disas_relative_address, "<{: >+1$x}> ", line.relative_addr, rel_addr_digits + 1);
+                    ui_write!(ui, disas_jump_arrow, " {} ", line.jump_indicator);
+
+                    assert_eq!(ui.text.unclosed_line_width(), prefix_width);
+                } else if line.kind != DisassemblyLineKind::Intro {
+                    ui_write!(ui, default, "{:1$}", "", prefix_width);
                 }
+
+                // Reserve space for indentation. These characters won't be visible, we'll cover them with clickable vertical-line widgets below.
+                if line.subfunction_level != 0 {
+                    ui_write!(ui, default, "{:1$}", "", line.subfunction_level as usize * disas.indent_width);
+                }
+
+                let l = ui.text.import_lines(&disas.text, i..i+1).start;
+
+                let mut w = widget!().identity(&('l', i)).fixed_height(1).fixed_y(i as isize).text(l).fill(' ', ui.palette.default).flags(WidgetFlags::HSCROLL_INDICATOR_RIGHT).highlight_on_hover();
+                if i == tab.area_state.cursor {
+                    w.style_adjustment.update(ui.palette.selected);
+                }
+                ui.add(w);
             }
 
-            for i in range {
-                let mut spans: Vec<Span> = Vec::new();
-                let line_addr = &disas.lines[i];
-
-                // (Comparing line number instead of address because the "instruction pointer" pseudoaddress may be in between instructions.)
-                let ip_idx = ip_lines.partition_point(|x| x.0 < i);
-                if ip_idx == ip_lines.len() || ip_lines[ip_idx].0 != i {
-                    spans.push(Span::raw("  "));
-                } else if ip_lines[ip_idx].1 {
-                    spans.push(Span::styled("⮕ ", palette.instruction_pointer));
-                } else {
-                    spans.push(Span::styled("⮕ ", palette.additional_instruction_pointer));
-                }
-
-                let loc_idx = debugger.breakpoint_locations.partition_point(|loc| loc.addr < line_addr.addr);
-                let mut marker = "  ";
-                if line_addr.kind == DisassemblyLineKind::Instruction && loc_idx < debugger.breakpoint_locations.len() {
-                    let loc = &debugger.breakpoint_locations[loc_idx];
-                    if loc.addr == line_addr.addr && loc.breakpoints.iter().any(|b| match b { BreakpointRef::Id {..} => true, BreakpointRef::Step(_) => false }) {
-                        marker = if loc.active { "● " } else { "○ " }
+            // Draw indentation lines.
+            let mut change_subfunction_level = tab.selected_subfunction_level;
+            for level in 1.. {
+                let mut found = false;
+                let mut start = line_range.start;
+                while start < line_range.end {
+                    let line = &disas.lines[start];
+                    if line.subfunction_level < level {
+                        start += 1;
+                        continue;
                     }
-                }
-                spans.push(Span::styled(marker, palette.secondary_breakpoint));
+                    found = true;
 
-                let indent_span_idx = spans.len() + line_addr.indent_span_idx;
-                disas.text.line_out(i, &mut spans);
+                    let line_sf_at_cur_level = |line: usize| -> usize {
+                        let mut idx = disas.lines[line].subfunction.clone().unwrap();
+                        while symbols_shard.subfunctions[idx].level > level {
+                            idx = symbols_shard.subfunctions[idx].parent;
+                        }
+                        idx
+                    };
 
-                if let (&Some(selected_subfunction_idx), &Some(mut cur_subfunction_idx)) = (&selected_subfunction_idx, &line_addr.subfunction) {
-                    let shard = symbols_shard.clone().unwrap();
-                    let levels = shard.subfunctions[cur_subfunction_idx].level as usize;
-                    assert!(levels > 0);
-                    while cur_subfunction_idx != selected_subfunction_idx && shard.subfunctions[cur_subfunction_idx].level > 0 {
-                        cur_subfunction_idx = shard.subfunctions[cur_subfunction_idx].parent;
+                    let cur_sf = line_sf_at_cur_level(start);
+                    let mut end = start + 1;
+                    while end < line_range.end && disas.lines[end].subfunction_level >= level && line_sf_at_cur_level(end) == cur_sf {
+                        end += 1;
                     }
-                    if cur_subfunction_idx == selected_subfunction_idx {
-                        let highlight_level = shard.subfunctions[cur_subfunction_idx].level as usize;
-                        assert!(highlight_level > 0);
-                        let span = std::mem::replace(&mut spans[indent_span_idx], Span::raw(""));
-                        assert!(span.content.len() % levels == 0);
-                        let bytes_per_level = span.content.len() / levels;
-                        let (start, end) = (bytes_per_level * (highlight_level - 1), bytes_per_level * highlight_level);
-                        assert!(span.content.is_char_boundary(start) && span.content.is_char_boundary(end));
-                        spans.splice(indent_span_idx..indent_span_idx+1, [
-                            Span {content: span.content[..start].to_string().into(), style: span.style},
-                            Span {content: span.content[start..end].to_string().into(), style: span.style.remove_modifier(Modifier::DIM).add_modifier(Modifier::BOLD)},
-                            Span {content: span.content[end..].to_string().into(), style: span.style}]);
-                    }
-                }
 
-                if i == tab.scroll.cursor && line_addr.kind != DisassemblyLineKind::Error {
-                    spans.push(Span::raw(format!("{: >0$}", widest_line.max(area.width as usize) + 10))); // fill the rest of the line with spaces
-                    for span in &mut spans[1..] {
-                        span.style.bg = palette.selected_text_line.bg.clone();
+                    let is_selected = selected_subfunction_idx == Some(cur_sf);
+                    let (symbol, style) = if is_selected {&ui.palette.tree_indent_selected} else {&ui.palette.tree_indent};
+                    for i in start..end {
+                        let mut s = *style;
+                        // Manually highlight selected row because there's no transparency.
+                        if i == tab.area_state.cursor {
+                            s = ui.palette.selected.apply(s);
+                        }
+                        styled_writeln!(ui.text, s, "{}", symbol);
                     }
-                }
+                    let lines = ui.text.num_lines()-(end-start)..ui.text.num_lines();
 
-                lines.push(Spans::from(spans));
+                    let w = widget!().identity(&('i', start, level)).fixed_width(disas.indent_width).fixed_x(prefix_width as isize + level as isize - 1).fixed_y(start as isize).fixed_height(end - start).text_lines(lines).highlight_on_hover();
+                    with_parent!(ui, ui.add(w), {
+                        if ui.check_mouse(MouseActions::CLICK) {
+                            change_subfunction_level = level;
+                        }
+                    });
+
+                    start = end;
+                }
+                if !found {
+                    break;
+                }
             }
-
-            let paragraph = Paragraph::new(Text {lines: lines}).scroll((0, tab.hscroll));
-
-            f.render_widget(paragraph, area);
-        }
-asdqwe;
-        }*/
+            if change_subfunction_level != tab.selected_subfunction_level {
+                tab.selected_subfunction_level = change_subfunction_level;
+                ui.should_redraw = true;
+            }
         });
     }
 
-    fn get_hints(&self, hints: &mut StyledText, ui: &mut UI) {
-        hints.chars.push_str("o - find function"); hints.close_span(ui.palette.default_dim); hints.close_line();
-        hints.chars.push_str("C-y - close/pin tab"); hints.close_span(ui.palette.default_dim); hints.close_line();
-        hints.chars.push_str(",/. - select level"); hints.close_span(ui.palette.default_dim); hints.close_line();
-        // TODO: hints.chars.push_str("b - toggle breakpoint"); hints.close_span(ui.palette.default_dim); hints.close_line();
+    fn get_key_hints(&self, out: &mut Vec<KeyHint>) {
+        out.extend([
+            KeyHint::key(KeyAction::Open, "find function"),
+            KeyHint::key(KeyAction::CloseTab, "close/pin tab"),
+            KeyHint::keys(&[KeyAction::PreviousMatch, KeyAction::NextMatch], "select level")]);
+        // TODO: KeyAction::ToggleBreakpoint, KeyAction::DisableBreakpoint
     }
 
     fn has_persistent_state(&self) -> bool {
         true
     }
     fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {
-        /*asdqwe
         for (idx, tab) in self.tabs.iter().enumerate() {
-            let locator = match &tab.status {
-                DisassemblyTabStatus::Function {locator, ..} => locator,
-                DisassemblyTabStatus::Unresolved {locator, ..} => locator,
-                DisassemblyTabStatus::Err(_) => continue,
-            };
-            out.write_u8(if idx == self.selected_tab {2} else {1})?;
+            let locator = match &tab.locator {
+                None => continue,
+                Some(x) => x };
+            out.write_u8(if idx == self.tabs_state.selected {2} else {1})?;
             locator.binary_id.save_state_incomplete(out)?;
             out.write_slice(&locator.mangled_name)?;
             out.write_str(&locator.demangled_name)?; // can't just demangle on load because we don't know the language (alernatively we could save the language here)
             out.write_usize(locator.addr.0)?;
-            tab.scroll.save_state(out)?;
+            tab.area_state.save_state(out)?;
             out.write_u16(tab.selected_subfunction_level)?;
-            out.write_u16(tab.hscroll)?;
-            out.write_u8(tab.pinned as u8)?;
+            out.write_u8(tab.ephemeral as u8)?;
         }
-        out.write_u8(0)?;*/
+        out.write_u8(0)?;
         Ok(())
     }
     fn load_state(&mut self, inp: &mut &[u8]) -> Result<()> {
-        /*asdqwe
         loop {
             let select_this_tab = match inp.read_u8()? {
                 0 => break,
@@ -1530,11 +1656,11 @@ asdqwe;
             };
             let locator = DisassemblyFunctionLocator {binary_id: BinaryId::load_state_incomplete(inp)?, mangled_name: inp.read_slice()?, demangled_name: inp.read_str()?, addr: FunctionAddr(inp.read_usize()?)};
             let title = Self::make_title(&locator.demangled_name);
-            self.tabs.push(DisassemblyTab {identity: random(), title, status: DisassemblyTabStatus::Unresolved {locator, cached_error: None}, scroll: Scroll::load_state(inp)?, selected_subfunction_level: inp.read_u16()?, hscroll: inp.read_u16()?, pinned: inp.read_u8()? != 0});
+            self.tabs.push(DisassemblyTab {identity: random(), title, locator: Some(locator), error: None, area_state: AreaState::load_state(inp)?, selected_subfunction_level: inp.read_u16()?, ephemeral: inp.read_u8()? != 0, cached_function_idx: None});
             if select_this_tab {
-                self.selected_tab = self.tabs.len() - 1;
+                self.tabs_state.select(self.tabs.len() - 1);
             }
-        }*/
+        }
         // TODO: Prevent scrolling code window before first input.
         Ok(())
     }
@@ -1557,14 +1683,13 @@ fn close_excess_ephemeral_tabs<T, F: FnMut(&T) -> bool>(tabs: &mut Vec<T>, tabs_
     }
     let mut i = 0;
     tabs.retain(|t| {
-        let r = if is_ephemeral(t) && i != tabs_state.selected {
+        if is_ephemeral(t) && i != tabs_state.selected {
             tabs_state.closed(i);
             false
         } else {
+            i += 1;
             true
-        };
-        i += 1;
-        r
+        }
     });
 }
 
@@ -1623,40 +1748,213 @@ impl WindowContent for StatusWindow {
 }
 
 #[derive(Default)]
-struct HintsWindow {}
+struct HintsWindow {
+    scroll: isize,
+}
+
+impl HintsWindow {
+    const NORMAL_HEIGHT: usize = 8;
+    const PROFILER_HEIGHT: usize = 17;
+
+    fn build_profiling_charts(&mut self, debugger: &mut Debugger, ui: &mut UI) {
+        ui.cur_mut().set_hstack();
+        let viewport = ui.add(widget!().width(AutoSize::Remainder(1.0)));
+        let scroll_bar = ui.add(widget!().fixed_width(1));
+        ui.layout_children(Axis::X);
+        let content_widget = ui.add(widget!().parent(viewport).fixed_y(0).height(AutoSize::Children).vstack());
+
+        with_parent!(ui, content_widget, {
+            styled_write!(ui.text, ui.palette.default, "frame: {:<10} widgets: {:<10} bucket: {:<10}", ui.frame_idx, ui.prev_tree.len(), PrettyDuration(debugger.context.settings.periodic_timer_seconds));
+            let l = ui.text.close_line();
+            ui.add(widget!().height(AutoSize::Text).text(l));
+
+            enum Type {
+                Count,
+                Tsc,
+                Bytes,
+            }
+            struct Chart {
+                title: &'static [&'static str],
+                data: Vec<usize>,
+                type_: Type,
+            }
+
+            let chart_height = 2;
+            let mut charts = [
+                Chart {title: &["ui"     , "max"  ], type_: Type::Tsc  , data: Vec::new()},
+                Chart {title: &["deb"    , "time" ], type_: Type::Tsc  , data: Vec::new()},
+                Chart {title: &["deb"    , "count"], type_: Type::Count, data: Vec::new()},
+                Chart {title: &["syscall", "time" ], type_: Type::Tsc  , data: Vec::new()},
+                Chart {title: &["syscall", "count"], type_: Type::Count, data: Vec::new()},
+                Chart {title: &["other"  , "time" ], type_: Type::Tsc  , data: Vec::new()},
+                Chart {title: &["build"  , "max"  ], type_: Type::Tsc  , data: Vec::new()},
+                Chart {title: &["render" , "max"  ], type_: Type::Tsc  , data: Vec::new()},
+                Chart {title: &["fill"   , "max"  ], type_: Type::Tsc  , data: Vec::new()},
+                Chart {title: &["input"  , "bytes"], type_: Type::Bytes, data: Vec::new()},
+                Chart {title: &["output" , "bytes"], type_: Type::Bytes, data: Vec::new()},
+            ];
+
+            let title_width = charts.iter().map(|c| c.title.iter().map(|t| str_width(*t)).max().unwrap()).max().unwrap();
+            let value_width = PrettyCount::MAX_LEN.max(PrettySize::MAX_LEN).max(PrettyDuration::MAX_LEN);
+            let total_width = ui.cur().axes[Axis::X].get_fixed_size();
+            let chart_width = total_width.saturating_sub(title_width + value_width + 2).max(1);
+            for c in &mut charts {
+                c.data = vec![0; chart_width];
+            }
+
+            let s_per_tsc = if debugger.prof.buckets.is_empty() {
+                1.0
+            } else {
+                let a = &debugger.prof.buckets[debugger.prof.buckets.len().saturating_sub(chart_width)];
+                let b = debugger.prof.buckets.back().unwrap();
+                (b.end_time - a.start_time).as_secs_f64() / (b.end_tsc - a.start_tsc) as f64
+            };
+
+            for i in 0..chart_width.min(debugger.prof.buckets.len()) {
+                let b = &debugger.prof.buckets[debugger.prof.buckets.len() - i - 1];
+                let j = chart_width - i - 1;
+
+                charts[ 0].data[j] = b.ui_max_tsc as usize;
+                charts[ 1].data[j] = b.debugger_tsc as usize;
+                charts[ 2].data[j] = b.debugger_count;
+                charts[ 3].data[j] = b.syscall_tsc as usize;
+                charts[ 4].data[j] = b.syscall_count;
+                charts[ 5].data[j] = b.other_tsc as usize;
+                charts[ 6].data[j] = b.ui_build_max_tsc as usize;
+                charts[ 7].data[j] = b.ui_render_max_tsc as usize;
+                charts[ 8].data[j] = b.ui_fill_max_tsc as usize;
+                charts[ 9].data[j] = b.ui_input_bytes;
+                charts[10].data[j] = b.ui_output_bytes;
+            }
+
+            let draw_hline = |left_corner: char, right_corner: char, ui: &mut UI| {
+                with_parent!(ui, ui.add(widget!().fixed_height(1).hstack()), {
+                    ui.add(widget!().fixed_width(1).fixed_x(title_width as isize).fill(left_corner, ui.palette.default));
+                    ui.add(widget!().fixed_width(chart_width).fill('─', ui.palette.default));
+                    ui.add(widget!().fixed_width(1).fill(right_corner, ui.palette.default));
+                });
+            };
+
+            draw_hline('╭', '╮', ui);
+            for idx in 0..charts.len() {
+                if idx > 0 {
+                    draw_hline('├', '┤', ui);
+                }
+                let chart = &charts[idx];
+                let max = chart.data.iter().copied().max().unwrap();
+                let max1 = max.max(1);
+                with_parent!(ui, ui.add(widget!().fixed_height(chart_height).hstack()), {
+                    let start = ui.text.num_lines();
+                    for s in chart.title {
+                        ui_writeln!(ui, default, "{}", s);
+                    }
+                    let end = ui.text.num_lines();
+                    ui.add(widget!().fixed_width(title_width).text_lines(start..end));
+                    ui.add(widget!().fixed_width(1).fill('│', ui.palette.default));
+
+                    let start = ui.text.num_lines();
+                    for i in 0..chart_height {
+                        let h = (chart_height - i - 1) * 8;
+                        for j in 0..chart_width {
+                            let v = (chart.data[j] * (chart_height * 8) + max/2) / max1;
+                            let c = match v {
+                                v if v <= h   => ' ',
+                                v if v == h+1 => '▁',
+                                v if v == h+2 => '▂',
+                                v if v == h+3 => '▃',
+                                v if v == h+4 => '▄',
+                                v if v == h+5 => '▅',
+                                v if v == h+6 => '▆',
+                                v if v == h+7 => '▇',
+                                _             => '█',
+                            };
+                            ui.text.chars.push(c);
+                        }
+                        ui.text.close_span(ui.palette.default);
+                        ui.text.close_line();
+                    }
+                    let end = ui.text.num_lines();
+                    ui.add(widget!().fixed_width(chart_width).text_lines(start..end));
+
+                    ui.add(widget!().fixed_width(1).fill('│', ui.palette.default));
+                    let start = ui.text.num_lines();
+                    for val in [max, *chart.data.last().unwrap()] {
+                        match chart.type_ {
+                            Type::Count => ui_writeln!(ui, default, "{}", PrettyCount(val)),
+                            Type::Tsc => ui_writeln!(ui, default, "{}", PrettyDuration(s_per_tsc * val as f64)),
+                            Type::Bytes => ui_writeln!(ui, default, "{}", PrettySize(val)),
+                        };
+                    }
+                    let end = ui.text.num_lines();
+                    ui.add(widget!().text_lines(start..end));
+                });
+            }
+            draw_hline('╰', '╯', ui);
+        });
+
+        let content_height = ui.calculate_size(content_widget, Axis::Y);
+        let viewport_height = ui.calculate_size(viewport, Axis::Y);
+
+        let root = ui.cur_parent;
+        with_parent!(ui, viewport, {
+            ui.focus();
+            cursorless_scrolling_navigation(&mut self.scroll, None, root, scroll_bar, ui);
+        });
+    }
+}
 impl WindowContent for HintsWindow {
     fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
-        styled_write!(ui.text, ui.palette.default, "frame {}", ui.frame_idx);
-        let l = ui.text.close_line();
-        ui.add(widget!().text(l));
-        /*asdqwe
-        let f = match f { Some(f) => f, None => return };
-        let palette = &debugger.context.settings.palette;
-
         if state.profiler_enabled {
-            let mut prof = StyledText::default();
-            debugger.log.prof.format_summary(&mut prof, area.width as usize);
-            let prof_lines = prof.to_lines();
-            let mut items: Vec<ListItem> = Vec::new();
-            items.push(ListItem::new("C-p to hide profiler").style(palette.default_dim));
-            for line in prof_lines {
-                items.push(ListItem::new(line));
+            self.build_profiling_charts(debugger, ui);
+            return;
+        }
+
+        let start = ui.text.num_lines();
+        for hint in &state.key_hints {
+            if hint.key_ranges.is_empty() { // spacer
+                ui.text.close_line();
+                continue;
             }
-            let list = List::new(items);
-            f.render_widget(list, area);
-        } else {
-            let mut x = area.x + 1;
-            for i in 0..2 {
-                let subarea = Rect {x, y: area.y, width: (area.width.saturating_sub(1) + i as u16)/2, height: area.height};
-                x += subarea.width;
-                let mut lines = state.hints[i].to_lines();
-                if lines.len() > subarea.height as usize && subarea.height > 0 {
-                    lines[subarea.height as usize - 1] = Spans::from(vec![Span::raw("…")]);
+            for (i, range) in hint.key_ranges.iter().enumerate() {
+                if i != 0 {
+                    ui_write!(ui, default_dim, "/");
                 }
-                let paragraph = Paragraph::new(Text {lines});
-                f.render_widget(paragraph, subarea);
+                styled_write!(ui.text, ui.palette.hotkey.apply(ui.palette.default_dim), "{}", ui.key_binds.action_to_key_name(range[0]));
+                if range[0] != range[1] {
+                    ui_write!(ui, default_dim, "…");
+                    styled_write!(ui.text, ui.palette.hotkey.apply(ui.palette.default_dim), "{}", ui.key_binds.action_to_key_name(range[1]));
+                }
             }
-        }*/
+            ui_writeln!(ui, default_dim, " - {}", hint.hint);
+        }
+        let end = ui.text.num_lines();
+
+        ui.cur_mut().set_hstack();
+        let viewport = ui.add(widget!().width(AutoSize::Remainder(1.0)));
+        let scroll_bar = ui.add(widget!().fixed_width(1));
+        ui.layout_children(Axis::X);
+        let content = ui.add(widget!().parent(viewport).height(AutoSize::Children).hstack());
+
+        let num_columns = 2;
+        let lines_per_column = (end - start + num_columns - 1) / num_columns;
+        with_parent!(ui, content, {
+            for i in 0..num_columns {
+                if i != 0 {
+                    ui.add(widget!().fixed_width(1).fixed_height(0));
+                }
+                let mut range = start + i*lines_per_column .. start + (i+1)*lines_per_column;
+                range.end = range.end.min(end);
+                range.start = range.start.min(range.end);
+                ui.add(widget!().width(AutoSize::Remainder(2.0)).height(AutoSize::Text).text_lines(range).flags(WidgetFlags::LINE_WRAP));
+            }
+            ui.layout_children(Axis::X);
+        });
+
+        let root = ui.cur_parent;
+        with_parent!(ui, viewport, {
+            ui.focus();
+            cursorless_scrolling_navigation(&mut self.scroll, None, root, scroll_bar, ui);
+        });
     }
 }
 
@@ -2016,8 +2314,8 @@ impl WindowContent for ThreadsWindow {
         self.filter.cached_results.clear();
     }
 
-    fn get_hints(&self, hints: &mut StyledText, ui: &mut UI) {
-        styled_write!(hints, ui.palette.default_dim, "/ - filter"); hints.close_line();
+    fn get_key_hints(&self, out: &mut Vec<KeyHint>) {
+        out.push(KeyHint::key(KeyAction::Find, "filter"));
     }
 }
 
@@ -2218,7 +2516,7 @@ impl WindowContent for StackWindow {
                 state.should_scroll_source = Some((subframe.line.as_ref().map(|line| SourceScrollTarget {path: line.path.clone(), version: line.version.clone(), line: line.line.line()}), !scroll_source_and_disassembly));
                 state.should_scroll_disassembly = Some((match &state.stack.subframes[frame.subframes.end - 1].function_idx {
                     &Ok(function_idx) => Ok(DisassemblyScrollTarget {binary_id: frame.binary_id.clone().unwrap(), symbols_identity: frame.symbols_identity, function_idx, static_pseudo_addr: frame.pseudo_addr.wrapping_sub(frame.addr_static_to_dynamic),
-                                                                         subfunction_level: if state.selected_subframe == frame.subframes.start {u16::MAX} else {(frame.subframes.end - state.selected_subframe) as u16}}),
+                                                                         subfunction_level: (frame.subframes.end - state.selected_subframe - 1) as u16}),
                     Err(e) => Err(e.clone()),
                 }, !scroll_source_and_disassembly));
             }
@@ -2716,7 +3014,7 @@ impl WindowContent for CodeWindow {
         self.file_cache.clear();
     }
 
-    fn get_hints(&self, hints: &mut StyledText, ui: &mut UI) {
+    fn get_key_hints(&self, out: &mut Vec<KeyHint>) {
         styled_write!(hints, ui.palette.default_dim, "o - open file"); hints.close_line();
         styled_write!(hints, ui.palette.default_dim, "C-y - pin/unpin tab"); hints.close_line();
         styled_write!(hints, ui.palette.default_dim, "b - toggle breakpoint"); hints.close_line();
@@ -2969,9 +3267,8 @@ struct BreakpointsWindow {
     selected_breakpoint: Option<BreakpointId>,
 }
 impl WindowContent for BreakpointsWindow {
-    fn get_hints(&self, hints: &mut StyledText, ui: &mut UI) {
-        hints.chars.push_str("<del> - delete breakpoint"); hints.close_span(ui.palette.default_dim); hints.close_line();
-        hints.chars.push_str("B - enable/disable"); hints.close_span(ui.palette.default_dim); hints.close_line();
+    fn get_key_hints(&self, out: &mut Vec<KeyHint>) {
+        out.extend([KeyHint::key(KeyAction::DeleteRow, "delete breakpoint"), KeyHint::key(KeyAction::DisableBreakpoint, "disable breakpoint")]);
     }
 
     fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {

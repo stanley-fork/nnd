@@ -169,9 +169,9 @@ pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) {
 // Must be called when the thread gets suspended (and not immediately resumed) - to assign registers, so we can unwind the stack.
 // Nice to also call whenever the thread is created (to assign thread name) or resumed (to update the state char faster).
 // We skip calling this if the thread was suspended and immediately resumed (e.g. skipped conditional breakpoints or ignored user signals).
-pub fn refresh_thread_info(pid: pid_t, t: &mut Thread, prof: Option<&mut Profiling>) {
+pub fn refresh_thread_info(pid: pid_t, t: &mut Thread, prof: &mut ProfileBucket) {
     if !t.exiting {
-        match ProcStat::parse(&format!("/proc/{}/task/{}/stat", pid, t.tid)) {
+        match ProcStat::parse(&format!("/proc/{}/task/{}/stat", pid, t.tid), prof) {
             Ok(s) => {
                 t.info.resource_stats.state = s.state;
                 t.info.name = s.comm().map(|s| s.to_string());
@@ -191,14 +191,14 @@ pub fn refresh_thread_info(pid: pid_t, t: &mut Thread, prof: Option<&mut Profili
     }
 }
 
-pub fn refresh_resource_stats(pid: pid_t, my_stats: &mut ResourceStats, debuggee_stats: &mut ResourceStats, threads: &mut HashMap<pid_t, Thread>) -> Result<()> {
+pub fn refresh_resource_stats(pid: pid_t, my_stats: &mut ResourceStats, debuggee_stats: &mut ResourceStats, threads: &mut HashMap<pid_t, Thread>, prof: &mut ProfileBucket) -> Result<()> {
     let now = Instant::now();
-    my_stats.update(now, &ProcStat::parse("/proc/self/stat")?);
-    debuggee_stats.update(now, &ProcStat::parse(&format!("/proc/{}/stat", pid))?);
+    my_stats.update(now, &ProcStat::parse("/proc/self/stat", prof)?);
+    debuggee_stats.update(now, &ProcStat::parse(&format!("/proc/{}/stat", pid), prof)?);
 
     for (tid, t) in threads {
         if !t.exiting {
-            let s = ProcStat::parse(&format!("/proc/{}/task/{}/stat", pid, tid))?;
+            let s = ProcStat::parse(&format!("/proc/{}/task/{}/stat", pid, tid), prof)?;
             t.info.resource_stats.update(&s);
             t.info.name = s.comm().map(|s| s.to_string());
         }
@@ -207,7 +207,7 @@ pub fn refresh_resource_stats(pid: pid_t, my_stats: &mut ResourceStats, debuggee
     Ok(())
 }
 
-pub fn ptrace_getregs(tid: pid_t, prof: Option<&mut Profiling>) -> Result<Registers> {
+pub fn ptrace_getregs(tid: pid_t, prof: &mut ProfileBucket) -> Result<Registers> {
     unsafe {
         let mut regs: libc::user_regs_struct = mem::zeroed();
         ptrace(libc::PTRACE_GETREGS, tid, 0, &mut regs as *mut _ as u64, prof)?;

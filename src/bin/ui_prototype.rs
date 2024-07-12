@@ -4547,7 +4547,7 @@ fn main() -> Result<()> {
     let mut render_secs = 0f64;
     let mut diff_secs = 0f64;
     let mut write_secs = 0f64;
-    
+
     let mut imgui = IMGUI::default();
     imgui.palette = Palette {
         default: Style {fg: Color::white(), ..D!()},

@@ -255,6 +255,11 @@ impl StyledText {
         self.num_lines()-lines.len() .. self.num_lines()
     }
 
+    pub fn unclose_line(&mut self) {
+        assert_eq!(self.lines.last(), Some(&(self.spans.len() - 1)));
+        self.lines.pop();
+    }
+
     pub fn line_wrap(&mut self, lines: Range<usize>, width: usize, max_lines: usize, line_wrap_indicator: &(String, String, Style), truncation_indicator: &(String, String, Style), mut out_lines: Option<&mut Vec<(/*start_x*/ isize, /*line_idx*/ usize, /*bytes*/ Range<usize>)>>) -> Range<usize> {
         let start = self.num_lines();
         for line_idx in lines.clone() {

@@ -70,6 +70,7 @@ pub fn list_cursor_navigation_with_variable_row_height<F: FnMut(usize, &mut UI) 
 //  * `container` - respond to scroll wheel when the mouse is over this widget (usually an ancestor of the viewport that also includes things like scroll bar and table header)
 //  * `scroll_bar` - tall widget of width 1 to the right of the viewport; should be initially empty, populated by this function; pass WidgetIdx::invalid() to disable
 // If `scroll_to` is set, we'll scroll to the nearest position such that this range of y coordinates is visible (or as much as possible is visible, if it's taller than the viewport).
+// Doesn't react to arrow keys, pageup/pagedown, home/end etc - the caller usually uses these to move the cursor instead of scrolling; use cursorless_scrolling_navigation to make these keys scroll the view.
 // Returns the visible range of y coordinates.
 pub fn scrolling_navigation(scroll: &mut isize, scroll_to: Option<Range<isize>>, container: WidgetIdx, scroll_bar: WidgetIdx, ui: &mut UI) -> Range<isize> {
     with_parent!(ui, container, {
@@ -204,44 +205,20 @@ pub fn hscrolling_navigation(hscroll: &mut isize, ui: &mut UI) {
     w.axes[Axis::X].rel_pos = -*hscroll;
 }
 
-pub fn make_dialog_frame(dialog_root: WidgetIdx, width: AutoSize, height: AutoSize, style_adjustment: StyleAdjustment, border: Style, title: &str, ui: &mut UI) -> Option<WidgetIdx> {
-    let dialog = with_parent!(ui, dialog_root, {
-        if ui.check_mouse(MouseActions::CLICK) || ui.check_key(KeyAction::Cancel) {
-            None
-        } else {
-            Some(ui.add(widget!().parent(dialog_root).width(width).height(height).hcenter().vcenter().fill(' ', ui.palette.default).style_adjustment(style_adjustment)))
-        }
-    });
-    let dialog = match dialog {
-        None => {
-            ui.close_dialog();
-            return None;
-        }
-        Some(x) => x,
-    };
-    ui.layout_children(Axis::X);
-    ui.layout_children(Axis::Y);
-    with_parent!(ui, dialog, {
-        ui.check_mouse(MouseActions::CLICK); // clicking inside the dialog shouldn't close it
-        let (w, h) = (ui.cur().axes[Axis::X].size, ui.cur().axes[Axis::Y].size);
-        ui.add(widget!().fixed_width(1).fixed_height(1).fill('┌', border));
-        styled_write!(ui.text, ui.palette.default, "{}", title);
-        let l = ui.text.close_line();
-        ui.add(widget!().fixed_width(w.saturating_sub(2)).fixed_height(1).fixed_x(1).fill('─', border).text(l));
-        ui.add(widget!().fixed_width(1).fixed_height(1).fixed_x(w as isize - 1).fill('┐', border));
-        ui.add(widget!().fixed_width(1).fixed_height(h.saturating_sub(2)).fixed_y(1).fill('│', border));
-        ui.add(widget!().fixed_width(1).fixed_height(h.saturating_sub(2)).fixed_y(1).fixed_x(w as isize - 1).fill('│', border));
-        ui.add(widget!().fixed_width(1).fixed_height(1).fixed_y(h as isize - 1).fill('└', border));
-        ui.add(widget!().fixed_width(w.saturating_sub(2)).fixed_height(1).fixed_x(1).fixed_y(h as isize - 1).fill('─', border));
-        ui.add(widget!().fixed_width(1).fixed_height(1).fixed_x(w as isize - 1).fixed_y(h as isize - 1).fill('┘', border));
-
-        with_parent!(ui, ui.add(widget!().fixed_width(w.saturating_sub(4)).fixed_height(h.saturating_sub(4)).fixed_x(2).fixed_y(2)), {
-            ui.focus();
-            Some(ui.cur_parent)
-        })
-    })
+// Like list_cursor_navigation() + scrolling_navigation(), but the up/down/pageup/pagedown/etc keys scroll the view instead of moving the cursor.
+pub fn cursorless_scrolling_navigation(scroll: &mut isize, scroll_to: Option<Range<isize>>, container: WidgetIdx, scroll_bar: WidgetIdx, ui: &mut UI) -> Range<isize> {
+    let viewport_height = ui.calculate_size(ui.cur_parent, Axis::Y);
+    let w = ui.cur();
+    assert_eq!(w.children.len(), 1);
+    let content_height = ui.calculate_size(w.children[0], Axis::Y);
+    if content_height > viewport_height {
+        // Pretend there's a cursor glued to the top of the viewport.
+        let mut uscroll = *scroll as usize;
+        list_cursor_navigation(&mut uscroll, content_height - viewport_height + 1, 1, ui);
+        *scroll = uscroll as isize;
+    }
+    scrolling_navigation(scroll, None, container, scroll_bar, ui)
 }
-
 
 #[derive(Default)]
 pub struct Column {
@@ -1053,11 +1030,15 @@ impl TextInput {
                         edited = true;
                     }
                     Key::Char('k') | Key::Char('u') if key.mods == ModKeys::CTRL => {
-                        //asdqwe if at start/end, remove the '\n'
                         self.mark = self.cursor;
                         let mut pos = self.offset_to_coordinates(self.cursor);
                         pos[0] = if key.key == Key::Char('k') {isize::MAX} else {0};
-                        self.cursor = self.coordinates_to_offset(pos);
+                        let new_cursor = self.coordinates_to_offset(pos);
+                        if new_cursor == self.cursor {//asdqwe test this behavior when there's any multiline text input to play with
+                            self.move_cursor(false, key.key == Key::Char('k'));
+                        } else {
+                            self.cursor = new_cursor;
+                        }
                         self.delete_selection(true, ui);
                         edited = true;
                     }
@@ -1226,324 +1207,134 @@ impl TextInput {
     }
 }
 
-
-/*asdqwe delet
-pub type Backend = TermionBackend<io::Stdout>;
-pub type Frame<'a> = tui::Frame<'a, Backend>;
-
-pub struct Scroll {
-    pub scroll: usize,
-    pub cursor: usize,
-}
-
-impl Scroll {
-    pub fn new() -> Self {
-        Self {scroll: 0, cursor: 0}
-    }
-    
-    pub fn update(&mut self, count: usize, height: u16, keys: &mut Vec<Key>, key_binds: &KeyBindings) -> Range<usize> {
-        self.update_detect_movement(count, height, keys, key_binds).0
-    }
-
-    pub fn update_cursorless(&mut self, count: usize, height: u16, keys: &mut Vec<Key>, key_binds: &KeyBindings) -> Range<usize> {
-        let height = height as usize;
-        let s = TryInto::<isize>::try_into(self.scroll).unwrap_or(isize::MAX).saturating_add(Self::delta(height, keys, key_binds));
-        self.scroll = (s.max(0) as usize).min(count.saturating_sub(1));
-        self.range(count, height)
-    }
-
-    // Returns true if any cursor movement keys were pressed (even if cursor wasn't moved).
-    pub fn update_detect_movement(&mut self, count: usize, height: u16, keys: &mut Vec<Key>, key_binds: &KeyBindings) -> (Range<usize>, bool) {
-        let height = height as usize;
-        let d = Self::delta(height, keys, key_binds);
-        let c = TryInto::<isize>::try_into(self.cursor).unwrap_or(isize::MAX).saturating_add(d);
-        self.cursor = (c.max(0) as usize).min(count.saturating_sub(1));
-        self.clamp_scroll(count, height);
-        (self.range(count, height), d != 0)
-    }
-
-    // Like update(usize::MAX), but the End key puts cursor at `count - 1` instead of some huge number.
-    pub fn update_with_virtual_space(&mut self, count: usize, height: u16, keys: &mut Vec<Key>, key_binds: &KeyBindings) -> Range<usize> {
-        let height = height as usize;
-        let d = Self::delta(height, keys, key_binds);
-        if d == isize::MAX {
-            self.cursor = count.saturating_sub(1);
+pub fn make_dialog_frame(create: bool, width: AutoSize, height: AutoSize, style_adjustment: StyleAdjustment, border: Style, title: &str, ui: &mut UI) -> Option<WidgetIdx> {
+    let dialog_root = match ui.check_dialog(create) {
+        None => return None,
+        Some(x) => x };
+    let dialog = with_parent!(ui, dialog_root, {
+        if ui.check_mouse(MouseActions::CLICK) || ui.check_key(KeyAction::Cancel) {
+            None // (can't return from inside with_parent)
         } else {
-            self.cursor = TryInto::<isize>::try_into(self.cursor).unwrap_or(isize::MAX).saturating_add(d).max(0) as usize;
+            Some(ui.add(widget!().width(width).height(height).hcenter().vcenter().fill(' ', ui.palette.default).style_adjustment(style_adjustment)))
         }
-        self.clamp_scroll(usize::MAX, height);
-        self.range(usize::MAX, height)
-    }
-
-    pub fn set(&mut self, count: usize, height: u16, pos: usize) -> Range<usize> {
-        let height = height as usize;
-        self.cursor = pos.min(count.saturating_sub(1));
-        self.clamp_scroll(count, height);
-        self.range(count, height)
-    }
-
-    fn delta(height: usize, keys: &mut Vec<Key>, key_binds: &KeyBindings) -> isize {
-        let mut cur = 0isize;
-        let mut res: Option<isize> = None;
-        keys.retain(|key| {
-            match key_binds.map.get(key) {
-                Some(KeyAction::CursorUp) => cur -= 1,
-                Some(KeyAction::CursorDown) => cur += 1,
-                Some(KeyAction::PageUp) => cur -= height as isize,
-                Some(KeyAction::PageDown) => cur += height as isize,
-                Some(KeyAction::Home) => { res.get_or_insert(isize::MIN); },
-                Some(KeyAction::End) => { res.get_or_insert(isize::MAX); },
-                _ => return true,
-            }
-            false
-        });
-        res.unwrap_or(cur)
-    }
-
-    fn clamp_scroll(&mut self, count: usize, height: usize) {
-        let margin = Self::scroll_margin(height);
-        self.scroll = self.scroll.min(self.cursor.saturating_sub(margin)).max(self.cursor.saturating_sub(height.saturating_sub(margin + 1)));
-        self.scroll = self.scroll.min(count.saturating_sub(height));
-    }
-
-    pub fn range(&self, count: usize, height: usize) -> Range<usize> {
-        self.scroll..(self.scroll + height).min(count)
-    }
-
-    fn scroll_margin(height: usize) -> usize {
-        (height / 3).min(5)
-    }
-
-    pub fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {
-        out.write_usize(self.scroll)?;
-        out.write_usize(self.cursor)?;
-        Ok(())
-    }
-
-    pub fn load_state(inp: &mut &[u8]) -> Result<Self> {
-        Ok(Self {scroll: inp.read_usize()?, cursor: inp.read_usize()?})
-    }
-}
-
-pub struct TextInput {
-    pub text: String,
-    pub cursor: usize, // byte index into `text`, must be in range and at char boundary
-    pub hscroll: usize,
-    // TODO: Undo.
-}
-
-#[derive(PartialEq, Eq, Clone, Copy, Debug)]
-pub enum TextInputEvent {
-    None,
-    Done, // return key
-    Cancel, // escape key
-    Open, // right arrow key when the cursor is at the end
-}
-
-impl TextInput {
-    pub fn new() -> Self { Self {text: String::new(), cursor: 0, hscroll: 0} }
-    pub fn with_text(text: String) -> Self { Self {cursor: text.len(), text, hscroll: 0} }
-
-    pub fn update(&mut self, keys: &mut Vec<Key>, key_binds: &KeyBindings) -> TextInputEvent {
-        let mut ret = TextInputEvent::None;
-        keys.retain(|key| {
-            if ret != TextInputEvent::None {
-                return false;
-            }
-            match (key_binds.map.get(key).cloned(), *key) {
-                (Some(KeyAction::Enter), _) => ret = TextInputEvent::Done,
-                (Some(KeyAction::Cancel), _) => ret = TextInputEvent::Cancel,
-
-                // Moving.
-                (a, k) if a == Some(KeyAction::CursorLeft) || k == Key::Ctrl('b') => { self.step_back(); }
-                (a, k) if a == Some(KeyAction::CursorRight) || k == Key::Ctrl('f') => if !self.step_forward() { ret = TextInputEvent::Open; }
-                (_, Key::Alt('f')) => self.cursor = self.word_end(),
-                (_, Key::Alt('b')) => self.cursor = self.word_start(),
-                (a, k) if a == Some(KeyAction::Home) || k == Key::Ctrl('a') => self.cursor = 0,
-                (a, k) if a == Some(KeyAction::End) || k == Key::Ctrl('e') => self.cursor = self.text.len(),
-
-                // Deleting.
-                (_, Key::Backspace) => {
-                    if self.step_back() {
-                        self.text.remove(self.cursor);
-                    }
-                }
-                (_, Key::Delete) | (_, Key::Ctrl('d')) => {
-                    if self.cursor < self.text.len() {
-                        self.text.remove(self.cursor);
-                    }
-                }
-                (_, Key::Ctrl('k')) => self.text.replace_range(self.cursor.., ""),
-                (_, Key::Ctrl('u')) => {
-                    self.text.replace_range(..self.cursor, "");
-                    self.cursor = 0;
-                }
-                (_, Key::Ctrl('w')) | (_, /*alt+backspace*/ Key::Alt('\x7f')) => {
-                    let w = self.word_start();
-                    self.text.replace_range(w..self.cursor, "");
-                    self.cursor = w;
-                }
-                (_, Key::Alt('d')) => self.text.replace_range(self.cursor..self.word_end(), ""),
-
-                // Typing.
-                (_, Key::Char(c)) => {
-                    self.text.insert(self.cursor, c);
-                    self.step_forward();
-                }
-
-                // Other things we could support:
-                //  * Undo (C-/). Something for redo: maybe another key combination (e.g. M-_), maybe the emacs-style weirdness where you can undo an undo.
-                //  * M-u/M-l/M-c to uppercase/lowercase/capitalize the word.
-                //  * Paste (C-y), clipboard shared across all widgets.
-                //  * Selection (C-space).
-                _ => return true,
-            }
-            false
-        });
-        ret
-    }
-
-    pub fn render(&mut self, f: &mut Frame, area: Rect, palette: &Palette) {
-        let width = str_width(&self.text);
-        let cursor_pos = str_width(&self.text[..self.cursor]);
-        let margin = (width/3).min(5);
-        self.hscroll = self.hscroll.min(cursor_pos.saturating_sub(margin)).max(cursor_pos.saturating_sub((area.width as usize).saturating_sub(margin + 1)));
-        self.hscroll = self.hscroll.min(width.saturating_sub(area.width as usize));
-        let paragraph = Paragraph::new(self.text.clone()).block(Block::default().style(palette.default)).scroll((0, self.hscroll as u16));
-        f.render_widget(paragraph, area);
-        if cursor_pos >= self.hscroll && cursor_pos - self.hscroll <= area.width as usize {
-            f.set_cursor(area.x + (cursor_pos - self.hscroll) as u16, area.y);
+    });
+    let dialog = match dialog {
+        None => {
+            ui.close_dialog();
+            return None;
         }
-    }
+        Some(x) => x,
+    };
+    ui.layout_children(Axis::X);
+    ui.layout_children(Axis::Y);
+    with_parent!(ui, dialog, {
+        ui.check_mouse(MouseActions::CLICK); // clicking inside the dialog shouldn't close it
+        let (w, h) = (ui.cur().axes[Axis::X].size, ui.cur().axes[Axis::Y].size);
+        ui.add(widget!().fixed_width(1).fixed_height(1).fill('╭', border));
+        styled_write!(ui.text, ui.palette.default, "{}", title);
+        let l = ui.text.close_line();
+        ui.add(widget!().fixed_width(w.saturating_sub(2)).fixed_height(1).fixed_x(1).fill('─', border).text(l));
+        ui.add(widget!().fixed_width(1).fixed_height(1).fixed_x(w as isize - 1).fill('╮', border));
+        ui.add(widget!().fixed_width(1).fixed_height(h.saturating_sub(2)).fixed_y(1).fill('│', border));
+        ui.add(widget!().fixed_width(1).fixed_height(h.saturating_sub(2)).fixed_y(1).fixed_x(w as isize - 1).fill('│', border));
+        ui.add(widget!().fixed_width(1).fixed_height(1).fixed_y(h as isize - 1).fill('╰', border));
+        ui.add(widget!().fixed_width(w.saturating_sub(2)).fixed_height(1).fixed_x(1).fixed_y(h as isize - 1).fill('─', border));
+        ui.add(widget!().fixed_width(1).fixed_height(1).fixed_x(w as isize - 1).fixed_y(h as isize - 1).fill('╯', border));
 
-    fn step_back(&mut self) -> bool {
-        if self.cursor == 0 { return false; }
-        self.cursor = self.text[..self.cursor].char_indices().rev().next().unwrap().0;
-        true
-    }
-    fn step_forward(&mut self) -> bool {
-        if self.cursor == self.text.len() { return false; }
-        self.cursor = self.text[self.cursor..].char_indices().nth(1).map_or(self.text.len(), |t| self.cursor + t.0);
-        true
-    }
-    fn is_word_character(c: char) -> bool {
-        match c {
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '_' => true,
-            _ => false }
-    }
-    fn word_end(&self) -> usize {
-        self.text[self.cursor..].char_indices().skip_while(|t| !Self::is_word_character(t.1)).skip_while(|t| Self::is_word_character(t.1)).next().map_or(self.text.len(), |t| self.cursor + t.0)
-    }
-    fn word_start(&self) -> usize {
-        let mut res = 0;
-        self.text[..self.cursor].char_indices().rev().skip_while(|t| !Self::is_word_character(t.1)).skip_while(|t| if Self::is_word_character(t.1) { res = t.0; true } else { false }).next();
-        res
-    }
-}*/
+        with_parent!(ui, ui.add(widget!().fixed_width(w.saturating_sub(4)).fixed_height(h.saturating_sub(4)).fixed_x(2).fixed_y(2)), {
+            ui.focus();
+            Some(ui.cur_parent)
+        })
+    })
+}
 
 pub struct SearchDialog {
     input: TextInput,
     search: SymbolSearcher,
-}
+    table_state: TableState,
 
-#[derive(Clone)]
-pub enum SearchDialogEvent {
-    None,
-    Done(SearchResultInfo),
-    Cancel,
-    Open(SearchResultInfo),
+    pub should_open_document: Option<SearchResultInfo>,
+    pub should_close_dialog: bool,
+    pub loading: bool,
 }
 
 impl SearchDialog {
-    pub fn new(searcher: Arc<dyn Searcher>, context: Arc<Context>) -> Self { Self {input: TextInput::default(), search: SymbolSearcher::new(searcher, context)} }
-/*asdqwe
-    pub fn update(&mut self, keys: &mut Vec<Key>, key_binds: &KeyBindings, registry: &SymbolsRegistry, binaries: Option<Vec<BinaryId>>) -> SearchDialogEvent {
-        let event = self.input.update(keys, key_binds);
-        let results = self.search.get_results();
-        self.scroll.update(results.results.len(), self.height, keys, key_binds);
-        let res = match event {
-            TextInputEvent::None => SearchDialogEvent::None,
-            TextInputEvent::Cancel => return SearchDialogEvent::Cancel,
-            TextInputEvent::Done if results.results.is_empty() => return SearchDialogEvent::Cancel,
-            TextInputEvent::Open if results.results.is_empty() => SearchDialogEvent::None,
-            TextInputEvent::Done | TextInputEvent::Open => {
-                let r = &results.results[self.scroll.cursor.min(results.results.len() - 1)];
-                let res = self.search.format_result(r);
-                match event {
-                    TextInputEvent::Done => return SearchDialogEvent::Done(res),
-                    _ => SearchDialogEvent::Open(res) }
-            }
-        };
+    pub fn new(searcher: Arc<dyn Searcher>, context: Arc<Context>) -> Self { Self {input: TextInput::default(), search: SymbolSearcher::new(searcher, context), table_state: TableState::default(), should_open_document: None, should_close_dialog: false, loading: false} }
+
+    pub fn build(&mut self, registry: &SymbolsRegistry, binaries: Option<Vec<BinaryId>>, ui: &mut UI) {
+        self.should_open_document = None;
+        self.should_close_dialog = false;
+        self.loading = false;
+
+        ui.cur_mut().set_vstack();
+        with_parent!(ui, ui.add(widget!().identity(&'i').fixed_height(1)), {
+            ui.focus();
+            self.input.build(ui);
+        });
+        ui.add(widget!().fixed_height(1));
 
         if self.search.update(registry, binaries, &self.input.text) {
-            self.scroll = Scroll::new();
+            self.table_state.select(0);
         }
-
-        res
-    }
-
-    pub fn render(&mut self, f: &mut Frame, screen_area: Rect, title: &str, palette: &Palette) -> /*loading*/ bool {
-        let area = screen_area.inner(&Margin {vertical: screen_area.height / 12, horizontal: screen_area.width / 8});
-        let input_area = Rect {x: area.x + 2, y: area.y + 2, width: area.width.saturating_sub(4), height: 1};
-        let status_area = Rect {x: area.x + 2, y: area.y + 4, width: area.width.saturating_sub(4), height: 1};
-        let results_area = Rect {x: area.x + 2, y: area.y + 6, width: area.width.saturating_sub(4), height: area.height.saturating_sub(7)};
-        let properties = self.search.searcher.properties();
-        let lines_per_result = properties.have_names as u16 + properties.have_files as u16;
-        self.height = results_area.height / lines_per_result;
-
-        // TODO: Subtly different background color for file/function/variable dialogs
-        let block = Block::default().title(title.to_string()).borders(Borders::ALL).style(palette.dialog);
-        f.render_widget(Clear, area);
-        f.render_widget(block, area);
-        f.render_widget(Clear, input_area);
-        self.input.render(f, input_area, palette);
 
         let res = self.search.get_results();
+        let properties = self.search.searcher.properties();
+        let lines_per_result = properties.have_names as usize + properties.have_files as usize;
+        self.loading = !res.complete;
 
-        if self.search.waiting_for_symbols {
-            f.render_widget(Paragraph::new(Span::styled("waiting for symbols to load (see 'binaries' window for progress)", palette.warning)), status_area);
+        let mut w = widget!().height(AutoSize::Text);
+        let l = if self.search.waiting_for_symbols {
+            ui_writeln!(ui, warning, "waiting for symbols to load (see 'binaries' window for progress)")
         } else if res.complete {
-            let text = if res.results.len() == res.total_results {
-                format!("{} matches ({} searched)", res.results.len(), PrettySize(res.bytes_done))
+            if res.results.len() == res.total_results {
+                ui_writeln!(ui, default, "{} matches ({} searched)", res.results.len(), PrettySize(res.bytes_done))
             } else {
-                format!("showing {}/{} matches ({} searched)", res.results.len(), res.total_results, PrettySize(res.bytes_done))
-            };
-            f.render_widget(Paragraph::new(text), status_area);
+                ui_writeln!(ui, default, "showing {}/{} matches ({} searched)", res.results.len(), res.total_results, PrettySize(res.bytes_done))
+            }
         } else {
-            f.render_widget(Gauge::default().ratio(res.items_done as f64 / res.items_total.max(1) as f64).label(format!("{}", PrettySize(res.bytes_done))).use_unicode(false).gauge_style(palette.progress_bar_remaining.fg(palette.progress_bar_done.bg.unwrap_or(Color::Reset))), status_area);
-        }
+            let progress = res.items_done as f64 / res.items_total.max(1) as f64;
+            w.draw_progress_bar = Some((progress, ui.palette.progress_bar));
+            ui_writeln!(ui, default, "{}", PrettySize(res.bytes_done))
+        };
+        w = w.text(l);
+        ui.add(w);
 
-        let range = self.scroll.range(res.results.len(), self.height as usize);
-        let mut table_state = TableState::default();
-        table_state.select(Some(self.scroll.cursor - range.start));
-
-        let mut rows: Vec<Row> = Vec::new();
-        for r in self.search.format_results(&res.results[range]) {
-            let mut lines: Vec<Spans> = Vec::new();
-            if properties.have_names {
-                lines.push(Spans::from(vec![Span::raw(format!("{}\n", r.name))]));
-            }
-            if properties.have_files {
-                let mut spans: Vec<Span> = Vec::new();
-                spans.push(Span::styled(format!("{}", r.file.as_os_str().to_string_lossy()), palette.location_filename));
-                if r.line.file_idx().is_some() && r.line.line() != 0 {
-                    spans.push(Span::styled(format!(":{}", r.line.line()), palette.location_line_number));
-                    if r.line.column() != 0 {
-                        spans.push(Span::styled(format!(":{}", r.line.column()), palette.location_column_number));
-                    }
+        let table_widget = ui.add(widget!().identity("table").height(AutoSize::Remainder(1.0)));
+        ui.layout_children(Axis::Y);
+        with_parent!(ui, table_widget, {
+            ui.multifocus();
+            let mut table = Table::new(mem::take(&mut self.table_state), ui, vec![Column::new("", AutoSize::Remainder(1.0))]);
+            let range = table.lazy(res.results.len(), lines_per_result, ui);
+            for (i, r) in self.search.format_results(&res.results[range]).iter().enumerate() {
+                table.start_row(i, ui);
+                let start = ui.text.num_lines();
+                if properties.have_names {
+                    ui_writeln!(ui, function_name, "{}", r.name);
                 }
-                lines.push(Spans::from(spans));
+                if properties.have_files {
+                    ui_write!(ui, filename, "{}", r.file.as_os_str().to_string_lossy());
+                    if r.line.file_idx().is_some() && r.line.line() != 0 {
+                        ui_write!(ui, line_number, ":{}", r.line.line());
+                        if r.line.column() != 0 {
+                            ui_write!(ui, column_number, ":{}", r.line.column());
+                        }
+                    }
+                    ui.text.close_line();
+                }
+                let end = ui.text.num_lines();
+                table.text_cell_lines(start..end, ui);
             }
-            rows.push(Row::new(vec![Cell::from(Text::from(lines))]).height(lines_per_result));
+            self.table_state = table.finish(ui);
+        });
+
+        let enter = ui.check_key(KeyAction::Enter);
+        if (enter || self.input.moved_past_the_end) && !res.results.is_empty() {
+            let r = &res.results[self.table_state.cursor];
+            let res = self.search.format_result(r);
+            self.should_open_document = Some(res);
         }
-
-        let table = Table::new(rows)
-            .widths(&[Constraint::Percentage(100)])
-            .highlight_style(palette.table_selected_item).highlight_symbol("➤ ");
-        f.render_stateful_widget(table, results_area, &mut table_state);
-
-        !res.complete
-    }*/
+        self.should_close_dialog |= enter;
+    }
 }
 
 #[derive(Default)]
@@ -1621,6 +1412,18 @@ impl AreaState {
         self.hcursor = 0;
         self.scroll_to_cursor = true;
     }
+
+    pub fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {
+        out.write_usize(self.cursor)?;
+        out.write_isize(self.scroll)?;
+        out.write_usize(self.hcursor)?;
+        out.write_isize(self.hscroll)?;
+        Ok(())
+    }
+
+    pub fn load_state(inp: &mut &[u8]) -> Result<Self> {
+        Ok(Self {cursor: inp.read_usize()?, scroll: inp.read_isize()?, hcursor: inp.read_usize()?, hscroll: inp.read_isize()?, scroll_to_cursor: false, cursor_extra_height: 0, no_auto_hscroll: false})
+    }
 }
 
 // Makes the tree of widgets used by code and disassembly windows (simplified):
@@ -1635,8 +1438,9 @@ impl AreaState {
 //
 // Moves cursor by arrow keys and clicks (using CLICK rather than CLICK_SUBTREE, so the caller may intercept it).
 // Returns content widget and its visible Y range. Remember to put HSCROLL_INDICATOR_RIGHT flag on each widget inside `content`.
-pub fn build_biscrollable_area(header_lines: Range<usize>, mut content_size: [usize; 2], state: &mut AreaState, ui: &mut UI) -> (WidgetIdx, Range<isize>) {
+pub fn build_biscrollable_area_with_header(header_lines: Range<usize>, mut content_size: [usize; 2], state: &mut AreaState, ui: &mut UI) -> (WidgetIdx, Range<isize>) {
     content_size[Axis::X] = content_size[Axis::X].max(ui.text.widest_line(header_lines.clone()));
+    content_size[Axis::X] = content_size[Axis::X].max(ui.cur().get_fixed_width());
 
     ui.cur_mut().set_hstack();
     let hscroll_viewport = ui.add(widget!().width(AutoSize::Remainder(1.0)));

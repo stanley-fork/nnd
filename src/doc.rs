@@ -1,4 +1,5 @@
-
+use crate::{error::*, terminal::*, log::*};
+use std::{io, io::Write};
 
 pub fn print_help_chapter(arg: &str, executable_name: &str) -> bool {
     match arg {
@@ -290,4 +291,49 @@ removing breakpoints on exit
         _ => return false,
     }
     true
+}
+
+pub fn run_input_echo_tool() -> Result<()> {
+    let _restorer = TerminalRestorer;
+    configure_terminal(MouseMode::Disabled)?;
+
+    let mut reader = InputReader::new();
+    let mut keys: Vec<KeyEx> = Vec::new();
+    let mut prof = ProfileBucket::invalid();
+    let mut commands: Vec<u8> = Vec::new();
+    loop {
+        // Read keys.
+        let mut evs: Vec<Event> = Vec::new();
+        reader.read(&mut evs, &mut prof)?;
+
+        // Exit on 'q'.
+        for ev in evs {
+            if let Event::Key(key) = ev {
+                if key.key == Key::Char('q') && key.mods.is_empty() {
+                    return Ok(());
+                }
+                keys.push(key);
+            }
+        }
+        if keys.len() > 200 {
+            keys.drain(..keys.len()-200);
+        }
+
+        // Render.
+        commands.clear();
+        write!(commands, "{}\x1B[{};{}H{}", CURSOR_HIDE, 1, 1, "input echo tool; showing key presses, as can be used in keys config file").unwrap();
+        write!(commands, "\x1B[{};{}H{}", 2, 1, "some keys combinations are indistinguishable due to ANSI escape codes, e.g. ctrl-j and enter").unwrap();
+        write!(commands, "\x1B[{};{}H{}", 3, 1, "press 'q' to exit").unwrap();
+        for (y, key) in keys.iter().rev().enumerate() {
+            write!(commands, "\x1B[{};{}H\x1B[K{}", y + 4 + 1, 1, key).unwrap();
+        }
+
+        // Output.
+        io::stdout().write_all(&commands)?;
+        io::stdout().flush()?;
+
+        // Wait for input.
+        let mut pfd = libc::pollfd {fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0};
+        unsafe {libc::poll(&mut pfd as *mut libc::pollfd, 1, -1)};
+    }
 }
