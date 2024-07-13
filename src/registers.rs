@@ -13,7 +13,7 @@ pub struct Registers {
 }
 
 #[repr(u8)]
-#[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
+#[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 pub enum RegisterIdx {
     // x86-64 registers.
     Rax = 0,

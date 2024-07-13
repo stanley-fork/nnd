@@ -120,6 +120,7 @@ impl TscScopeExcludingSyscalls {
 
     pub fn restart(&mut self, prof: &ProfileBucket) -> u64 {
         let t = prof.syscall_tsc;
+        assert!(t >= self.prev_syscall_tsc, "syscall tsc went backwards: {} {}", self.prev_syscall_tsc, t);
         self.scope.restart().saturating_sub(t - mem::replace(&mut self.prev_syscall_tsc, t))
     }
     pub fn finish(mut self, prof: &ProfileBucket) -> u64 {
@@ -136,7 +137,6 @@ pub struct ProfileBucket {
     pub ui_max_tsc: u64,
     pub other_tsc: u64,
 
-    //asdqwe assign and render
     pub ui_build_max_tsc: u64,
     pub ui_render_max_tsc: u64,
     pub ui_fill_max_tsc: u64,

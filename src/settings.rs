@@ -89,6 +89,7 @@ pub struct Palette {
 
     pub tree_indent: (String, Style),
     pub tree_indent_selected: (String, Style),
+    pub tree_indent_limit_reached: (String, Style),
 
     pub window_border: Style,
     pub window_border_active: Style,
@@ -151,7 +152,7 @@ impl Default for Palette {
             line_number: Style {fg: green, ..D!()},
             column_number: Style {fg: green.darker(), ..D!()},
             type_name: Style {fg: white, ..D!()},
-            field_name: Style {fg: white, ..D!()},
+            field_name: Style {fg: green, ..D!()},
             keyword: Style {fg: white, ..D!()},
             hotkey: StyleAdjustment {add_modifier: Modifier::UNDERLINED, ..D!()},
 
@@ -188,6 +189,7 @@ impl Default for Palette {
 
             tree_indent: ("┆".to_string(), Style {fg: white.darker(), ..D!()}),
             tree_indent_selected: ("┇".to_string(), Style {fg: white, ..D!()}),
+            tree_indent_limit_reached: ("┼".to_string(), Style {fg: white, ..D!()}),
 
             window_border: Style {fg: white.darker(), ..D!()},
             window_border_active: Style {fg: white, modifier: Modifier::BOLD, ..D!()},
@@ -198,7 +200,7 @@ impl Default for Palette {
 
             value: Style {fg: white, ..D!()},
             value_misc: Style {fg: white.darker(), ..D!()},
-            value_dubious: StyleAdjustment {add_fg: (-100, -100, -100), ..D!()},
+            value_dubious: StyleAdjustment {add_fg: (-80, -80, -80), ..D!()},
 
             code_statement: Style {fg: white, bg: dark_gray, ..D!()},
             code_inlined_site: Style {fg: white, bg: light_blue, ..D!()},

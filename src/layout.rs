@@ -506,7 +506,7 @@ impl Layout {
 
             with_parent!(ui, leaf.tabs_widget, {
                 if is_active {
-                    ui.focus();
+                    ui.multifocus();
                 }
 
                 let mut tabs = Tabs::new(mem::take(&mut leaf.tabs_state), ui);

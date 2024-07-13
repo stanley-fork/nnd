@@ -9,6 +9,7 @@ use std::{mem, ptr, alloc::{alloc, Layout, handle_alloc_error, dealloc}, slice, 
 // but it quickly got out of hand because types from different pools may interact and even reference each other (when temporary types are introduced in watch expressions).
 // So we use arenas for that, with some manual transmuting of lifetimes.
 
+#[derive(Default)]
 pub struct Arena {
     chunks: Vec<Chunk>,
     current_chunk: Option<usize>,
@@ -37,7 +38,7 @@ unsafe impl Sync for Chunk {}
 const CHUNK_SIZE: usize = 1 << 18;
 
 impl Arena {
-    pub fn new() -> Self { Self {chunks: Vec::new(), current_chunk: None} }
+    pub fn new() -> Self { Self::default() }
 
     pub fn alloc(&mut self, size: usize, align: usize) -> &mut [u8] {
         assert!(align != 0 && (align - 1) & align == 0);

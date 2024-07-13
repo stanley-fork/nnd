@@ -1,19 +1,15 @@
-use key chords instead of ctrl+wasd, use ctrl+w for closing tab
-investigate crash in to_investigate
+set up build modes such that I use a build with optimizations+asserts+overflow-checks+debug-info, but publish a stripped release build
+profile the ui
 fix empty symbols loading stage name near the end
 make u8 always be non-ambiguous non-char
 key to send SIGINT to the program
 ignore anon executable mmaps, don't treat them as "binaries" (currently visible in binaries window)
-refresh cpu/ram stats more frequently; but less frequently if not focused; refresh threads less often if refreshing is slow (lots of threads)
-show last seen cpu usage for threads when suspended; update it when suspending (period [1, 2] seconds)
+show last seen cpu usage for threads when suspended; update it when suspending (based on last 2 buckets)
 fix picking up updated binary unnecessarily
 search and go-to-line in code window
 make search auto-case-sensitive (insensitive if all lowercase, sensitive otherwise)
-when stepping in disassembly, keep focus on the selected subfunction level (if any) instead of jumping to the top of the stack after each step; similar to source code steps
-make hints window show actual key bindings instead of fixed strings
 key to sort by cpu usage in threads window
 key to follow a jump in disas
-fix selected subfunction level highlighting being broken again
 investigate regression in symbols loading speed (stuck on "parsing drawf" for ~10 seconds)
 instruction breakpoints
 hide <frame base> from locals, make it available as watchable variable instead (maybe as just `<frame base>`, maybe something nicer)

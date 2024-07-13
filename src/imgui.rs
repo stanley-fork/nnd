@@ -92,6 +92,8 @@ pub struct WidgetFlags : u32 {
     // If the text doesn't fit horizontally, keep a suffix rather than a prefix, and put the "…" at the start. If the text is not truncated, it's aligned left.
     const TEXT_TRUNCATION_ALIGN_RIGHT = 0x2;
     const LINE_WRAP = 0x4;
+    const REPEAT_TEXT_VERTICALLY = 0x8;
+    // const REPEAT_TEXT_HORIZONTALLY = 0x10; - not implemented
 
     // These two flags are for drawing left/right arrows to the left and right of each line of text (or other content) to indicate that the text is cut off and horizontal scrolling is available.
     // Draws a corresponding arrow when the corresponding edge of this widget is clipped off by ancestor widgets.
@@ -110,33 +112,33 @@ pub struct WidgetFlags : u32 {
     //       line2 (width=100)          <-- put HSCROLL_INDICATOR_RIGHT here
     // (In this example, we can't put HSCROLL_INDICATOR_RIGHT on "hscroll content" because it doesn't "know" that line1 is shorter than 100.
     //  And we can't put HSCROLL_INDICATOR_LEFT on "line1" because it'll fail to show the left arrow if hscroll offset is >= 42, when line1 is fully off-screen.)
-    const HSCROLL_INDICATOR_LEFT = 0x8;
-    const HSCROLL_INDICATOR_RIGHT = 0x10;
+    const HSCROLL_INDICATOR_LEFT = 0x20;
+    const HSCROLL_INDICATOR_RIGHT = 0x40;
 
     // StyleAdjstment won't be inherited from ancestors. E.g. for drawing text input box with standard background in a panel with tinted background.
-    const RESET_STYLE_ADJUSTMENT = 0x20;
+    const RESET_STYLE_ADJUSTMENT = 0x80;
 
     // If any part of this rect is visible (i.e. not clipped by parents' rects), trigger a redraw. May be useful for speculative hiding of elements,
     // but currently unused because I made everything non-speculative instead.
-    const REDRAW_IF_VISIBLE = 0x40;
+    const REDRAW_IF_VISIBLE = 0x100;
 
     // Any simple character key presses (no modifier keys, no special keys like tab or enter) are captured by this Widget as if they were in capture_keys.
     // Doesn't include text navigation keys like arrow keys, home/end, etc; they should be requested through capture_keys as usual.
-    const CAPTURE_TEXT_INPUT_KEYS = 0x80;
+    const CAPTURE_TEXT_INPUT_KEYS = 0x200;
     // Capture all keys that reach this Widget (i.e. if this widget is focused and keys are not captured by focused descendants first).
-    const CAPTURE_ALL_KEYS = 0x100;
+    const CAPTURE_ALL_KEYS = 0x400;
 
     // Trigger redraw is this Widget gets focused or unfocused.
-    const REDRAW_IF_FOCUS_CHANGES = 0x200;
+    const REDRAW_IF_FOCUS_CHANGES = 0x800;
 
     // Equivalent to:
     //   if ui.check_mouse(MouseActions::HOVER_SUBTREE) {
     //       widget.style_adjustment.update(ui.palette.hovered);
     //   }
-    const HIGHLIGHT_ON_HOVER = 0x400;
+    const HIGHLIGHT_ON_HOVER = 0x1000;
 
     // This widget's identity won't be hashed into children identities. Instead, the nearest ancestor without this flag will be hashed. As if this widget didn't exist and its children were its parent's children.
-    const SKIP_IDENTITY = 0x800;
+    const SKIP_IDENTITY = 0x2000;
 }}
 
 bitflags! {
@@ -921,7 +923,7 @@ impl UI {
                     0 => pos[1] = other.axes[1].abs_pos - w.axes[1].size as isize,
                     1 => pos[0] = other.axes[0].abs_pos - w.axes[0].size as isize,
                     2 => pos[1] = other.axes[1].abs_pos + other.axes[1].size as isize,
-                    3 => pos[1] = other.axes[0].abs_pos + other.axes[0].size as isize,
+                    3 => pos[0] = other.axes[0].abs_pos + other.axes[0].size as isize,
                     _ => panic!("huh"),
                 }
                 pos[0] = pos[0].min(root.axes[0].size as isize - w.axes[0].size as isize).max(0);
@@ -983,9 +985,13 @@ impl UI {
                     let wid = str_width(&self.palette.hscroll_indicator.1);
                     let mut new_clip = clip;
                     new_clip.size[0] = new_clip.size[0].saturating_sub(wid);
-                    for y in clip.y()..clip.bottom() {
+                    for y in clip.y_range() {
                         if let Some(lines) = &w.draw_text {
-                            let line_idx = lines.start + (y - rect.y()) as usize;
+                            let mut i = (y - rect.y()) as usize;
+                            if w.flags.contains(WidgetFlags::REPEAT_TEXT_VERTICALLY) && !lines.is_empty() {
+                                i %= lines.len();
+                            }
+                            let line_idx = lines.start + i;
                             let line_width = if line_idx < lines.end {str_width(self.text.get_line_str(line_idx))} else {0};
                             if rect.x() + line_width as isize <= new_clip.right() {
                                 continue;
@@ -1023,16 +1029,24 @@ impl UI {
             }
 
             if let Some(text_range) = draw_text {
-                for (y_offset, line_idx) in text_range.clone().enumerate() {
-                    if y_offset >= rect.height() {
+                for y in clip.y_range() {
+                    let mut indicate_vertical_truncation = show_vertical_text_truncation_indicator && y + 1 == rect.bottom();
+                    let mut indicate_horizontal_truncation = show_horizontal_text_truncation_indicator;
+
+                    let mut i = (y - rect.y()) as usize;
+                    if w.flags.contains(WidgetFlags::REPEAT_TEXT_VERTICALLY) && !text_range.is_empty() {
+                        i %= text_range.len();
+                        indicate_vertical_truncation = false;
+                    } else if i >= text_range.len() {
                         break;
+                    } else {
+                        indicate_vertical_truncation &= i + 1 < text_range.len();
                     }
+                    let line_idx = text_range.start + i;
+
                     let mut spans = self.text.get_line(line_idx);
                     let line_str = self.text.get_line_str(line_idx);
-                    let y = rect.y() + y_offset as isize;
                     let mut x = rect.x();
-                    let indicate_vertical_truncation = show_vertical_text_truncation_indicator && y_offset + 1 == rect.height() && line_idx + 1 < text_range.end;
-                    let mut indicate_horizontal_truncation = show_horizontal_text_truncation_indicator;
 
                     if str_width(line_str) <= rect.width() {
                         indicate_horizontal_truncation = false;

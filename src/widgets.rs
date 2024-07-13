@@ -386,6 +386,13 @@ impl Table {
         })
     }
 
+    pub fn empty_cell(&mut self, ui: &mut UI) -> WidgetIdx {
+        with_parent!(ui, self.start_cell(ui), {
+            ui.cur_mut().axes[Axis::Y].set_fixed_size(1);
+            ui.cur_parent
+        })
+    }
+
     // Add empty cell inside which you can add arbitrary widgets.
     pub fn start_cell(&mut self, ui: &mut UI) -> WidgetIdx {
         let w = *ui.get(self.rows_container).children.last().unwrap();
@@ -1034,7 +1041,7 @@ impl TextInput {
                         let mut pos = self.offset_to_coordinates(self.cursor);
                         pos[0] = if key.key == Key::Char('k') {isize::MAX} else {0};
                         let new_cursor = self.coordinates_to_offset(pos);
-                        if new_cursor == self.cursor {//asdqwe test this behavior when there's any multiline text input to play with
+                        if new_cursor == self.cursor {
                             self.move_cursor(false, key.key == Key::Char('k'));
                         } else {
                             self.cursor = new_cursor;

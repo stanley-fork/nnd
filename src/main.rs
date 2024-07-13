@@ -169,7 +169,7 @@ fn main() {
 
             // This is not fully reliable because other threads still execute while this hook is running,
             // so the main thread may hide cursor or output a rendered frame after we restored the terminal.
-            // To minimize this, we put this near the end of the hook, importantly after the slow default hook.
+            // To minimize the chance of that, we put this near the end of the hook, importantly after the slow default hook.
             restore_terminal();
 
             // Print something to the console, otherwise it'll be left confusingly empty, as if the debugger just quit silently.

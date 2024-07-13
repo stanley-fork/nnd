@@ -167,7 +167,6 @@ impl DebuggerUI {
         let status_window = layout.new_window(Some(rows[1]), WindowType::Status, true, "status".to_string(), Box::new(StatusWindow::default()));
         layout.set_fixed_size(status_window, Axis::Y, 7);
         let watches_window = layout.new_window(Some(rows[2]), WindowType::Watches, true, "watches".to_string(), Box::new(WatchesWindow::default()));
-        layout.new_window(Some(rows[2]), WindowType::Watches, true, "registers".to_string(), Box::new(RegistersWindow::default()));
         layout.new_window(Some(rows[2]), WindowType::Locations, true, "locations".to_string(), Box::new(LocationsWindow::default()));
 
         let rows = layout.split(cols[1], Axis::Y, vec![0.4]);
@@ -378,44 +377,14 @@ fn report_result<R>(state: &mut UIState, r: &Result<R>) {
     }
 }
 
-// TODO: Make it a subtree in locals instead.
-#[derive(Default)]
-struct RegistersWindow {
-    table_state: TableState,
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SpecialWatch {
+    Locals,
+    Registers,
+    AddWatch,
 }
 
-impl WindowContent for RegistersWindow {
-    fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
-        let l = ui_writeln!(ui, default, "registers");
-        ui.add(widget!().text(l));
-        /*asdqwe
-        let f = match f { Some(f) => f, None => return };
-        let palette = &debugger.context.settings.palette;
-
-        let mut rows: Vec<Row> = Vec::new();
-        if let Some(frame) = state.stack.frames.get(state.selected_frame) {
-            let regs = &frame.regs;
-            for reg in RegisterIdx::all() {
-                if let Ok((v, dubious)) = regs.get_int(*reg) {
-                    rows.push(Row::new(vec![
-                        Cell::from(format!("{}", reg)),
-                        Cell::from(format!("{:x}", v)).style(if dubious {palette.value_dubious} else {palette.value}),
-                    ]));
-                }
-            }
-        }
-
-        let range = self.scroll.update_cursorless(rows.len(), area.height.saturating_sub(1), &mut keys, &debugger.context.settings.keys);
-        let rows = rows[range].to_vec();
-        let table = Table::new(rows)
-            .header(Row::new(vec!["reg", "value"]).style(palette.table_header))
-            .widths(&[Constraint::Length(7), Constraint::Length(16)]);
-
-        f.render_widget(table, area);*/
-     }
-}
-/*asdqwe
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 struct ValueTreeNodeIdx(usize);
 impl ValueTreeNodeIdx {
     fn invalid() -> Self { Self(usize::MAX) }
@@ -424,8 +393,10 @@ impl ValueTreeNodeIdx {
 
 struct ValueTreeNode {
     name: Range<usize>, // lines in ValueTree's `text`
+    line_wrapped_name: Option<Range<usize>>,
     value: Result<Value>,
     dubious: bool,
+    special: Option<SpecialWatch>,
 
     // Unique identifier of this node. Hash of identities (field names or array indices or similar) of nodes on the path from the root to here.
     // For remembering which subtrtees were expanded and where the cursor was, in a way that survives recalculation or partial change of the values.
@@ -435,33 +406,31 @@ struct ValueTreeNode {
     parent: ValueTreeNodeIdx,
 
     // These are populated lazily.
-    formatted_line: [Option<Range<usize>>; 3], // collapsed, expanded, line-wrapped; ranges in ValueTree's `text`
-    has_children: Option<bool>, // populated together with either element of formatted_line
-    children: Option<Range<ValueTreeNodeIdx>>, // populated together with formatted_line[1]
-}
-impl Default for ValueTreeNode { fn default() -> Self { Self {name: "", value: err!(Internal, "if you're seeing this, there's a bug"), dubious: false, identity: 0, depth: 0, parent: ValueTreeNodeIdx::invalid(), formatted_line: [None; 2], has_children: None, children: None} } }
+    formatted_value: [Option<Range<usize>>; 3], // collapsed, expanded, line-wrapped; ranges in ValueTree's `text`; if value is Err, the error message is formatted into here
+    has_children: bool, // populated together with either element of formatted_value
+    children: Range<usize>, // indices in `nodes`; populated together with formatted_value[1]
 
-// An element of depth-first traversal of tree nodes, descending only into expanded ones. The cursor stands on one of these.
-#[derive(Clone, Default)]
-struct ValueTreeRow {
-    node: ValueTreeNodeIdx,
+    // Layout information, recalculated every frame, valid only for reachable nodes.
+    start_y: isize,
+    node_end_y: isize,
+    subtree_end_y: isize,
     expanded: bool,
-
-    widget: WidgetIdx, // invalid() if we didn't create it yet
-    // Information needed to create the widget.
-    parent_widget: WidgetIdx,
-    rel_y: isize,
-    indent_built: bool,
-    // If false, widget for this row should be created by build_tree(). Otherwise widget may be created later, after layout and visibility check.
-    deferred: bool,
+    is_text_input: bool,
+    // These are just for asserts.
+    layout_frame_idx: usize, // when this node's layout information was updated
+    name_line_wrap_width: usize, // what width was used for line_wrapped_name
 }
+impl Default for ValueTreeNode { fn default() -> Self { Self {name: 0..0, line_wrapped_name: None, value: err!(ValueTreePlaceholder, ""), dubious: false, special: None, identity: 0, depth: 0, parent: ValueTreeNodeIdx::invalid(), formatted_value: [None, None, None], has_children: false, children: 0..0, start_y: 0, node_end_y: 0, subtree_end_y: 0, expanded: false, is_text_input: false, layout_frame_idx: 0, name_line_wrap_width: 0} } }
 
 #[derive(Default)]
 struct ValueTree {
     nodes: Vec<ValueTreeNode>,
     roots: Vec<ValueTreeNodeIdx>, // (so it's technically a forest, but ValueTree sounds nicer, and you can always imagine an implicit root node that has these "root" nodes as children)
-    text: StyledText,
-    rows: Vec<ValueTreeRow>, // if empty, we should repopulate it
+    // An element of depth-first traversal of tree nodes, descending only into expanded ones. The cursor stands on one of these.
+    rows: Vec<ValueTreeNodeIdx>,
+
+    text: StyledText, // arena for various text
+    temp_text: StyledText,
     arena: Arena,
 }
 impl ValueTree {
@@ -469,20 +438,28 @@ impl ValueTree {
 
     fn add(&mut self, mut node: ValueTreeNode) -> ValueTreeNodeIdx {
         assert!(node.depth == 0);
-        if node.parent != usize::MAX {
-            let parent = &self.nodes[node.parent];
+        if node.parent.is_valid() {
+            let parent = &self.nodes[node.parent.0];
             node.identity = hash(&(parent.identity, node.identity));
             node.depth = parent.depth + 1;
         } else {
-            self.roots.push(self.nodes.len());
+            self.roots.push(ValueTreeNodeIdx(self.nodes.len()));
         }
         self.nodes.push(node);
         ValueTreeNodeIdx(self.nodes.len() - 1)
     }
-}*/
+}
 
-#[derive(Default)]
-struct WatchesWindow {/*asdqwe
+struct WatchExpression {
+    identity: usize,
+    text: String,
+    special: Option<SpecialWatch>,
+}
+impl WatchExpression {
+    fn is_editable(&self) -> bool { !self.special.is_some_and(|s| s != SpecialWatch::AddWatch) }
+}
+
+struct WatchesWindow {
     tree: ValueTree,
     expanded_nodes: HashSet<usize>,
 
@@ -501,25 +478,25 @@ struct WatchesWindow {/*asdqwe
     // When this changes, we recalculate everything.
     seen: (/*thread*/ pid_t, /*selected_subframe*/ usize, /*stop_count*/ usize),
 
-    next_watch_id: usize,
-    expressions: Vec<(/*identity*/ usize, String)>, // watch expressions; parallel to tree.roots
-    text_input: Option<(/*identity*/ usize, TextInput)>, // if editing watch expression
+    expressions: Vec<WatchExpression>, // watch expressions; parallel to tree.roots
+    text_input: Option<(/*identity*/ usize, /*height*/ usize, TextInput)>, // if editing watch expression
     text_input_built: bool,
 
-    eval_state: EvalState,*/
+    eval_state: EvalState,
 }
-impl WatchesWindow {/*asdqwe
-    fn clear_tree(&mut self) {
-        self.tree.clear();
-        self.eval_state.clear();
-    }
+impl Default for WatchesWindow {
+    fn default() -> Self {
+        let mut r = Self {tree: ValueTree::default(), expanded_nodes: HashSet::new(), cursor_path: Vec::new(), cursor_idx: 0, scroll: 0, scroll_to_cursor: false, name_width: 0, value_width: 0, row_height_limit: 0, indent_width: 0, max_indent: 0, seen: (0, usize::MAX, usize::MAX), expressions: Vec::new(), text_input: None, text_input_built: false, eval_state: EvalState::new() };
 
-    fn eval_locals(&mut self, context: &EvalContext, root_idx: ValueTreeNodeIdx) {
-        let root = &mut self.tree.nodes[root_idx.0];
-        root.has_children = Some(true);
-        root.children = Some(0..0);
-        /*
-        asdqwe;
+        let locals_identity: usize = random();
+        r.expanded_nodes.insert(locals_identity);
+        r.expressions.push(WatchExpression {identity: locals_identity, text: "[locals]".to_string(), special: Some(SpecialWatch::Locals)});
+        r.expressions.push(WatchExpression {identity: random(), text: "[registers]".to_string(), special: Some(SpecialWatch::Registers)});
+        r
+    }
+}
+impl WatchesWindow {
+    fn eval_locals(&mut self, context: &EvalContext, parent: ValueTreeNodeIdx, palette: &Palette) {
         let (dwarf_context, _) = match self.eval_state.make_local_dwarf_eval_context(context, context.selected_subframe) {
             Ok(x) => x,
             Err(e) => {
@@ -533,7 +510,7 @@ impl WatchesWindow {/*asdqwe
         let static_pseudo_addr = dwarf_context.addr_map.dynamic_to_static(pseudo_addr);
 
         let mut idxs_per_name: HashMap<&str, usize> = HashMap::new();
-        for v in drarf_context.local_variables {
+        for v in dwarf_context.local_variables {
             if !v.range().contains(&(static_pseudo_addr)) {
                 continue;
             }
@@ -542,462 +519,608 @@ impl WatchesWindow {/*asdqwe
                 Err(e) => (Err(e), false),
             };
             let name = unsafe {v.name()};
+            let l = styled_writeln!(self.tree.text, palette.default, "{}", name);
             let idx_per_name = *idxs_per_name.entry(name).and_modify(|x| *x += 1).or_insert(1) - 1;
-            self.tree.add(ValueTreeNode {name, value: value.map(|val| Value {val, type_: v.type_, flags: ValueFlags::empty()}), dubious, identity: hash(&(name, idx_per_name)), ..Default::default()});
-        }*/
+            self.tree.add(ValueTreeNode {name: l..l+1, value: value.map(|val| Value {val, type_: v.type_, flags: ValueFlags::empty()}), dubious, identity: hash(&(name, idx_per_name)), parent, ..Default::default()});
+        }
     }
 
-    fn eval_registers(&mut self, context: EvalContext, root_idx: ValueTreeNodeIdx) {
-        let root = &mut self.tree.nodes[root_idx.0];
-        root.has_children = Some(true);
-        root.children = Some(0..0);
-        //asdqwe
+    fn eval_registers(&mut self, context: &EvalContext, parent: ValueTreeNodeIdx, palette: &Palette) {
+        if let Some(sf) = context.stack.subframes.get(context.selected_subframe) {
+            let regs = &context.stack.frames[sf.frame_idx].regs;
+            for reg in RegisterIdx::all() {
+                if let Ok((v, dubious)) = regs.get_int(*reg) {
+                    let l = styled_writeln!(self.tree.text, palette.default, "{}", reg);
+                    let value = Value {val: AddrOrValueBlob::Blob(ValueBlob::new(v as usize)), type_: self.eval_state.builtin_types.u64_, flags: ValueFlags::empty()};
+                    self.tree.add(ValueTreeNode {name: l..l+1, value: Ok(value), dubious, identity: hash(&reg), parent, ..D!()});
+                }
+            }
+        }
     }
 
-    fn eval_watches(&mut self, context: &EvalContext, ui: &mut UI) {
-        for &(identity, ref expr) in &self.expressions {
-            styled_write!(self.tree.text, ui.palette.default, "{}", expr);
-            let l = text.close_line();
+    fn eval_watches(&mut self, context: Option<&EvalContext>, palette: &Palette) {
+        for i in 0..self.expressions.len() {
+            let expr = &self.expressions[i];
+            let style = if expr.special.is_some() {palette.default_dim} else {palette.default};
+            let l = styled_writeln!(self.tree.text, style, "{}", expr.text);
             let name = self.tree.text.split_by_newline_character(l, None);
-            let root_idx = self.tree.add(ValueTreeNode {name, identity, ..D!()});
-            let root = &mut self.tree.nodes[root_idx.0];
+            let node_idx = self.tree.add(ValueTreeNode {name, identity: expr.identity, special: expr.special.clone(), ..D!()});
+            let node = &mut self.tree.nodes[node_idx.0];
 
-            if expr.is_empty() {
-                root.has_children = Some(false);
-            } else if expr == "<locals>" {
-                self.eval_locals(context, root);
-            } else if expr == "<registers>" {
-                self.eval_registers(context, root);
-            } else {
-                match eval_watch_expression(expr, &mut self.eval_state, context) {
-                    Ok((val, dub)) => {
-                        root.value = val;
-                        root.dubious = dub;
-                    }
-                    Err(e) => root.value = Err(e),
+            if expr.special.is_some() {
+                continue;
+            }
+            
+            let context = match &context {
+                None => continue,
+                &Some(x) => x };
+            match eval_watch_expression(&expr.text, &mut self.eval_state, context) {
+                Ok((val, dub)) => {
+                    node.value = Ok(val);
+                    node.dubious = dub;
                 }
+                Err(e) => node.value = Err(e),
             }
         }
     }
-*/
-    /*asdqwe
-    fn populate_lines(&mut self, context: Option<&EvalContext>, palette: &Palette) {
-        self.lines.clear();
-        let mut max_cursor_match = 0usize;
-        self.scroll.cursor = 0;
-        // DFS.
-        for root_idx in self.tree.roots.clone() {
-            let mut stack: Vec<usize> = vec![root_idx];
-            while let Some(idx) = stack.pop() {
-                let node = &self.tree.nodes[idx];
 
-                if node.depth + 1 > max_cursor_match && self.cursor_path.get(node.depth) == Some(&node.identity) {
-                    max_cursor_match = node.depth + 1;
-                    self.scroll.cursor = self.lines.len();
+    // If !node.expanded: populates formatted_value[0], has_children.
+    // If  node.expanded: populates formatted_value[1], has_children, children.
+    // If already populated, does nothing.
+    // If context is none, may not populate; in this case the caller should show the error from `context` (e.g. "running") instead of formatted_value.
+    fn ensure_node_info(&mut self, node_idx: ValueTreeNodeIdx, context: Option<&EvalContext>, palette: &Palette) {
+        let node = &mut self.tree.nodes[node_idx.0];
+        let i = node.expanded as usize;
+        if node.formatted_value[i].is_some() {
+            return;
+        }
+        match (&node.special, &node.value) {
+            (&Some(SpecialWatch::AddWatch), _) => {
+                node.formatted_value = [Some(0..0), Some(0..0), Some(0..0)];
+            }
+            (&Some(special), _) => if let &Some(context) = &context {
+                node.formatted_value[0] = Some(0..0);
+                node.has_children = true;
+                if node.expanded {
+                    node.formatted_value[1] = Some(0..0);
+                    let start = self.tree.nodes.len();
+                    let what = match special {
+                        SpecialWatch::Locals => {
+                            self.eval_locals(context, node_idx, palette);
+                            "locals"
+                        }
+                        SpecialWatch::Registers => {
+                            self.eval_registers(context, node_idx, palette);
+                            "registers"
+                        }
+                        SpecialWatch::AddWatch => panic!("huh"),
+                    };
+                    let end = self.tree.nodes.len();
+                    let node = &mut self.tree.nodes[node_idx.0];
+                    node.children = start..end;
+                    if node.children.is_empty() {
+                        let l = styled_writeln!(self.tree.text, palette.default_dim, "no {}", what);
+                        node.formatted_value[1] = Some(l..l+1);
+                    }
                 }
+            }
+            (&None, Err(e)) if e.is_value_tree_placeholder() => (),
+            (&None, Err(e)) => {
+                let l = styled_writeln!(self.tree.text, palette.error, "<{}>", e);
+                node.formatted_value[0] = Some(l..l+1);
+                node.formatted_value[1] = Some(l..l+1);
+            }
+            (&None, Ok(value)) => if let &Some(context) = &context {
+                let (has_children, children) = format_value(value, node.expanded, &mut self.eval_state, context, &mut self.tree.temp_text, &mut self.tree.text, palette);
+                let l = self.tree.temp_text.close_line();
+                let l = self.tree.text.import_lines(&self.tree.temp_text, l..l+1);
+                node.formatted_value[i] = Some(l);
+                node.has_children = has_children;
 
-                let expanded = self.expanded_nodes.contains(&node.identity);
-                self.lines.push((idx, expanded));
-
-                if !expanded {
-                    // Skip children.
-                    continue;
-                }
-
-                if node.formatted_line[1].is_none() && node.value.is_ok() && context.is_some() {
-                    // List children.
-                    let (expandable, children) = format_value(node.value.as_ref().unwrap(), true, &mut self.eval_state, context.as_ref().unwrap(), &mut self.tree.arena, &mut self.tree.text, palette);
-                    let start_idx = self.tree.nodes.len();
-                    let node = &mut self.tree.nodes[idx];
-                    node.formatted_line[1] = Some(self.tree.text.num_lines());
-                    node.expandable = Some(expandable);
-                    node.children = start_idx..start_idx+children.len();
+                if i == 1 {
                     let dubious = node.dubious;
-                    self.tree.text.close_line();
-                    for (name, identity, value) in children {
-                        self.tree.add(ValueTreeNode {name, value, dubious, identity, parent: idx, ..Default::default()});
+                    let start = self.tree.nodes.len();
+                    for c in children {
+                        self.tree.add(ValueTreeNode {name: c.name_line..c.name_line+1, identity: c.identity, value: c.value, dubious, parent: node_idx, ..D!()});
+                    }
+                    let end = self.tree.nodes.len();
+                    self.tree.nodes[node_idx.0].children = start..end;
+                }
+            }
+        }
+    }
+
+    fn do_layout(&mut self, context: Option<&EvalContext>, palette: &Palette, frame_idx: usize) -> usize {
+        self.cursor_idx = 0;
+        self.tree.rows.clear();
+        let mut y = 0isize;
+        let mut stack: Vec<(ValueTreeNodeIdx, u8)> = self.tree.roots.iter().map(|i| (*i, 0)).rev().collect();
+        while let Some((node_idx, pass)) = stack.pop() {
+            let node = &mut self.tree.nodes[node_idx.0];
+            if pass == 1 {
+                node.subtree_end_y = y;
+                continue;
+            }
+            let row_idx = self.tree.rows.len();
+            self.tree.rows.push(node_idx);
+            node.layout_frame_idx = frame_idx;
+            node.start_y = y;
+            node.expanded = self.expanded_nodes.contains(&node.identity);
+            node.is_text_input = self.text_input.as_ref().is_some_and(|(identity, _, _)| *identity == node.identity);
+            if self.cursor_path.get(node.depth) == Some(&node.identity) {
+                self.cursor_idx = row_idx;
+            }
+
+            // Calculate height. If expanded, this requires formatting the value and doing line wrap.
+            let mut height = node.name.len().max(1);
+            if node.is_text_input {
+                height.set_max(self.text_input.as_ref().unwrap().1);
+            }
+            let mut pushed_children_to_stack = false;
+            if node.expanded {
+                if !node.is_text_input {
+                    let name_line_wrap_width = self.name_width.saturating_sub(node.depth.min(self.max_indent) * self.indent_width + 2);
+                    if node.line_wrapped_name.is_some() {
+                        assert_eq!(node.name_line_wrap_width, name_line_wrap_width);
+                    } else {
+                        node.name_line_wrap_width = name_line_wrap_width;
+                        node.line_wrapped_name = Some(self.tree.text.line_wrap(node.name.clone(), name_line_wrap_width, self.row_height_limit, &palette.line_wrap_indicator, &palette.truncation_indicator, None));
+                    }
+                    height.set_max(node.line_wrapped_name.clone().unwrap().len());
+                }
+
+                self.ensure_node_info(node_idx, context, palette);
+                let node = &mut self.tree.nodes[node_idx.0];
+
+                if node.formatted_value[2].is_none() && node.formatted_value[1].is_some() {
+                    node.formatted_value[2] = Some(self.tree.text.line_wrap(node.formatted_value[1].clone().unwrap(), self.value_width, self.row_height_limit, &palette.line_wrap_indicator, &palette.truncation_indicator, None));
+                }
+                if let Some(v) = &node.formatted_value[2] {
+                    height.set_max(v.len());
+                }
+
+                if node.has_children && !node.children.is_empty() {
+                    pushed_children_to_stack = true;
+                    stack.push((node_idx, 1));
+                    for idx in node.children.clone().rev() {
+                        stack.push((ValueTreeNodeIdx(idx), 0));
                     }
                 }
+            }
+            let node = &mut self.tree.nodes[node_idx.0];
 
-                let node = &self.tree.nodes[idx];
-                for c in node.children.clone().rev() {
-                    stack.push(c);
+            y += height as isize;
+            node.node_end_y = y;
+            if !pushed_children_to_stack {
+                node.subtree_end_y = y;
+            }
+        }
+
+        y as usize
+    }
+
+    fn build_widgets(&mut self, visible_y: Range<isize>, context: &Result<EvalContext>, ui: &mut UI) {
+        let mut stack: Vec<ValueTreeNodeIdx> = self.tree.roots.iter().copied().rev().collect();
+        while let Some(node_idx) = stack.pop() {
+            let node = &self.tree.nodes[node_idx.0];
+            assert_eq!(node.layout_frame_idx, ui.frame_idx);
+            if node.start_y >= visible_y.end || node.subtree_end_y <= visible_y.start {
+                continue;
+            }
+
+            if node.expanded {
+                for idx in node.children.clone().rev() {
+                    stack.push(ValueTreeNodeIdx(idx));
                 }
             }
-        }
-    }
 
-    fn populate_tree_with_placeholders(&mut self) {
-        if self.is_locals_window {
-            self.tree.add(ValueTreeNode {value: err!(ValueTreePlaceholder, ""), ..Default::default()});
-        } else {
-            for (identity, expr) in &self.expressions {
-                let name = self.tree.arena.add_str(expr);
-                self.tree.add(ValueTreeNode {name, identity: *identity, value: err!(ValueTreePlaceholder, ""), ..Default::default()});
+            let indent = node.depth.min(self.max_indent) * self.indent_width;
+
+            // Order of operations:
+            //  1. Format the value and determine whether the node has children.
+            //  2. Create indentation arrow+line widget.
+            //  3. Create the row widget. It may partially cover the indentation widget if indent width is > 2 cells in palette.
+            //    3a. Create value widget.
+            //    3b. Create name or text input widget. It may partially cover the value widget if it's a text input.
+
+            let formatted = if node.expanded {
+                node.formatted_value[2].clone()
+            } else {
+                self.ensure_node_info(node_idx, context.as_ref().ok(), &ui.palette);
+                self.tree.nodes[node_idx.0].formatted_value[0].clone()
+            };
+            let node = &self.tree.nodes[node_idx.0];
+            let value_start = ui.text.num_lines();
+            if let Some(lines) = formatted {
+                ui.text.import_lines(&self.tree.text, lines);
+            } else {
+                // We don't do line wrap on this error message, but that's ok, it's short (something like "<running>" or "<no process>").
+                ui_writeln!(ui, default_dim, "<{}>", context.as_ref().err().unwrap());
+            }
+            let value_end = ui.text.num_lines();
+
+            // Draw vertical line showing indentation, and arrow showing whether the node is expanded or expandable.
+            // This must be below the `node.has_children` assignment above (where we lazily format the value).
+            with_parent!(ui, ui.add(widget!().identity(&('|', node.identity)).fixed_x(indent as isize).fixed_y(node.start_y).fixed_width(1).fixed_height(1).vstack().highlight_on_hover()), {
+                if ui.check_mouse(MouseActions::CLICK) {
+                    if node.expanded {
+                        self.expanded_nodes.remove(&node.identity);
+                    } else {
+                        self.expanded_nodes.insert(node.identity);
+                    }
+                    self.scroll_to_cursor = true;
+                    ui.should_redraw = true;
+                }
+
+                let arrow = if !node.has_children {
+                    ' '
+                } else if node.expanded {
+                    '▾'
+                } else {
+                    '▸'
+                };
+                if node.has_children && node.expanded && node.depth < self.max_indent {
+                    // Draw the line.
+                    let w = ui.cur_mut();
+                    w.axes[Axis::X].set_fixed_size(self.indent_width.max(1));
+                    w.axes[Axis::Y].set_fixed_size((node.subtree_end_y - node.start_y) as usize);
+                    ui.add(widget!().fixed_width(1).fixed_height(1).fill('▾', ui.palette.default));
+                    let line = if node.depth + 1 < self.max_indent {
+                        styled_writeln!(ui.text, ui.palette.tree_indent.1, "{}", ui.palette.tree_indent.0)
+                    } else {
+                        styled_writeln!(ui.text, ui.palette.tree_indent_limit_reached.1, "{}", ui.palette.tree_indent_limit_reached.0)
+                    };
+                    ui.add(widget!().text(line).flags(WidgetFlags::REPEAT_TEXT_VERTICALLY));
+                } else {
+                    // Draw only an arrow, or a ' ' if the node doesn't have children.
+                    // A node can be expanded even if it doesn't have children, to enable line wrap. We currently don't have any indicator this, but still draw a clickable ' ' as a sort of secret feature.
+                    // Would be nice to detect that the text doesn't fit and show some special kind of arrow instead of ' ' in that case.
+                    let s = ui.palette.default;
+                    ui.cur_mut().draw_fill = Some((arrow, s));
+                }
+            });
+
+            if node.node_end_y > visible_y.start {
+                let row_x = indent + 2;
+                with_parent!(ui, ui.add(widget!().identity(&node.identity).fixed_x(row_x as isize).fixed_width((self.name_width + self.value_width + 1).saturating_sub(row_x)).fixed_height((node.node_end_y - node.start_y) as usize).fixed_y(node.start_y).fill(' ', ui.palette.default).highlight_on_hover()), {
+                    if self.cursor_path.last() == Some(&node.identity) {
+                        let a = ui.palette.selected;
+                        ui.cur_mut().style_adjustment.update(a);
+                    }
+
+                    if ui.check_mouse(MouseActions::CLICK) {
+                        self.set_cursor_path_from_node(node_idx);
+                        ui.should_redraw = true;
+                    }
+                    let node = &self.tree.nodes[node_idx.0];
+
+                    let name_effective_width = self.name_width.saturating_sub(row_x);
+
+                    let mut w = widget!().fixed_x(name_effective_width as isize + 1).fixed_width(self.value_width).text_lines(value_start..value_end);
+                    if node.dubious || context.is_err() {
+                        w.style_adjustment.update(ui.palette.value_dubious);
+                    }
+                    ui.add(w);
+
+                    if node.is_text_input {
+                        let (identity, height, input) = self.text_input.as_mut().unwrap();
+                        assert_eq!(*identity, node.identity);
+                        let input_widget = ui.add(widget!().identity(&'i').width(AutoSize::Children).min_width(name_effective_width).max_width(name_effective_width + self.value_width + 1).height(AutoSize::Children).max_height(self.row_height_limit));
+                        with_parent!(ui, input_widget, {
+                            ui.focus();
+                            let changed = input.build(ui);
+                            self.scroll_to_cursor |= changed && (visible_y.start > node.start_y || visible_y.end < node.node_end_y);
+                            self.text_input_built = true;
+                        });
+                        let new_height = ui.calculate_size(input_widget, Axis::Y);
+                        if new_height != *height {
+                            *height = new_height;
+                            self.scroll_to_cursor = true;
+                            ui.should_redraw = true;
+                        }
+                    } else {
+                        let lines = if node.expanded {
+                            assert_eq!(node.name_line_wrap_width, name_effective_width);
+                            node.line_wrapped_name.clone().unwrap()
+                        } else {
+                            node.name.clone()
+                        };
+                        let lines = ui.text.import_lines(&self.tree.text, lines);
+                        let mut w = widget!().text_lines(lines).fixed_width(name_effective_width);
+                        // Dim the *name* if parent's value is dubious, i.e. the existence of this node is dubious.
+                        if node.depth > 0 && (self.tree.nodes[node.parent.0].dubious || context.is_err()) {
+                            w.style_adjustment.update(ui.palette.value_dubious);
+                        }
+                        ui.add(w);
+                    }
+                });
             }
         }
     }
 
-    fn delete_watch(&mut self, identity: usize) {
-        assert!(!self.is_locals_window);
-        let i = match self.expressions.iter().position(|(id, _)| *id == identity) {
-            None => return,
-            Some(x) => x };
-        self.expressions.remove(i);
-        if !self.tree.roots.is_empty() {
-            self.tree.roots.remove(i);
-
-            if self.cursor_path.get(0) == Some(&identity) && !self.tree.roots.is_empty() {
-                let i = i.min(self.tree.roots.len() - 1);
-                self.cursor_path = vec![self.tree.nodes[self.tree.roots[i]].identity];
-            }
+    fn set_cursor_path_from_node(&mut self, mut node_idx: ValueTreeNodeIdx) {
+        self.cursor_path.clear();
+        while node_idx.is_valid() {
+            let node = &self.tree.nodes[node_idx.0];
+            self.cursor_path.push(node.identity);
+            node_idx = node.parent;
         }
-    }*/
+        self.cursor_path.reverse();
+    }
 }
 
 impl WindowContent for WatchesWindow {
-    fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {/*asdqwe
+    fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
         // Plan:
         //  1. Handle expand/collapse/edit-start/edit-stop inputs using last frame rows and tree.
         //  2. Recalculate the tree if needed.
-        //  3. Build widget tree and rows list.
-        //     For nodes whose height isn't known asdqwe
-        //     For nodes that affect layout of other nodes (expanded nodes, text input node) the widgets are created immediately.
-        //     For other nodes, widget creation is deferred to a later stage, after layout, to avoid building invisible nodes.
-        //     Locate cursor (map cursor_path to cursor_idx). Build TextInput, close it on focus loss.
-        //  4. layout_subtree(). Now we know the heights and coordinates of all rows.
-        //  5. Cursor navigation.
-        //  6. Scrolling navigation. Now we know which rows are visible.
-        //  7. Build the visible rows and the selected row.
-        //  8. Focus and highlight selected row.
+        //  3. Recalculate layout and rows list if needed.
+        //  4. Handle cursor movement and scrolling. Now we know which rows are visible.
+        //  5. Build widgets for visible rows (and for selected row with text input, even if not visible).
 
-        styled_write!(ui.text, ui.palette.default, "{}", if self.is_locals_window {"locals"} else {"watches"});
-        let l = ui.text.close_line();
-        ui.add(widget!().text(l));
-        /*asdqwe
-        if let Some((_, area, _)) = &mut self.text_input {
-            *area = Rect::default();
+        // Keyboard input.
+        let mut refresh_data = self.tree.roots.is_empty();
+        for action in ui.check_keys(&[KeyAction::CursorRight, KeyAction::CursorLeft, KeyAction::Enter, KeyAction::DeleteRow, KeyAction::DuplicateRow]) {
+            self.scroll_to_cursor = true;
+
+            if action == KeyAction::Cancel {
+                self.text_input = None;
+                continue;
+            }
+
+            let node_idx = match self.tree.rows.get(self.cursor_idx) {
+                None => continue,
+                Some(x) => *x };
+            let node = &self.tree.nodes[node_idx.0];
+            let expr_idx = if node.depth == 0 {
+                self.tree.roots.iter().position(|ix| *ix == node_idx)
+            } else {
+                None
+            };
+            match action {
+                KeyAction::CursorRight => {self.expanded_nodes.insert(node.identity);}
+                KeyAction::CursorLeft => {
+                    self.expanded_nodes.remove(&node.identity);
+                    if node.depth > 0 && (!node.expanded || !node.has_children) {
+                        self.expanded_nodes.remove(&self.tree.nodes[node.parent.0].identity);
+                    }
+                }
+                // TODO: For non-root nodes, on Enter add a new watch for the corresponding field/element.
+                KeyAction::Enter if expr_idx.is_some_and(|i| self.expressions[i].is_editable()) => {
+                    let expr = &mut self.expressions[expr_idx.unwrap()];
+                    if let Some((identity, _, input)) = &mut self.text_input {
+                        if node.identity == *identity {
+                            expr.text = input.text.clone();
+                            let empty = expr.text.is_empty();
+                            expr.special = None;
+                            let i = expr_idx.unwrap();
+                            if i + 1 < self.expressions.len() {
+                                self.cursor_path = vec![self.expressions[i+1].identity];
+                            }
+
+                            if empty {
+                                self.expressions.remove(i);
+                                self.tree.roots.remove(i);
+                            } else {
+                                refresh_data = true;
+                            }
+                        }
+                        self.text_input = None;
+                    } else {
+                        let height_estimate = (node.node_end_y - node.start_y).max(1) as usize;
+                        let text = if expr.special.is_some() {String::new()} else {expr.text.clone()};
+                        self.text_input = Some((node.identity, height_estimate, TextInput::new_multiline(text)));
+                    }
+                }
+                KeyAction::DeleteRow if expr_idx.is_some_and(|i| self.expressions[i].special.is_none()) => {
+                    let i = expr_idx.unwrap();
+                    self.expressions.remove(i);
+                    self.tree.roots.remove(i); // this way we don't have to refresh_data
+                    if !self.expressions.is_empty() {
+                        self.cursor_path = vec![self.expressions[i.min(self.expressions.len()-1)].identity];
+                    }
+                }
+                KeyAction::DuplicateRow if expr_idx.is_some_and(|i| !self.expressions[i].special.is_none()) => {
+                    let i = expr_idx.unwrap();
+                    let text = self.expressions[i].text.clone();
+                    let identity: usize = random();
+                    self.expressions.push(WatchExpression {identity, text, special: None});
+                    self.cursor_path = vec![identity];
+                    refresh_data = true;
+                }
+                _ => (),
+            }
         }
 
-        let f = match f { Some(f) => f, None => return };
-        let palette = &debugger.context.settings.palette;
+        // Add the "<add watch>" placeholder watch.
+        if self.expressions.iter().position(|e| &e.special == &Some(SpecialWatch::AddWatch)).is_none() {
+            let identity: usize = random();
+            self.expressions.push(WatchExpression {identity, text: "<add watch>".to_string(), special: Some(SpecialWatch::AddWatch)});
+            self.cursor_path = vec![identity];
+            refresh_data = true;
+        }
 
-        let mut refresh_lines = false;
-
-        keys.retain(|key| {
-            if self.text_input.is_some() {
-                return false;
-            }
-            match debugger.context.settings.keys.map.get(key) {
-                Some(KeyAction::CursorRight) => match self.lines.get(self.scroll.cursor) {
-                    Some(&(idx, _)) => {
-                        let node = &self.tree.nodes[idx];
-                        if node.expandable == Some(true) {
-                            self.expanded_nodes.insert(node.identity);
-                            refresh_lines = true;
-                        }
-                    }
-                    _ => (),
-                }
-                Some(KeyAction::CursorLeft) => match self.lines.get(self.scroll.cursor) {
-                    Some(&(idx, expanded)) => {
-                        let node = &self.tree.nodes[idx];
-                        if expanded {
-                            self.expanded_nodes.remove(&node.identity);
-                        } else if node.depth > 0 {
-                            self.expanded_nodes.remove(&self.tree.nodes[node.parent].identity);
-                        };
-                        refresh_lines = true;
-                    }
-                    None => (),
-                }
-                Some(KeyAction::Enter) if !self.is_locals_window => match self.lines.get(self.scroll.cursor) {
-                    Some(&(idx, _)) => {
-                        let node = &self.tree.nodes[idx];
-                        if node.depth == 0 {
-                            if let Some((_, text)) = self.expressions.iter().find(|(id, _)| id == &node.identity) {
-                                self.text_input = Some((node.identity, Rect::default(), TextInput::with_text(text.clone())));
-                            }
-                        }
-                    }
-                    _ => (),
-                }
-                Some(KeyAction::DeleteRow) if !self.is_locals_window => match self.lines.get(self.scroll.cursor) {
-                    Some(&(idx, _)) => {
-                        let node = &self.tree.nodes[idx];
-                        if node.depth == 0 {
-                            self.delete_watch(node.identity);
-                            refresh_lines = true;
-                        }
-                    }
-                    _ => (),
-                }
-                Some(KeyAction::DuplicateRow) if !self.is_locals_window => match self.lines.get(self.scroll.cursor) {
-                    Some(&(idx, _)) => {
-                        let node = &self.tree.nodes[idx];
-                        if node.depth == 0 {
-                            if let Some(i) = self.expressions.iter().position(|(id, _)| id == &node.identity) {
-                                let id = self.next_watch_id;
-                                let s = self.expressions[i].1.clone();
-                                self.next_watch_id += 1;
-                                self.expressions.insert(i + 1, (id, s));
-                                self.cursor_path = vec![id];
-                                self.clear_tree();
-                            }
-                        }
-                    }
-                    _ => (),
-                }
-                _ => return true,
-            }
-            false
-        });
-
-        let mut unavailable_reason: Option<String> = None;
-        let mut refresh_values = false;
-        let mut context = None;
-        match debugger.threads.get(&state.selected_thread) {
-            None => unavailable_reason = Some("<no process>".to_string()),
-            Some(thread) => if thread.state != ThreadState::Suspended || state.stack.frames.is_empty() {
-                unavailable_reason = Some("<running>".to_string());
-            } else {
+        // See if we're able to evaluate expressions.
+        let eval_context: Result<EvalContext> = match debugger.threads.get(&state.selected_thread) {
+            None => err!(ProcessState, "no process"),
+            Some(thread) if thread.state != ThreadState::Suspended || state.stack.frames.is_empty() => err!(ProcessState, "running"),
+            Some(thread) => {
                 let t = (state.selected_thread, state.selected_subframe, thread.stop_count);
                 if t != self.seen {
-                    if self.is_locals_window && (t.0, t.1) != (self.seen.0, self.seen.1) {
-                        //self.expanded_nodes.clear();
-                    }
                     self.seen = t;
-                    refresh_values = true;
+                    refresh_data = true;
                 }
-                context = Some(debugger.make_eval_context(&state.stack, state.selected_subframe));
+                Ok(debugger.make_eval_context(&state.stack, state.selected_subframe))
             }
-        }
-
-        if !self.expressions.last().is_some_and(|(_, s)| s.is_empty()) {
-            // Add the "<add watch>" placeholder watch.
-            self.expressions.push((self.next_watch_id, String::new()));
-            self.cursor_path = vec![self.next_watch_id];
-            self.next_watch_id += 1;
-            self.clear_tree();
-        }
-
-        if context.is_some() && (refresh_values || self.tree.nodes.is_empty()) {
-            let context = context.as_ref().unwrap();
-            self.clear_tree();
-            self.eval_state.update(context);
-            if self.is_locals_window {
-                self.eval_locals(context);
-            } else {
-                self.eval_watches(context);
-            }
-            refresh_lines = true;
-        } else if self.tree.nodes.is_empty() {
-            self.populate_tree_with_placeholders();
-            self.seen.2 = usize::MAX;
-            refresh_lines = true;
-        }
-
-        if refresh_lines {
-            self.populate_lines(context.as_ref(), palette);
-        }
-
-        let mut no_keys = Vec::new();
-        let range = self.scroll.update(self.lines.len(), area.height.saturating_sub(1), if self.text_input.is_none() {&mut keys} else {&mut no_keys}, &debugger.context.settings.keys);
-        self.cursor_path.clear();
-        if let Some(&(mut idx, _)) = self.lines.get(self.scroll.cursor) {
-            while idx != usize::MAX {
-                let node = &self.tree.nodes[idx];
-                self.cursor_path.push(node.identity);
-                idx = node.parent;
-            }
-            self.cursor_path.reverse();
         };
 
-        let name_column_width = area.width / 3;
-        let mut rows: Vec<Row> = Vec::new();
-        for line_idx in range.clone() {
-            let &(idx, expanded) = &self.lines[line_idx];
-            let node = &mut self.tree.nodes[idx];
-            let expanded = expanded && node.expandable == Some(true);
-            if node.formatted_line[expanded as usize].is_none() && context.is_some() && node.value.is_ok() {
-                assert!(!expanded); // (if this doesn't hold, we have to also populate node.children here)
-                let (expandable, _) = format_value(node.value.as_ref().unwrap(), expanded, &mut self.eval_state, context.as_ref().unwrap(), &mut self.tree.arena, &mut self.tree.text, palette);
-                node.expandable = Some(expandable);
-                node.formatted_line[expanded as usize] = Some(self.tree.text.num_lines());
-                self.tree.text.close_line();
-            }
-            let node = &self.tree.nodes[idx];
-            // Is this the "<add watch>" line at the end.
-            let is_add_watch_placeholder = !self.is_locals_window && node.depth == 0 && self.expressions.last().is_some_and(|(id, s)| s.is_empty() && *id == node.identity);
+        // Recalculate everything if needed.
+        if refresh_data {
+            self.tree.clear();
+            self.eval_state.clear();
+            self.scroll_to_cursor = true;
 
-            // Indentation, expansion arrow, name.
-            let mut spans = vec![Span::styled("┆".to_string().repeat(node.depth), palette.default_dim)];
-            if node.expandable.unwrap_or(expanded) {
-                spans.push(Span::raw(if expanded {"▾ "} else {"▸ "}));
-            } else {
-                spans.push(Span::raw("  "));
+            if let Ok(context) = &eval_context {
+                self.eval_state.update(context);
             }
-            spans.push(Span::raw(if is_add_watch_placeholder {"<add watch>".to_string()} else {node.name.to_string()}));
-            // Dim the name if parent's value is dubious or the existence of this item comes from cache.
-            if (node.depth > 0 && self.tree.nodes[node.parent].dubious) || (context.is_none() && (node.depth > 0 || self.is_locals_window)) || is_add_watch_placeholder {
-                for span in &mut spans {
-                    span.style = palette.default_dim;
-                }
-            }
-
-            let mut cells = vec![Cell::from(Spans::from(spans))];
-
-            let mut spans: Vec<Span> = Vec::new();
-            if let &Some(line_idx) = &node.formatted_line[expanded as usize] {
-                self.tree.text.line_out_copy(line_idx, &mut spans);
-            } else if node.value.as_ref().is_err_and(|e| !e.is_value_tree_placeholder()) {
-                spans.push(Span::styled(format!("<{}>", node.value.as_ref().err().unwrap()), palette.error));
-            } else if !is_add_watch_placeholder {
-                spans.push(Span::raw(unavailable_reason.as_ref().unwrap().clone()));
-            }
-            if node.dubious || context.is_none() {
-                for span in &mut spans {
-                    span.style = span.style.add_modifier(Modifier::DIM);
-                }
-            }
-            cells.push(Cell::from(Spans::from(spans)));
-            let mut row = Row::new(cells);
-
-            // Highlight selected line.
-            if line_idx == self.scroll.cursor {
-                row = row.style(palette.selected_text_line);
-            }
-
-            if let Some((id, a, _)) = &mut self.text_input {
-                if node.depth == 0 && *id == node.identity {
-                    *a = Rect {x: area.x + 2, y: area.y + 1 + (line_idx - range.start) as u16, width: name_column_width.saturating_sub(1), height: 1};
-                }
-            }
-
-            rows.push(row);
+            self.eval_watches(eval_context.as_ref().ok(), &ui.palette);
         }
 
-        let column_widths = [Constraint::Length(name_column_width), Constraint::Length(area.width - name_column_width)];
-        let table = Table::new(rows)
-            .header(Row::new(vec!["  name", "value"]).style(palette.table_header))
-            .widths(&column_widths);
+        // Create container widgets.
+        ui.cur_mut().set_hstack();
+        let header_and_viewport = ui.add(widget!().width(AutoSize::Remainder(1.0)).vstack());
+        let scroll_bar = ui.add(widget!().fixed_width(1));
+        ui.layout_children(Axis::X);
+        let viewport_width = ui.calculate_size(header_and_viewport, Axis::X);
+        let name_width = viewport_width * 4 / 10;
+        let value_width = viewport_width.saturating_sub(name_width + 1);
+        let viewport;
+        with_parent!(ui, header_and_viewport, {
+            if !ui.check_focus() {
+                self.text_input = None;
+            }
+            ui.focus();
 
-        f.render_widget(table, area);
+            with_parent!(ui, ui.add(widget!().fixed_height(1)), {
+                let l = ui_writeln!(ui, table_header, "  name");
+                ui.add(widget!().text(l).fixed_width(name_width));
+                let l = ui_writeln!(ui, table_header, "value");
+                ui.add(widget!().text(l).fixed_width(value_width).fixed_x(name_width as isize + 1));
+            });
+
+            viewport = ui.add(widget!().height(AutoSize::Remainder(1.0)));
+            ui.layout_children(Axis::Y);
+        });
+        let indent_width = str_width(&ui.palette.tree_indent.0).max(1);
+        let max_indent = name_width / 2 / indent_width;
+        let row_height_limit = ui.calculate_size(viewport, Axis::Y);
+
+        if (name_width, value_width, indent_width, max_indent, row_height_limit) != (self.name_width, self.value_width, self.indent_width, self.max_indent, self.row_height_limit) {
+            (self.name_width, self.value_width, self.indent_width, self.max_indent, self.row_height_limit) = (name_width, value_width, indent_width, max_indent, row_height_limit);
+            self.scroll_to_cursor = true;
+
+            // Clear line wrapping cache.
+            for node in &mut self.tree.nodes {
+                node.line_wrapped_name = None;
+                node.formatted_value[2] = None;
+            }
+        }
+
+        // Determine positions and sizes of all nodes, do line wrapping (unless cached). Also assign cursor_idx.
+        // We currently do this on each frame because determining if anything changed would be error-prone.
+        let content_height = self.do_layout(eval_context.as_ref().ok(), &ui.palette, ui.frame_idx);
+
+        // Do cursor movement and scrolling.
+        let visible_y: Range<isize>;
+        let content_widget;
+        let root_widget = ui.cur_parent;
+        with_parent!(ui, viewport, {
+            content_widget = ui.add(widget!().fixed_height(content_height));
+
+            ui.focus();
+            self.scroll_to_cursor |= list_cursor_navigation_with_variable_row_height(&mut self.cursor_idx, self.tree.rows.len(), |i, ui| {
+                let n = &self.tree.nodes[self.tree.rows[i].0];
+                (n.node_end_y - n.start_y) as usize
+            }, ui);
+
+            let scroll_to = if mem::take(&mut self.scroll_to_cursor) && !self.tree.rows.is_empty() {
+                let n = &self.tree.nodes[self.tree.rows[self.cursor_idx].0];
+                Some(n.start_y..n.node_end_y)
+            } else {
+                None
+            };
+            visible_y = scrolling_navigation(&mut self.scroll, scroll_to, root_widget, scroll_bar, ui);
+        });
+
+        // Convert cursor_idx back to cursor_path.
+        if !self.tree.rows.is_empty() {
+            self.set_cursor_path_from_node(self.tree.rows[self.cursor_idx]);
+        }
+
+        // Create widgets for visible nodes, handle mouse clicks.
+        with_parent!(ui, content_widget, {
+            self.build_widgets(visible_y, &eval_context, ui);
+        });
+
+        if self.text_input.is_some() && !self.text_input_built {
+            self.text_input = None;
+            ui.should_redraw = true;
+        }
     }
 
     fn drop_caches(&mut self) {
-        self.clear_tree();
+        self.tree.clear();
+        self.eval_state.clear();
         self.seen.2 = usize::MAX;
     }
 
-    fn update_modal(&mut self, state: &mut UIState, debugger: &mut Debugger, keys: &mut Vec<Key>) {
-        if let Some((identity, _, input)) = &mut self.text_input {
-            let event = input.update(keys, &debugger.context.settings.keys);
-            match event {
-                TextInputEvent::None | TextInputEvent::Open => (),
-                TextInputEvent::Cancel => self.text_input = None,
-                TextInputEvent::Done => {
-                    if let Some(i) = self.expressions.iter().position(|(id, _)| id == identity) {
-                        if input.text.is_empty() {
-                            if i + 1 != self.expressions.len() {
-                                let identity = *identity;
-                                self.delete_watch(identity);
-                                self.clear_tree(); // some kind of populate_lines() would be enough, but meh
-                            }
-                        } else {
-                            self.expressions[i].1 = input.text.clone();
-                            if i + 1 < self.expressions.len() {
-                                self.cursor_path = vec![self.expressions[i+1].0];
-                            }
-                            self.clear_tree();
-                        }
-                    }
-                    self.text_input = None;
-                }
-            }
-        }
-    }
-
-    fn render_modal(&mut self, state: &mut UIState, debugger: &mut Debugger, f: &mut Frame, window_area: Rect, screen_area: Rect) {
-        if let Some((_, area, input)) = &mut self.text_input {
-            f.render_widget(Clear, *area);
-            input.render(f, *area, &debugger.context.settings.palette);
-        }
-    }
-
-    fn cancel_modal(&mut self, state: &mut UIState, debugger: &mut Debugger) {
-        self.text_input = None;
-    }
-
-    fn get_key_hints(&self, out: &mut Vec<KeyHint>) {}
-        styled_write!(hints, ui.palette.default_dim, "ret - edit"); hints.close_line();
-        styled_write!(hints, ui.palette.default_dim, "d - duplicate"); hints.close_line();
-        styled_write!(hints, ui.palette.default_dim, "backspace - delete"); hints.close_line();
+    fn get_key_hints(&self, out: &mut Vec<KeyHint>) {
+        out.extend([
+            KeyHint::key(KeyAction::Enter, "edit"),
+            KeyHint::key(KeyAction::DuplicateRow, "duplicate"),
+            KeyHint::key(KeyAction::DeleteRow, "delete"),
+            KeyHint::keys(&[KeyAction::CursorRight, KeyAction::CursorLeft], "expand/collapse"),
+        ]);
     }
 
     fn has_persistent_state(&self) -> bool {
-        !self.is_locals_window
+        true
     }
     fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {
-        out.write_usize(self.expressions.len())?;
-        for (_, expr) in &self.expressions {
-            out.write_str(&expr)?;
+        for expr in &self.expressions {
+            if expr.special.is_none() {
+                out.write_u8(1)?;
+                out.write_str(&expr.text)?;
+            }
         }
+        out.write_u8(0)?;
         Ok(())
     }
     fn load_state(&mut self, inp: &mut &[u8]) -> Result<()> {
-        for i in 0..inp.read_usize()? {
-            let expr = inp.read_str()?;
-            let id = self.next_watch_id;
-            self.next_watch_id += 1;
-            self.expressions.push((id, expr));
+        while inp.read_u8()? != 0 {
+            let text = inp.read_str()?;
+            self.expressions.push(WatchExpression {identity: random(), text, special: None});
         }
         Ok(())
-    }*/ */
     }
 }
 
+// TODO: Add Type::MetaVariable instead and allow inspecting variables in watches window like types and fields.
 #[derive(Default)]
 struct LocationsWindow {
     table_state: TableState,
 }
 impl WindowContent for LocationsWindow {
     fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
-        styled_write!(ui.text, ui.palette.default, "locations");
-        let l = ui.text.close_line();
-        ui.add(widget!().text(l));
-        /*
-        let f = match f { Some(f) => f, None => return };
-        let palette = &debugger.context.settings.palette;
+        ui.cur_mut().set_vstack();
+        let l = ui_writeln!(ui, default_dim, "(for address selected in disassembly window)");
+        ui.add(widget!().text(l).height(AutoSize::Text));
+        let table_widget = ui.add(widget!().height(AutoSize::Remainder(1.0)));
+        ui.layout_children(Axis::Y);
 
-        if area.height > 0 {
-            let mut a = area;
-            a.height = 1;
-            let paragraph = Paragraph::new(Text {lines: vec![Spans::from(vec![Span::styled("(for address selected in disassembly window)", palette.default_dim)])]});
-            f.render_widget(paragraph, a);
-            area.y += a.height;
-            area.height -= a.height;
-        }
-
-        let rows = match self.fill_table(ui, debugger) {
-            Ok(rows) => {
-                let range = self.scroll.update_cursorless(rows.len(), area.height.saturating_sub(1), &mut keys, &debugger.context.settings.keys);
-                rows[range].to_vec()
+        with_parent!(ui, table_widget, {
+            let mut table = Table::new(mem::take(&mut self.table_state), ui, vec![
+                Column::new("name", AutoSize::Remainder(0.25)),
+                Column::new("type", AutoSize::Remainder(0.3)),
+                Column::new("expression", AutoSize::Remainder(0.3)),
+                Column::new("die", AutoSize::Fixed(9)),
+            ]);
+            if let Err(e) = self.fill_table(&mut table, state, debugger, ui) {
+                table.start_row(hash(&'e'), ui);
+                table.empty_cell(ui);
+                table.empty_cell(ui);
+                ui_writeln!(ui, error, "{}", e);
+                table.text_cell(ui);
+                table.empty_cell(ui);
             }
-            Err(e) => vec![Row::new(vec![Cell::from(""), Cell::from(""), Cell::from(format!("{}", e)).style(palette.error), Cell::from("")])],
-        };
-        let table = Table::new(rows)
-            .header(Row::new(vec!["name", "type", "expression", "die"]).style(palette.table_header))
-            .widths(&[Constraint::Percentage(25), Constraint::Percentage(30), Constraint::Percentage(30), Constraint::Length(9)]);
-
-        f.render_widget(table, area);*/
+            self.table_state = table.finish(ui);
+        });
     }
 }
 
-impl LocationsWindow {/*asdqwe
-    fn fill_table(&mut self, state: &mut UIState, debugger: &Debugger) -> Result<Vec<Row<'static>>> {
-        let palette = &debugger.context.settings.palette;
-        let (binary_id, function_idx, addr) = match state.selected_addr.clone() { Some(x) => x, None => return Ok(Vec::new()) };
+impl LocationsWindow {
+    fn fill_table(&mut self, table: &mut Table, state: &mut UIState, debugger: &Debugger, ui: &mut UI) -> Result<()> {
+        let (binary_id, function_idx, addr) = match state.selected_addr.clone() { Some(x) => x, None => return Ok(()) };
         let binary = match debugger.info.binaries.get(&binary_id) {
             Some(x) => x,
             None => return err!(ProcessState, "binary not mapped"),
@@ -1009,7 +1132,7 @@ impl LocationsWindow {/*asdqwe
             Some(off) => symbols.find_unit(off).map(|u| u.unit.header.encoding()),
             None => err!(Internal, "internal error: function has no debug info") /* should be no local variables in this case */ };
 
-        let mut rows: Vec<Row> = Vec::new();
+        let mut row_idx = 0;
         for level in 0..function.num_levels() {
             let ranges = symbols.subfunction_ranges_at_level(level, function);
             for (i, range) in ranges.iter().enumerate() {
@@ -1024,22 +1147,30 @@ impl LocationsWindow {/*asdqwe
                     let expr_str = match &encoding {
                         Ok(e) => format_dwarf_expression(v.expr, *e),
                         Err(e) => Err(e.clone()) };
-                    let mut text = StyledText::default();
-                    print_type_name(v.type_, &mut text, palette, 0);
-                    rows.push(Row::new(vec![
-                        Cell::from(format!("{}", unsafe {v.name()})),
-                        Cell::from(text.into_line()),
-                        match expr_str {
-                            Ok(s) => Cell::from(s),
-                            Err(e) => Cell::from(format!("{}", e)).style(palette.error),
-                        },
-                        Cell::from(format!("{:x}", v.offset().0)),
-                    ]));
+
+                    table.start_row(row_idx, ui);
+                    row_idx += 1;
+
+                    ui_writeln!(ui, default, "{}", unsafe {v.name()});
+                    table.text_cell(ui);
+
+                    print_type_name(v.type_, &mut ui.text, &ui.palette, 0);
+                    ui.text.close_line();
+                    table.text_cell(ui);
+
+                    match expr_str {
+                        Ok(s) => ui_writeln!(ui, default, "{}", s),
+                        Err(e) => ui_writeln!(ui, error, "{}", e),
+                    };
+                    table.text_cell(ui);
+
+                    ui_writeln!(ui, default, "{:x}", v.offset().0);
+                    table.text_cell(ui);
                 }
             }
         }
-        Ok(rows)
-    }*/
+        Ok(())
+    }
 }
 
 // Identifying information about a function, suitable for writing to the save file.

@@ -474,11 +474,27 @@ pub struct Value {
     pub flags: ValueFlags,
 }
 
-// Appends to out.chars. Doesn't close the line, the caller should do it after the call.
-// If expanded is true, the returned Vec is populated, and field names and array elements are not included in `out`.
-// TODO: Make the /*name*/-s styled, into a second StyledText.
-pub fn format_value(v: &Value, expanded: bool, state: &mut EvalState, context: &EvalContext, arena: &mut Arena, out: &mut StyledText, palette: &Palette) -> (/*expandable*/ bool, /*children*/ Vec<(/*name*/ &'static str, /*identity*/ usize, Result<Value>)>) {
-    format_value_recurse(v, expanded, state, context, arena, out, palette, (out.lines.len(), out.chars.len()), false)
+pub enum ValueChildKind {
+    ArrayElement(usize),
+    ArrayTail(usize),
+    StructField, // field name is child name in ValueChildInfo
+    Other,
+}
+
+pub struct ValueChildInfo {
+    pub identity: usize,
+    pub name_line: usize, // line in `names_out` given to format_value()
+    pub kind: ValueChildKind,
+    pub value: Result<Value>,
+}
+
+// Prints the value human-readably to the unclosed line of `out`.
+// If `expanded`, also lists the "children" of the value, e.g. struct fields or array elements. Their names are formatted into `names_out`.
+// `has_children` is returned even if expanded = false; it tells whether the value "logically" has children, even if there are 0 of them (e.g. empty array).
+// The format can depend on `expanded`, e.g. array and struct contents are omitted (because they should be visible as children instead).
+// Doesn't close the line in `out`, the caller should do it.
+pub fn format_value(v: &Value, expanded: bool, state: &mut EvalState, context: &EvalContext, out: &mut StyledText, names_out: &mut StyledText, palette: &Palette) -> (/*has_children*/ bool, /*children*/ Vec<ValueChildInfo>) {
+    format_value_recurse(v, expanded, state, context, out, names_out, palette, (out.lines.len(), out.chars.len()), false)
 }
 
 fn over_output_limit(out: &StyledText, text_start: (/*lines*/ usize, /*chars*/ usize)) -> bool {
@@ -486,7 +502,7 @@ fn over_output_limit(out: &StyledText, text_start: (/*lines*/ usize, /*chars*/ u
     out.chars.len() - text_start.1 > 10000 || out.lines.len() - text_start.0 > 100 || (out.lines.len() == text_start.0 && out.chars.len() - text_start.1 > 1000)
 }
 
-pub fn format_value_recurse(v: &Value, expanded: bool, state: &mut EvalState, context: &EvalContext, arena: &mut Arena, out: &mut StyledText, palette: &Palette, text_start: (/*lines*/ usize, /*chars*/ usize), address_already_shown: bool) -> (/*expandable*/ bool, /*children*/ Vec<(/*name*/ &'static str, /*identity*/ usize, Result<Value>)>) {
+pub fn format_value_recurse(v: &Value, expanded: bool, state: &mut EvalState, context: &EvalContext, out: &mut StyledText, names_out: &mut StyledText, palette: &Palette, text_start: (/*lines*/ usize, /*chars*/ usize), address_already_shown: bool) -> (/*has_children*/ bool, /*children*/ Vec<ValueChildInfo>) {
     // Output length limit. Also acts as recursion depth limit.
     if over_output_limit(out, text_start) {
         styled_write!(out, palette.truncation_indicator.2, "{}", palette.truncation_indicator.1);
@@ -503,23 +519,19 @@ pub fn format_value_recurse(v: &Value, expanded: bool, state: &mut EvalState, co
             }
         }
     };
-    let list_struct_children = |value: &AddrOrValueBlob, s: &StructType, flags: ValueFlags, state: &mut EvalState, context: &EvalContext| -> Vec<(&'static str, usize, Result<Value>)> {
-        let mut children: Vec<(&'static str, usize, Result<Value>)> = Vec::new();
-        for (field_idx, field) in s.fields().iter().enumerate() {
-            let name = if field.name.is_empty() {
-                let mut w = state.types.misc_arena.write();
-                write!(w, "{}", field_idx).unwrap();
-                w.finish_str()
+    let list_struct_children = |value: &AddrOrValueBlob, s: &StructType, flags: ValueFlags, state: &mut EvalState, context: &EvalContext, names_out: &mut StyledText, palette: &Palette| -> Vec<ValueChildInfo> {
+        s.fields().iter().enumerate().map(|(field_idx, field)| {
+            let name_line = if field.name.is_empty() {
+                styled_writeln!(names_out, palette.value_misc, "{}", field_idx)
             } else {
-                field.name
+                styled_writeln!(names_out, palette.field_name, "{}", field.name)
             };
-            let field_val = match get_struct_field(value, field, context.memory) {
+            let value = match get_struct_field(value, field, context.memory) {
                 Ok(val) => Ok(Value {val, type_: field.type_, flags: flags.inherit()}),
                 Err(e) => Err(e),
             };
-            children.push((name, hash(&(name, field_idx)), field_val));
-        }
-        children
+            ValueChildInfo {identity: field_idx, name_line, kind: ValueChildKind::StructField, value}
+        }).collect()
     };
 
     let mut prettified_value: Option<Value> = None;
@@ -544,7 +556,7 @@ pub fn format_value_recurse(v: &Value, expanded: bool, state: &mut EvalState, co
         v
     };
 
-    let mut children: Vec<(&'static str, usize, Result<Value>)> = Vec::new();
+    let mut children: Vec<ValueChildInfo> = Vec::new();
     let t = unsafe {&*v.type_};
     let size = t.calculate_size();
     let value = match v.val.clone().into_value(size.min(1000000), context.memory) {
@@ -604,7 +616,7 @@ pub fn format_value_recurse(v: &Value, expanded: bool, state: &mut EvalState, co
         Type::Pointer(p) => match value.get_usize() {
             Ok(x) => if p.flags.contains(PointerFlags::REFERENCE) {
                 write_address(x, out);
-                return format_value_recurse(&Value {val: AddrOrValueBlob::Addr(x), type_: p.type_, flags: v.flags.inherit()}, expanded, state, context, arena, out, palette, text_start, true);
+                return format_value_recurse(&Value {val: AddrOrValueBlob::Addr(x), type_: p.type_, flags: v.flags.inherit()}, expanded, state, context, out, names_out, palette, text_start, true);
             } else {
                 styled_write!(out, if expanded {palette.value_misc} else {palette.value}, "*0x{:x} ", x);
                 if x == 0 {
@@ -615,7 +627,7 @@ pub fn format_value_recurse(v: &Value, expanded: bool, state: &mut EvalState, co
                 }
                 if !try_format_as_string(Some(x), None, p.type_, None, false, v.flags, context.memory, "", out, palette) {
                     // If expanded, act like a reference, i.e. expand the pointee.
-                    (_, children) = format_value_recurse(&Value {val: AddrOrValueBlob::Addr(x), type_: p.type_, flags: v.flags.inherit()}, true, state, context, arena, out, palette, text_start, true);
+                    (_, children) = format_value_recurse(&Value {val: AddrOrValueBlob::Addr(x), type_: p.type_, flags: v.flags.inherit()}, true, state, context, out, names_out, palette, text_start, true);
                 }
                 return (true, children);
             }
@@ -643,14 +655,16 @@ pub fn format_value_recurse(v: &Value, expanded: bool, state: &mut EvalState, co
             if expanded {
                 for i in 0..len {
                     if i > 1000 {
-                        children.push(("…", i, err!(TooLong, "{} more elements", len - i)));
+                        let name_line = styled_writeln!(names_out, palette.value_misc, "…");
+                        children.push(ValueChildInfo {identity: i, name_line, kind: ValueChildKind::ArrayTail(i), value: err!(TooLong, "{} more elements", len - i)});
                         break;
                     }
-                    let v = get_val(i);
-                    let err = v.is_err();
-                    let mut w = arena.write();
-                    write!(w, "[{}]", i).unwrap();
-                    children.push((unsafe {mem::transmute(w.finish())}, i, v));
+                    let value = get_val(i);
+                    let err = value.is_err();
+                    styled_write!(names_out, palette.value_misc, "[");
+                    styled_write!(names_out, palette.value, "{}", i);
+                    let name_line = styled_writeln!(names_out, palette.value_misc, "]");
+                    children.push(ValueChildInfo {identity: i, name_line, kind: ValueChildKind::ArrayElement(i), value});
                     if err {
                         break;
                     }
@@ -675,7 +689,7 @@ pub fn format_value_recurse(v: &Value, expanded: bool, state: &mut EvalState, co
                         }
                         match get_val(i) {
                             Ok(v) => {
-                                format_value_recurse(&v, false, state, context, arena, out, palette, text_start, false);
+                                format_value_recurse(&v, false, state, context, out, names_out, palette, text_start, false);
                             }
                             Err(e) if e.is_too_long() => styled_write!(out, palette.truncation_indicator.2, "{}", palette.truncation_indicator.1),
                             Err(e) => {
@@ -699,29 +713,40 @@ pub fn format_value_recurse(v: &Value, expanded: bool, state: &mut EvalState, co
                 assert!(v.val.addr().is_some());
                 v.val.clone()
             };
-            children = list_struct_children(&value, s, v.flags, state, context);
+            children = list_struct_children(&value, s, v.flags, state, context, names_out, palette);
             if v.flags.contains(ValueFlags::SHOW_TYPE_NAME) || (expanded && (!t.name.is_empty() || t.die.0 != 0)) {
                 if t.name.is_empty() {
                     // TODO: Print file+line instead of DIE offset.
-                    styled_write!(out, palette.type_name, "<{} @{:x}> ", t.t.kind_name(), t.die.0);
+                    styled_write!(out, palette.value_misc, "<{} @{:x}> ", t.t.kind_name(), t.die.0);
                 } else {
-                    styled_write!(out, palette.type_name, "{} ", t.name);
+                    let limit = 200;
+                    if v.flags.contains(ValueFlags::SHOW_TYPE_NAME) || t.name.len() <= limit {
+                        styled_write!(out, palette.type_name, "{} ", t.name);
+                    } else {
+                        // Truncate long type names to avoid filling up half the window with nonsense C++ template names.
+                        // Instead of truncating here, it would be better to tell the caller to reduce height limit for this row (to e.g. 2 lines).
+                        let mut i = limit;
+                        while !t.name.is_char_boundary(i) {
+                            i -= 1;
+                        }
+                        styled_write!(out, palette.type_name, "{} ", t.name);
+                        styled_write!(out, palette.truncation_indicator.2, "{} ", palette.truncation_indicator.1);
+                    }
                 }
             }
             if !expanded {
                 styled_write!(out, palette.value_misc, "{{");
-                for (idx, (name, _, value)) in children.iter().enumerate() {
+                for (idx, child) in children.iter().enumerate() {
                     if idx != 0 {
                         styled_write!(out, palette.value_misc, ", ");
                     }
 
-                    let style = if name.starts_with('#') {palette.value_misc} else {palette.field_name};
-                    styled_write!(out, style, "{}", name);
+                    out.import_spans(names_out, names_out.get_line(child.name_line));
                     styled_write!(out, palette.value_misc, ": ");
 
-                    match value {
+                    match &child.value {
                         Ok(v) => {
-                            format_value_recurse(v, false, state, context, arena, out, palette, text_start, false);
+                            format_value_recurse(v, false, state, context, out, names_out, palette, text_start, false);
                         }
                         Err(e) => styled_write!(out, palette.error, "<{}>", e),
                     }
@@ -768,7 +793,7 @@ pub fn format_value_recurse(v: &Value, expanded: bool, state: &mut EvalState, co
         }
         Type::MetaType | Type::MetaField => {
             let val = reflect_meta_value(v, state, context, Some((out, palette)));
-            children = list_struct_children(&val.val, unsafe {(*val.type_).t.as_struct().unwrap()}, val.flags, state, context);
+            children = list_struct_children(&val.val, unsafe {(*val.type_).t.as_struct().unwrap()}, val.flags, state, context, names_out, palette);
         }
     }
     (!children.is_empty(), children)

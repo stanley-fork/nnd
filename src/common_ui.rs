@@ -19,7 +19,8 @@ impl Rect {
     pub fn right(&self) -> isize { self.end(Axis::X) }
     pub fn bottom(&self) -> isize { self.end(Axis::Y) }
     pub fn center(&self) -> [isize; 2] { [self.pos[0] + self.size[0] as isize / 2, self.pos[1] + self.size[1] as isize / 2] }
-    
+    pub fn y_range(&self) -> Range<isize> { self.pos[Axis::Y]..self.pos[Axis::Y]+self.size[Axis::Y] as isize }
+
     pub fn intersection(mut self, r: Rect) -> Rect {
         for axis in 0..2 {
             let p = self.pos[axis].max(r.pos[axis]);
@@ -241,7 +242,13 @@ impl StyledText {
             *x = x.wrapping_add(offset);
         }
 
-        let spans = from.lines[lines.start]..from.lines[lines.end];
+        self.import_spans(from, from.lines[lines.start]..from.lines[lines.end]);
+
+        self.num_lines()-lines.len() .. self.num_lines()
+    }
+
+    // Adds the spans to the unclosed line, doesn't close it.
+    pub fn import_spans(&mut self, from: &StyledText, spans: Range<usize>) {
         let start = self.spans.len();
         let offset = self.chars.len().wrapping_sub(from.spans[spans.start].0);
         self.spans.extend_from_slice(&from.spans[spans.start+1..spans.end+1]);
@@ -251,8 +258,6 @@ impl StyledText {
 
         let chars = from.spans[spans.start].0..from.spans[spans.end].0;
         self.chars.push_str(&from.chars[chars]);
-
-        self.num_lines()-lines.len() .. self.num_lines()
     }
 
     pub fn unclose_line(&mut self) {

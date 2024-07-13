@@ -290,8 +290,8 @@ impl Thread {
 }
 
 impl Debugger {
-    fn new(mode: RunMode, command_line: Vec<String>, context: Arc<Context>, symbols: SymbolsRegistry, breakpoints: Pool<Breakpoint>, persistent: PersistentState, my_resource_stats: ResourceStats) -> Self {
-        Debugger {mode, command_line, context, pid: 0, target_state: ProcessState::NoProcess, log: Log::new(), prof: Profiling::new(), threads: HashMap::new(), pending_wait_events: VecDeque::new(), next_thread_idx: 1, info: ProcessInfo::new(), my_resource_stats, symbols, memory: MemReader::invalid(), waiting_for_initial_sigstop: false, stepping: None, breakpoint_locations: Vec::new(), breakpoints, stopping_to_handle_breakpoints: false, hardware_breakpoints: std::array::from_fn(|_| HardwareBreakpoint {active: false, thread_specific: None, addr: 0}), persistent}
+    fn new(mode: RunMode, command_line: Vec<String>, context: Arc<Context>, symbols: SymbolsRegistry, breakpoints: Pool<Breakpoint>, persistent: PersistentState, my_resource_stats: ResourceStats, prof: Profiling) -> Self {
+        Debugger {mode, command_line, context, pid: 0, target_state: ProcessState::NoProcess, log: Log::new(), prof, threads: HashMap::new(), pending_wait_events: VecDeque::new(), next_thread_idx: 1, info: ProcessInfo::new(), my_resource_stats, symbols, memory: MemReader::invalid(), waiting_for_initial_sigstop: false, stepping: None, breakpoint_locations: Vec::new(), breakpoints, stopping_to_handle_breakpoints: false, hardware_breakpoints: std::array::from_fn(|_| HardwareBreakpoint {active: false, thread_specific: None, addr: 0}), persistent}
     }
 
     pub fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {
@@ -316,11 +316,11 @@ impl Debugger {
     }
 
     pub fn from_command_line(args: &[String], context: Arc<Context>, persistent: PersistentState) -> Self {
-        Self::new(RunMode::Run, args.into(), context.clone(), SymbolsRegistry::new(context), Pool::new(), persistent, ResourceStats::new())
+        Self::new(RunMode::Run, args.into(), context.clone(), SymbolsRegistry::new(context), Pool::new(), persistent, ResourceStats::new(), Profiling::new())
     }
 
     pub fn attach(pid: pid_t, context: Arc<Context>, persistent: PersistentState) -> Result<Self> {
-        let mut r = Self::new(RunMode::Attach, Vec::new(), context.clone(), SymbolsRegistry::new(context), Pool::new(), persistent, ResourceStats::new());
+        let mut r = Self::new(RunMode::Attach, Vec::new(), context.clone(), SymbolsRegistry::new(context), Pool::new(), persistent, ResourceStats::new(), Profiling::new());
         r.pid = pid;
         r.target_state = ProcessState::Running;
         r.memory = MemReader::new(pid);
@@ -380,12 +380,13 @@ impl Debugger {
             let persistent = mem::replace(&mut self.persistent, PersistentState::empty());
             let my_resource_stats = mem::replace(&mut self.my_resource_stats, ResourceStats::new());
             let mut breakpoints = mem::replace(&mut self.breakpoints, Pool::new());
+            let prof = mem::replace(&mut self.prof, Profiling::new());
             for (id, b) in breakpoints.iter_mut() {
                 // Have to redo the mapping source-line -> address because dynamic libraries may be loaded at different addresses.
                 b.addrs = err!(NotCalculated, "");
                 b.active = false;
             }
-            *self = Debugger::new(mode, command_line, context, symbols, breakpoints, persistent, my_resource_stats);
+            *self = Debugger::new(mode, command_line, context, symbols, breakpoints, persistent, my_resource_stats, prof);
         }
 
         let pid;
