@@ -10,4 +10,5 @@ fn main() {
     let g = [10usize, 20, 30];
     let h = &g[2..];
     let s = a.len() + b.len() + c.len() + d.len() + e.as_os_str().len() + f.as_os_str().len() + g.len() + h.len();
+    std::hint::black_box(s);
 }

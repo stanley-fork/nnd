@@ -824,13 +824,15 @@ pub struct TextInput {
 
     // If moving vertically through: long line -> short line -> long line, remember the cursor horizontal position even if it's beyond the short line's width.
     saved_x: Option<isize>,
+    // If we're doing a sequence of emacs-like cut operations, e.g. pressing C-k a few times to cut multiple lines. Each line should be appended to clipboard instead of replacing it.
+    killing_spree: bool,
 }
 impl Default for TextInput {
-    fn default() -> Self { Self {text: String::new(), cursor: 0, mark: 0, multiline: false, line_wrap: false, capture_vertical_movement_keys: false, capture_return_key: false, undo: vec![(String::new(), 0, 0)], undo_idx: 0, scroll: 0, hscroll: 0, scroll_to_cursor: false, moved_past_the_end: false, lines: Vec::new(), saved_x: None, viewport_height: 0} }
+    fn default() -> Self { Self {text: String::new(), cursor: 0, mark: 0, multiline: false, line_wrap: false, capture_vertical_movement_keys: false, capture_return_key: false, undo: vec![(String::new(), 0, 0)], undo_idx: 0, scroll: 0, hscroll: 0, scroll_to_cursor: false, moved_past_the_end: false, lines: Vec::new(), saved_x: None, killing_spree: false, viewport_height: 0} }
 }
 impl TextInput {
-    pub fn new_with_text(text: String) -> Self { Self {cursor: text.len(), mark: text.len(), multiline: false, line_wrap: false, capture_vertical_movement_keys: false, capture_return_key: false, undo: vec![(text.clone(), text.len(), text.len())], text, undo_idx: 0, scroll: 0, hscroll: 0, scroll_to_cursor: true, moved_past_the_end: false, lines: Vec::new(), saved_x: None, viewport_height: 0} }
-    pub fn new_multiline(text: String) -> Self { Self {cursor: text.len(), mark: text.len(), multiline: true, line_wrap: true, capture_vertical_movement_keys: true, capture_return_key: false, undo: vec![(text.clone(), text.len(), text.len())], text, undo_idx: 0, scroll: 0, hscroll: 0, scroll_to_cursor: true, moved_past_the_end: false, lines: Vec::new(), saved_x: None, viewport_height: 0} }
+    pub fn new_with_text(text: String) -> Self { Self {cursor: text.len(), mark: text.len(), multiline: false, line_wrap: false, capture_vertical_movement_keys: false, capture_return_key: false, undo: vec![(text.clone(), text.len(), text.len())], text, undo_idx: 0, scroll: 0, hscroll: 0, scroll_to_cursor: true, moved_past_the_end: false, lines: Vec::new(), saved_x: None, killing_spree: false, viewport_height: 0} }
+    pub fn new_multiline(text: String) -> Self { Self {cursor: text.len(), mark: text.len(), multiline: true, line_wrap: true, capture_vertical_movement_keys: true, capture_return_key: false, undo: vec![(text.clone(), text.len(), text.len())], text, undo_idx: 0, scroll: 0, hscroll: 0, scroll_to_cursor: true, moved_past_the_end: false, lines: Vec::new(), saved_x: None, killing_spree: false, viewport_height: 0} }
 
     pub fn go_to_end(&mut self) {
         self.cursor = self.text.len();
@@ -938,6 +940,7 @@ impl TextInput {
         keys.retain(|key| {
             let mut moved = true; // scroll to cursor
             let mut edited = false; // add undo entry
+            let mut killed = false; // did emacs-style cut operation
             let saved_x = mem::take(&mut self.saved_x);
             let old_cursor = self.cursor;
             match ui.key_binds.text_input_key_to_action.get(key) {
@@ -969,13 +972,13 @@ impl TextInput {
                 }
                 Some(KeyAction::Cut) => {
                     if !self.selection().is_empty() {
-                        self.delete_selection(true, ui);
+                        self.delete_selection(true, false, ui);
                         edited = true;
                     }
                 }
                 Some(KeyAction::Paste) => {
                     if !ui.clipboard.is_empty() {
-                        self.delete_selection(false, ui);
+                        self.delete_selection(false, false, ui);
                         self.text.insert_str(self.cursor, &ui.clipboard);
                         self.cursor += ui.clipboard.len();
                         self.mark = self.cursor;
@@ -983,7 +986,7 @@ impl TextInput {
                     }
                 }
                 Some(KeyAction::NewLine) if self.multiline => {
-                    self.delete_selection(false, ui);
+                    self.delete_selection(false, false, ui);
                     self.text.insert(self.cursor, '\n');
                     self.move_cursor(false, true);
                     self.mark = self.cursor;
@@ -991,7 +994,7 @@ impl TextInput {
                 }
                 _ => match key.key {
                     Key::Char(c) if (key.mods.is_empty() || c == '\n') && (c != '\n' || self.multiline) => {
-                        self.delete_selection(false, ui);
+                        self.delete_selection(false, false, ui);
                         self.text.insert(self.cursor, c);
                         self.move_cursor(false, true);
                         self.mark = self.cursor;
@@ -1026,15 +1029,15 @@ impl TextInput {
                         }
                     }
                     Key::Backspace | Key::Delete | Key::Char('d') | Key::Char('w') => {
-                        //asdqwe group consecutive kills into one clipboard string, like in emacs kill ring; same for other kill operations
                         let to_clipboard = key.mods.contains(ModKeys::ALT) || key == &Key::Char('w').ctrl(); // backspace/delete/ctrl+backspace/ctrl+delete don't put the string into clipboard, while more emacs-like alt+backspace/alt+d/etc do
                         if self.cursor == self.mark {
                             let word = key.mods.contains(ModKeys::ALT) || (key.mods.contains(ModKeys::CTRL) && key.key != Key::Char('d'));
                             let right = key.key == Key::Delete || key.key == Key::Char('d');
                             self.move_cursor(word, right);
                         }
-                        self.delete_selection(to_clipboard, ui);
+                        self.delete_selection(to_clipboard, true, ui);
                         edited = true;
+                        killed |= to_clipboard;
                     }
                     Key::Char('k') | Key::Char('u') if key.mods == ModKeys::CTRL => {
                         self.mark = self.cursor;
@@ -1046,8 +1049,9 @@ impl TextInput {
                         } else {
                             self.cursor = new_cursor;
                         }
-                        self.delete_selection(true, ui);
+                        self.delete_selection(true, true, ui);
                         edited = true;
+                        killed = true;
                     }
                     Key::Up | Key::Down | Key::Char('n') | Key::Char('p') | Key::PageUp | Key::PageDown | Key::Char('v') | Key::Char('V') => {
                         let select = key.mods.contains(ModKeys::SHIFT);
@@ -1080,6 +1084,7 @@ impl TextInput {
                 self.undo.truncate(self.undo_idx);
                 self.undo.push((self.text.clone(), old_cursor, self.cursor));
             }
+            self.killing_spree = killed;
             false
         });
         ui.cur_mut().keys = keys;
@@ -1112,10 +1117,15 @@ impl TextInput {
             _ => false }
     }
 
-    fn delete_selection(&mut self, to_clipboard: bool, ui: &mut UI) {
+    fn delete_selection(&mut self, to_clipboard: bool, kill: bool, ui: &mut UI) {
         let r = self.selection();
         if to_clipboard {
-            ui.clipboard = self.text[r.clone()].to_string();
+            if !kill || !self.killing_spree {
+                ui.clipboard.clear();
+            }
+            // Append or prepend to the clipboard.
+            let pos = if self.cursor > self.mark {ui.clipboard.len()} else {0};
+            ui.clipboard.insert_str(pos, &self.text[r.clone()]);
         }
         self.text.replace_range(r.clone(), "");
         self.cursor = r.start;

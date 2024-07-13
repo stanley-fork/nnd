@@ -1541,18 +1541,21 @@ impl Debugger {
         true
     }
 
-    pub fn toggle_breakpoint_enabledness(&mut self, id: BreakpointId) -> Result<bool> {
+    pub fn set_breakpoint_enabled(&mut self, id: BreakpointId, enabled: bool) -> Result<bool> {
         let b = match self.breakpoints.try_get_mut(id) {
             None => return Ok(false),
             Some(x) => x };
-        if b.enabled {
-            b.enabled = false;
-            self.deactivate_breakpoint(id);
-        } else {
+        if b.enabled == enabled {
+            return Ok(true);
+        }
+        if enabled {
             b.enabled = true;
             if self.target_state.breakpoints_should_be_active() {
                 self.activate_breakpoints(vec![id])?;
             }
+        } else {
+            b.enabled = false;
+            self.deactivate_breakpoint(id);
         }
         Ok(true)
     }

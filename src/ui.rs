@@ -860,7 +860,7 @@ impl WindowContent for WatchesWindow {
 
         // Keyboard input.
         let mut refresh_data = self.tree.roots.is_empty();
-        for action in ui.check_keys(&[KeyAction::CursorRight, KeyAction::CursorLeft, KeyAction::Enter, KeyAction::DeleteRow, KeyAction::DuplicateRow]) {
+        for action in ui.check_keys(&[KeyAction::Cancel, KeyAction::CursorRight, KeyAction::CursorLeft, KeyAction::Enter, KeyAction::DeleteRow, KeyAction::DuplicateRow]) {
             self.scroll_to_cursor = true;
 
             if action == KeyAction::Cancel {
@@ -1463,7 +1463,7 @@ impl WindowContent for DisassemblyWindow {
                 }
                 KeyAction::CloseTab if self.tabs.get(self.tabs_state.selected).is_some() => {
                     let tab = &mut self.tabs[self.tabs_state.selected];
-                    if tab.ephemeral {
+                    if tab.ephemeral && tab.locator.is_some() {
                         tab.ephemeral = false;
                     } else {
                         self.tabs.remove(self.tabs_state.selected);
@@ -1594,7 +1594,7 @@ impl WindowContent for DisassemblyWindow {
                     KeyAction::ToggleBreakpoint if has_addr => {
                         // TODO: Instruction breakpoints. Probably store static addr + binary id, not dynamic addr. But make it work without requiring Symbols, just based on mmaps.
                     }
-                    KeyAction::PreviousMatch => tab.selected_subfunction_level = tab.selected_subfunction_level.saturating_sub(1).min(disas_line.subfunction_level),
+                    KeyAction::PreviousMatch => tab.selected_subfunction_level = tab.selected_subfunction_level.min(disas_line.subfunction_level).saturating_sub(1),
                     KeyAction::NextMatch => {
                         tab.selected_subfunction_level = tab.selected_subfunction_level.saturating_add(1);
                         if tab.selected_subfunction_level > disas_line.subfunction_level {
@@ -1606,13 +1606,20 @@ impl WindowContent for DisassemblyWindow {
             }
 
             let mut source_line_info = disas_line.leaf_line.clone();
+            let level = tab.selected_subfunction_level.min(disas_line.subfunction_level);
             if let &Some(mut sf_idx) = &disas_line.subfunction {
-                while symbols_shard.subfunctions[sf_idx].level > tab.selected_subfunction_level {
+                while symbols_shard.subfunctions[sf_idx].level > level.saturating_add(1) {
                     sf_idx = symbols_shard.subfunctions[sf_idx].parent;
                 }
-                if symbols_shard.subfunctions[sf_idx].level == tab.selected_subfunction_level {
-                    selected_subfunction_idx = Some(sf_idx);
+                if symbols_shard.subfunctions[sf_idx].level == level.saturating_add(1) {
                     source_line_info = Some(symbols_shard.subfunctions[sf_idx].call_line.clone());
+                }
+
+                while symbols_shard.subfunctions[sf_idx].level > level {
+                    sf_idx = symbols_shard.subfunctions[sf_idx].parent;
+                }
+                if symbols_shard.subfunctions[sf_idx].level == level {
+                    selected_subfunction_idx = Some(sf_idx);
                 }
             }
             if let Some(line) = source_line_info {
@@ -1621,11 +1628,13 @@ impl WindowContent for DisassemblyWindow {
             }
         }
         let key = (symbols.identity, function_idx, tab.area_state.cursor, tab.selected_subfunction_level);
-        if !suppress_code_autoscroll && self.source_scrolled_to.as_ref() != Some(&key) {
+        if self.source_scrolled_to.as_ref() != Some(&key) {
             self.source_scrolled_to = Some(key);
-            if let Some(target) = source_line {
-                state.should_scroll_source = Some((Some(target), false));
-                ui.should_redraw = true;
+            if !suppress_code_autoscroll {
+                if let Some(target) = source_line {
+                    state.should_scroll_source = Some((Some(target), false));
+                    ui.should_redraw = true;
+                }
             }
         }
 
@@ -1763,6 +1772,9 @@ impl WindowContent for DisassemblyWindow {
     }
     fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {
         for (idx, tab) in self.tabs.iter().enumerate() {
+            if tab.ephemeral {
+                continue;
+            }
             let locator = match &tab.locator {
                 None => continue,
                 Some(x) => x };
@@ -1773,7 +1785,6 @@ impl WindowContent for DisassemblyWindow {
             out.write_usize(locator.addr.0)?;
             tab.area_state.save_state(out)?;
             out.write_u16(tab.selected_subfunction_level)?;
-            out.write_u8(tab.ephemeral as u8)?;
         }
         out.write_u8(0)?;
         Ok(())
@@ -1787,7 +1798,7 @@ impl WindowContent for DisassemblyWindow {
             };
             let locator = DisassemblyFunctionLocator {binary_id: BinaryId::load_state_incomplete(inp)?, mangled_name: inp.read_slice()?, demangled_name: inp.read_str()?, addr: FunctionAddr(inp.read_usize()?)};
             let title = Self::make_title(&locator.demangled_name);
-            self.tabs.push(DisassemblyTab {identity: random(), title, locator: Some(locator), error: None, area_state: AreaState::load_state(inp)?, selected_subfunction_level: inp.read_u16()?, ephemeral: inp.read_u8()? != 0, cached_function_idx: None});
+            self.tabs.push(DisassemblyTab {identity: random(), title, locator: Some(locator), error: None, area_state: AreaState::load_state(inp)?, selected_subfunction_level: inp.read_u16()?, ephemeral: false, cached_function_idx: None});
             if select_this_tab {
                 self.tabs_state.select(self.tabs.len() - 1);
             }
@@ -2677,13 +2688,14 @@ fn rust_fake_path_to_url(path: &str) -> Option<String> {
     Some(res)
 }
 
+#[derive(Default)]
 struct CodeTab {
     title: String,
+    identity: usize,
     path_in_symbols: PathBuf, // empty if not known
     version_in_symbols: FileVersionInfo,
-
-    //asdqwe scroll, cursor, hscroll
-    pinned: bool,
+    ephemeral: bool,
+    area_state: AreaState,
 }
 
 struct SourceFile {
@@ -2694,19 +2706,18 @@ struct SourceFile {
     num_lines_in_local_file: usize,
 }
 
+#[derive(Default)]
 struct CodeWindow {
     tabs: Vec<CodeTab>,
+    tabs_state: TabsState,
     file_cache: HashMap<(PathBuf, FileVersionInfo), SourceFile>,
-    selected_tab: usize,
 
     search_dialog: Option<SearchDialog>,
 
     // When this changes (usually because the user moved the cursor around the file), we scroll disassembly to the address corresponding to the selected line.
     disassembly_scrolled_to: Option<(PathBuf, FileVersionInfo, /*cursor*/ usize)>,
 }
-impl Default for CodeWindow { fn default() -> Self { Self {tabs: Vec::new(), file_cache: HashMap::new(), selected_tab: 0, search_dialog: None, disassembly_scrolled_to: None} } }
-
-//asdqwe check no tab title truncation happens in CodeWindow and DisassemblyWindow
+// TODO: Column cursor mode, to set breakpoints on columns. And/or clickable statements.
 impl CodeWindow {
     fn find_or_open_file<'a>(file_cache: &'a mut HashMap<(PathBuf, FileVersionInfo), SourceFile>, path_in_symbols: &Path, version: &FileVersionInfo, debugger: &Debugger, palette: &Palette) -> &'a SourceFile {
         file_cache.entry((path_in_symbols.to_owned(), version.clone())).or_insert_with(|| Self::open_file(path_in_symbols, version, debugger, palette))
@@ -2806,7 +2817,7 @@ impl CodeWindow {
         markers.sort_unstable_by_key(|l| (l.line(), l.column().saturating_sub(1), !l.flags().contains(LineFlags::INLINED_FUNCTION)));
 
         let insert_markers_and_close_line = |line_idx: &mut usize, text: &mut StyledText, marker_idx: &mut usize| {
-            assert_eq!(*text.lines.last().unwrap(), text.spans.len());
+            assert_eq!(*text.lines.last().unwrap(), text.num_spans());
             let line_chars_start = text.spans.last().unwrap().0;
             *line_idx += 1;
             let mut prev_column = -1isize;
@@ -2877,7 +2888,7 @@ impl CodeWindow {
         while marker_idx < markers.len() {
             insert_markers_and_close_line(&mut line_idx, &mut res.text, &mut marker_idx);
         }
-        
+
         res.widest_line = res.text.widest_line(0..res.text.num_lines());
 
         Ok((buffered.count, buffered.hasher.compute().into()))
@@ -2892,36 +2903,35 @@ impl CodeWindow {
             "?".to_string()
         }
     }
-/*
+
     fn switch_to_file(&mut self, path_in_symbols: &Path, version: &FileVersionInfo, debugger: &Debugger) {
         if let Some(i) = self.tabs.iter().position(|t| &t.path_in_symbols == path_in_symbols && &t.version_in_symbols == version) {
-            self.selected_tab = i;
+            self.tabs_state.select(i);
             return;
         }
         let title = Self::make_title(path_in_symbols);
-        self.tabs.push(CodeTab {title, path_in_symbols: path_in_symbols.to_owned(), version_in_symbols: version.clone(), scroll: Scroll::new(), hscroll: 0, pinned: false});
-        self.selected_tab = self.tabs.len() - 1;
+        self.tabs.push(CodeTab {identity: random(), title, path_in_symbols: path_in_symbols.to_owned(), version_in_symbols: version.clone(), area_state: AreaState::default(), ephemeral: true});
+        self.tabs_state.select(self.tabs.len() - 1);
     }
 
-    fn switch_tab(&mut self, delta: isize) {
-        self.selected_tab = (self.selected_tab as isize + delta).rem_euclid(self.tabs.len().max(1) as isize) as usize;
-    }
-
-    fn toggle_breakpoint(&mut self, toggle_enabledness: bool, state: &mut UIState, debugger: &mut Debugger) {
+    fn toggle_breakpoint(&mut self, disable: bool, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
         if self.tabs.is_empty() {
             return;
         }
-        let tab = &self.tabs[self.selected_tab];
+        let tab = &self.tabs[self.tabs_state.selected];
         if tab.path_in_symbols.as_os_str().is_empty() {
             return;
         }
         ui.should_redraw = true;
         for (id, breakpoint) in debugger.breakpoints.iter() {
             match &breakpoint.on {
-                BreakpointOn::Line(bp) if bp.path == tab.path_in_symbols && (bp.line == tab.scroll.cursor + 1 || bp.adjusted_line == Some(tab.scroll.cursor + 1)) => {
-                    if toggle_enabledness {
-                        let r = debugger.toggle_breakpoint_enabledness(id);
-                        report_result(ui, &r);
+                BreakpointOn::Line(bp) if bp.path == tab.path_in_symbols && (bp.line == tab.area_state.cursor + 1 || bp.adjusted_line == Some(tab.area_state.cursor + 1)) => {
+                    if disable {
+                        let r = debugger.set_breakpoint_enabled(id, false);
+                        report_result(state, &r);
+                    } else if !breakpoint.enabled {
+                        let r = debugger.set_breakpoint_enabled(id, true);
+                        report_result(state, &r);
                     } else {
                         debugger.remove_breakpoint(id);
                     }
@@ -2930,30 +2940,15 @@ impl CodeWindow {
                 _ => (),
             }
         }
-        if toggle_enabledness {
-            ui.last_error = "no breakpoint".to_string();
+        if disable {
+            state.last_error = "no breakpoint".to_string();
         } else {
-            let r = debugger.add_breakpoint(BreakpointOn::Line(LineBreakpoint {path: tab.path_in_symbols.clone(), file_version: tab.version_in_symbols.clone(), line: tab.scroll.cursor + 1, adjusted_line: None}));
-            report_result(ui, &r);
+            let r = debugger.add_breakpoint(BreakpointOn::Line(LineBreakpoint {path: tab.path_in_symbols.clone(), file_version: tab.version_in_symbols.clone(), line: tab.area_state.cursor + 1, adjusted_line: None}));
+            report_result(state, &r);
         }
     }
 
-    fn garbage_collect(&mut self) {
-        let unpinned_tabs = self.tabs.iter().filter(|t| !t.pinned).count();
-        if unpinned_tabs > 1 {
-            // Remove all non-selected non-pinned tabs.
-            let mut j = 0usize;
-            for i in 0..self.tabs.len() {
-                if self.tabs[i].pinned || j == self.selected_tab {
-                    self.tabs.swap(i, j);
-                    j += 1;
-                } else if j < self.selected_tab {
-                    self.selected_tab -= 1;
-                }
-            }
-            self.tabs.truncate(j);
-        }
-
+    fn evict_cache(&mut self) {
         if self.file_cache.len().saturating_sub(self.tabs.len()) > 100 {
             // Drop half of the cached files that don't have tabs open.
             let in_use: HashSet<(PathBuf, FileVersionInfo)> = self.tabs.iter().map(|t| (t.path_in_symbols.clone(), t.version_in_symbols.clone())).collect();
@@ -2971,8 +2966,8 @@ impl CodeWindow {
     }
 
     fn disassembly_scroll_key(&self) -> Option<(PathBuf, FileVersionInfo, usize)> {
-        match self.tabs.get(self.selected_tab) {
-            Some(t) if !t.path_in_symbols.as_os_str().is_empty() => Some((t.path_in_symbols.clone(), t.version_in_symbols.clone(), t.scroll.cursor)),
+        match self.tabs.get(self.tabs_state.selected) {
+            Some(t) if !t.path_in_symbols.as_os_str().is_empty() => Some((t.path_in_symbols.clone(), t.version_in_symbols.clone(), t.area_state.cursor)),
             _ => None,
         }
     }
@@ -3001,12 +2996,11 @@ impl CodeWindow {
                 Err(_) => continue,
             };
             assert!(!addrs0.is_empty());
-            let mut addrs: Vec<(/*function_idx*/ usize, /*subfunction_level*/ u16, /*addr*/ usize)> = Vec::new();
+            let mut addrs: Vec<(/*function_idx*/ usize, /*subfunction_level*/ u16, /*static_addr*/ usize)> = Vec::new();
             for (line, level) in addrs0 {
                 let static_addr = line.addr();
                 if let Ok((_, function_idx)) = symbols.addr_to_function(static_addr) {
-                    let addr = binary.addr_map.static_to_dynamic(static_addr);
-                    addrs.push((function_idx, level, addr));
+                    addrs.push((function_idx, level, static_addr));
                 }
             }
             if addrs.is_empty() {
@@ -3022,7 +3016,7 @@ impl CodeWindow {
             // same function and has the lowest lowest-common-ancestor in subfunction tree. That's what we do here.
             // This can be pretty annoying though: if you randomly scroll back and forth in the source file, the disassembly will probably
             // jump to a different function at some point and will forget the relevant inlined site; maybe we should take stack trace into account too?
-            let mut closest_idx = addrs.iter().position(|&(function_idx, level, addr)| {
+            let mut closest_idx = addrs.iter().position(|&(function_idx, level, static_addr)| {
                 if level == 0 {
                     return true;
                 }
@@ -3034,34 +3028,35 @@ impl CodeWindow {
                     return true;
                 }
                 let ranges = symbols.subfunction_ranges_at_level(1, function);
-                let idx = ranges.partition_point(|r| r.range.end <= addr);
-                idx == ranges.len() || ranges[idx].range.start > addr
+                let idx = ranges.partition_point(|r| r.range.end <= static_addr);
+                idx == ranges.len() || ranges[idx].range.start > static_addr
             }).unwrap_or(0);
             let mut selected_idx: Option<usize> = None;
-            if let Some((binary_id, selected_function_idx, selected_addr)) = &ui.selected_addr {
+            if let Some((binary_id, selected_function_idx, selected_addr)) = &state.selected_addr {
                 if let Some(binary) = debugger.info.binaries.get(binary_id) {
+                    let selected_static_addr = binary.addr_map.dynamic_to_static(*selected_addr);
                     let symbols = binary.symbols.as_ref().unwrap();
                     let function = &symbols.functions[*selected_function_idx];
                     let shard = &symbols.shards[function.shard_idx()];
                     let mut subfunction_ranges: Vec<Range<usize>> = Vec::new();
                     for level in 1..function.num_levels().max(1) {
                         let pc_ranges = symbols.subfunction_ranges_at_level(level, function);
-                        let idx = pc_ranges.partition_point(|r| r.range.end <= *selected_addr);
-                        if idx == pc_ranges.len() || pc_ranges[idx].range.start > *selected_addr {
+                        let idx = pc_ranges.partition_point(|r| r.range.end <= selected_static_addr);
+                        if idx == pc_ranges.len() || pc_ranges[idx].range.start > selected_static_addr {
                             break;
                         }
                         subfunction_ranges.push(pc_ranges[idx].range.clone());
                     }
                     let mut closest = (0usize, 0usize);
-                    for (idx, &(function_idx, _, addr)) in addrs.iter().enumerate() {
-                        if addr == *selected_addr {
+                    for (idx, &(function_idx, _, static_addr)) in addrs.iter().enumerate() {
+                        if static_addr == selected_static_addr {
                             selected_idx = Some(idx);
                         }
                         if function_idx != *selected_function_idx {
                             continue;
                         }
                         let mut level = 0usize;
-                        while level < subfunction_ranges.len() && subfunction_ranges[level].contains(&addr) {
+                        while level < subfunction_ranges.len() && subfunction_ranges[level].contains(&static_addr) {
                             level += 1;
                         }
                         if level+1 > closest.0 {
@@ -3077,150 +3072,103 @@ impl CodeWindow {
                 None => closest_idx,
             };
 
-            state.should_scroll_disassembly = Some((Ok(DisassemblyScrollTarget {binary_id: binary_id.clone(), function_idx: addrs[idx].0, addr: addrs[idx].2, subfunction_level: addrs[idx].1.saturating_add(1)}), false));
+            state.should_scroll_disassembly = Some((Ok(DisassemblyScrollTarget {binary_id: binary_id.clone(), symbols_identity: symbols.identity, function_idx: addrs[idx].0, static_pseudo_addr: addrs[idx].2, subfunction_level: addrs[idx].1}), false));
 
             break;
         }
-    }*/
-}
+    }
 
-impl WindowContent for CodeWindow {
-    fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
-        styled_write!(ui.text, ui.palette.default, "code");
-        let l = ui.text.close_line();
-        ui.add(widget!().text(l));
-        /*asdqwe
-    fn update_modal(&mut self, state: &mut UIState, debugger: &mut Debugger, keys: &mut Vec<Key>) {
-        if let Some(d) = &mut self.search_dialog {
-            let event = d.update(keys, &debugger.context.settings.keys, &debugger.symbols, None);
-            let mut file_to_open = None;
-            match event {
-                SearchDialogEvent::None => (),
-                SearchDialogEvent::Cancel => self.search_dialog = None,
-                SearchDialogEvent::Open(res) => file_to_open = Some(res),
-                SearchDialogEvent::Done(res) => {
-                    file_to_open = Some(res);
-                    self.search_dialog = None;
-                }
-            }
-            if let Some(res) = file_to_open {
-                let file = &res.symbols.files[res.id];
-                self.switch_to_file(&res.file, &file.version, debugger);
-                self.tabs[self.selected_tab].pinned = true;
-            }
-            if self.search_dialog.is_some() {
+    fn build_search_dialog(&mut self, create: bool, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
+        let dialog_widget = match make_dialog_frame(create, AutoSize::Remainder(0.75), AutoSize::Remainder(0.83), ui.palette.dialog, ui.palette.filename, "find file (by path from debug info)", ui) {
+            None => {
+                self.search_dialog = None;
                 return;
             }
+            Some(x) => x };
+
+        let d = self.search_dialog.get_or_insert_with(|| SearchDialog::new(Arc::new(FileSearcher), debugger.context.clone()));
+        with_parent!(ui, dialog_widget, {
+            d.build(&debugger.symbols, None, ui);
+        });
+
+        if d.should_close_dialog {
+            ui.close_dialog();
         }
 
-        keys.retain(|key| {
-            match debugger.context.settings.keys.map.get(key) {
-                // Code window has its own tabs and consumes all tab switching inputs when active.
-                // If code window shares a region with another window, there's currently no way to switch to it. When adding layout editing mode, we should probably just disallow that.
-                Some(KeyAction::NextTab) => self.switch_tab(1),
-                Some(KeyAction::PreviousTab) => self.switch_tab(-1),
-                Some(KeyAction::PinTab) => if !self.tabs.is_empty() {
-                    let t = &mut self.tabs[self.selected_tab];
-                    if !t.path_in_symbols.as_os_str().is_empty() || t.pinned {
-                        t.pinned ^= true;
+        if let Some(res) = mem::take(&mut d.should_open_document) {
+            let file = &res.symbols.files[res.id];
+            self.switch_to_file(&res.file, &file.version, debugger);
+            self.tabs[self.tabs_state.selected].ephemeral = false;
+        }
+    }
+}
+impl WindowContent for CodeWindow {
+    fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
+        let mut open_dialog = false;
+        // TODO: Move CloseTab logic into Tabs, next to reordering logic.
+        for action in ui.check_keys(&[KeyAction::Open, KeyAction::CloseTab]) {
+            match action {
+                KeyAction::Open if self.search_dialog.is_none() => open_dialog = true,
+                KeyAction::CloseTab if self.tabs.get(self.tabs_state.selected).is_some() => {
+                    let tab = &mut self.tabs[self.tabs_state.selected];
+                    if tab.ephemeral && !tab.path_in_symbols.as_os_str().is_empty() {
+                        tab.ephemeral = false;
+                    } else {
+                        self.tabs.remove(self.tabs_state.selected);
                     }
                 }
-                _ => return true,
+                _ => (),
             }
-            false
-        });
-    }
-
-    fn render_modal(&mut self, state: &mut UIState, debugger: &mut Debugger, f: &mut Frame, window_area: Rect, screen_area: Rect) {
-        if let Some(d) = &mut self.search_dialog {
-            ui.loading |= d.render(f, screen_area, "find file", &debugger.context.settings.palette);
         }
-    }
 
-    fn cancel_modal(&mut self, state: &mut UIState, debugger: &mut Debugger) {
-        self.search_dialog = None;
-    }
+        self.build_search_dialog(open_dialog, state, debugger, ui);
 
-    fn drop_caches(&mut self) {
-        self.file_cache.clear();
-    }
-
-    fn get_key_hints(&self, out: &mut Vec<KeyHint>) {
-        styled_write!(hints, ui.palette.default_dim, "o - open file"); hints.close_line();
-        styled_write!(hints, ui.palette.default_dim, "C-y - pin/unpin tab"); hints.close_line();
-        styled_write!(hints, ui.palette.default_dim, "b - toggle breakpoint"); hints.close_line();
-        styled_write!(hints, ui.palette.default_dim, "B - enable/disable breakpoint"); hints.close_line();
-        styled_write!(hints, ui.palette.default_dim, ",/. - cycle disasm addrs"); hints.close_line();
-    }
-
-    fn has_persistent_state(&self) -> bool {
-        true
-    }
-    fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {
-        out.write_usize(self.tabs.len())?;
-        for tab in &self.tabs {
-            out.write_path(&tab.path_in_symbols)?;
-            tab.version_in_symbols.save_state(out)?;
-            tab.scroll.save_state(out)?;
-            out.write_u16(tab.hscroll)?;
-            out.write_u8(tab.pinned as u8)?;
-        }
-        out.write_usize(self.selected_tab)?;
-        Ok(())
-    }
-    fn load_state(&mut self, inp: &mut &[u8]) -> Result<()> {
-        for i in 0..inp.read_usize()? {
-            let path_in_symbols = inp.read_path()?;
-            let title = Self::make_title(&path_in_symbols);
-            self.tabs.push(CodeTab {title, path_in_symbols, version_in_symbols: FileVersionInfo::load_state(inp)?, scroll: Scroll::load_state(inp)?, hscroll: inp.read_u16()?, pinned: inp.read_u8()? != 0});
-        }
-        self.selected_tab = inp.read_usize()?.min(self.tabs.len().saturating_sub(1));
-        // Prevent auto-scrolling the disassembly window before any input is made.
-        self.disassembly_scrolled_to = self.disassembly_scroll_key();
-        Ok(())
-    }
-
-    fn update_and_render(&mut self, state: &mut UIState, debugger: &mut Debugger, mut keys: Vec<Key>, f: Option<&mut Frame>, mut area: Rect) {
         let suppress_disassembly_autoscroll = state.should_scroll_source.is_some();
         let switch_to = match mem::take(&mut state.should_scroll_source) {
             Some((to, false)) => Some(to),
-            Some((to, true)) if self.tabs.is_empty() || self.tabs[self.selected_tab].path_in_symbols.as_os_str().is_empty() => Some(to),
+            Some((to, true)) if self.tabs.is_empty() || self.tabs[self.tabs_state.selected].path_in_symbols.as_os_str().is_empty() => Some(to),
             _ => None,
         };
 
-        let f = match f { Some(f) => f, None => return };
-
-        if self.search_dialog.is_some() {
-            keys.clear();
-        }
-
         let mut select_disassembly_address: isize = 0;
-        keys.retain(|key| {
-            match debugger.context.settings.keys.map.get(key) {
-                Some(KeyAction::ToggleBreakpoint) => self.toggle_breakpoint(false, ui, debugger),
-                Some(KeyAction::ToggleBreakpointEnabledness) => self.toggle_breakpoint(true, ui, debugger),
-                Some(KeyAction::Open) => {
-                    self.search_dialog = Some(SearchDialog::new(Arc::new(FileSearcher), debugger.context.clone()));
-                    self.update_modal(ui, debugger, &mut Vec::new()); // kick off initial search with empty query
-                }
-                Some(KeyAction::PreviousMatch) => select_disassembly_address -= 1,
-                Some(KeyAction::NextMatch) => select_disassembly_address += 1,
-                _ => return true
+        for action in ui.check_keys(&[KeyAction::ToggleBreakpoint, KeyAction::DisableBreakpoint, KeyAction::PreviousMatch, KeyAction::NextMatch]) {
+            match action {
+                KeyAction::ToggleBreakpoint => self.toggle_breakpoint(false, state, debugger, ui),
+                KeyAction::DisableBreakpoint => self.toggle_breakpoint(true, state, debugger, ui),
+                KeyAction::PreviousMatch => select_disassembly_address -= 1,
+                KeyAction::NextMatch => select_disassembly_address += 1,
+                _ => (),
             }
-            false
-        });
+        }
 
         match switch_to {
             None => (),
             Some(None) => self.switch_to_file(Path::new(""), &FileVersionInfo::default(), debugger),
             Some(Some(target)) => {
                 self.switch_to_file(&target.path, &target.version, debugger);
-                let tab = &mut self.tabs[self.selected_tab];
-                tab.scroll.set(usize::MAX, area.height.saturating_sub(3), target.line.saturating_sub(1));
+                let tab = &mut self.tabs[self.tabs_state.selected];
+                tab.area_state.select(target.line.saturating_sub(1));
             }
         }
 
-        self.garbage_collect();
+        close_excess_ephemeral_tabs(&mut self.tabs, &mut self.tabs_state, |t| t.ephemeral);
+        self.evict_cache();
+
+        ui.cur_mut().set_vstack();
+        with_parent!(ui, ui.add(widget!().fixed_height(1)), {
+            ui.focus();
+            let mut tabs = Tabs::new(mem::take(&mut self.tabs_state), ui);
+            for tab in &self.tabs {
+                let full_title = tab.path_in_symbols.as_os_str().to_string_lossy().into_owned();
+                tabs.add(Tab {identity: tab.identity, short_title: tab.title.clone(), full_title, ephemeral: tab.ephemeral, ..Default::default()}, ui);
+            }
+            self.tabs_state = tabs.finish(ui);
+        });
+        let content_root = ui.add(widget!().height(AutoSize::Remainder(1.0)));
+        with_parent!(ui, content_root, {
+            ui.multifocus();
+        });
+        ui.layout_children(Axis::Y);
 
         // (path_in_symbols, line) -> (column, selected, top)
         let mut instruction_pointers: HashMap<(&Path, usize), (usize, bool, bool)> = HashMap::new();
@@ -3230,47 +3178,18 @@ impl WindowContent for CodeWindow {
             }
         }
 
-        let mut headers = 0u16;
-        let palette = &debugger.context.settings.palette;
-
-        if area.height > 0 {
-            let mut a = area;
-            a.height = 1;
-            let tabs = Tabs::new(self.tabs.iter().map(
-                |t| Spans::from(vec![
-                    if t.pinned {
-                        Span::styled("📌 ".to_string() + &t.title, palette.tab_title_active)
-                    } else {
-                        // Italic would be better, and would remove the need for the weird pin icon, but it doesn't work in some terminals (e.g. doesn't work for me with gterm+ssh+tmux combination).
-                        Span::styled(t.title.clone(), palette.tab_title)
-                    }])).collect())
-                .select(self.selected_tab).highlight_style(palette.tab_title_selected);
-            f.render_widget(tabs, a);
-            headers += 1;
-
-            area.y += 1;
-            area.height -= 1;
-        }
-
-        let tab = match self.tabs.get_mut(self.selected_tab) {
+        let tab = match self.tabs.get_mut(self.tabs_state.selected) {
             None => return,
             Some(t) => t };
         let file = Self::find_or_open_file(&mut self.file_cache, &tab.path_in_symbols, &tab.version_in_symbols, debugger, &ui.palette);
-        headers += file.header.num_lines() as u16;
 
         let line_num_len = (file.text.num_lines().saturating_add(1) as f64).log10().ceil() as usize;
-        let height = area.height.saturating_sub(headers);
-        let width = area.width.saturating_sub(2 + 2 + line_num_len as u16 + 1);
+        let prefix_width = line_num_len + 2 + 2 + 1;
 
-        let range = tab.scroll.update(file.text.num_lines(), height, &mut keys, &debugger.context.settings.keys);
-        keys.retain(|key| {
-            match debugger.context.settings.keys.map.get(key) {
-                Some(KeyAction::CursorRight) => tab.hscroll = tab.hscroll.saturating_add(width),
-                Some(KeyAction::CursorLeft) => tab.hscroll = tab.hscroll.saturating_sub(width),
-                _ => return true }
-            false
+        let (content, visible_y) = with_parent!(ui, content_root, {
+            let header = ui.text.import_lines(&file.header, 0..file.header.num_lines());
+            build_biscrollable_area_with_header(header, [prefix_width + file.widest_line, file.text.num_lines()], &mut tab.area_state, ui)
         });
-        tab.hscroll = tab.hscroll.min(file.widest_line.saturating_sub(width as usize).try_into().unwrap_or(u16::MAX));
 
         struct BreakpointLine {
             line: usize,
@@ -3310,85 +3229,118 @@ impl WindowContent for CodeWindow {
         }
         breakpoint_lines.sort_by_key(|t| (t.line, /* if there's an adjusted and unadjusted breakpoint on the same line, show the unadjusted one */ t.adjusted));
 
-        let mut lines = file.header.to_lines();
-
-        if !tab.path_in_symbols.as_os_str().is_empty() {
-            for i in range {
-                let mut spans: Vec<Span> = Vec::new();
+        with_parent!(ui, content, {
+            let line_range = visible_y.start.max(0) as usize .. (visible_y.end.max(0) as usize).min(file.text.num_lines());
+            for i in line_range.clone() {
                 let mut column_number = 0usize;
 
-                let ip_span = match instruction_pointers.get(&(&tab.path_in_symbols, i + 1)) {
-                    None => Span::raw("  "),
+                match instruction_pointers.get(&(&tab.path_in_symbols, i + 1)) {
+                    None => ui_write!(ui, default, "  "),
                     Some(&(col, is_selected, is_top)) => {
                         column_number = col;
-                        Span::styled("⮕ ", if is_selected {palette.instruction_pointer} else {palette.additional_instruction_pointer})
+                        let style = if is_selected {ui.palette.instruction_pointer} else {ui.palette.additional_instruction_pointer};
+                        styled_write!(ui.text, style, "⮕ ");
                     }
                 };
-                spans.push(ip_span);
 
                 let idx = breakpoint_lines.partition_point(|t| t.line < i + 1);
                 if idx < breakpoint_lines.len() && breakpoint_lines[idx].line == i + 1 {
                     let l = &breakpoint_lines[idx];
                     if !l.enabled {
-                        spans.push(Span::styled("○ ", palette.secondary_breakpoint));
+                        ui_write!(ui, secondary_breakpoint, "○ ");
                     } else {
                         let active = l.active && l.has_locations;
-                        spans.push(Span::styled(if active { "● " } else { "○ " }, if l.adjusted {palette.secondary_breakpoint} else {palette.breakpoint}));
+                        let style = if l.adjusted {ui.palette.secondary_breakpoint} else {ui.palette.breakpoint};
+                        let s = if active { "● " } else { "○ " };
+                        styled_write!(ui.text, style, "{}", s);
                     }
                 } else {
-                    spans.push(Span::raw("  "));
+                    ui_write!(ui, default, "  ");
                 }
 
-                let line_number_span = spans.len();
-                spans.push(Span::styled(format!("{: >2$}{}", i + 1, if i < file.num_lines_in_local_file {" "} else {"~"}, line_num_len), palette.default_dim));
-
-                let contents_span = spans.len();
-                file.text.line_out(i, &mut spans);
+                ui_write!(ui, default_dim, "{: >2$}{}", i + 1, if i < file.num_lines_in_local_file {" "} else {"~"}, line_num_len);
 
                 // Underline the character at the column number.
-                if column_number != 0 {
-                    let mut pos = column_number - 1;
-                    let mut found = false;
-                    for i in contents_span..spans.len() {
-                        if pos < spans[i].content.len() {
-                            found = true;
-                            if !spans[i].content.is_char_boundary(pos) {
-                                break;
-                            }
-
-                            let span = std::mem::replace(&mut spans[i], Span::raw(""));
-                            let mut end = pos + 1;
-                            while !span.content.is_char_boundary(end) { end += 1; }
-                            spans.splice(i..i+1, [Span {content: span.content[..pos].to_string().into(), style: span.style},
-                                                  Span {content: span.content[pos..end].to_string().into(), style: span.style.add_modifier(Modifier::UNDERLINED | Modifier::BOLD)},
-                                                  Span {content: span.content[end..].to_string().into(), style: span.style}]);
-                            break;
-                        }
-                        pos -= spans[i].content.len();
+                let s = file.text.get_line_str(i);
+                let spans = file.text.get_line(i);
+                if column_number == 0 {
+                    ui.text.import_spans(&file.text, spans);
+                } else if column_number - 1 >= s.len() {
+                    ui.text.import_spans(&file.text, spans);
+                    ui_write!(ui, default, "{:<1$}", "", column_number - 1 - s.len());
+                    let style = ui.palette.code_instruction_pointer_column.apply(ui.palette.default);
+                    styled_write!(ui.text, style, " ");
+                } else {
+                    let mut start = column_number - 1;
+                    while !s.is_char_boundary(start) {
+                        start -= 1;
                     }
-                    if !found {
-                        spans.push(Span::raw(" ".to_string().repeat(pos)));
-                        spans.push(Span::styled(" ", ui.palette.ip_column.apply(ui.palette.default)));
+                    let mut end = start + 1;
+                    while !s.is_char_boundary(end) {
+                        end += 1;
                     }
+                    let spans = file.text.get_line(i);
+                    ui.text.import_substring(&file.text, spans.clone(), 0..start);
+                    let mid = ui.text.import_substring(&file.text, spans.clone(), start..end);
+                    ui.text.import_substring(&file.text, spans.clone(), end..s.len());
+                    ui.text.adjust_spans_style(mid, ui.palette.code_instruction_pointer_column);
                 }
 
-                if i == tab.scroll.cursor {
-                    spans.push(Span::raw(format!("{: >0$}", file.widest_line.max(area.width as usize) + 10))); // fill the rest of the line with spaces; the +10 is needed because str_width() is not implemented
-                    for span in &mut spans[line_number_span..] {
-                        if span.style.bg.is_none() {
-                            span.style.bg = palette.selected_text_line.bg.clone();
-                        }
-                    }
+                let l = ui.text.close_line();
+                let mut w = widget!().fixed_height(1).fixed_y(i as isize).text(l).fill(' ', ui.palette.default).flags(WidgetFlags::HSCROLL_INDICATOR_RIGHT).highlight_on_hover();
+                if i == tab.area_state.cursor {
+                    w.style_adjustment.update(ui.palette.selected);
                 }
-                lines.push(Spans::from(spans));
+                ui.add(w);
             }
+        });
+
+        self.scroll_disassembly_if_needed(suppress_disassembly_autoscroll, select_disassembly_address, state, debugger);
+    }
+
+    fn drop_caches(&mut self) {
+        self.file_cache.clear();
+    }
+
+    fn get_key_hints(&self, out: &mut Vec<KeyHint>) {
+        out.extend([
+            KeyHint::key(KeyAction::Open, "open file"),
+            KeyHint::key(KeyAction::CloseTab, "close/pin tab"),
+            KeyHint::keys(&[KeyAction::ToggleBreakpoint, KeyAction::DisableBreakpoint], "toggle/disable breakpoint"),
+            KeyHint::keys(&[KeyAction::PreviousMatch, KeyAction::NextMatch], "cycle disasm addrs"),
+        ]);
+    }
+
+    fn has_persistent_state(&self) -> bool {
+        true
+    }
+    fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {
+        for (i, tab) in self.tabs.iter().enumerate() {
+            if tab.ephemeral {
+                continue;
+            }
+            out.write_u8(if i == self.tabs_state.selected {2} else {1})?;
+            out.write_path(&tab.path_in_symbols)?;
+            tab.version_in_symbols.save_state(out)?;
+            tab.area_state.save_state(out)?;
         }
-
-        let paragraph = Paragraph::new(Text {lines}).scroll((0, tab.hscroll));
-
-        f.render_widget(paragraph, area);
-
-        self.scroll_disassembly_if_needed(suppress_disassembly_autoscroll, select_disassembly_address, ui, debugger);*/
+        out.write_u8(0)?;
+        Ok(())
+    }
+    fn load_state(&mut self, inp: &mut &[u8]) -> Result<()> {
+        loop {
+            match inp.read_u8()? {
+                1 => (),
+                2 => self.tabs_state.select(self.tabs.len()),
+                _ => break,
+            }
+            let path_in_symbols = inp.read_path()?;
+            let title = Self::make_title(&path_in_symbols);
+            self.tabs.push(CodeTab {identity: random(), title, path_in_symbols, version_in_symbols: FileVersionInfo::load_state(inp)?, area_state: AreaState::load_state(inp)?, ephemeral: false});
+        }
+        // Prevent auto-scrolling the disassembly window before any input is made.
+        self.disassembly_scrolled_to = self.disassembly_scroll_key();
+        Ok(())
     }
 }
 
@@ -3399,14 +3351,10 @@ struct BreakpointsWindow {
 }
 impl WindowContent for BreakpointsWindow {
     fn get_key_hints(&self, out: &mut Vec<KeyHint>) {
-        out.extend([KeyHint::key(KeyAction::DeleteRow, "delete breakpoint"), KeyHint::key(KeyAction::DisableBreakpoint, "disable breakpoint")]);
+        out.extend([KeyHint::key(KeyAction::DeleteRow, "delete breakpoint"), KeyHint::key(KeyAction::ToggleBreakpoint, "enable/disable breakpoint")]);
     }
 
     fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
-        styled_write!(ui.text, ui.palette.default, "breakpoints");
-        let l = ui.text.close_line();
-        ui.add(widget!().text(l));
-        /*asdqwe
         let mut hit_breakpoints: Vec<BreakpointId> = Vec::new();
         for (tid, thread) in &debugger.threads {
             for reason in &thread.stop_reasons {
@@ -3418,21 +3366,31 @@ impl WindowContent for BreakpointsWindow {
         hit_breakpoints.sort();
         hit_breakpoints.dedup();
 
-        let f = match f { Some(f) => f, None => return };
-        let height = area.height.saturating_sub(1);
+        let mut table = Table::new(mem::take(&mut self.table_state), ui, vec![
+            Column::new("idx", AutoSize::Text),
+            Column::new("", AutoSize::Fixed(2)),
+            Column::new("on", AutoSize::Remainder(1.0)),
+            Column::new("locs", AutoSize::Text),
+            Column::new("hits", AutoSize::Text),
+        ]);
+        table.hide_cursor_if_unfocused = true;
 
-        if let &Some(id) = &self.selected_breakpoint {
-            keys.retain(|key| {
-                match debugger.context.settings.keys.map.get(key) {
-                    Some(KeyAction::DeleteRow) => {debugger.remove_breakpoint(id);}
-                    Some(KeyAction::ToggleBreakpointEnabledness) => {
-                        let r = debugger.toggle_breakpoint_enabledness(id);
-                        report_result(ui, &r);
-                    }
-                    _ => return true,
+        for action in ui.check_keys(&[KeyAction::DeleteRow, KeyAction::ToggleBreakpoint, KeyAction::DisableBreakpoint]) {
+            let id = match &self.selected_breakpoint {
+                None => continue,
+                &Some(x) => x };
+            let breakpoint = match debugger.breakpoints.try_get(id) {
+                None => continue,
+                Some(x) => x };
+            match action {
+                KeyAction::DeleteRow => {debugger.remove_breakpoint(id);}
+                KeyAction::ToggleBreakpoint | KeyAction::DisableBreakpoint => {
+                    let enable = !breakpoint.enabled && action != KeyAction::DisableBreakpoint;
+                    let r = debugger.set_breakpoint_enabled(id, enable);
+                    report_result(state, &r);
                 }
-                false
-            });
+                _ => (),
+            }
         }
 
         let mut breakpoints: Vec<BreakpointId> = debugger.breakpoints.iter().map(|p| p.0).collect();
@@ -3440,7 +3398,7 @@ impl WindowContent for BreakpointsWindow {
 
         if let &Some(id) = &self.selected_breakpoint {
             if let Some(idx) = breakpoints.iter().position(|b| b == &id) {
-                self.scroll.cursor = idx;
+                self.table_state.cursor = idx;
             }
         }
 
@@ -3454,80 +3412,80 @@ impl WindowContent for BreakpointsWindow {
         }
         locations.sort();
 
-        let (range, moved) = self.scroll.update_detect_movement(breakpoints.len(), height, &mut keys, &debugger.context.settings.keys);
-        self.selected_breakpoint = breakpoints.get(self.scroll.cursor).copied();
+        for &id in &breakpoints {
+            let b = debugger.breakpoints.get(id);
+            let is_hit = hit_breakpoints.binary_search(&id).is_ok();
+            let locs_begin = locations.partition_point(|t| t.0 < id);
+            let locs_end = locations.partition_point(|t| t.0 <= id);
 
-        if moved && !breakpoints.is_empty() {
-            match &debugger.breakpoints.get(breakpoints[self.scroll.cursor]).on {
-                BreakpointOn::Line(on) => {
-                    state.should_scroll_source = Some((Some(SourceScrollTarget {path: on.path.clone(), version: on.file_version.clone(), line: on.line}), false));
-                }
-            }
-        }
+            let row_widget = table.start_row(id.seqno, ui);
 
-        let mut table_state = TableState::default();
-        table_state.select(Some(self.scroll.cursor - range.start));
+            ui_writeln!(ui, default_dim, "{}", id.seqno);
+            table.text_cell(ui);
 
-        let on_width = area.width.saturating_sub(3+4+2+5+5+4);
-        let widths = [Constraint::Length(4), Constraint::Length(2), Constraint::Length(on_width), Constraint::Length(5), Constraint::Length(5)];
-
-        let palette = &debugger.context.settings.palette;
-        let mut rows: Vec<Row> = Vec::new();
-        for id in &breakpoints[range] {
-            let b = debugger.breakpoints.get(*id);
-            let is_hit = hit_breakpoints.binary_search(id).is_ok();
-            let locs_begin = locations.partition_point(|t| t.0 < *id);
-            let locs_end = locations.partition_point(|t| t.0 <= *id);
-            let mut cells = vec![Cell::from(format!("{}", id.seqno)).style(palette.default_dim)];
             if is_hit {
-                cells.push(Cell::from("⮕ ").style(palette.instruction_pointer));
+                ui_writeln!(ui, instruction_pointer, "⮕ ");
             } else if !b.enabled {
-                cells.push(Cell::from("○ ").style(palette.secondary_breakpoint));
+                ui_writeln!(ui, secondary_breakpoint, "○ ");
             } else if !b.active || locs_begin == locs_end {
-                cells.push(Cell::from("○ ").style(palette.breakpoint));
+                ui_writeln!(ui, breakpoint, "○ ");
             } else {
-                cells.push(Cell::from("● ").style(palette.breakpoint));
+                ui_writeln!(ui, breakpoint, "● ");
             }
+            with_parent!(ui, table.text_cell(ui), {
+                ui.cur_mut().flags.insert(WidgetFlags::HIGHLIGHT_ON_HOVER);
+                if ui.check_mouse(MouseActions::CLICK) {
+                    let enabled = b.enabled;
+                    let r = debugger.set_breakpoint_enabled(id, !enabled);
+                    report_result(state, &r);
+                    ui.should_redraw = true;
+                }
+            });
+            let b = debugger.breakpoints.get(id);
+
             match &b.on {
                 BreakpointOn::Line(on) => {
                     let name = on.path.as_os_str().to_string_lossy();
-                    let mut spans = vec![
-                        Span::styled(name, palette.filename),
-                        Span::styled(format!(":{}", on.line), palette.location_line_number)];
+                    ui_write!(ui, filename, "{}", name);
+                    ui_write!(ui, line_number, ":{}", on.line);
                     if let &Some(adj) = &on.adjusted_line {
-                        spans.push(Span::styled("→", palette.default_dim));
-                        spans.push(Span::styled(format!("{}", adj), palette.location_line_number));
+                        ui_write!(ui, default_dim, "→");
+                        ui_write!(ui, line_number, "{}", adj);
                     }
-
-                    // Manually cut off the text on the left side instead of right. When we rewrite the TUI library, this should just be a flag on the table cell, or something.
-                    let suf: usize = spans[1..].iter().map(|s| str_width(&s.content)).sum();
-                    let w = str_width(&spans[0].content);
-                    let on_width = on_width as usize;
-                    if w + suf > on_width {
-                        let i = str_suffix_with_width(&spans[0].content, on_width.saturating_sub(suf + 1));
-                        spans[0].content = ("…".to_string() + &spans[0].content[i..]).into();
-                    }
-
-                    cells.push(Cell::from(Spans::from(spans)));
                 }
             }
-            cells.push(Cell::from(format!("{}", locs_end - locs_begin)));
-            cells.push(Cell::from(format!("{}", b.hits)));
+            let l = ui.text.close_line();
+            with_parent!(ui, table.start_cell(ui), {
+                ui.cur_mut().flags.insert(WidgetFlags::TEXT_TRUNCATION_ALIGN_RIGHT);
+                ui.cur_mut().axes[Axis::Y].auto_size = AutoSize::Text;
+                ui.cur_mut().draw_text = Some(l..l+1);
+            });
+
+            ui_writeln!(ui, default_dim, "{}", locs_end - locs_begin);
+            table.text_cell(ui);
+
+            ui_writeln!(ui, default_dim, "{}", b.hits);
+            table.text_cell(ui);
 
             let error = b.addrs.as_ref().is_err_and(|e| !e.is_not_calculated()) || locations[locs_begin..locs_end].iter().any(|t| t.1);
-            let mut style = if error {palette.error} else {palette.default};
-            if !b.enabled {
-                style = style.add_modifier(Modifier::DIM);
+            if error {
+                let a = ui.palette.breakpoint_error;
+                ui.get_mut(row_widget).style_adjustment.update(a);
             }
-
-            rows.push(Row::new(cells).style(style));
         }
 
-        let table = Table::new(rows)
-            .header(Row::new(vec!["idx", "", "on", "locs", "hits"]).style(palette.table_header))
-            .widths(&widths)
-            .highlight_style(palette.table_selected_item).highlight_symbol("➤ ");
+        self.table_state = table.finish(ui);
 
-        f.render_stateful_widget(table, area, &mut table_state);*/
+        self.selected_breakpoint = breakpoints.get(self.table_state.cursor).copied();
+
+        if self.table_state.did_scroll_to_cursor {
+            if let &Some(id) = &self.selected_breakpoint {
+                match &debugger.breakpoints.get(id).on {
+                    BreakpointOn::Line(on) => {
+                        state.should_scroll_source = Some((Some(SourceScrollTarget {path: on.path.clone(), version: on.file_version.clone(), line: on.line}), false));
+                    }
+                }
+            }
+        }
     }
 }

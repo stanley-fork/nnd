@@ -123,6 +123,7 @@ pub struct Palette {
 
     pub thread_breakpoint_hit: StyleAdjustment,
     pub thread_crash: StyleAdjustment,
+    pub breakpoint_error: StyleAdjustment,
 }
 impl Default for Palette {
     fn default() -> Self {
@@ -175,7 +176,7 @@ impl Default for Palette {
             placeholder_fill: Some(('.', Style {fg: white.darker(), bg: black, ..D!()})),
             truncation_indicator: (("…".to_string(), "…".to_string(), Style {fg: white.darker(), ..D!()})),
             hscroll_indicator: (("❮".to_string(), "❯".to_string(), Style {fg: white.darker(), ..D!()})),
-            line_wrap_indicator: (String::new(), "\\".to_string(), Style {fg: white.darker(), ..D!()}),
+            line_wrap_indicator: ("\\".to_string(), "\\".to_string(), Style {fg: white.darker(), ..D!()}),
 
             progress_bar: Style {fg: blue, bg: Color(30, 30, 30), ..D!()},
             scroll_bar_background: Style {fg: white.darker(), ..D!()},
@@ -223,6 +224,7 @@ impl Default for Palette {
 
             thread_breakpoint_hit: StyleAdjustment {add_fg: (100, 100, 100), add_bg: (10, 100, 10), ..D!()},
             thread_crash: StyleAdjustment {add_fg: (100, 100, 100), add_bg: (150, 50, 50), ..D!()},
+            breakpoint_error: StyleAdjustment {add_fg: (100, 100, 100), add_bg: (150, 50, 50), ..D!()},
        }
     }
 }
@@ -330,7 +332,7 @@ impl KeyBinds {
     }
 
     fn new(key_to_action: &[(KeyEx, KeyAction)], text_input_key_to_action: &[(KeyEx, KeyAction)]) ->  Self {
-        let mut r = KeyBinds {key_to_action: key_to_action.iter().cloned().collect(), text_input_key_to_action: text_input_key_to_action.iter().cloned().collect(), action_to_keys: HashMap::new(), vscroll_sensitivity: 1, hscroll_sensitivity: 10};
+        let mut r = KeyBinds {key_to_action: key_to_action.iter().cloned().collect(), text_input_key_to_action: text_input_key_to_action.iter().cloned().collect(), action_to_keys: HashMap::new(), vscroll_sensitivity: 8, hscroll_sensitivity: 20};
         // Order somewhat matters here: if there are multiple keys for the same action, we show only the first one in the hints window.
         // So here we add keys in the same order in which the keys were specified in the input, not in HashMap iteration order.
         for (key, action) in key_to_action {

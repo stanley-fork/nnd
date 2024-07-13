@@ -247,7 +247,7 @@ impl StyledText {
         self.num_lines()-lines.len() .. self.num_lines()
     }
 
-    // Adds the spans to the unclosed line, doesn't close it.
+    // Adds the spans to the unclosed line.
     pub fn import_spans(&mut self, from: &StyledText, spans: Range<usize>) {
         let start = self.spans.len();
         let offset = self.chars.len().wrapping_sub(from.spans[spans.start].0);
@@ -258,6 +258,30 @@ impl StyledText {
 
         let chars = from.spans[spans.start].0..from.spans[spans.end].0;
         self.chars.push_str(&from.chars[chars]);
+    }
+
+    // Extracts a given range of characters from the range of spans, not necessarily aligned. Adds to the unclosed line. Returns the range of spans.
+    pub fn import_substring(&mut self, from: &StyledText, spans: Range<usize>, mut byte_range: Range<usize>) -> Range<usize> {
+        let res_start = self.num_spans();
+        let start = from.spans[spans.start].0;
+        byte_range.end += start;
+        byte_range.start += start;
+        for span_idx in spans {
+            let span = from.spans[span_idx].0..from.spans[span_idx+1].0;
+            let span = span.start.max(byte_range.start)..span.end.min(byte_range.end);
+            if span.end <= span.start {
+                continue;
+            }
+            self.chars.push_str(&from.chars[span]);
+            self.close_span(from.spans[span_idx+1].1);
+        }
+        res_start..self.num_spans()
+    }
+
+    pub fn adjust_spans_style(&mut self, spans: Range<usize>, a: StyleAdjustment) {
+        for i in spans {
+            self.spans[i+1].1 = a.apply(self.spans[i+1].1);
+        }
     }
 
     pub fn unclose_line(&mut self) {

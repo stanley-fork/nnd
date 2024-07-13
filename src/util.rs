@@ -489,16 +489,16 @@ pub trait ByteRead : BufRead {
     fn read_path(&mut self) -> io::Result<PathBuf>;
 }
 impl<R: BufRead> ByteRead for R {
-    fn read_u8(&mut self) -> io::Result<u8> { let mut b = [0u8]; self.read(&mut b)?; Ok(b[0]) }
-    fn read_u16(&mut self) -> io::Result<u16> { let mut b = [0u8; 2]; self.read(&mut b)?; Ok(u16::from_le_bytes(b)) }
-    fn read_u32(&mut self) -> io::Result<u32> { let mut b = [0u8; 4]; self.read(&mut b)?; Ok(u32::from_le_bytes(b)) }
-    fn read_u64(&mut self) -> io::Result<u64> { let mut b = [0u8; 8]; self.read(&mut b)?; Ok(u64::from_le_bytes(b)) }
-    fn read_usize(&mut self) -> io::Result<usize> { let mut b = [0u8; 8]; self.read(&mut b)?; Ok(usize::from_le_bytes(b)) }
-    fn read_i8(&mut self) -> io::Result<i8> { let mut b = [0u8]; self.read(&mut b)?; Ok(b[0] as i8) }
-    fn read_i16(&mut self) -> io::Result<i16> { let mut b = [0u8; 2]; self.read(&mut b)?; Ok(i16::from_le_bytes(b)) }
-    fn read_i32(&mut self) -> io::Result<i32> { let mut b = [0u8; 4]; self.read(&mut b)?; Ok(i32::from_le_bytes(b)) }
-    fn read_i64(&mut self) -> io::Result<i64> { let mut b = [0u8; 8]; self.read(&mut b)?; Ok(i64::from_le_bytes(b)) }
-    fn read_isize(&mut self) -> io::Result<isize> { let mut b = [0u8; 8]; self.read(&mut b)?; Ok(isize::from_le_bytes(b)) }
+    fn read_u8(&mut self) -> io::Result<u8> { let mut b = [0u8]; self.read_exact(&mut b)?; Ok(b[0]) }
+    fn read_u16(&mut self) -> io::Result<u16> { let mut b = [0u8; 2]; self.read_exact(&mut b)?; Ok(u16::from_le_bytes(b)) }
+    fn read_u32(&mut self) -> io::Result<u32> { let mut b = [0u8; 4]; self.read_exact(&mut b)?; Ok(u32::from_le_bytes(b)) }
+    fn read_u64(&mut self) -> io::Result<u64> { let mut b = [0u8; 8]; self.read_exact(&mut b)?; Ok(u64::from_le_bytes(b)) }
+    fn read_usize(&mut self) -> io::Result<usize> { let mut b = [0u8; 8]; self.read_exact(&mut b)?; Ok(usize::from_le_bytes(b)) }
+    fn read_i8(&mut self) -> io::Result<i8> { let mut b = [0u8]; self.read_exact(&mut b)?; Ok(b[0] as i8) }
+    fn read_i16(&mut self) -> io::Result<i16> { let mut b = [0u8; 2]; self.read_exact(&mut b)?; Ok(i16::from_le_bytes(b)) }
+    fn read_i32(&mut self) -> io::Result<i32> { let mut b = [0u8; 4]; self.read_exact(&mut b)?; Ok(i32::from_le_bytes(b)) }
+    fn read_i64(&mut self) -> io::Result<i64> { let mut b = [0u8; 8]; self.read_exact(&mut b)?; Ok(i64::from_le_bytes(b)) }
+    fn read_isize(&mut self) -> io::Result<isize> { let mut b = [0u8; 8]; self.read_exact(&mut b)?; Ok(isize::from_le_bytes(b)) }
     fn read_slice(&mut self) -> io::Result<Vec<u8>> {
         let n = self.read_usize()?;
         // Don't unconditionally allocate the whole n bytes because it may be huge if the input contains garbage.
