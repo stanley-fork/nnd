@@ -634,7 +634,7 @@ pub fn format_value_recurse(v: &Value, expanded: bool, state: &mut EvalState, co
             Err(e) => styled_write!(out, palette.error, "<{}>", e),
         }
         Type::Array(a) => {
-            // TODO: Print as string if element is char. Hexdump (0x"1a74673bc67f") if element is 1-byte and HEX value flag is set.
+            // TODO: Hexdump (0x"1a74673bc67f") if element is 1-byte and HEX value flag is set.
             let inner_type = unsafe {&*a.type_};
             let inner_size = inner_type.calculate_size();
             let stride = if a.stride != 0 { a.stride } else { inner_size };
@@ -719,7 +719,7 @@ pub fn format_value_recurse(v: &Value, expanded: bool, state: &mut EvalState, co
                     // TODO: Print file+line instead of DIE offset.
                     styled_write!(out, palette.value_misc, "<{} @{:x}> ", t.t.kind_name(), t.die.0);
                 } else {
-                    let limit = 200;
+                    let limit = 100;
                     if v.flags.contains(ValueFlags::SHOW_TYPE_NAME) || t.name.len() <= limit {
                         styled_write!(out, palette.type_name, "{} ", t.name);
                     } else {

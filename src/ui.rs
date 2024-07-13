@@ -107,7 +107,7 @@ impl DebuggerUI {
     pub fn new() -> Self {
         let ui = UI::default();
         let mut state = UIState::default();
-        state.profiler_enabled = true;
+        //state.profiler_enabled = true;
         let layout = Self::default_layout(&state);
         // TODO: Load keys and colors from config file(s), do hot-reloading (for experimenting with colors quickly).
 

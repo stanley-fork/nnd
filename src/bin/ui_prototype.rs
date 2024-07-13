@@ -2750,7 +2750,7 @@ pub struct Column {
     pub auto_width: AutoSize, // Fixed, Text, Children, Remainder are supported
     width: usize,
     pos: isize,
-    // TODO: sortable: bool,
+    // sortable: bool,
 }
 impl Column {
     pub fn new(title: &'static str, auto_width: AutoSize) -> Self { Self {auto_width, title, width: str_width(title), pos: 0} }
@@ -2760,8 +2760,7 @@ impl Column {
 pub struct TableState {
     pub cursor: usize,
     pub scroll: isize,
-    // TODO: pub auto_tooltip: bool,
-    // TODO: sort_by: Vec<usize>,
+    // sort_by: Vec<usize>,
 }
 
 // For columns with auto_width = Text/Children, the width negotiation is a bit complicated:
@@ -4663,7 +4662,3 @@ fn main() -> Result<()> {
 
     Ok(())
 }
-
-// Plan:
-//  * figure out how to do the "stack truncated" thing in stack window; just make it a normal selectable row, to allow tooltip for full error message?
-//  * disassembly inline level lines - not gonna be clickable?

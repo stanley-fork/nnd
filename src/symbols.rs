@@ -1338,13 +1338,17 @@ impl SymbolsLoader {
                             Err(e) => if shard.warn.check(line!()) { eprintln!("warning: failed to demangle (1) vtable symtab entry '{}': {}", String::from_utf8_lossy(mangled), e); }
                             Ok(symbol) => match symbol.demangle(&cpp_demangle::DemangleOptions::default().recursion_limit(1000)) {
                                 Err(e) => if shard.warn.check(line!()) { eprintln!("warning: failed to demangle (2) vtable symtab entry '{}': {}", String::from_utf8_lossy(mangled), e); }
-                                Ok(name) if name.starts_with("{vtable(") && name.ends_with(")}") => {
-                                    let name = &name["{vtable(".len()..name.len()-")}".len()];
-                                    let name = shard.sym.misc_arena.add_str(name);
-                                    shard.vtables.push(VTableInfo {start: addr, end: addr + sym.st_size as usize, name, type_: None});
+                                Ok(name) if name.starts_with("{vtable(") => {
+                                    // It's either "{vtable(Foo)}" or "{vtable(Foo)} [.clone .3e570ba5df68adedf72ec05448f83d40]". AFAIU, the latter means it's a synthetic type that's not quite Foo; I guess we should still treat it as Foo.
+                                    let name = &name["{vtable(".len()..];
+                                    if let Some(end) = name.rfind(")}") {
+                                        let name = &name[..end];
+                                        let name = shard.sym.misc_arena.add_str(name);
+                                        shard.vtables.push(VTableInfo {start: addr, end: addr + sym.st_size as usize, name, type_: None});
+                                    } else {
+                                        if shard.warn.check(line!()) { eprintln!("error: unexpected demangled vtable name format, this is a bug: '{}' -> {}", String::from_utf8_lossy(mangled), name); }
+                                    }
                                 }
-                                // TODO: Handle the case name = "{vtable(X)} [.clone .3e570ba5df68adedf72ec05448f83d40]". AFAIU, this means it's a synthetic type that's not quite X; I guess we should still treat it as X.
-                                Ok(name) if name.starts_with("{vtable(") && name.ends_with("]") => (),
                                 Ok(name) => if shard.warn.check(line!()) { eprintln!("error: unexpected demangled vtable name format, this is a bug: '{}' -> {}", String::from_utf8_lossy(mangled), name); }
                             }
                         }

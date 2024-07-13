@@ -238,7 +238,6 @@ pub struct TableState {
     pub scroll: isize,
     pub scroll_to_cursor: bool,
     pub did_scroll_to_cursor: bool, // whether the latest finish() had a reason to auto-scroll (because of keyboard input or mouse click or because scroll_to_cursor was set from outside).
-    // TODO: pub auto_tooltip: bool,
     // TODO: sort_by: Vec<usize>,
 }
 impl TableState {

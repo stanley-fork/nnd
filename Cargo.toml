@@ -7,8 +7,13 @@ edition = "2021"
 panic = 'abort'
 
 [profile.release]
-debug = true
 panic = 'abort'
+
+[profile.dbgo]
+inherits = "release"
+debug = true
+debug-assertions = true
+overflow-checks = true
 
 [dependencies]
 memmap2 = "0.7" # for mmapping ELF files
