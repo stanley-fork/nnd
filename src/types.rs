@@ -123,7 +123,7 @@ pub struct StructType {
     pub fields_ptr: *const StructField,
     pub fields_len: usize,
 }
-impl Default for StructType { fn default() -> Self { Self {flags: StructFlags::empty(), fields_ptr: ptr::null(), fields_len: 0} } }
+impl Default for StructType { fn default() -> Self { let p: &'static [StructField] = &[]; Self {flags: StructFlags::empty(), fields_ptr: unsafe {p.as_ptr()}, fields_len: 0} } }
 impl Hash for StructType { fn hash<H: Hasher>(&self, state: &mut H) { self.flags.hash(state); self.fields().hash(state); } }
 impl PartialEq for StructType { fn eq(&self, other: &Self) -> bool { (self.flags, self.fields()).eq(&(other.flags, other.fields())) } }
 impl StructType {

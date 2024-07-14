@@ -146,7 +146,16 @@ pub fn reflect_meta_value(val: &Value, state: &mut EvalState, context: &EvalCont
     let mut builder = StructBuilder::default();
     match meta_t.t {
         Type::MetaType => {
-            let t: *const TypeInfo = unsafe {mem::transmute(val.val.blob_ref().unwrap().get_usize().unwrap())};
+            eprintln!("asdqwe A");
+            let b1 = val.val.blob_ref();
+            eprintln!("asdqwe B: {}", b1.is_some());
+            let b2 = b1.unwrap();
+            eprintln!("asdqwe C");
+            let b3 = b2.get_usize();
+            eprintln!("asdqwe D: {} {}", b3.is_ok(), b3.is_err());
+            let b4 = b3.unwrap();
+            eprintln!("asdqwe E");
+            let t: *const TypeInfo = unsafe {mem::transmute(b4)};
             let t = unsafe {&*t};
             let mut show_size = false;
             match &t.t {
@@ -371,12 +380,16 @@ fn resolve_discriminated_union(val: &Value, fields: &mut Vec<StructField>, conte
         }
         true
     });
-    if !found && has_default {
-        found = true;
-        fields.retain(|f| !f.flags.contains(FieldFlags::VARIANT));
+    if !found && !has_default {
+        return Ok(true);
     }
-    if found && !has_nonvariant {
-        fields.retain(|f| !f.flags.contains(FieldFlags::DISCRIMINANT));
+    let mut del = FieldFlags::empty();
+    if !has_nonvariant {
+        del.insert(FieldFlags::DISCRIMINANT);
     }
+    if found {
+        del.insert(FieldFlags::DEFAULT_VARIANT);
+    }
+    fields.retain(|f| !f.flags.intersects(del));
     Ok(true)
 }
