@@ -630,7 +630,7 @@ impl Debugger {
                                 let new_tid;
                                 {
                                     let mut t: pid_t = 0;
-                                    ptrace(libc::PTRACE_GETEVENTMSG, tid, 0, mem::transmute(&mut t), &mut self.prof.bucket)?;
+                                    ptrace(libc::PTRACE_GETEVENTMSG, tid, 0, &mut t as *mut pid_t as u64, &mut self.prof.bucket)?;
                                     new_tid = t;
                                 }
                                 if let Some(existing_thread) = self.threads.get(&new_tid) {

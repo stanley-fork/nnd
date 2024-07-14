@@ -180,7 +180,7 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
         }
         AST::TypeInfo => {
             let type_ = eval_type(expr, node.children[0], state, context)?;
-            Ok(Value {val: AddrOrValueBlob::Blob(ValueBlob::new(unsafe {mem::transmute(type_)})), type_: state.types.types_arena.add(TypeInfo {name: "type", size: 8, flags: TypeFlags::SIZE_KNOWN, t: Type::MetaType, ..Default::default()}), flags: ValueFlags::empty()})
+            Ok(Value {val: AddrOrValueBlob::Blob(ValueBlob::new(type_ as usize)), type_: state.types.types_arena.add(TypeInfo {name: "type", size: 8, flags: TypeFlags::SIZE_KNOWN, t: Type::MetaType, ..Default::default()}), flags: ValueFlags::empty()})
         }
         &AST::BinaryOperator(op) if op == BinaryOperator::Assign => {
             match &expr.ast[node.children[0].0].a {
@@ -419,7 +419,7 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                     return err!(TypeMismatch, "typeof() expects 1 argument, got {}", node.children.len());
                 }
                 let val = eval_expression(expr, node.children[0], state, context, true)?;
-                Ok(Value {val: AddrOrValueBlob::Blob(ValueBlob::new(unsafe {mem::transmute(val.type_)})), type_: state.types.types_arena.add(TypeInfo {name: "type", size: 8, flags: TypeFlags::SIZE_KNOWN, t: Type::MetaType, ..Default::default()}), flags: ValueFlags::empty()})
+                Ok(Value {val: AddrOrValueBlob::Blob(ValueBlob::new(val.type_ as usize)), type_: state.types.types_arena.add(TypeInfo {name: "type", size: 8, flags: TypeFlags::SIZE_KNOWN, t: Type::MetaType, ..Default::default()}), flags: ValueFlags::empty()})
             }
             // TODO: downcast() to explicitly downcast to concrete type (to be able to typeof() the result)
             // TODO: maybe pretty() to explicitly apply pretty-printers

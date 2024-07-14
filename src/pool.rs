@@ -92,7 +92,7 @@ impl<T> Pool<T> {
     }
 
     pub fn iter_mut(&mut self) -> PoolIterMut<T> {
-        PoolIterMut {pool: self, slot: 0}
+        PoolIterMut {iter: self.slots.iter_mut(), idx: 0, slot: 0}
     }
 }
 
@@ -117,9 +117,9 @@ impl<'a, T> Iterator for PoolIter<'a, T> {
     }
 }
 
-// Copy-pasta, yum.
 pub struct PoolIterMut<'a, T> where T: 'a {
-    pool: &'a mut Pool<T>,
+    iter: std::slice::IterMut<'a, Slot<T>>,
+    idx: usize,
     slot: usize,
 }
 
@@ -127,14 +127,16 @@ impl<'a, T: 'a> Iterator for PoolIterMut<'a, T> {
     type Item = (Id, &'a mut T);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut slot = self.slot;
-        while slot < self.pool.slots.len() && self.pool.slots[slot].val.is_none() {
-            slot += 1;
-        }
-        self.slot = slot + 1;
-        match self.pool.slots.get_mut(slot) {
-            None => None,
-            Some(s) => Some((Id {slot, seqno: s.seqno}, unsafe {std::mem::transmute(s.val.as_mut().unwrap())}))
+        loop {
+            let idx = self.idx;
+            self.idx += 1;
+            match self.iter.next() {
+                None => return None,
+                Some(slot) => match &mut slot.val {
+                    None => (),
+                    Some(val) => return Some((Id {slot: idx, seqno: slot.seqno}, val)),
+                }
+            }
         }
     }
 }

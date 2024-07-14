@@ -146,16 +146,7 @@ pub fn reflect_meta_value(val: &Value, state: &mut EvalState, context: &EvalCont
     let mut builder = StructBuilder::default();
     match meta_t.t {
         Type::MetaType => {
-            eprintln!("asdqwe A");
-            let b1 = val.val.blob_ref();
-            eprintln!("asdqwe B: {}", b1.is_some());
-            let b2 = b1.unwrap();
-            eprintln!("asdqwe C");
-            let b3 = b2.get_usize();
-            eprintln!("asdqwe D: {} {}", b3.is_ok(), b3.is_err());
-            let b4 = b3.unwrap();
-            eprintln!("asdqwe E");
-            let t: *const TypeInfo = unsafe {mem::transmute(b4)};
+            let t = val.val.blob_ref().unwrap().get_usize().unwrap() as *const TypeInfo;
             let t = unsafe {&*t};
             let mut show_size = false;
             match &t.t {
@@ -177,18 +168,18 @@ pub fn reflect_meta_value(val: &Value, state: &mut EvalState, context: &EvalCont
                 }
                 Type::Pointer(p) => {
                     if let Some((text, palette)) = &mut out {print_type_name(t, *text, *palette, 0);}
-                    builder.add_usize_field("type", unsafe {mem::transmute(p.type_)}, state.builtin_types.meta_type);
+                    builder.add_usize_field("type", p.type_ as usize, state.builtin_types.meta_type);
                 }
                 Type::Array(a) => {
                     if let Some((text, palette)) = &mut out {print_type_name(t, *text, *palette, 0);}
-                    builder.add_usize_field("type", unsafe {mem::transmute(a.type_)}, state.builtin_types.meta_type);
+                    builder.add_usize_field("type", a.type_ as usize, state.builtin_types.meta_type);
                 }
                 Type::Struct(s) => {
                     styled_write_maybe!(out, keyword, "{}", if s.flags.contains(StructFlags::UNION) {"union"} else {"struct"});
                     show_size = true;
                     let mut fields = StructBuilder::default();
                     for f in s.fields() {
-                        fields.add_usize_field(f.name, unsafe {mem::transmute(f)}, state.builtin_types.meta_field);
+                        fields.add_usize_field(f.name, f as *const StructField as usize, state.builtin_types.meta_field);
                     }
                     let fields = fields.finish("", val.flags, &mut state.types);
                     builder.add_field("fields", fields);
@@ -206,7 +197,7 @@ pub fn reflect_meta_value(val: &Value, state: &mut EvalState, context: &EvalCont
                     }
                     let items = items.finish("", val.flags, &mut state.types);
                     builder.add_field("items", items);
-                    builder.add_usize_field("type", unsafe {mem::transmute(e.type_)}, state.builtin_types.meta_type);
+                    builder.add_usize_field("type", e.type_ as usize, state.builtin_types.meta_type);
                 }
                 Type::MetaType | Type::MetaField => {
                     styled_write_maybe!(out, default, "{}", match &t.t { Type::MetaType => "type", Type::MetaField => "field", _ => panic!("huh") });
@@ -230,10 +221,10 @@ pub fn reflect_meta_value(val: &Value, state: &mut EvalState, context: &EvalCont
             builder.finish("", val.flags | ValueFlags::NO_UNWRAPPING_INTERNAL, &mut state.types)
         }
         Type::MetaField => {
-            let f: *const StructField = unsafe {mem::transmute(val.val.blob_ref().unwrap().get_usize().unwrap())};
+            let f = val.val.blob_ref().unwrap().get_usize().unwrap() as *const StructField;
             let f = unsafe {&*f};
             builder.add_str_field("name", f.name, &mut state.types, &state.builtin_types);
-            builder.add_usize_field("type", unsafe {mem::transmute(f.type_)}, state.builtin_types.meta_type);
+            builder.add_usize_field("type", f.type_ as usize, state.builtin_types.meta_type);
             if f.bit_offset % 8 == 0 {
                 styled_write_maybe!(out, default, "offset {}: ", f.bit_offset / 8);
                 builder.add_usize_field("offset", f.bit_offset / 8, state.builtin_types.u64_);

@@ -159,8 +159,8 @@ pub enum Type {
     Struct(StructType),
     Enum(EnumType),
     // *TypeInfo pointer, for inspecting types in the watch window. E.g. a MetaType value is returned from typeof() expression when evaluating watches.
-    // Only produced by expression interpreter, never appears in Symbols.
-    // Unlike Pointer, this pointer is in debugger's address space.
+    // Only produced by expression interpreter, never appears in Symbols. Unlike Pointer, this pointer is in debugger's address space.
+    // We cast pointers to bytes and back, which may stop being possible in rust in future. Maybe we'll have to add a designated pointer to ValueBlob or something.
     MetaType,
     // Similar to MetaType, but for *StructField.
     MetaField,
@@ -295,11 +295,11 @@ impl Types {
     pub fn find_by_name(&self, name: &str) -> Option<*const TypeInfo> {
         let i = self.sorted_type_names.strings.partition_point(|s| s.s < name.as_bytes());
         if self.sorted_type_names.strings.get(i).is_some_and(|s| s.s == name.as_bytes()) {
-            return Some(unsafe {mem::transmute(self.sorted_type_names.strings[i].id)});
+            return Some(self.sorted_type_names.strings[i].id as *const TypeInfo);
         }
         for s in &self.unsorted_type_names.strings {
             if s.s == name.as_bytes() {
-                return Some(unsafe {mem::transmute(s.id)});
+                return Some(s.id as *const TypeInfo);
             }
         }
         None

@@ -1728,7 +1728,7 @@ impl<'a> DwarfLoader<'a> {
                 return builtin_types.unknown;
             }
         };
-        unsafe {mem::transmute(offset.0)}
+        offset.0 as *const TypeInfo
     }
 
     fn parse_type_ref(&mut self, attr: &AttributeSpecification, tag: DwTag, cursor: &mut EntriesRaw<'a, 'a, SliceType>) -> Result<*const TypeInfo> {

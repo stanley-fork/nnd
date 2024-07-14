@@ -54,7 +54,7 @@ impl Arena {
     // Source: https://doc.rust-lang.org/std/cell/struct.UnsafeCell.html ("The precise Rust aliasing rules are somewhat in flux, but the main points are not contentious: [...]")
     pub fn add_mut<T>(&mut self, val: T) -> &mut T {
         assert!(!mem::needs_drop::<T>());
-        let r: &mut T = unsafe {mem::transmute(self.alloc(mem::size_of::<T>(), mem::align_of::<T>()).as_mut_ptr())};
+        let r: &mut T = unsafe {&mut *(self.alloc(mem::size_of::<T>(), mem::align_of::<T>()).as_mut_ptr() as *mut T)};
         *r = val;
         r
     }
@@ -200,7 +200,7 @@ impl<'a, T: 'a> Iterator for Iter<'a, T> {
                 self.offset = 0;
                 continue;
             }
-            let r: &'a T = unsafe {mem::transmute(&*chunk.data.add(self.offset))};
+            let r: &'a T = unsafe {&*(chunk.data.add(self.offset) as *const T)};
             self.offset += entry_size;
             return Some(r)
         }

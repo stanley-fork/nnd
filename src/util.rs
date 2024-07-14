@@ -128,7 +128,7 @@ impl TimerFD {
     pub fn read(&self) -> usize {
         loop {
             let mut res = 0usize;
-            let r = unsafe {libc::read(self.fd, mem::transmute(&mut res), 8)};
+            let r = unsafe {libc::read(self.fd, &mut res as *mut usize as *mut libc::c_void, 8)};
             if r < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                 continue;
             }
@@ -165,7 +165,7 @@ impl EventFD {
     pub fn read(&self) -> usize {
         loop {
             let mut res = 0usize;
-            let r = unsafe {libc::read(self.fd, mem::transmute(&mut res), 8)};
+            let r = unsafe {libc::read(self.fd, &mut res as *mut usize as *mut libc::c_void, 8)};
             if r < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                 continue;
             }
@@ -176,7 +176,7 @@ impl EventFD {
 
     pub fn write(&self, v: usize) {
         loop {
-            let r = unsafe {libc::write(self.fd, mem::transmute(&v), 8)};
+            let r = unsafe {libc::write(self.fd, &v as *const usize as *const libc::c_void, 8)};
             if r < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                 continue;
             }
