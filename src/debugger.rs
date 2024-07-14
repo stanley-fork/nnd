@@ -1369,14 +1369,15 @@ impl Debugger {
         loop {
             let idx = stack.frames.len();
 
-            if idx > 30000 {
+            if idx > 1000 {
                 return err!(ProcessState, "stack too deep");
             }
 
-            if !regs.has(RegisterIdx::Rip) {
-                return Ok(());
-            }
             let addr = regs.get_int(RegisterIdx::Rip).unwrap().0 as usize;
+            if addr == 0 {
+                // (I've seen this in MUSL's clone.s, which has bad unwind info.)
+                return err!(Dwarf, "zero return address");
+            }
             let pseudo_addr = if idx == 0 {addr} else {addr - 1};
             stack.subframes.push(StackSubframe {frame_idx: stack.frames.len(), function_idx: err!(MissingSymbols, "unwind failed"), ..Default::default()});
             stack.frames.push(StackFrame {addr, pseudo_addr, regs: regs.clone(), subframes: stack.subframes.len()-1..stack.subframes.len(), .. Default::default()});
@@ -1398,7 +1399,16 @@ impl Debugger {
                 return Ok(());
             }
 
-            regs = next_regs_result?;
+            let next_regs = next_regs_result?;
+            if !next_regs.has(RegisterIdx::Rip) {
+                return Ok(());
+            }
+            if next_regs.get_int(RegisterIdx::Rip).unwrap().0 as usize == addr && next_regs.has(RegisterIdx::Rsp) && regs.has(RegisterIdx::Rsp) && next_regs.get_int(RegisterIdx::Rsp).unwrap().0 == regs.get_int(RegisterIdx::Rsp).unwrap().0 {
+                // RIP and RSP didn't change, we'd almost certainly be stuck in a loop if we continue. I've seen this in MUSL's clone.s, which has bad unwind info.
+                return err!(Dwarf, "cycle");
+            }
+
+            regs = next_regs;
         }
     }
 

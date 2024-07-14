@@ -619,7 +619,8 @@ pub fn format_value_recurse(v: &Value, expanded: bool, state: &mut EvalState, co
                 return format_value_recurse(&Value {val: AddrOrValueBlob::Addr(x), type_: p.type_, flags: v.flags.inherit()}, expanded, state, context, out, names_out, palette, text_start, true);
             } else {
                 styled_write!(out, if expanded {palette.value_misc} else {palette.value}, "*0x{:x} ", x);
-                if x == 0 {
+                let t = unsafe {&*p.type_};
+                if x == 0 || (t.flags.contains(TypeFlags::SIZE_KNOWN) && t.size == 0) { // don't expand nullptr and void*
                     return (false, children);
                 }
                 if !expanded {
@@ -1145,7 +1146,7 @@ impl StructBuilder {
     pub fn add_blob_field(&mut self, name: &'static str, value: &[u8], type_: *const TypeInfo) {
         let prev_len = self.value_blob.len();
         self.value_blob.extend_from_slice(value);
-        self.fields.push(StructField {name, bit_offset: prev_len*8, bit_size: (self.value_blob.len() - prev_len)*8, flags: FieldFlags::empty(), type_});
+        self.fields.push(StructField {name, bit_offset: prev_len*8, bit_size: (self.value_blob.len() - prev_len)*8, flags: FieldFlags::empty(), type_, discr_value: 0});
     }
     pub fn add_field(&mut self, name: &'static str, value: Value) {
         let size = unsafe {(*value.type_).calculate_size()};

@@ -70,6 +70,13 @@ bitflags! { pub struct FieldFlags: u8 {
     const ARTIFICIAL = 0x4;
     // If bit_size was assigned. Otherwise use type_'s calculated size.
     const SIZE_KNOWN = 0x8;
+
+    // This is the discriminant field of a discriminated union (e.g. Rust enum).
+    const DISCRIMINANT = 0x10;
+    // Field of discriminated union. Active if the value of DISCRIMINANT field is equal to this field's discr_value.
+    const VARIANT = 0x20;
+    // Field of discriminated union. Active if no DISCRIMINATED fields are active.
+    const DEFAULT_VARIANT = 0x40;
 }}
 
 #[derive(Hash, PartialEq, Eq, Clone, Debug)]
@@ -79,6 +86,8 @@ pub struct StructField {
     pub bit_offset: usize,
     pub bit_size: usize,
     pub type_: *const TypeInfo,
+
+    pub discr_value: usize,
 }
 impl StructField {
     pub fn calculate_bit_size(&self) -> usize {
@@ -87,6 +96,20 @@ impl StructField {
         } else {
             unsafe {(*self.type_).calculate_size() * 8}
         }
+    }
+
+    // Prints non-internal flags in form readable to the user.
+    pub fn readable_flags(&self) -> String {
+        let mut s = String::new();
+        if self.flags.contains(FieldFlags::INHERITANCE) {s.push_str("inheritance | ");}
+        if self.flags.contains(FieldFlags::ARTIFICIAL) {s.push_str("artificial | ");}
+        if self.flags.contains(FieldFlags::DISCRIMINANT) {s.push_str("discriminant | ");}
+        if self.flags.contains(FieldFlags::VARIANT) {s.push_str("variant | ");}
+        if self.flags.contains(FieldFlags::DEFAULT_VARIANT) {s.push_str("default_variant | ");}
+        if !s.is_empty() {
+            s.replace_range(s.len()-3.., "");
+        }
+        s
     }
 }
 
@@ -314,6 +337,7 @@ impl Types {
 
 pub struct BuiltinTypes {
     pub void: *const TypeInfo,
+    pub void_pointer: *const TypeInfo,
     pub unknown: *const TypeInfo,
     pub u8_: *const TypeInfo,
     pub u16_: *const TypeInfo,
@@ -332,17 +356,19 @@ pub struct BuiltinTypes {
     pub meta_field: *const TypeInfo,
 }
 impl BuiltinTypes {
-    pub fn invalid() -> Self { Self {void: ptr::null(), unknown: ptr::null(), u8_: ptr::null(), u16_: ptr::null(), u32_: ptr::null(), u64_: ptr::null(), i8_: ptr::null(), i16_: ptr::null(), i32_: ptr::null(), i64_: ptr::null(), f32_: ptr::null(), f64_: ptr::null(), char8: ptr::null(), char32: ptr::null(), bool_: ptr::null(), meta_type: ptr::null(), meta_field: ptr::null()} }
+    pub fn invalid() -> Self { Self {void: ptr::null(), void_pointer: ptr::null(), unknown: ptr::null(), u8_: ptr::null(), u16_: ptr::null(), u32_: ptr::null(), u64_: ptr::null(), i8_: ptr::null(), i16_: ptr::null(), i32_: ptr::null(), i64_: ptr::null(), f32_: ptr::null(), f64_: ptr::null(), char8: ptr::null(), char32: ptr::null(), bool_: ptr::null(), meta_type: ptr::null(), meta_field: ptr::null()} }
 
     fn map<F: FnMut(*const TypeInfo) -> *const TypeInfo>(&self, mut f: F) -> Self {
-        Self {void: f(self.void), unknown: f(self.unknown), u8_: f(self.u8_), u16_: f(self.u16_), u32_: f(self.u32_), u64_: f(self.u64_), i8_: f(self.i8_), i16_: f(self.i16_), i32_: f(self.i32_), i64_: f(self.i64_), f32_: f(self.f32_), f64_: f(self.f64_), char8: f(self.char8), char32: f(self.char32), bool_: f(self.bool_), meta_type: f(self.meta_type), meta_field: f(self.meta_field)}
+        Self {void: f(self.void), void_pointer: f(self.void_pointer), unknown: f(self.unknown), u8_: f(self.u8_), u16_: f(self.u16_), u32_: f(self.u32_), u64_: f(self.u64_), i8_: f(self.i8_), i16_: f(self.i16_), i32_: f(self.i32_), i64_: f(self.i64_), f32_: f(self.f32_), f64_: f(self.f64_), char8: f(self.char8), char32: f(self.char32), bool_: f(self.bool_), meta_type: f(self.meta_type), meta_field: f(self.meta_field)}
     }
 
     fn create<F: FnMut(TypeInfo) -> *const TypeInfo>(mut f: F) -> Self {
         let primitive = |name, size, flags| TypeInfo {name, size, flags: TypeFlags::SIZE_KNOWN, t: Type::Primitive(flags), ..Default::default()};
+        let void = f(primitive("void", 0, PrimitiveFlags::UNSPECIFIED));
         Self {
             unknown: f(TypeInfo {name: "<unknown>", size: 8, flags: TypeFlags::SIZE_KNOWN, ..Default::default()}),
-            void: f(primitive("void", 0, PrimitiveFlags::UNSPECIFIED)),
+            void,
+            void_pointer: f(TypeInfo {size: 8, flags: TypeFlags::SIZE_KNOWN, t: Type::Pointer(PointerType {type_: void, flags: PointerFlags::empty()}), ..Default::default()}),
             u8_: f(primitive("u8", 1, PrimitiveFlags::empty())),
             u16_: f(primitive("u16", 2, PrimitiveFlags::empty())),
             u32_: f(primitive("u32", 4, PrimitiveFlags::empty())),

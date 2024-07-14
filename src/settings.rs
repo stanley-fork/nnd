@@ -17,6 +17,8 @@ pub struct Settings {
     pub stdin_file: Option<String>,
     pub stdout_file: Option<String>,
     pub stderr_file: Option<String>,
+
+    pub fixed_fps: bool, // render `fps` times per second even if nothing changes
 }
 
 impl Default for Settings {
@@ -31,6 +33,8 @@ impl Default for Settings {
         stdin_file: None,
         stdout_file: None,
         stderr_file: None,
+
+        fixed_fps: false,
     } }
 }
 
@@ -205,7 +209,7 @@ impl Default for Palette {
 
             code_statement: Style {fg: white, bg: dark_gray, ..D!()},
             code_inlined_site: Style {fg: white, bg: light_blue, ..D!()},
-            code_instruction_pointer_column: StyleAdjustment {add_bg: (0, 100, 0), add_modifier: Modifier::UNDERLINED, ..D!()},
+            code_instruction_pointer_column: StyleAdjustment {add_bg: (0, 100, 0), add_fg: (-600, -600, -600), add_modifier: Modifier::UNDERLINED, ..D!()},
             instruction_pointer: Style {fg: green, modifier: Modifier::BOLD, ..D!()},
             additional_instruction_pointer: Style {fg: blue, ..D!()},
             breakpoint: Style {fg: red, ..D!()},

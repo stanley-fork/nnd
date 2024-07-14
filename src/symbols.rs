@@ -1641,12 +1641,22 @@ struct SubfunctionEvent {
     sign: i8, // +1 - range start, -1 - range end
 }
 
+#[derive(Clone, Copy)]
+struct VariantInfo {
+    discriminant_die: DieOffset,
+    field_flags: FieldFlags, // VARIANT, DEFAULT_VARIANT, or empty
+    discr_value: usize,
+}
+
 struct LoaderStackEntry {
     tag: DwTag,
     scope_name_len: usize, // excluding current DIE
     // Indicates that we're not inside an anonymous namespace or function, so scope_name should be somewhat legit and can be used for deduplication.
     scope_name_is_linkable: bool,
+
     exact_type: *mut TypeInfo, // a real pointer (not DieOffset) to the type; non-null iff the *current* DIE is a type (struct/union/array/etc); not propagated to descendants, e.g. if there's a function inside the type, the type_ is unset inside the function
+    variant: Option<VariantInfo>, // if we're inside a discriminated union (e.g. Rust enum)
+
     // Address Range(s) of this unit/function/lexical-scope/inlined-function/etc. Used as the range for local variables (unless they have loclist ranges).
     pc_ranges: Vec<gimli::Range>,
     pc_ranges_depth: usize, // stack[pc_ranges_depth].pc_ranges is the actual value to use
@@ -1663,7 +1673,7 @@ struct LoaderStackEntry {
     subfunction_depth: usize,
     local_variables: Vec<LocalVariable>, // for current subfunction
 }
-impl Default for LoaderStackEntry { fn default() -> Self { Self {tag: DW_TAG_null, scope_name_len: 0, scope_name_is_linkable: true, exact_type: ptr::null_mut(), pc_ranges: Vec::new(), pc_ranges_depth: 0, function: usize::MAX, function_depth: 0, subfunction_events: Vec::new(), subfunction: usize::MAX, subfunction_depth: 0, local_variables: Vec::new()} } }
+impl Default for LoaderStackEntry { fn default() -> Self { Self {tag: DW_TAG_null, scope_name_len: 0, scope_name_is_linkable: true, exact_type: ptr::null_mut(), variant: None, pc_ranges: Vec::new(), pc_ranges_depth: 0, function: usize::MAX, function_depth: 0, subfunction_events: Vec::new(), subfunction: usize::MAX, subfunction_depth: 0, local_variables: Vec::new()} } }
 
 // The way tree traversal is currently implemented is kind of complicated and has a lot of boilerplate, in part because it's trying to be fast.
 // I wonder if there's a better way to organize this.
@@ -1690,6 +1700,7 @@ impl<'a> DwarfLoader<'a> {
         new.subfunction_depth = old.subfunction_depth;
 
         new.exact_type = ptr::null_mut();
+        new.variant = None;
         new.pc_ranges.clear();
         new.function = usize::MAX;
         new.subfunction_events.clear();
@@ -2143,7 +2154,7 @@ impl<'a> DwarfLoader<'a> {
 
                         if let Some(frame_base) = frame_base {
                             let var = LocalVariable {
-                                name_ptr: "<frame base>".as_ptr(), name_len: "<frame_base>".len() as u32, type_: self.loader.types.builtin_types.unknown, offset_and_flags: LocalVariable::pack_offset_and_flags(offset, LocalVariableFlags::FRAME_BASE),
+                                name_ptr: "#frame_base".as_ptr(), name_len: "#frame_base".len() as u32, type_: self.loader.types.builtin_types.void_pointer, offset_and_flags: LocalVariable::pack_offset_and_flags(offset, LocalVariableFlags::FRAME_BASE),
                                 expr: Expression(SliceType::default()), start: 0, len: 0};
                             self.add_variable_locations(&frame_base, &var, offset)?;
                         }
@@ -2331,7 +2342,14 @@ impl<'a> DwarfLoader<'a> {
                         if self.shard.warn.check(line!()) { eprintln!("warning: {} in {} is not supported", abbrev.tag(), self.stack[self.depth - 1].tag); }
                         cursor.skip_attributes(abbrev.attributes())?;
                     } else {
-                        let mut field = StructField {name: "", flags: FieldFlags::empty(), bit_offset: 0, bit_size: 0, type_: self.loader.types.builtin_types.unknown};
+                        let mut field = StructField {name: "", flags: FieldFlags::empty(), bit_offset: 0, bit_size: 0, type_: self.loader.types.builtin_types.unknown, discr_value: 0};
+                        if let Some(variant) = &self.stack[self.depth - 1].variant {
+                            if offset == variant.discriminant_die {
+                                field.flags.insert(FieldFlags::DISCRIMINANT);
+                            }
+                            field.flags.insert(variant.field_flags);
+                            field.discr_value = variant.discr_value;
+                        }
                         if abbrev.tag() == DW_TAG_inheritance {
                             field.flags.insert(FieldFlags::INHERITANCE);
                             field.name = "#base";
@@ -2484,11 +2502,71 @@ impl<'a> DwarfLoader<'a> {
                         cursor.skip_attributes(abbrev.attributes())?;
                 }
 
-                // TODO: Handle rust enums nicely. Currently we just add the discriminant and fields of all variants as fields of the union.
-                DW_TAG_variant_part | DW_TAG_variant => {
+                // Rust enum.
+                // The tree usually looks like this:
+                //   structure_type
+                //     variant_part - with DW_AT_discr pointing to the discriminant member
+                //       member - discriminant
+                //       variant - with DW_AT_discr_value
+                //         member
+                //       variant
+                //         member
+                //       ...
+                DW_TAG_variant_part => {
+                    // Applicable attributes:
+                    // Useful: discr
+                    // Other: accessibility, declaration, type
+                    let mut variant = VariantInfo {discriminant_die: DebugInfoOffset(0), field_flags: FieldFlags::empty(), discr_value: 0};
+                    for &attr in abbrev.attributes() {
+                        match attr.name() {
+                            DW_AT_discr => match cursor.read_attribute(attr)?.value() {
+                                AttributeValue::UnitRef(unit_offset) => variant.discriminant_die = unit_offset.to_debug_info_offset(&self.unit.header).unwrap(),
+                                v => if self.shard.warn.check(line!()) { eprintln!("warning: {} has unexpected form: {:?}", attr.name(), v); }
+                            }
+                            _ => cursor.skip_attributes(&[attr])?,
+                        }
+                    }
                     let t = self.stack[self.depth - 1].exact_type;
                     self.stack[self.depth].exact_type = t;
-                    cursor.skip_attributes(abbrev.attributes())?;
+                    self.stack[self.depth].variant = Some(variant);
+                }
+                DW_TAG_variant => {
+                    // Applicable attributes:
+                    // Useful: discr_value, discr_list
+                    // Other: accessibility, declaration
+                    let mut variant = self.stack[self.depth - 1].variant.clone();
+                    let mut found_discr = false;
+                    if let Some(variant) = &mut variant {
+                        for &attr in abbrev.attributes() {
+                            match attr.name() {
+                                DW_AT_discr_value => {
+                                    found_discr = true;
+                                    let v = cursor.read_attribute(attr)?.value();
+                                    if let Some(x) = v.udata_value().or_else(|| v.sdata_value().map(|x| x as u64)) {
+                                        variant.discr_value = x as usize;
+                                        variant.field_flags.insert(FieldFlags::VARIANT);
+                                    } else {
+                                        if self.shard.warn.check(line!()) { eprintln!("warning: {} has unexpected form: {:?}", attr.name(), v); }
+                                    }
+                                }
+                                // (I looked at one Rust binary, and there were no disct_list-s, so not supporting it yet.)
+                                DW_AT_discr_list => {
+                                    found_discr = true;
+                                    if self.shard.warn.check(line!()) { eprintln!("warning: DW_AT_discr_list is not supported"); }
+                                }
+                                _ => cursor.skip_attributes(&[attr])?,
+                            }
+                        }
+                        if !found_discr {
+                            variant.field_flags.insert(FieldFlags::DEFAULT_VARIANT);
+                        }
+                    } else {
+                        if self.shard.warn.check(line!()) { eprintln!("warning: variant is not inside variant_part @0x{:x}", offset.0); }
+                        cursor.skip_attributes(abbrev.attributes())?;
+                    }
+                    let t = self.stack[self.depth - 1].exact_type;
+                    self.stack[self.depth].exact_type = t;
+                    self.stack[self.depth].variant = variant;
                 }
 
                 // TODO: Function pointers and pointers to members.

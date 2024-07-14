@@ -100,6 +100,8 @@ fn main() {
                 Err(e) => eprintln!("error: {}", e),
             }
             return;
+        } else if let Some(_) = parse_arg(&mut args, "--fixed-fps", "", true) {
+            settings.fixed_fps = true;
         } else if print_help_chapter(&args[0], &all_args[0]) {
             process::exit(0);
         } else {
@@ -235,7 +237,6 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, command_line: Option<Vec<S
 
     let frame_ns = (1e9 / context.settings.fps) as usize;
     let render_timer = TimerFD::new();
-    // for fixed fps, do this here: render_timer.set(1, frame_ns), and remove other render_timer.set(...) calls
 
     // Timer for various periodic tasks.
     let periodic_timer = TimerFD::new();
@@ -278,6 +279,10 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, command_line: Option<Vec<S
     let mut pending_render = true;
     render_timer.set(1, 0);
 
+    if context.settings.fixed_fps {
+        render_timer.set(1, frame_ns);
+    }
+
     // The debugger.process_events() path of this loop should be kept light, it'll likely be the bottleneck for conditional breakpoints (including thread-specific breakpoints, including temporary breakpoints when stepping).
     loop {
         let mut events: [libc::epoll_event; 32] = unsafe { mem::zeroed() };
@@ -305,7 +310,7 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, command_line: Option<Vec<S
                 let significant = ui.buffer_input(&mut debugger.prof.bucket)?;
                 if !significant {
                     schedule_render = false;
-                } else if !pending_render {
+                } else if !pending_render && !context.settings.fixed_fps {
                     render_now = true;
                 }
             } else if fd == render_timer.fd {
@@ -356,7 +361,7 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, command_line: Option<Vec<S
             }
         }
 
-        if schedule_render && !pending_render {
+        if schedule_render && !pending_render && !context.settings.fixed_fps {
             pending_render = true;
             render_timer.set(frame_ns, 0);
         }

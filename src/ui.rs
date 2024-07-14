@@ -106,7 +106,7 @@ pub enum WindowType {
 impl DebuggerUI {
     pub fn new() -> Self {
         let ui = UI::default();
-        let mut state = UIState::default();
+        let state = UIState::default();
         //state.profiler_enabled = true;
         let layout = Self::default_layout(&state);
         // TODO: Load keys and colors from config file(s), do hot-reloading (for experimenting with colors quickly).
@@ -500,7 +500,7 @@ impl WatchesWindow {
         let (dwarf_context, _) = match self.eval_state.make_local_dwarf_eval_context(context, context.selected_subframe) {
             Ok(x) => x,
             Err(e) => {
-                self.tree.add(ValueTreeNode {value: Err(e), ..Default::default()});
+                self.tree.nodes[parent.0].value = Err(e);
                 return;
             }
         };
@@ -512,6 +512,10 @@ impl WatchesWindow {
         let mut idxs_per_name: HashMap<&str, usize> = HashMap::new();
         for v in dwarf_context.local_variables {
             if !v.range().contains(&(static_pseudo_addr)) {
+                continue;
+            }
+            if v.flags().contains(LocalVariableFlags::FRAME_BASE) {
+                // Pseudo-variable internal to eh_frame unwind mechanism. We don't list it here, but it's available as `#frame_base` in watch expressions.
                 continue;
             }
             let (value, dubious) = match eval_dwarf_expression(v.expr, &dwarf_context) {
@@ -531,7 +535,7 @@ impl WatchesWindow {
             for reg in RegisterIdx::all() {
                 if let Ok((v, dubious)) = regs.get_int(*reg) {
                     let l = styled_writeln!(self.tree.text, palette.default, "{}", reg);
-                    let value = Value {val: AddrOrValueBlob::Blob(ValueBlob::new(v as usize)), type_: self.eval_state.builtin_types.u64_, flags: ValueFlags::empty()};
+                    let value = Value {val: AddrOrValueBlob::Blob(ValueBlob::new(v as usize)), type_: self.eval_state.builtin_types.u64_, flags: ValueFlags::HEX};
                     self.tree.add(ValueTreeNode {name: l..l+1, value: Ok(value), dubious, identity: hash(&reg), parent, ..D!()});
                 }
             }
@@ -2115,11 +2119,11 @@ impl WindowContent for BinariesWindow {
             }
         }
 
-        let mut table = Table::new(mem::take(&mut self.table_state), ui, vec![Column::new("idx", AutoSize::Fixed(3)), Column::new("name", AutoSize::Remainder(1.0)), Column::new("file", AutoSize::Fixed(PrettySize::MAX_LEN))]);
+        let mut table = Table::new(mem::take(&mut self.table_state), ui, vec![Column::new("idx", AutoSize::Fixed(3)), Column::new("name", AutoSize::Remainder(1.0)), Column::new("offset", AutoSize::Fixed(12)), Column::new("file", AutoSize::Fixed(PrettySize::MAX_LEN))]);
         table.hide_cursor_if_unfocused = true;
         for (idx, id) in state.binaries.iter().enumerate() {
             let binary = debugger.symbols.get_if_present(id).unwrap();
-            let is_mapped = debugger.info.binaries.contains_key(id);
+            let mapped_binary = debugger.info.binaries.get(id);
             table.start_row(hash(id), ui);
 
             ui_writeln!(ui, default_dim, "{}", idx + 1);
@@ -2130,7 +2134,7 @@ impl WindowContent for BinariesWindow {
                 ui.cur_mut().axes[Axis::Y].flags.insert(AxisFlags::STACK);
 
                 // Path.
-                let style = if is_mapped {ui.palette.default} else {ui.palette.default_dim};
+                let style = if mapped_binary.is_some() {ui.palette.default} else {ui.palette.default_dim};
                 let l = styled_writeln!(ui.text, style, "{}", id.path);
                 ui.add(widget!().height(AutoSize::Text).flags(WidgetFlags::TEXT_TRUNCATION_ALIGN_RIGHT).text(l));
 
@@ -2173,6 +2177,11 @@ impl WindowContent for BinariesWindow {
                     ui.add(widget!().height(AutoSize::Text).text_lines(start..end));
                 }
             });
+
+            if let &Some(b) = &mapped_binary {
+                ui_writeln!(ui, default_dim, "{:>12x}", b.addr_map.static_to_dynamic(0) & 0xffffffffffff);
+            }
+            table.text_cell(ui);
 
             // ELF or unwind error/loading/stats.
             match &binary.elf {
@@ -3105,7 +3114,7 @@ impl CodeWindow {
 impl WindowContent for CodeWindow {
     fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
         let mut open_dialog = false;
-        // TODO: Move CloseTab logic into Tabs, next to reordering logic.
+        // TODO: Move CloseTab logic into Tabs, next to reordering logic. Also close tabs with middle click.
         for action in ui.check_keys(&[KeyAction::Open, KeyAction::CloseTab]) {
             match action {
                 KeyAction::Open if self.search_dialog.is_none() => open_dialog = true,
@@ -3375,7 +3384,7 @@ impl WindowContent for BreakpointsWindow {
         ]);
         table.hide_cursor_if_unfocused = true;
 
-        for action in ui.check_keys(&[KeyAction::DeleteRow, KeyAction::ToggleBreakpoint, KeyAction::DisableBreakpoint]) {
+        for action in ui.check_keys(&[KeyAction::DeleteRow, KeyAction::ToggleBreakpoint, KeyAction::DisableBreakpoint, KeyAction::Enter]) {
             let id = match &self.selected_breakpoint {
                 None => continue,
                 &Some(x) => x };
@@ -3384,8 +3393,8 @@ impl WindowContent for BreakpointsWindow {
                 Some(x) => x };
             match action {
                 KeyAction::DeleteRow => {debugger.remove_breakpoint(id);}
-                KeyAction::ToggleBreakpoint | KeyAction::DisableBreakpoint => {
-                    let enable = !breakpoint.enabled && action != KeyAction::DisableBreakpoint;
+                KeyAction::ToggleBreakpoint | KeyAction::DisableBreakpoint | KeyAction::Enter => {
+                    let enable = !breakpoint.enabled;
                     let r = debugger.set_breakpoint_enabled(id, enable);
                     report_result(state, &r);
                 }

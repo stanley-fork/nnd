@@ -5,17 +5,18 @@ use std::{mem, fmt::Write};
 // E.g. this function may turn an std::vector<int> into a *[int; 123], making it appear as an array both when printed whole
 // and when used in expression like v[10] (will index the array) or v._M_begin (will fail even if std::vector has field _M_begin).
 pub fn prettify_value(val: &Value, state: &mut EvalState, context: &EvalContext) -> Result<(Option<Value>, Option</*warning*/ Error>)> {
-    // Inline fields from base class, remove fields of size 0, unwrap single-field structs. Repeat to convergence.
+    // Inline fields from base class, remove fields of size 0, handle discriminated unions, unwrap single-field structs. Repeat to convergence.
     // Main practical cases to cover:
     //  * Unwrap nested boilerplate wrappers - structs with just one field. Common in Rust and C++.
     //    E.g. Atomic/atomic, Box/unique_ptr (and the crazy tuple nonsense C++ does inside unique_ptr, pair, etc),
-    //    NonzeroUsize, Pin, Rust's strong typedefs (I don't remember what they're called and don't have internet righ now, sorry).
+    //    NonzeroUsize, Pin, Rust's strong typedefs.
     //    This transformation automatically turns e.g. unique_ptr into a raw pointer, no separate pretty-printer needed.
     //  * Omit empty base class. Common in C++. Often combined with boilerplate wrappers.
     //  * Show base class's fields as if they're this class's fields. That's just what people are used to.
-    //     ** But if the base class has custom pretty-printer (e.g. it's a container), inlining its fields into this class will
+    //     ** But if the base class has custom pretty-printer (e.g. it's a container), inlining its fields into this class may
     //        prevent it from being pretty-printed. We should detect that and don't inline the fields in this case.
     //        If this class has no other fields, unwrapping will take precedence and pretty-printing will work automatically.
+    //  * For Rust enum, look at discriminant and keep only the field corresponding to the active variant.
 
     if val.flags.contains(ValueFlags::NO_UNWRAPPING_INTERNAL) {
         return Ok((None, None));
@@ -26,23 +27,25 @@ pub fn prettify_value(val: &Value, state: &mut EvalState, context: &EvalContext)
         Type::Struct(s) => s,
         _ => return Ok((None, None)),
     };
-    let (mut has_inheritance, mut has_vptr, mut empty_fields) = (false, false, 0usize);
+    let (mut has_inheritance, mut has_vptr, mut has_discriminant, mut empty_fields) = (false, false, false, 0usize);
     for f in s.fields() {
         has_inheritance |= f.flags.contains(FieldFlags::INHERITANCE);
+        has_discriminant |= f.flags.contains(FieldFlags::DISCRIMINANT);
         has_vptr |= is_field_vtable_ptr(f);
         if is_field_uninformative(f) {
             empty_fields += 1;
         }
     }
-    if !has_inheritance && !has_vptr && empty_fields == 0 && s.fields().len() != 1 {
+    if !has_inheritance && !has_vptr && !has_discriminant && empty_fields == 0 && s.fields().len() != 1 {
         // Fast path.
         return Ok((None, None));
     }
 
     let mut val = val.clone();
     let mut unwrap_limit = 100usize;
-    let mut warning = None;
+    let mut warning: Option<Error> = None;
 
+    // Downcast to concrete type.
     if has_inheritance || has_vptr {
         if let Some(off) = find_vtable_ptr_field_offset(val.type_) {
             val.flags.insert(ValueFlags::SHOW_TYPE_NAME);
@@ -53,7 +56,7 @@ pub fn prettify_value(val: &Value, state: &mut EvalState, context: &EvalContext)
             }
         }
     }
-    
+
     loop {
         unwrap_limit = unwrap_limit.saturating_sub(1);
 
@@ -64,49 +67,56 @@ pub fn prettify_value(val: &Value, state: &mut EvalState, context: &EvalContext)
         };
 
         let mut new_fields: Vec<StructField> = s.fields().iter().cloned().collect();
-        let mut temp_fields: Vec<StructField> = Vec::new();
-        let mut should_unwrap = false;
-        for fields_pass in 0..100 {
-            new_fields.retain(|f| !is_field_uninformative(f));
-            if new_fields.is_empty() {
-                break;
-            }
-            // Check for single-field struct before inlining base classes.
-            // This is the only reason why we do the field inlining in passes instead of as a more efficient DFS.
-            if new_fields.len() == 1 && !new_fields[0].flags.contains(FieldFlags::ARTIFICIAL) && unwrap_limit > 0 {
-                let field_val = get_struct_field(&val.val, &new_fields[0], context.memory)?;
-                val = Value {val: field_val, type_: new_fields[0].type_, flags: val.flags};
-                should_unwrap = true;
-                break;
-            }
 
-            mem::swap(&mut new_fields, &mut temp_fields);
-            new_fields.clear();
-            let mut changed = false;
-            for f in &temp_fields {
-                // TODO: When we have custom pretty-printers, check here that f's type doesn't have one, and don't inline if it does.
-                let mut inlined = false;
-                if f.flags.contains(FieldFlags::INHERITANCE) {
-                    let field_type = unsafe {&*f.type_};
-                    if let Type::Struct(field_struct) = &field_type.t {
-                        for mut ff in field_struct.fields().iter().cloned() {
-                            ff.bit_offset += f.bit_offset;
-                            new_fields.push(ff);
+        // For Rust enums, currently we report the active variant as a single field, without unwrapping. Otherwise the variant name wouldn't be reported.
+        // Maybe we should make format_value() recognize this and print such single-field struct as "Some(42)" instead of "{Some: 42}" (need to handle empty, tuple, and struct variants).
+        let is_discriminated_union = resolve_discriminated_union(&val, &mut new_fields, context, &mut warning)?;
+
+        if !is_discriminated_union {
+            let mut temp_fields: Vec<StructField> = Vec::new();
+            let mut should_unwrap = false;
+            for fields_pass in 0..100 {
+                new_fields.retain(|f| !is_field_uninformative(f));
+                if new_fields.is_empty() {
+                    break;
+                }
+                // Check for single-field struct before inlining base classes.
+                // This is the only reason why we do the field inlining in passes instead of as a more efficient DFS.
+                if new_fields.len() == 1 && !new_fields[0].flags.contains(FieldFlags::ARTIFICIAL) && unwrap_limit > 0 {
+                    let field_val = get_struct_field(&val.val, &new_fields[0], context.memory)?;
+                    val = Value {val: field_val, type_: new_fields[0].type_, flags: val.flags};
+                    should_unwrap = true;
+                    break;
+                }
+
+                mem::swap(&mut new_fields, &mut temp_fields);
+                new_fields.clear();
+                let mut changed = false;
+                for f in &temp_fields {
+                    // TODO: When we have custom pretty-printers, check here that f's type doesn't have one, and don't inline if it does.
+                    let mut inlined = false;
+                    if f.flags.contains(FieldFlags::INHERITANCE) {
+                        let field_type = unsafe {&*f.type_};
+                        if let Type::Struct(field_struct) = &field_type.t {
+                            for mut ff in field_struct.fields().iter().cloned() {
+                                ff.bit_offset += f.bit_offset;
+                                new_fields.push(ff);
+                            }
+                            inlined = true;
+                            changed = true;
                         }
-                        inlined = true;
-                        changed = true;
+                    }
+                    if !inlined {
+                        new_fields.push(f.clone());
                     }
                 }
-                if !inlined {
-                    new_fields.push(f.clone());
+                if !changed {
+                    break;
                 }
             }
-            if !changed {
-                break;
+            if should_unwrap {
+                continue;
             }
-        }
-        if should_unwrap {
-            continue;
         }
 
         let mut new_type = t.clone();
@@ -213,6 +223,7 @@ pub fn reflect_meta_value(val: &Value, state: &mut EvalState, context: &EvalCont
         Type::MetaField => {
             let f: *const StructField = unsafe {mem::transmute(val.val.blob_ref().unwrap().get_usize().unwrap())};
             let f = unsafe {&*f};
+            builder.add_str_field("name", f.name, &mut state.types, &state.builtin_types);
             builder.add_usize_field("type", unsafe {mem::transmute(f.type_)}, state.builtin_types.meta_type);
             if f.bit_offset % 8 == 0 {
                 styled_write_maybe!(out, default, "offset {}: ", f.bit_offset / 8);
@@ -225,8 +236,11 @@ pub fn reflect_meta_value(val: &Value, state: &mut EvalState, context: &EvalCont
             if f.flags.contains(FieldFlags::SIZE_KNOWN) && f.bit_size != unsafe {(*f.type_).calculate_size() * 8} {
                 builder.add_usize_field("bit_size", f.bit_size, state.builtin_types.u64_);
             }
+            builder.add_str_field("flags", &f.readable_flags(), &mut state.types, &state.builtin_types);
+            if f.flags.contains(FieldFlags::VARIANT) {
+                builder.add_usize_field("discriminant_value", f.discr_value, state.builtin_types.u64_);
+            }
             // TODO: Decl file+line.
-            builder.add_str_field("name", f.name, &mut state.types, &state.builtin_types);
             builder.finish("", val.flags, &mut state.types)
         }
         _ => panic!("expected meta type/field, got {}", meta_t.t.kind_name()),
@@ -300,4 +314,69 @@ fn downcast_to_concrete_type(val: &Value, vtable_ptr_field_offset: usize, contex
     let offset = context.memory.read_u64(vptr.saturating_sub(16))? as usize;
     let addr = (addr + vtable_ptr_field_offset).wrapping_add(offset);
     Ok(Value {val: AddrOrValueBlob::Addr(addr), type_, flags: val.flags})
+}
+
+fn resolve_discriminated_union(val: &Value, fields: &mut Vec<StructField>, context: &EvalContext, warning: &mut Option<Error>) -> Result<bool> {
+    let mut discriminant: Option<usize> = None;
+    for field in &mut *fields {
+        if field.flags.contains(FieldFlags::DISCRIMINANT) {
+            if discriminant.is_some() {
+                *warning = Some(error!(Dwarf, "multiple discriminants"));
+                return Ok(false);
+            }
+
+            let t = unsafe {&*field.type_};
+
+            let (size, signed) = match &t.t {
+                Type::Primitive(p) => (t.size, p.contains(PrimitiveFlags::SIGNED)),
+                _ if t.flags.contains(TypeFlags::SIZE_KNOWN) => (t.size, false),
+                _ => {
+                    *warning = Some(error!(Dwarf, "unexpected discriminant type"));
+                    return Ok(false);
+                }
+            };
+            if size > 8 {
+                *warning = Some(error!(Dwarf, "discriminant too big: {} bytes", size));
+                return Ok(false);
+            }
+
+            let val = get_struct_field(&val.val, field, context.memory)?;
+            let mut x = val.into_value(size, context.memory)?.get_usize()?;
+
+            if signed && size < 8 && size > 0 && x & 1 << (size*8-1) as u32 != 0 {
+                // Sign-extend (because that's what we do to discr_values when parsing DWARF).
+                x |= !((1usize << size*8)-1);
+            }
+
+            discriminant = Some(x);
+        }
+    }
+
+    let discriminant = match discriminant {
+        None => return Ok(false),
+        Some(x) => x };
+
+    let (mut found, mut has_default, mut has_nonvariant) = (false, false, false);
+    fields.retain(|f| {
+        if f.flags.contains(FieldFlags::DEFAULT_VARIANT) {
+            has_default = true;
+        } else if f.flags.contains(FieldFlags::VARIANT) {
+            if f.discr_value == discriminant {
+                found = true;
+            } else {
+                return false;
+            }
+        } else if !f.flags.contains(FieldFlags::DISCRIMINANT) {
+            has_nonvariant = true;
+        }
+        true
+    });
+    if !found && has_default {
+        found = true;
+        fields.retain(|f| !f.flags.contains(FieldFlags::VARIANT));
+    }
+    if found && !has_nonvariant {
+        fields.retain(|f| !f.flags.contains(FieldFlags::DISCRIMINANT));
+    }
+    Ok(true)
 }
