@@ -3,6 +3,11 @@ set -e
 
 BASEDIR=$(dirname "$0")
 
+if [ ! -d "$BASEDIR/build" ]
+then
+    mkdir "$BASEDIR/build"
+fi
+
 for name in `ls "$BASEDIR" | grep -P '\.c$'`
 do
     name_without_extension="${name%.*}"
