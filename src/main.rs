@@ -2,7 +2,7 @@
 #![allow(unused_variables)]
 #![allow(unused_imports)]
 use nnd::{*, elf::*, error::*, debugger::*, util::*, ui::*, log::*, process_info::*, symbols::*, symbols_registry::*, procfs::*, unwind::*, range_index::*, settings::*, context::*, executor::*, persistent::*, doc::*, terminal::*, common_ui::*};
-use std::{rc::Rc, mem, fs, os::fd::{FromRawFd}, io::Read, io, io::Write, panic, process, thread, thread::ThreadId, cell::UnsafeCell, ptr, pin::Pin, sync::Arc, str::FromStr};
+use std::{rc::Rc, mem, fs, os::fd::{FromRawFd}, io::Read, io, io::Write, panic, process, thread, thread::ThreadId, cell::UnsafeCell, ptr, pin::Pin, sync::Arc, str::FromStr, path::PathBuf};
 use libc::{self, STDIN_FILENO, pid_t};
 
 // Pipes written from corresponding signal handlers, read from main loop. We could use one pipe and write signal number to it, but it would break in the unlikely case when one signal fills up the whole pipe before the main loop drains it - then other signals would get lost. Probably not actually important.
@@ -84,7 +84,7 @@ fn main() {
             settings.stderr_file = Some(v);
         } else if let Some(_) = parse_arg(&mut args, "--continue", "-c", true) {
             settings.stop_on_initial_exec = false;
-        } else if let Some(m) = parse_arg(&mut args, "--mouse", "-m", false) { // TODO: document
+        } else if let Some(m) = parse_arg(&mut args, "--mouse", "-m", false) {
             settings.mouse_mode = match &m.to_lowercase()[..] {
                 "full" => MouseMode::Full,
                 "no-hover" => MouseMode::NoHover,
@@ -102,12 +102,17 @@ fn main() {
             return;
         } else if let Some(_) = parse_arg(&mut args, "--fixed-fps", "", true) {
             settings.fixed_fps = true;
+        } else if let Some(path) = parse_arg(&mut args, "--dir", "-d", false) {
+            settings.code_dirs.push(PathBuf::from(path));
         } else if print_help_chapter(&args[0], &all_args[0]) {
             process::exit(0);
         } else {
             eprintln!("unrecognized argument: '{}' (if it's the command to run, prepend '\\' to escape)", args[0]);
             process::exit(1);
         }
+    }
+    if settings.code_dirs.is_empty() {
+        settings.code_dirs.push(PathBuf::from(""));
     }
 
     if !args.is_empty() {

@@ -1,131 +1,93 @@
-use crate::{*, types::*, error::*, expr::*, util::*, settings::*, common_ui::*};
-use std::{mem, fmt::Write};
+use crate::{*, types::*, error::*, expr::*, util::*, settings::*, common_ui::*, procfs::*};
+use std::{mem, ptr, fmt::Write, borrow::Cow, io::Write as ioWrite};
+use bitflags::*;
 
 // Apply pretty-printers and other transformations to a value. Used both for printing and expression evaluaion.
 // E.g. this function may turn an std::vector<int> into a *[int; 123], making it appear as an array both when printed whole
 // and when used in expression like v[10] (will index the array) or v._M_begin (will fail even if std::vector has field _M_begin).
-pub fn prettify_value(val: &Value, state: &mut EvalState, context: &EvalContext) -> Result<(Option<Value>, Option</*warning*/ Error>)> {
-    // Inline fields from base class, remove fields of size 0, handle discriminated unions, unwrap single-field structs. Repeat to convergence.
-    // Main practical cases to cover:
-    //  * Unwrap nested boilerplate wrappers - structs with just one field. Common in Rust and C++.
-    //    E.g. Atomic/atomic, Box/unique_ptr (and the crazy tuple nonsense C++ does inside unique_ptr, pair, etc),
-    //    NonzeroUsize, Pin, Rust's strong typedefs.
-    //    This transformation automatically turns e.g. unique_ptr into a raw pointer, no separate pretty-printer needed.
-    //  * Omit empty base class. Common in C++. Often combined with boilerplate wrappers.
-    //  * Show base class's fields as if they're this class's fields. That's just what people are used to.
-    //     ** But if the base class has custom pretty-printer (e.g. it's a container), inlining its fields into this class may
-    //        prevent it from being pretty-printed. We should detect that and don't inline the fields in this case.
-    //        If this class has no other fields, unwrapping will take precedence and pretty-printing will work automatically.
-    //  * For Rust enum, look at discriminant and keep only the field corresponding to the active variant.
-
+pub fn prettify_value(val: &mut Cow<Value>, warning: &mut Option<Error>, state: &mut EvalState, context: &EvalContext) -> Result<()> {
     if val.flags.contains(ValueFlags::NO_UNWRAPPING_INTERNAL) {
-        return Ok((None, None));
+        return Ok(());
     }
 
-    let t = unsafe {&*val.type_};
-    let s = match &t.t {
+    // Plan:
+    //  1. Downcast to concrete type.
+    //  2. Unravel.
+    //  3. Resolve discriminated union.
+    //  4. Recognize containers.
+    //  5. Unwrap single-field struct.
+
+    let mut type_ = unsafe {&*val.type_};
+    let mut struct_ = match &type_.t {
         Type::Struct(s) => s,
-        _ => return Ok((None, None)),
+        _ => return Ok(()),
     };
-    let (mut has_inheritance, mut has_vptr, mut has_discriminant, mut empty_fields) = (false, false, false, 0usize);
-    for f in s.fields() {
-        has_inheritance |= f.flags.contains(FieldFlags::INHERITANCE);
-        has_discriminant |= f.flags.contains(FieldFlags::DISCRIMINANT);
-        has_vptr |= is_field_vtable_ptr(f);
-        if is_field_uninformative(f) {
-            empty_fields += 1;
-        }
-    }
-    if !has_inheritance && !has_vptr && !has_discriminant && empty_fields == 0 && s.fields().len() != 1 {
-        // Fast path.
-        return Ok((None, None));
-    }
 
-    let mut val = val.clone();
-    let mut unwrap_limit = 100usize;
-    let mut warning: Option<Error> = None;
+    let mut allow_full_unwrap = true;
 
-    // Downcast to concrete type.
-    if has_inheritance || has_vptr {
-        if let Some(off) = find_vtable_ptr_field_offset(val.type_) {
-            val.flags.insert(ValueFlags::SHOW_TYPE_NAME);
-            unwrap_limit = 0;
-            match downcast_to_concrete_type(&val, off, context) {
-                Ok(v) => val = v,
-                Err(e) => warning = Some(e),
+    if let Some(off) = find_vtable_ptr_field_offset(type_, struct_) {
+        match downcast_to_concrete_type(val, off, context) {
+            Ok(()) => {
+                allow_full_unwrap = false;
+                type_ = unsafe {&*val.type_};
+                struct_ = match &type_.t {
+                    Type::Struct(s) => s,
+                    _ => return Ok(()),
+                };
             }
+            Err(e) => *warning = Some(e),
         }
     }
 
-    loop {
-        unwrap_limit = unwrap_limit.saturating_sub(1);
+    let mut fields = Cow::Borrowed(struct_.fields());
+    let mut additional_names: Vec<&'static str> = Vec::new();
+    unravel_struct(&mut fields, Some(&mut additional_names));
 
-        let t = unsafe {&*val.type_};
-        let s = match &t.t {
-            Type::Struct(s) => s,
-            _ => return Ok((Some(val), warning)),
-        };
+    if resolve_discriminated_union(&val.val, &mut fields, warning, context)? {
+        allow_full_unwrap = false;
+    }
 
-        let mut new_fields: Vec<StructField> = s.fields().iter().cloned().collect();
+    match recognize_containers(val, &mut fields, &additional_names, warning, state, context) {
+        Ok(true) => return Ok(()),
+        Err(e) if !e.is_not_container() => *warning = Some(e),
+        _ => (),
+    }
 
-        // For Rust enums, currently we report the active variant as a single field, without unwrapping. Otherwise the variant name wouldn't be reported.
-        // Maybe we should make format_value() recognize this and print such single-field struct as "Some(42)" instead of "{Some: 42}" (need to handle empty, tuple, and struct variants).
-        let is_discriminated_union = resolve_discriminated_union(&val, &mut new_fields, context, &mut warning)?;
+    // Final level of unwrapping: replace the whole struct with its field. Unlike unravel_struct(), this works even if the field is not a struct.
+    // E.g. turns unique_ptr into plain pointer. Useful for things like strong typedefs, Box/unique_ptr, Atomic/atomic, NonzeroUsize, Pin, etc.
+    //
+    // If the field is a pointer to the same struct, don't unwrap it; it's probably an std::forward_list;
+    // if we unwrap, it gets formatted in a single line, as a long chain of addresses with no children, which is valid but confusing.
+    let is_pointer_to = |ptr: *const TypeInfo, inner: *const TypeInfo| -> bool {
+        let t = unsafe {&*ptr};
+        t.t.as_pointer().is_some_and(|p| p.type_ == inner)
+    };
+    if allow_full_unwrap && fields.len() == 1 && !is_pointer_to(fields[0].type_, type_) {
+        let field_val = get_struct_field(&val.val, &fields[0], context.memory)?;
+        let new_val = Value {val: field_val, type_: fields[0].type_, flags: val.flags};
+        *val = Cow::Owned(new_val);
+        return Ok(());
+    }
 
-        if !is_discriminated_union {
-            let mut temp_fields: Vec<StructField> = Vec::new();
-            let mut should_unwrap = false;
-            for fields_pass in 0..100 {
-                new_fields.retain(|f| !is_field_uninformative(f));
-                if new_fields.is_empty() {
-                    break;
-                }
-                // Check for single-field struct before inlining base classes.
-                // This is the only reason why we do the field inlining in passes instead of as a more efficient DFS.
-                if new_fields.len() == 1 && !new_fields[0].flags.contains(FieldFlags::ARTIFICIAL) && unwrap_limit > 0 {
-                    let field_val = get_struct_field(&val.val, &new_fields[0], context.memory)?;
-                    val = Value {val: field_val, type_: new_fields[0].type_, flags: val.flags};
-                    should_unwrap = true;
-                    break;
-                }
-
-                mem::swap(&mut new_fields, &mut temp_fields);
-                new_fields.clear();
-                let mut changed = false;
-                for f in &temp_fields {
-                    // TODO: When we have custom pretty-printers, check here that f's type doesn't have one, and don't inline if it does.
-                    let mut inlined = false;
-                    if f.flags.contains(FieldFlags::INHERITANCE) {
-                        let field_type = unsafe {&*f.type_};
-                        if let Type::Struct(field_struct) = &field_type.t {
-                            for mut ff in field_struct.fields().iter().cloned() {
-                                ff.bit_offset += f.bit_offset;
-                                new_fields.push(ff);
-                            }
-                            inlined = true;
-                            changed = true;
-                        }
-                    }
-                    if !inlined {
-                        new_fields.push(f.clone());
-                    }
-                }
-                if !changed {
-                    break;
-                }
-            }
-            if should_unwrap {
-                continue;
-            }
-        }
-
-        let mut new_type = t.clone();
+    // If we altered the set of fields, create a new struct type.
+    if let Cow::Owned(fields) = fields {
+        let val = val.to_mut();
+        assert!(type_ as *const TypeInfo == val.type_);
+        let mut new_type = type_.clone();
         let new_struct = new_type.t.as_struct_mut().unwrap();
-        let new_fields = state.types.fields_arena.add_slice(&new_fields);
+
+        let new_fields = state.types.fields_arena.add_slice(&fields);
         new_struct.set_fields(new_fields);
+
+        let mut w = state.types.unsorted_type_names.write();
+        write!(w, "{}#pretty", type_.name).unwrap();
+        new_type.name = w.finish_str(0);
+
         let new_type = state.types.types_arena.add(new_type);
-        return Ok((Some(Value {val: val.val.clone(), type_: new_type, flags: val.flags}), warning));
+        val.type_ = new_type;
     }
+
+    Ok(())
 }
 
 // Append a span to Option<&mut StyledText> if it's Some. The Option must be mut.
@@ -173,6 +135,10 @@ pub fn reflect_meta_value(val: &Value, state: &mut EvalState, context: &EvalCont
                 Type::Array(a) => {
                     if let Some((text, palette)) = &mut out {print_type_name(t, *text, *palette, 0);}
                     builder.add_usize_field("type", a.type_ as usize, state.builtin_types.meta_type);
+                }
+                Type::Slice(s) => {
+                    if let Some((text, palette)) = &mut out {print_type_name(t, *text, *palette, 0);}
+                    builder.add_usize_field("type", s.type_ as usize, state.builtin_types.meta_type);
                 }
                 Type::Struct(s) => {
                     styled_write_maybe!(out, keyword, "{}", if s.flags.contains(StructFlags::UNION) {"union"} else {"struct"});
@@ -259,8 +225,8 @@ fn is_field_uninformative(mut f: &StructField) -> bool {
 
         // If 1 byte, this may be the C++ thing where empty struct has size 1 instead of 0.
         // This is common for comparators and allocators.
-        // Here's a partial check for that.
-        // It doesn't cover the case where the struct has multiple uninformative fields (and may have size > 1 byte).
+        // Here's a partial check for that. It doesn't cover the case where the struct
+        // has multiple uninformative fields (and may have size > 1 byte), but that's rare.
         let t = unsafe {&*f.type_};
         f = match &t.t {
             Type::Struct(s) if s.fields().len() == 0 => return true,
@@ -271,11 +237,99 @@ fn is_field_uninformative(mut f: &StructField) -> bool {
     false
 }
 
+// Static transformation on a struct type that makes it more digestible:
+//  * Remove fields that carry no information, specifically empty structs possibly wrapped in some number of layers of single-field structs.
+//    Common in C++ for allocators (often as base class, which we consider a field).
+//  * If there's only one field, and it's a struct, inline that struct's fields as if they're this struct's fields.
+//    Very common for various wrappers in C++ and Rust.
+//  * Inline fields from base structs, as if they're this struct's fields.
+//  * Repeat to convergence.
+// This undoes a lot of cruft in standard libraries and makes watch values much more readable.
+// This is a shallow operation: it changes the set of fields, but doesn't change the types inside those fields.
+// When formatting a value, we apply prettification for each tree node, so end up with a deeply prettified tree.
+// When unwrapping single-field structs, the names of removed structs are added to additional_names; they're useful for container detection,
+// e.g. if the user has struct Foo {s: String}, and we inline the String, the container detection needs to know that there was a struct named "String" in there,
+// to distinguish between string and array of u8.
+// Returns the new set of fields if any changes were made, None otherwise.
+fn unravel_struct(fields: &mut Cow<[StructField]>, mut additional_names: Option<&mut Vec<&'static str>>) {
+    let (mut has_inheritance, mut empty_fields) = (false, 0usize);
+    for f in fields.iter() {
+        has_inheritance |= f.flags.contains(FieldFlags::INHERITANCE);
+        if is_field_uninformative(f) {
+            empty_fields += 1;
+        }
+    }
+    if !has_inheritance && empty_fields == 0 && fields.len() != 1 {
+        // Fast path.
+        return;
+    }
+
+    let mut temp_fields: Vec<StructField> = Vec::new();
+    for pass in 0..100 {
+        temp_fields.clear();
+
+        // Remove uninformative fields.
+        let mut changed = false;
+        for f in fields.iter() {
+            if is_field_uninformative(f) {
+                changed = true;
+            } else {
+                temp_fields.push(f.clone());
+            }
+        }
+        let mut res = match fields {
+            Cow::Borrowed(_) => Vec::new(),
+            Cow::Owned(v) => { // reuse memory
+                v.clear();
+                mem::take(v)
+            }
+        };
+
+        for f in &temp_fields {
+            // Inline field's fields if it's base class or the only field.
+            // This works correctly with Rust enums: the discriminant and all variants will be inlined and will work correctly
+            // (as long as we inline only one field this way; there should be no base classes in Rust, so we're fine).
+            let unwrap = temp_fields.len() == 1;
+            let mut inlined = false;
+            if f.flags.contains(FieldFlags::INHERITANCE) || unwrap {
+                let field_type = unsafe {&*f.type_};
+                if let Type::Struct(field_struct) = &field_type.t {
+                    for mut ff in field_struct.fields().iter().cloned() {
+                        ff.bit_offset += f.bit_offset;
+                        res.push(ff);
+                    }
+                    inlined = true;
+                    changed = true;
+                    if unwrap && !field_type.name.is_empty() {
+                        if let Some(v) = &mut additional_names {
+                            v.push(field_type.name);
+                        }
+                    }
+                }
+            }
+            if !inlined {
+                res.push(f.clone());
+            }
+        }
+
+        *fields = Cow::Owned(res);
+
+        if !changed {
+            break;
+        }
+    }
+}
+
 fn is_field_vtable_ptr(f: &StructField) -> bool {
     f.flags.contains(FieldFlags::ARTIFICIAL) && f.name.starts_with("_vptr$")
 }
 
-fn find_vtable_ptr_field_offset(t: *const TypeInfo) -> Option<usize> {
+fn find_vtable_ptr_field_offset(t: &TypeInfo, s: &StructType) -> Option<usize> {
+    // Quickly check if any inheritance is involved.
+    if !s.fields().iter().any(|f| f.flags.contains(FieldFlags::INHERITANCE) || is_field_vtable_ptr(f)) {
+        return None;
+    }
+
     // DFS through all base classes of this class. (E.g. imagine multiple inheritance where some of the base classes are nonvirtual.)
     let mut bases: Vec<(usize, *const TypeInfo)> = vec![(0, t)];
     for attempt in 0..100 {
@@ -297,7 +351,7 @@ fn find_vtable_ptr_field_offset(t: *const TypeInfo) -> Option<usize> {
     None
 }
 
-fn downcast_to_concrete_type(val: &Value, vtable_ptr_field_offset: usize, context: &EvalContext) -> Result<Value> {
+fn downcast_to_concrete_type(val: &mut Cow<Value>, vtable_ptr_field_offset: usize, context: &EvalContext) -> Result<()> {
     let Some(addr) = val.val.addr() else { return err!(Runtime, "struct address not known") };
     let vptr = context.memory.read_u64(addr + vtable_ptr_field_offset)? as usize;
     // Itanium ABI vtable layout is:
@@ -313,12 +367,15 @@ fn downcast_to_concrete_type(val: &Value, vtable_ptr_field_offset: usize, contex
     let Some(type_) = vtable.type_.clone() else { return err!(Dwarf, "unknown type: {}", vtable.name) };
     let offset = context.memory.read_u64(vptr.saturating_sub(16))? as usize;
     let addr = (addr + vtable_ptr_field_offset).wrapping_add(offset);
-    Ok(Value {val: AddrOrValueBlob::Addr(addr), type_, flags: val.flags})
+    let new_val = Value {val: AddrOrValueBlob::Addr(addr), type_, flags: val.flags | ValueFlags::SHOW_TYPE_NAME};
+    *val = Cow::Owned(new_val);
+    Ok(())
 }
 
-fn resolve_discriminated_union(val: &Value, fields: &mut Vec<StructField>, context: &EvalContext, warning: &mut Option<Error>) -> Result<bool> {
+// Removes fields representing inactive variants. If nothing looks broken, removes discriminant too.
+fn resolve_discriminated_union(val: &AddrOrValueBlob, fields: &mut Cow<[StructField]>, warning: &mut Option<Error>, context: &EvalContext) -> Result<bool> {
     let mut discriminant: Option<usize> = None;
-    for field in &mut *fields {
+    for field in fields.iter() {
         if field.flags.contains(FieldFlags::DISCRIMINANT) {
             if discriminant.is_some() {
                 *warning = Some(error!(Dwarf, "multiple discriminants"));
@@ -340,7 +397,7 @@ fn resolve_discriminated_union(val: &Value, fields: &mut Vec<StructField>, conte
                 return Ok(false);
             }
 
-            let val = get_struct_field(&val.val, field, context.memory)?;
+            let val = get_struct_field(&val, field, context.memory)?;
             let mut x = val.into_value(size, context.memory)?.get_usize()?;
 
             if signed && size < 8 && size > 0 && x & 1 << (size*8-1) as u32 != 0 {
@@ -357,7 +414,7 @@ fn resolve_discriminated_union(val: &Value, fields: &mut Vec<StructField>, conte
         Some(x) => x };
 
     let (mut found, mut has_default, mut has_nonvariant) = (false, false, false);
-    fields.retain(|f| {
+    fields.to_mut().retain(|f| {
         if f.flags.contains(FieldFlags::DEFAULT_VARIANT) {
             has_default = true;
         } else if f.flags.contains(FieldFlags::VARIANT) {
@@ -371,16 +428,302 @@ fn resolve_discriminated_union(val: &Value, fields: &mut Vec<StructField>, conte
         }
         true
     });
-    if !found && !has_default {
+    if found || has_default {
+        let mut delete_if = FieldFlags::empty();
+        if !has_nonvariant {
+            delete_if.insert(FieldFlags::DISCRIMINANT);
+        }
+        if found {
+            delete_if.insert(FieldFlags::DEFAULT_VARIANT);
+        }
+        fields.to_mut().retain(|f| !f.flags.intersects(delete_if));
+    }
+    Ok(true)
+}
+
+fn container_unravel_pointer_or_size_field(field: &StructField, offset: &mut usize) -> Result<&'static TypeInfo> {
+    // Non-64-bit or bit-packed not supported, I haven't seen them in std containers in C++ or Rust
+    // (except as part of more elaborate packing that needs separate logic anyway).
+    if field.calculate_bit_size() != 64 || field.bit_offset % 8 != 0 {
+        return err!(NotContainer, "");
+    }
+    *offset = field.bit_offset / 8;
+    let t = unsafe {&*field.type_};
+    if let Type::Struct(s) = &t.t {
+        // Container begin/end/size/capacity fields are often wrapped in more structs. Ugh. Peel them too.
+        let mut fields = Cow::Borrowed(s.fields());
+        unravel_struct(&mut fields, None);
+        if fields.len() == 1 && fields[0].bit_size == field.bit_size && fields[0].bit_offset % 8 == 0 {
+            *offset += fields[0].bit_offset / 8;
+            return Ok(unsafe {&*fields[0].type_});
+        }
+        err!(NotContainer, "")
+    } else {
+        Ok(t)
+    }
+}
+fn container_pointer_field(field: &StructField, inner_type: &mut *const TypeInfo, offset: &mut usize) -> Result<()> {
+    let t = container_unravel_pointer_or_size_field(field, offset)?;
+    if let Some(p) = t.t.as_pointer() {
+        if *inner_type != ptr::null() && *inner_type != p.type_ {
+            return err!(NotContainer, "");
+        }
+        *inner_type = p.type_;
+        return Ok(());
+    }
+    err!(NotContainer, "")
+}
+fn container_size_field(field: &StructField, offset: &mut usize) -> Result<()> {
+    let t = container_unravel_pointer_or_size_field(field, offset)?;
+    if let Some(p) = t.t.as_primitive() {
+        // Allow u64 and i64.
+        if p.intersects(PrimitiveFlags::FLOAT | PrimitiveFlags::CHAR | PrimitiveFlags::UNSPECIFIED) {
+            return err!(NotContainer, "");
+        }
+        return Ok(());
+    }
+    err!(NotContainer, "")
+}
+
+fn read_container_struct<'a>(value: &'a Value, scratch: &'a mut [u8], memory: &MemReader) -> Result<&'a [u8]> {
+    let t = unsafe {&*value.type_};
+    if t.size > scratch.len() {
+        return err!(NotContainer, "");
+    }
+    match &value.val {
+        AddrOrValueBlob::Blob(b) => Ok(b.as_slice()),
+        &AddrOrValueBlob::Addr(addr) => {
+            memory.read(addr, &mut scratch[..t.size])?;
+            Ok(&scratch[..t.size])
+        }
+    }
+}
+
+fn get_container_usize_field(offset: usize, slice: &[u8]) -> Result<usize> {
+    if offset + 8 > slice.len() {
+        return err!(NotContainer, "");
+    }
+    let mut a = [0u8; 8];
+    a.copy_from_slice(&slice[offset..offset+8]);
+    Ok(usize::from_le_bytes(a))
+}
+
+fn one_container_name_looks_like_string(s: &str) -> bool {
+    let end = s.find('<').unwrap_or(s.len());
+    let s = &s[..end];
+    // Hope no one will have a struct called "NotString".
+    s.find("str").is_some() || s.find("Str").is_some()
+}
+
+fn container_name_looks_like_string(t: &TypeInfo, additional_names: &[&str]) -> bool {
+    if one_container_name_looks_like_string(t.name) {
+        return true;
+    }
+    additional_names.iter().any(|s| one_container_name_looks_like_string(*s))
+}
+
+fn trim_field_name(mut name: &str) -> &str {
+    if name.starts_with("_M_") {
+        name = &name[3..];
+    } else if name.starts_with("c_") {
+        name = &name[3..];
+    }
+    while name.starts_with("_") {
+        name = &name[1..];
+    }
+    while name.ends_with("_") {
+        name = &name[..name.len()-1];
+    }
+    name
+}
+
+// Rust RawVec: {ptr: *T, cap: usize}
+fn recognize_raw_vec(type_: *const TypeInfo, inner_type: &mut *const TypeInfo, out_ptr_offset: &mut usize, out_cap_offset: &mut usize) -> Result<()> {
+    let type_ = unsafe {&*type_};
+    if type_.size != 16 {
+        return err!(NotContainer, "");
+    }
+    if let Type::Struct(s) = &type_.t {
+        let mut fields = Cow::Borrowed(s.fields());
+        unravel_struct(&mut fields, None);
+        if fields.len() != 2 {
+            return err!(NotContainer, "");
+        }
+        let mut found = 0usize;
+        for f in fields.iter() {
+            if f.bit_offset % 8 != 0 {
+                return err!(NotContainer, "");
+            }
+            match trim_field_name(f.name) {
+                "ptr" => {
+                    found |= 1;
+                    container_pointer_field(f, inner_type, out_ptr_offset)?;
+                }
+                "cap" => {
+                    found |= 2;
+                    container_size_field(f, out_cap_offset)?;
+                }
+                _ => return err!(NotContainer, ""),
+            }
+        }
+        if found == 3 {
+            return Ok(());
+        }
+    }
+    err!(NotContainer, "")
+}
+
+// Fields we're looking for to recognize standard library containers.
+bitflags! { pub struct ContainerFields: u64 {
+    const BEGIN = 0x1;
+    const END = 0x2;
+    const END_OF_STORAGE = 0x4;
+    const LEN = 0x8;
+    const CAPACITY = 0x10;
+    const DATA = 0x20;
+    const PTR = 0x40;
+    const STR = 0x80;
+    const REFCOUNT = 0x100;
+    const BUF = 0x200;
+    const HEAD = 0x400;
+}}
+const CONTAINER_FIELD_NAMES: [(&'static str, ContainerFields); 20] = [
+    ("begin", ContainerFields::BEGIN),
+    ("start", ContainerFields::BEGIN),
+    ("data_ptr", ContainerFields::BEGIN),
+    ("end", ContainerFields::END),
+    ("finish", ContainerFields::END),
+    ("end_of_storage", ContainerFields::END_OF_STORAGE),
+    ("end_cap", ContainerFields::END_OF_STORAGE),
+    ("len", ContainerFields::LEN),
+    ("length", ContainerFields::LEN),
+    ("size", ContainerFields::LEN),
+    ("extent", ContainerFields::LEN),
+    ("cap", ContainerFields::CAPACITY),
+    ("capacity", ContainerFields::CAPACITY),
+    ("data", ContainerFields::DATA),
+    ("ptr", ContainerFields::PTR),
+    ("str", ContainerFields::STR),
+    ("refcount", ContainerFields::REFCOUNT),
+    ("ctrl", ContainerFields::REFCOUNT),
+    ("buf", ContainerFields::BUF),
+    ("head", ContainerFields::HEAD),
+];
+
+// Guess the common C++ and Rust containers. Turn them into slices/arrays/pointers as needed.
+// The input Value already went through do_general_transformations(), so wrappers and inheritance are mostly gone.
+// Returns true if the whole Value was replaced and doesn't need any further transformations.
+// May modify `fields` and return false, e.g. remove refcount field from shared_ptr expecting the caller to unwrap the remaining single-field struct into a plain pointer.
+// Returning NotContainer error is equivalent to Ok(false) - just for convenience.
+pub fn recognize_containers(val: &mut Cow<Value>, fields: &mut Cow<[StructField]>, additional_names: &[&str], warning: &mut Option<Error>, state: &mut EvalState, context: &EvalContext) -> Result<bool> {
+    let t = unsafe {&*val.type_};
+    let language = match t.language {
+        LanguageFamily::Internal => return Ok(false),
+        LanguageFamily::Rust => LanguageFamily::Rust,
+        LanguageFamily::Cpp | LanguageFamily::Other | LanguageFamily::Unknown => LanguageFamily::Cpp,
+    };
+
+    // We recognize containers in a duck-typed way, by approximate field names, after do_general_transformations().
+    // This way we're not too sensitive to small changes in implementation, and sometimes recognize custom containers along the way.
+    // This may have some false positives, but that's not catastrophic, the user can always use .#r to see raw struct.
+
+    const max_fields: usize = 5;
+    if fields.len() > max_fields {
+        return Ok(false);
+    }
+
+    // Map field names to a bitset. If there are any unrecognized names, assume it's not a container.
+    // We should make this part reasonably fast.
+    let mut seen_fields = ContainerFields::empty();
+    let mut field_kinds = [ContainerFields::empty(); max_fields];
+    for (i, f) in fields.iter().enumerate() {
+        let name = trim_field_name(f.name);
+        let mut found = false;
+        for &(n, f) in &CONTAINER_FIELD_NAMES {
+            if name == n {
+                found = true;
+                field_kinds[i] = f;
+                seen_fields.insert(f);
+                break;
+            }
+        }
+        if !found {
+            return Ok(false);
+        }
+    }
+
+    // Slice or vector.
+    // Something like: {start: *T, len: usize} or {begin: *T, end: *T, end_of_storage: *T}, or {buf: {ptr: *T, cap: usize}, len: usize}.
+    let begin_like: ContainerFields = ContainerFields::BEGIN | ContainerFields::DATA | ContainerFields::PTR | ContainerFields::STR | ContainerFields::BUF;
+    let len_like: ContainerFields = ContainerFields::END | ContainerFields::LEN;
+    let capacity_like: ContainerFields = ContainerFields::END_OF_STORAGE | ContainerFields::CAPACITY;
+    if seen_fields.intersects(begin_like) && seen_fields.intersects(len_like) && (begin_like | len_like | capacity_like).contains(seen_fields) {
+        // Find field offsets.
+        let (mut begin_field, mut end_field, mut len_field, mut end_of_storage_field, mut capacity_field) = (usize::MAX, usize::MAX, usize::MAX, usize::MAX, usize::MAX);
+        let mut inner_type: *const TypeInfo = ptr::null();
+        for (i, f) in fields.iter().enumerate() {
+            if field_kinds[i] == ContainerFields::BUF {
+                if f.bit_offset % 8 != 0 {
+                    return Ok(false);
+                }
+                recognize_raw_vec(f.type_, &mut inner_type, &mut begin_field, &mut capacity_field)?;
+                begin_field += f.bit_offset / 8;
+                capacity_field += f.bit_offset / 8;
+                continue;
+            }
+            if begin_like.contains(field_kinds[i]) {
+                container_pointer_field(f, &mut inner_type, &mut begin_field)?;
+                continue;
+            }
+            match field_kinds[i] {
+                ContainerFields::END => container_pointer_field(f, &mut inner_type, &mut end_field)?,
+                ContainerFields::END_OF_STORAGE => container_pointer_field(f, &mut inner_type, &mut end_of_storage_field)?,
+                ContainerFields::LEN => container_size_field(f, &mut len_field)?,
+                ContainerFields::CAPACITY => container_size_field(f, &mut capacity_field)?,
+                _ => panic!("huh"),
+            }
+        }
+        let inner_size = (unsafe {&*inner_type}).calculate_size();
+
+        // Read the struct into temp buffer (instead of reading fields one by one using multiple syscalls).
+        let mut scratch = [0u8; 40];
+        let slice = read_container_struct(val, &mut scratch, &context.memory)?;
+
+        // Parse the field values.
+        let start = get_container_usize_field(begin_field, slice)?;
+        let len = if len_field != usize::MAX {
+            get_container_usize_field(len_field, slice)?
+        } else {
+            if inner_size == 0 {
+                *warning = Some(error!(NotContainer, "element size is 0"));
+                return Ok(false);
+            }
+            let end = get_container_usize_field(end_field, slice)?;
+            if end < start {
+                *warning = Some(error!(ProcessState, "end < start"));
+                return Ok(false);
+            }
+            let bytes = end - start;
+            if bytes % inner_size != 0 {
+                *warning = Some(error!(ProcessState, "slice size not divisible by element size"));
+                return Ok(false);
+            }
+            bytes / inner_size
+        };
+
+        // Guess whether this is a string.
+        let mut flags = SliceFlags::empty();
+        if inner_size == 1 && container_name_looks_like_string(t, additional_names) {
+            flags.insert(SliceFlags::UTF_STRING);
+        }
+
+        // Return a slice.
+        let type_ = state.types.add_slice(inner_type, flags);
+        let v = AddrOrValueBlob::Blob(ValueBlob::from_two_usizes([start, len]));
+        let new_val = Value {val: v, type_, flags: val.flags};
+        *val = Cow::Owned(new_val);
         return Ok(true);
     }
-    let mut del = FieldFlags::empty();
-    if !has_nonvariant {
-        del.insert(FieldFlags::DISCRIMINANT);
-    }
-    if found {
-        del.insert(FieldFlags::DEFAULT_VARIANT);
-    }
-    fields.retain(|f| !f.flags.intersects(del));
-    Ok(true)
+
+    Ok(false)
 }

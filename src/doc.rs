@@ -15,10 +15,12 @@ sudo {0} -p pid   - attach to an existing process
 You may need to `cd` to the directory with the source code in order for the debugger to find the source code.
 (Specifically, this is needed if (a) the debug info don't contain absolute paths, or (b) the source code is at a different absolute path than when the program was built; e.g. it was built on some CI server.)
 
-Additional arguments (not available with -p):
+Additional arguments:
 --stdin/--stdout/--stderr path   - redirect stdin/stdout/stderr to file
 --tty path   - equivalent to --stdin path --stdout path, see --help-tty
 -c   - don't pause on startup, continue the program immediately (similar to pressing 'c' right after startup)
+-d path   - directory in which to look for source code; can be specified multiple times; default: current directory
+-m full|no-hover|disabled   - mouse mode; no-hover to react only to clicking and dragging, disabled to disable mouse altogether
 --help   - show this help message; see below for more help pages
 
 Documentation chapters:

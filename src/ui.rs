@@ -756,12 +756,12 @@ impl WatchesWindow {
                     ui.should_redraw = true;
                 }
 
-                let arrow = if !node.has_children {
-                    ' '
-                } else if node.expanded {
+                let arrow = if node.expanded {
                     '▾'
-                } else {
+                } else if node.has_children {
                     '▸'
+                } else {
+                    ' '
                 };
                 if node.has_children && node.expanded && node.depth < self.max_indent {
                     // Draw the line.
@@ -776,9 +776,6 @@ impl WatchesWindow {
                     };
                     ui.add(widget!().text(line).flags(WidgetFlags::REPEAT_TEXT_VERTICALLY));
                 } else {
-                    // Draw only an arrow, or a ' ' if the node doesn't have children.
-                    // A node can be expanded even if it doesn't have children, to enable line wrap. We currently don't have any indicator this, but still draw a clickable ' ' as a sort of secret feature.
-                    // Would be nice to detect that the text doesn't fit and show some special kind of arrow instead of ' ' in that case.
                     let s = ui.palette.default;
                     ui.cur_mut().draw_fill = Some((arrow, s));
                 }
@@ -882,10 +879,11 @@ impl WindowContent for WatchesWindow {
                 None
             };
             match action {
+                // We allow expanding even nodes without children, to enable line wrapping. Currently we have no indication of that, would be nice to check whether the text fits and allow expanding only if it doesn't.
                 KeyAction::CursorRight => {self.expanded_nodes.insert(node.identity);}
                 KeyAction::CursorLeft => {
                     self.expanded_nodes.remove(&node.identity);
-                    if node.depth > 0 && (!node.expanded || !node.has_children) {
+                    if node.depth > 0 && !node.expanded {
                         self.expanded_nodes.remove(&self.tree.nodes[node.parent.0].identity);
                     }
                 }
@@ -2739,79 +2737,99 @@ impl CodeWindow {
             return res;
         }
 
-        // Search for the file in all suffixes of the path, in case the code is in a different place from where the binary was built, or we're in subdirectory (e.g. build command was run from foo/build/, and we're in foo/src/).
-        // This is kind of sketchy, but seems really useful and hopefully not too slow.
-        let components: Vec<path::Component> = path_in_symbols.components().collect();
-        for start_idx in 0..components.len().max(1) {
-            let path_to_try: PathBuf = if start_idx == 0 {
-                // Make sure to try the original path, in case components() -> collect() doesn't roundtrip exactly.
-                path_in_symbols.to_owned()
-            } else {
-                components[start_idx..].iter().collect()
-            };
-            let mut file = match File::open(&path_to_try) {
-                Ok(f) => f,
-                Err(e) => continue,
-            };
+        match Self::find_file(path_in_symbols, &debugger.context.settings.code_dirs) {
+            Some((mut file, path)) => {
+                res.local_path = match std::fs::canonicalize(&path) {
+                    Ok(p) => p,
+                    Err(_) => path
+                };
 
-            res.local_path = match std::fs::canonicalize(&path_to_try) {
-                Ok(p) => p,
-                Err(_) => path_to_try.clone() };
+                write!(res.header.chars, "{}", res.local_path.to_string_lossy()).unwrap();
+                res.header.close_span(palette.filename);
+                res.header.close_line();
 
-            write!(res.header.chars, "{}", res.local_path.to_string_lossy()).unwrap();
-            res.header.close_span(palette.filename);
-            res.header.close_line();
-
-            match Self::read_and_format_file(&mut file, debugger, &mut res, path_in_symbols, palette) {
-                Ok((len, md5)) => {
-                    let mut warn = true;
-                    if version.size != 0 && version.size as usize != len {
-                        write!(res.header.chars, "file doesn't match debug symbols (different size: {} vs {})", len, version.size).unwrap();
-                    } else if version.md5.is_some() && version.md5 != Some(md5) {
-                        write!(res.header.chars, "file doesn't match debug symbols (md5 mismatch)").unwrap();
-                    } else {
-                        // We don't check modification time because it's usually not preserved by version control systems, so the check would only work if the binary was built locally.
-                        warn = false;
+                match Self::read_and_format_file(&mut file, debugger, &mut res, path_in_symbols, palette) {
+                    Ok((len, md5)) => {
+                        let mut warn = true;
+                        if version.size != 0 && version.size as usize != len {
+                            write!(res.header.chars, "file doesn't match debug symbols (different size: {} vs {})", len, version.size).unwrap();
+                        } else if version.md5.is_some() && version.md5 != Some(md5) {
+                            write!(res.header.chars, "file doesn't match debug symbols (md5 mismatch)").unwrap();
+                        } else {
+                            // We don't check modification time because it's usually not preserved by version control systems, so the check would only work if the binary was built locally.
+                            warn = false;
+                        }
+                        if warn {
+                            res.header.close_span(palette.warning);
+                            res.header.close_line();
+                        }
                     }
-                    if warn {
-                        res.header.close_span(palette.warning);
+                    Err(e) => {
+                        write!(res.header.chars, "{}", e).unwrap();
+                        res.header.close_span(palette.error);
                         res.header.close_line();
+                        res.text.clear();
                     }
-                }
-                Err(e) => {
-                    write!(res.header.chars, "{}", e).unwrap();
-                    res.header.close_span(palette.error);
-                    res.header.close_line();
-                    res.text.clear();
                 }
             }
+            None => {
+                let path_str = path_in_symbols.to_string_lossy();
+                write!(res.header.chars, "{}", path_str).unwrap();
+                res.header.close_span(palette.default);
+                res.header.close_line();
+                if let Some(url) = rust_fake_path_to_url(&path_str) {
+                    write!(res.header.chars, "can be found here:").unwrap();
+                    res.header.close_span(palette.default_dim);
+                    res.header.close_line();
+                    
+                    write!(res.header.chars, "{}", url).unwrap();
+                    res.header.close_span(palette.url);
+                    res.header.close_line();
+                } else {
+                    write!(res.header.chars, "file not found (tried all suffixes of this path)").unwrap();
+                    res.header.close_span(palette.default_dim);
+                    res.header.close_line();
+                }
 
-            return res;
+                // Make a ghost file by adding LineInfo markers to empty space.
+                let mut empty: &[u8] = &[];
+                Self::read_and_format_file(&mut empty, debugger, &mut res, path_in_symbols, palette).unwrap();
+            }
         }
-
-        let path_str = path_in_symbols.to_string_lossy();
-        write!(res.header.chars, "{}", path_str).unwrap();
-        res.header.close_span(palette.default);
-        res.header.close_line();
-        if let Some(url) = rust_fake_path_to_url(&path_str) {
-            write!(res.header.chars, "can be found here:").unwrap();
-            res.header.close_span(palette.default_dim);
-            res.header.close_line();
-            
-            write!(res.header.chars, "{}", url).unwrap();
-            res.header.close_span(palette.url);
-            res.header.close_line();
-        } else {
-            write!(res.header.chars, "file not found (tried all suffixes of this path, relative to current directory)").unwrap();
-            res.header.close_span(palette.default_dim);
-            res.header.close_line();
-        }
-
-        // Make a ghost file by adding LineInfo markers to empty space.
-        let mut empty: &[u8] = &[];
-        Self::read_and_format_file(&mut empty, debugger, &mut res, path_in_symbols, palette).unwrap();
 
         res
+    }
+
+    fn find_file(path_in_symbols: &Path, code_dirs: &[PathBuf]) -> Option<(File, PathBuf)> {
+        let components: Vec<path::Component> = path_in_symbols.components().collect();
+        if components.is_empty() {
+            return None;
+        }
+        let absolute = match &components[0] {path::Component::RootDir => true, _ => false};
+
+        // If "" is among the search dirs, try absolute path first. Otherwise try it last (because maybe the user is specifically trying to override the root directory).
+        let try_absolute_first = code_dirs.iter().any(|d| d.as_os_str().is_empty());
+        if absolute && try_absolute_first {
+            if let Ok(f) = File::open(path_in_symbols) {
+                return Some((f, path_in_symbols.to_owned()));
+            }
+        }
+        // Search for the file in all suffixes of the path, in case the code is in a different place from where the binary was built, or we're in subdirectory (e.g. build command was run from foo/build/, and we're in foo/src/).
+        for start in absolute as usize .. components.len() {
+            for base in code_dirs {
+                let mut path_to_try = base.clone();
+                path_to_try.extend(components[start..].iter());
+                if let Ok(f) = File::open(&path_to_try) {
+                    return Some((f, path_to_try));
+                }
+            }
+        }
+        if absolute && !try_absolute_first {
+            if let Ok(f) = File::open(path_in_symbols) {
+                return Some((f, path_in_symbols.to_owned()));
+            }
+        }
+        None
     }
 
     fn read_and_format_file(input: &mut dyn Read, debugger: &Debugger, res: &mut SourceFile, path_in_symbols: &Path, palette: &Palette) -> Result<(usize, [u8; 16])> {

@@ -1,5 +1,18 @@
-set up build modes such that I use a build with optimizations+asserts+overflow-checks+debug-info, but publish a stripped release build
-profile the ui
+built-in pretty printers
+  strings in libstdc++:
+    std::string: std::__cxx11::basic_string<...>, ._M_dataplus._M_p, ._M_string_length, .2._M_local_buf, .2._M_allocated_capacity
+    std::string_view: std::basic_string_view<...>, ._M_str, ._M_len
+  libc++: ?
+  strings in Rust:
+    &str: data_ptr, length; by name?
+    alloc::string::String: .vec is Vec<u8>; detect by name suffix and field name+type?
+    &std::ffi::os_str::OsStr: data_ptr (of some complicated type, ignore?), length; detect by name and fields?
+    std::ffi::os_str::OsString: .inner.inner is a Vec<u8>
+    &std::path::Path: data_ptr (complicated type), length
+    std::path::PathBuf: .inner.inner.inner is a Vec<u8>
+    &[usize] (not string): data_ptr, length
+investigate unbounded pointer expansion in forward_list
+optimize simple things found by profiler (samply is nice)
 fix empty symbols loading stage name near the end
 make u8 always be non-ambiguous non-char
 key to send SIGINT to the program
@@ -12,9 +25,6 @@ key to sort by cpu usage in threads window
 key to follow a jump in disas
 investigate regression in symbols loading speed (stuck on "parsing drawf" for ~10 seconds)
 instruction breakpoints
-hide <frame base> from locals, make it available as watchable variable instead (maybe as just `<frame base>`, maybe something nicer)
-make readable size formatting use 4 significant digits total, not up to 6
-make profiler readable again
 option to load symbols from another file (unstripped executable) - will make it usable in ch cloud
 look at profiler on ch server (1500 threads)
 make return key do something in each window: go from threads to stack -> code -> disassembly -> code; from locals create a watch; from watch sub-value create another watch for that field/element; from breakpoints to code/disassembly/watch (depending on breakpoint type)
@@ -28,7 +38,6 @@ test with 10k threads
   waitpid is suspiciously slow; does it iterate over threads? can partially avoid it by anticipating which threads will get events?
   if there are enough free hw breakpoints, activate new breakpoints as hw and thread-specific right away without waiting for them to be spuriously hit by other threads
   maybe avoid duplicate POKEUSER calls for debug registers if the thread already had them assigned
-make closing tabs more intuitive
 do something to prevent stopping again on the same line when continuing from a breakpoint, when there are multiple locations on the same line (e.g. function args)
 "warning: DW_AT_encoding = DW_ATE_complex_float on DW_TAG_base_type is not supported" (/usr/lib/x86_64-linux-gnu/libm.so.6)
 find function by address (like addr2line)
@@ -71,19 +80,6 @@ watches, expressions
   stateful expression interpreter, yield, functions
   evaluate watches in order, preserving variables (including functions), UI to reorder watches
   associating print expressions with types (by substring match to cover templates?)
-  built-in pretty printers for strings, lists, slices (in C++ and Rust)
-    strings in libstdc++:
-      std::string: std::__cxx11::basic_string<...>, ._M_dataplus._M_p, ._M_string_length, .2._M_local_buf, .2._M_allocated_capacity
-      std::string_view: std::basic_string_view<...>, ._M_str, ._M_len
-    libc++: ?
-    strings in Rust:
-      &str: data_ptr, length; by name?
-      alloc::string::String: .vec is Vec<u8>; detect by name suffix and field name+type?
-      &std::ffi::os_str::OsStr: data_ptr (of some complicated type, ignore?), length; detect by name and fields?
-      std::ffi::os_str::OsString: .inner.inner is a Vec<u8>
-      &std::path::Path: data_ptr (complicated type), length
-      std::path::PathBuf: .inner.inner.inner is a Vec<u8>
-      &[usize] (not string): data_ptr, length
   always show raw value as one of the children, including for container elements (yield raw value when recursing)
   print options: hex, raw, array length (expression), expanded (i.e. omit array contents etc)
   maybe: api to output a tree of nested values, skipping subtrees if collapsed (`if $yield(val, nested)`, `$yield((), end)`?)

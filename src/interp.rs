@@ -1,5 +1,5 @@
 use crate::{*, types::*, expr::*, error::*, procfs::*, pretty::*, registers::*};
-use std::{ops::Range, mem};
+use std::{ops::Range, mem, borrow::Cow};
 
 pub struct Expression {
     ast: Vec<ASTNode>,
@@ -449,8 +449,11 @@ fn follow_references_and_prettify(val: &mut Value, pointers_too: bool, state: &m
             return Ok(());
         }
         if !val.flags.contains(ValueFlags::RAW) {
-            if let Some(vv) = prettify_value(val, state, context)?.0 {
-                *val = vv;
+            let mut cow = Cow::Borrowed(val);
+            let mut _warning = None;
+            prettify_value(&mut cow, &mut _warning, state, context)?;
+            if let Cow::Owned(v) = cow {
+                *val = v;
             }
         }
         let type_ = unsafe {&*val.type_};

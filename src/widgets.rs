@@ -560,21 +560,19 @@ impl Table {
             let mut width = 0usize;
             for (col_idx, col) in self.columns.iter().enumerate() {
                 width = width.max(str_width(col.title));
-                styled_write!(ui.text, ui.palette.table_header, "{}", col.title);
-                let l = ui.text.close_line();
+                let l = styled_writeln!(ui.text, ui.palette.table_header, "{}", col.title);
                 ui.add(widget!().height(AutoSize::Text).text(l).flags(WidgetFlags::LINE_WRAP));
-                
+
                 let cell = ui.get(row).children[col_idx];
                 let w = Self::questionable_autotooltip(ui, cell);
                 width = width.max(w);
-                
+
                 if col_idx + 1 < self.columns.len() {
                     ui.add(widget!().fixed_height(1));
                 }
             }
-            let parent = ui.cur().parent;
-            width = width.min(ui.get(parent).axes[Axis::X].size);
-            ui.cur_mut().axes[Axis::X].auto_size = AutoSize::Fixed(width);
+            let max_width = ui.cur().axes[Axis::X].max_size;
+            ui.cur_mut().axes[Axis::X].set_fixed_size(width.min(max_width));
         });
     }
 
@@ -1231,7 +1229,13 @@ pub fn make_dialog_frame(create: bool, width: AutoSize, height: AutoSize, style_
         if ui.check_mouse(MouseActions::CLICK) || ui.check_key(KeyAction::Cancel) {
             None // (can't return from inside with_parent)
         } else {
-            Some(ui.add(widget!().width(width).height(height).hcenter().vcenter().fill(' ', ui.palette.default).style_adjustment(style_adjustment)))
+            let l = ui_writeln!(ui, default, "{}", title);
+            let mut w = widget!().width(width).height(height).hcenter().vcenter().fill(' ', ui.palette.default).style_adjustment(style_adjustment).text(l);
+            w.draw_frame = Some((border, /*rounded*/ true));
+            let d = ui.add(w);
+            ui.layout_children(Axis::X);
+            ui.layout_children(Axis::Y);
+            Some(d)
         }
     });
     let dialog = match dialog {
@@ -1241,22 +1245,9 @@ pub fn make_dialog_frame(create: bool, width: AutoSize, height: AutoSize, style_
         }
         Some(x) => x,
     };
-    ui.layout_children(Axis::X);
-    ui.layout_children(Axis::Y);
     with_parent!(ui, dialog, {
         ui.check_mouse(MouseActions::CLICK); // clicking inside the dialog shouldn't close it
-        let (w, h) = (ui.cur().axes[Axis::X].size, ui.cur().axes[Axis::Y].size);
-        ui.add(widget!().fixed_width(1).fixed_height(1).fill('╭', border));
-        styled_write!(ui.text, ui.palette.default, "{}", title);
-        let l = ui.text.close_line();
-        ui.add(widget!().fixed_width(w.saturating_sub(2)).fixed_height(1).fixed_x(1).fill('─', border).text(l));
-        ui.add(widget!().fixed_width(1).fixed_height(1).fixed_x(w as isize - 1).fill('╮', border));
-        ui.add(widget!().fixed_width(1).fixed_height(h.saturating_sub(2)).fixed_y(1).fill('│', border));
-        ui.add(widget!().fixed_width(1).fixed_height(h.saturating_sub(2)).fixed_y(1).fixed_x(w as isize - 1).fill('│', border));
-        ui.add(widget!().fixed_width(1).fixed_height(1).fixed_y(h as isize - 1).fill('╰', border));
-        ui.add(widget!().fixed_width(w.saturating_sub(2)).fixed_height(1).fixed_x(1).fixed_y(h as isize - 1).fill('─', border));
-        ui.add(widget!().fixed_width(1).fixed_height(1).fixed_x(w as isize - 1).fixed_y(h as isize - 1).fill('╯', border));
-
+        let (w, h) = (ui.cur().get_fixed_width(), ui.cur().get_fixed_height());
         with_parent!(ui, ui.add(widget!().fixed_width(w.saturating_sub(4)).fixed_height(h.saturating_sub(4)).fixed_x(2).fixed_y(2)), {
             ui.focus();
             Some(ui.cur_parent)

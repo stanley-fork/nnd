@@ -185,6 +185,9 @@ pub struct Widget {
     // Fill the rect with repetitions of one character (must be 1 column wide).
     pub draw_fill: Option<(char, Style)>,
 
+    // Draw a rectangle just inside this Widget. If draw_text is set, put it at the top left as a title.
+    pub draw_frame: Option<(Style, /*rounded*/ bool)>,
+
     // Renders a progress bar, 1 cell high, horizontally filling this Widget.
     // The f64 is in [0, 1]. Style fg is for the left side of the progress bar, bg is for the right side.
     // If draw_text is set, the text is drawn at the center, using the progress bar's style (text color is the opposite fg/bg color of the progress bar); the text's style is ignored, only the first line is used.
@@ -254,7 +257,7 @@ impl Widget {
     // Copy and clear all fields related to being already part of the tree. The resulting Widget can be add()ed to the tree.
     pub fn make_questionable_copy(&self) -> Self {
         let mut r = Self {
-            identity: self.identity, source_line: self.source_line, axes: self.axes.clone(), flags: self.flags, draw_text: self.draw_text.clone(), style_adjustment: self.style_adjustment, draw_fill: self.draw_fill.clone(), draw_progress_bar: self.draw_progress_bar.clone(),
+            identity: self.identity, source_line: self.source_line, axes: self.axes.clone(), flags: self.flags, draw_text: self.draw_text.clone(), style_adjustment: self.style_adjustment, draw_fill: self.draw_fill.clone(), draw_progress_bar: self.draw_progress_bar.clone(), draw_frame: self.draw_frame.clone(),
             parent: WidgetIdx::invalid(), depth: 0, children: Vec::new(), position_next_to: None, focus_children: Vec::new(), capture_keys: Vec::new(), keys: Vec::new(), capture_mouse: MouseActions::empty(), mouse: MouseActions::empty(), scroll: 0, mouse_pos: [0, 0], scroll_bar_drag_offset: 0, line_wrapped_text: None, draw_cursor_if_focused: None, focus_frame_idx: 0};
         r.flags.remove(WidgetFlags::REDRAW_IF_FOCUS_CHANGES);
         for axis in &mut r.axes {
@@ -764,11 +767,26 @@ impl UI {
         }
         let idx = self.cur_parent;
         Some(with_parent!(self, self.tooltip_root, {
-            // TODO: Add margins or draw a box.
-            let mut w = widget!().width(AutoSize::Children).height(AutoSize::Children).fill(' ', self.palette.default);
+            let mut w = widget!().width(AutoSize::Children).height(AutoSize::Children).fill(' ', self.palette.default).hstack();
             w.position_next_to = Some(idx);
             w.style_adjustment = self.palette.tooltip;
-            self.add(w)
+            w.draw_frame = Some((self.palette.default_dim, /*rounded*/ false));
+            let outer = self.add(w);
+            // Margins.
+            let mid;
+            with_parent!(self, outer, {
+                self.add(widget!().fixed_width(1));
+                mid = self.add(widget!().width(AutoSize::Children).height(AutoSize::Children).vstack());
+                self.add(widget!().fixed_width(1));
+            });
+            let inner;
+            let (width, height) = (self.cur().get_fixed_width(), self.cur().get_fixed_height());
+            with_parent!(self, mid, {
+                self.add(widget!().fixed_height(1));
+                inner = self.add(widget!().width(AutoSize::Children).height(AutoSize::Children).max_width(width.saturating_sub(2)).max_height(height.saturating_sub(2)));
+                self.add(widget!().fixed_height(1));
+            });
+            inner
         }))
     }
 
@@ -1008,6 +1026,20 @@ impl UI {
                 screen.fill(clip, c.encode_utf8(&mut buf), style_adjustment.apply(style));
             }
 
+            let mut text_x_offset = 0;
+            if let Some((style, rounded)) = w.draw_frame.clone() {
+                let style = style_adjustment.apply(style);
+                screen.fill(Rect {pos: rect.pos, size: [1, 1]}, if rounded {"╭"} else {"┌"}, style);
+                screen.fill(Rect {pos: [rect.x() + 1, rect.y()], size: [rect.width().saturating_sub(2), 1]}, "─", style);
+                screen.fill(Rect {pos: [rect.right() - 1, rect.y()], size: [1, 1]}, if rounded {"╮"} else {"┐"}, style);
+                screen.fill(Rect {pos: [rect.x(), rect.y() + 1], size: [1, rect.height().saturating_sub(2)]}, "│", style);
+                screen.fill(Rect {pos: [rect.right() - 1, rect.y() + 1], size: [1, rect.height().saturating_sub(2)]}, "│", style);
+                screen.fill(Rect {pos: [rect.x(), rect.bottom() - 1], size: [1, 1]}, if rounded {"╰"} else {"└"}, style);
+                screen.fill(Rect {pos: [rect.x() + 1, rect.bottom() - 1], size: [rect.width().saturating_sub(2), 1]}, "─", style);
+                screen.fill(Rect {pos: [rect.right() - 1, rect.bottom() - 1], size: [1, 1]}, if rounded {"╯"} else {"┘"}, style);
+                text_x_offset = 1;
+            }
+
             if let &Some((progress, style)) = &w.draw_progress_bar {
                 let text = match &draw_text {
                     Some(r) if !r.is_empty() => self.text.get_line_str(r.start),
@@ -1046,9 +1078,9 @@ impl UI {
 
                     let mut spans = self.text.get_line(line_idx);
                     let line_str = self.text.get_line_str(line_idx);
-                    let mut x = rect.x();
+                    let mut x = rect.x() + text_x_offset as isize;
 
-                    if str_width(line_str) <= rect.width() {
+                    if x + str_width(line_str) as isize <= rect.right() {
                         indicate_horizontal_truncation = false;
                     } else if w.flags.contains(WidgetFlags::TEXT_TRUNCATION_ALIGN_RIGHT) {
                         if indicate_horizontal_truncation {

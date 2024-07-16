@@ -1,3 +1,6 @@
+`samply record`
+
+or:
 sudo perf record -F 1000 --call-graph=dwarf -- <command>
 sudo chown al13n perf.data
 `hotspot` or profiler.firefox.com or `perf report`

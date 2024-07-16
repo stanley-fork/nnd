@@ -1,5 +1,5 @@
 use crate::{*, terminal::*, common_ui::*};
-use std::collections::HashMap;
+use std::{collections::HashMap, path::PathBuf};
 
 pub struct Settings {
     pub tab_width: usize,
@@ -13,6 +13,7 @@ pub struct Settings {
     //  * rotating profiling time series buckets.
     pub periodic_timer_seconds: f64,
     pub mouse_mode: MouseMode,
+    pub code_dirs: Vec<PathBuf>,
 
     pub stdin_file: Option<String>,
     pub stdout_file: Option<String>,
@@ -29,6 +30,7 @@ impl Default for Settings {
         max_threads: 128,
         periodic_timer_seconds: 0.25,
         mouse_mode: MouseMode::Full,
+        code_dirs: Vec::new(),
 
         stdin_file: None,
         stdout_file: None,

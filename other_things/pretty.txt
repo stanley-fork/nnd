@@ -1,0 +1,107 @@
+_M_start: *T, _M_finish: *T, _M_end_of_storage: *T  -> vec
+__begin_: *T, __end_: *T, __end_cap_: *T  -> vec
+__data_: *char, __size_: u64  -> str,  use name to rule out str
+_M_str: *char, _M_len: u64  -> str
+__data_: *T, __size_: u64  -> slice
+_M_ptr: *T, _M_extent: u64  -> slice
+__begin_: *T, __end_: *T  -> slice
+_M_data: *T, _M_size: u64  -> slice
+c_start: *T, c_end: *T, c_end_of_storage: *T  -> slice
+
+ptr: *T, cap: u64  -> RawVec
+buf: RawVec, len: u64  -> vec
+data_ptr: *T, length: u64  -> slice, use name to rule in str
+head: usize, len: usize, buf: RawVec  -> VecDeque
+
+
+C++
+  remove common prefix and suffix (_M_*, __*_, __*, c_*)
+    start|begin|data|ptr|str: *T
+      (finish|end: *T)|(size|len|extent: u64) [, (end_of_storage|end_cap: *T)|(capacity|cap: u64)]  -> slice [with capacity]
+    ptr
+      refcount|cntrl  -> shared ptr
+    TODO: unordered_{map,...}, {map,...}, optional, deque, tuple, list, forward_list
+    TODO: absl::InlinedVector, absl::flat_hash_map, google::dense_hash_map, google::sparse_hash_map, Field, boost::intrusive::list, boost::intrusive::{set,multiset,map,multimap}, boost::container::flat_{set,map}, boost::container::small_vector, boost::shared_ptr
+Rust
+  ptr: *T, cap: u64  -> slice // RawVec
+  buf
+    buf is RawVec
+      len
+        head  -> VecDeque
+        -  -> slice with capacity, stringness from name (if "str" or "Str" in pre-template part of the name; use pre-unwrapping name!)
+  data_ptr: *T
+    length: u64  -> slice, stringness from name
+  TODO: HashMap, HashSet
+
+
+
+
+
+
+
+Rust to do:
+Vec, String, OSString, PathBuf: {buf: {ptr, cap}, len}
+&[T], &str, Box<[T]>: {data_ptr, length}
+VecDeque: {head, len, buf: {ptr, cap}}
+
+Rust to figure out:
+HashMap, HashSet: ???
+
+Rust meh:
+BinaryHeap: {data: Vec}
+LinkedList: {head: Some({element, next: ..., prev: ...}), tail: Some(...), len}   - traversable by hand
+BTreeMap, BTreeSet: looks traversable by hand
+RefCell: {borrow, value}
+Mutex, RWLock: {inner, poison, data}
+slice iter: {ptr, end_or_len}
+Rc, Arc, Weak: {ptr: {pointer: {strong, weak, value}}}
+
+
+C++ to do:
+vector: {_M_start, _M_finish, _M_end_of_storage}
+string_view: {_M_str, _M_len}
+span: {_M_ptr, _M_extent}
+valarray: {_M_size, _M_data}
+
+list: {_M_size, _M_next: {_M_next, _M_prev}, _M_prev: ...}, values after links
+forward_list: ... _M_next, values after links
+set, multiset, map, multimap: {_M_node_count, _M_header: {_M_parent: root, _M_left: min, _M_right: max}}, values after nodes
+unordered_{set,map,multiset,multimap}: {_M_element_count, _M_bucket_count, _M_buckets}, buckets are forward_list-like
+optional: {_M_payload, _M_engaged}
+tuple: chain of bases with multiple inheritance and _M_head_impl
+shared_ptr, weak_ptr: {_M_ptr, _M_refcount}
+
+C++ to figure out:
+string, wstring, u16string, u32string: {_M_string_length, _M_dataplus: {_M_p}, union {_M_local_buf, _M_allocated_capacity}} - ?
+deque, stack, queue: {_M_map, _M_map_size, _M_start, _M_finish} - ?
+
+C++ meh:
+priority_queue: vector
+any: ?
+
+
+libc++ to do:
+vector: {__begin_, __end_, __end_cap_}
+string_view, span: {__data_, __size_}
+valarray: {__begin_, __end_}
+
+list: {__size_alloc_, __end_: {__prev_, __next_}}, values after links
+forward_list: {__next_, 1: {__value_}}
+shared_ptr, weak_ptr: {__ptr_, __cntrl_}
+string, wstring, u16string, u32string: {__s: {0: {__is_long_, __size_}, __data_}, __l: {0: {__is_long_, __cap_}, __size_, __data_}, __r}
+optional: {union 0: {__null_state_, __val_}, __engaged_}
+variant: {__index, __data: {__dummy, __head: value, __tail: {__dummy, __head, __tail: {...}}}}
+
+libc++ to figure out:
+set, multiset, map, multimap: {__pair3__, __pair1_: {__left_, __right_, __parent_}} - ?
+unordered_{set,multiset,map,multimap}: {__bucket_list_: {__value_, __value_}, __p1_, __p2_, __p3_} - ?
+deque, stack, queue: {__size_, __start_, __map_: {__first_, __begin_, __end_, __end_cap_}} - ?
+
+libc++ meh:
+priority_queue: vector
+tuple: {__base_: {#base: {__value_}, #base: {__value_}, ...}}
+any: ?
+
+
+PODArrayBase: {c_start: *char, c_end, c_end_of_storage}
+PODArray: cast to *value_type

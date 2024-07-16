@@ -166,24 +166,6 @@ pub struct Symbols {
     //  * "Global" variables, i.e. variables that are available at ~any ip, including static variables in functions. Expect tens of millions of them. Can be inspected using watches. Name may be mangled. May come from symtab.
 }
 
-#[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LanguageFamily {
-    Cpp,
-    Rust,
-    Other,
-    Unknown,
-}
-impl LanguageFamily {
-    // For unrecognized or missing language id, assume C++. In particular, covers future versions of C++ until we add them to the list of recognized language ids.
-    pub fn presumably_cpp(self) -> bool {
-        match self {
-            LanguageFamily::Cpp | LanguageFamily::Other | LanguageFamily::Unknown => true,
-            _ => false,
-        }
-    }
-}
-
 pub struct CompilationUnit {
     pub offset: DieOffset,
     pub unit: Unit<SliceType>,
@@ -2199,7 +2181,7 @@ impl<'a> DwarfLoader<'a> {
                             Type::Pointer(PointerType {flags: PointerFlags::empty(), type_: self.loader.types.builtin_types.unknown})
                         }
                         _ => panic!("huh?") };
-                    let mut info = TypeInfo {die: offset, t, ..Default::default()};
+                    let mut info = TypeInfo {die: offset, t, language: self.unit_language, ..Default::default()};
                     let mut saw_type = false;
                     for &attr in abbrev.attributes() {
                         match attr.name() {
@@ -2449,7 +2431,7 @@ impl<'a> DwarfLoader<'a> {
                         array.flags.insert(ArrayFlags::PARSED_SUBRANGE);
                     } else {
                         // Turn multidimensional array into array of arrays.
-                        let info = TypeInfo {die: offset, t: Type::Array(ArrayType {flags: ArrayFlags::PARSED_SUBRANGE, type_: array.type_, stride: 0, len: 0}), ..TypeInfo::default()};
+                        let info = TypeInfo {die: offset, language: self.unit_language, t: Type::Array(ArrayType {flags: ArrayFlags::PARSED_SUBRANGE, type_: array.type_, stride: 0, len: 0}), ..TypeInfo::default()};
                         let (ptr, off) = self.shard.types.add_type(info);
                         assert!(ptr != ptr::null());
                         array.type_ = off;
@@ -2571,7 +2553,7 @@ impl<'a> DwarfLoader<'a> {
 
                 // TODO: Function pointers and pointers to members.
                 DW_TAG_ptr_to_member_type | DW_TAG_subroutine_type => {
-                    self.shard.types.add_type(TypeInfo {name: "<unsupported>", die: offset, flags: TypeFlags::UNSUPPORTED, ..TypeInfo::default()});
+                    self.shard.types.add_type(TypeInfo {name: "<unsupported>", die: offset, language: self.unit_language, flags: TypeFlags::UNSUPPORTED, ..TypeInfo::default()});
                     skip_subtree = self.depth;
                     cursor.skip_attributes(abbrev.attributes())?;
                 }
