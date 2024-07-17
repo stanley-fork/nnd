@@ -38,6 +38,19 @@ int main() {
     std::valarray<int> va = {1, 2, 3};   // [yes, yes]
     std::span<int> sp(vec);              // [yes, yes]
 
+    // Smart pointers.
+    std::shared_ptr<int> sptr = std::make_shared<int>(42);  // [yes, yes]
+    std::weak_ptr<int> wptr = sptr;                         // [yes, yes]
+
+    // String.
+    std::string short_str = "hello";       // [yes, yes]
+    std::string long_str(100, '.');
+
+    // Wide strings.
+    std::wstring wstr = L"hello";          // [no, no]
+    std::u16string u16str = u"hello";      // [no, no]
+    std::u32string u32str = U"hello";      // [no, no]
+
     // Deque.
     std::deque<int> deq = {1, 2, 3};     // [no, no]
     std::stack<int> stk;                 // [no, no]
@@ -60,18 +73,6 @@ int main() {
     std::unordered_multiset<int> umset = {1, 1, 2, 3};                                       // [no, no]
     std::unordered_map<int, std::string> umap = {{1, "one"}, {2, "two"}};                    // [no, no]
     std::unordered_multimap<int, std::string> ummap = {{1, "one"}, {1, "uno"}, {2, "two"}};  // [no, no]
-
-    // Smart pointers.
-    std::shared_ptr<int> sptr = std::make_shared<int>(42);  // [no, no]
-    std::weak_ptr<int> wptr = sptr;                         // [no, no]
-
-    // String.
-    std::string str = "hello";             // [no, no]
-
-    // Wide strings.
-    std::wstring wstr = L"hello";          // [no, no]
-    std::u16string u16str = u"hello";      // [no, no]
-    std::u32string u32str = U"hello";      // [no, no]
 
     // Discriminated unions.
     std::optional<int> opt = 42;           // [no, no]
@@ -103,7 +104,7 @@ int main() {
     auto range = std::views::iota(1, 10);
 
     // Prevent optimizations
-    volatile int dummy = vec[0] + arr[0] + *uptr + *sptr + str[0] + pair.first + std::get<0>(tuple) + 
+    volatile int dummy = vec[0] + arr[0] + *uptr + *sptr + short_str[0] + long_str[0] + pair.first + std::get<0>(tuple) + 
         *opt + (int)std::get<double>(var) + std::any_cast<int>(any_val) + func(1) + 
         bits.count() + c.real() + va[0] + sp[0] + *range.begin() + strview[0] + 
         wstr[0] + u16str[0] + u32str[0];

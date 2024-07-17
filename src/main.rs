@@ -55,7 +55,7 @@ fn parse_arg(args: &mut &[String], long_name: &str, short_name: &str, bool_switc
 }
 
 fn main() {
-    precalc_global_constants();
+    precalc_globals_util();
     std::env::set_var("RUST_BACKTRACE", "short");
 
     let mut settings = Settings::default();

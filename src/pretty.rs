@@ -1,5 +1,5 @@
 use crate::{*, types::*, error::*, expr::*, util::*, settings::*, common_ui::*, procfs::*};
-use std::{mem, ptr, fmt::Write, borrow::Cow, io::Write as ioWrite};
+use std::{mem, mem::MaybeUninit, ptr, fmt::Write, borrow::Cow, io::Write as ioWrite, ops::Range};
 use bitflags::*;
 
 // Apply pretty-printers and other transformations to a value. Used both for printing and expression evaluaion.
@@ -48,8 +48,8 @@ pub fn prettify_value(val: &mut Cow<Value>, warning: &mut Option<Error>, state: 
     }
 
     match recognize_containers(val, &mut fields, &additional_names, warning, state, context) {
-        Ok(true) => return Ok(()),
-        Err(e) if !e.is_not_container() => *warning = Some(e),
+        Ok(()) => return Ok(()),
+        Err(e) if !e.is_not_container() && !e.is_no_field() => *warning = Some(e),
         _ => (),
     }
 
@@ -441,51 +441,165 @@ fn resolve_discriminated_union(val: &AddrOrValueBlob, fields: &mut Cow<[StructFi
     Ok(true)
 }
 
-fn container_unravel_pointer_or_size_field(field: &StructField, offset: &mut usize) -> Result<&'static TypeInfo> {
-    // Non-64-bit or bit-packed not supported, I haven't seen them in std containers in C++ or Rust
-    // (except as part of more elaborate packing that needs separate logic anyway).
-    if field.calculate_bit_size() != 64 || field.bit_offset % 8 != 0 {
-        return err!(NotContainer, "");
-    }
-    *offset = field.bit_offset / 8;
-    let t = unsafe {&*field.type_};
-    if let Type::Struct(s) = &t.t {
-        // Container begin/end/size/capacity fields are often wrapped in more structs. Ugh. Peel them too.
-        let mut fields = Cow::Borrowed(s.fields());
-        unravel_struct(&mut fields, None);
-        if fields.len() == 1 && fields[0].bit_size == field.bit_size && fields[0].bit_offset % 8 == 0 {
-            *offset += fields[0].bit_offset / 8;
-            return Ok(unsafe {&*fields[0].type_});
-        }
-        err!(NotContainer, "")
-    } else {
-        Ok(t)
-    }
+
+// Container stuff.
+// Throughout these functions, error NoField means "this container wasn't recognized, but we should try others", while NotContainer means "stop all container recognition".
+
+struct ContainerSubstruct<'a> {
+    fields: Cow<'a, [StructField]>,
+    bit_offset: usize,
+    used_fields_mask: usize,
 }
-fn container_pointer_field(field: &StructField, inner_type: &mut *const TypeInfo, offset: &mut usize) -> Result<()> {
-    let t = container_unravel_pointer_or_size_field(field, offset)?;
-    if let Some(p) = t.t.as_pointer() {
-        if *inner_type != ptr::null() && *inner_type != p.type_ {
-            return err!(NotContainer, "");
+impl ContainerSubstruct<'_> {
+    fn check_all_fields_used(&self) -> Result<()> {
+        if self.used_fields_mask != (!0usize >> (64-self.fields.len().min(64) as u32)) {
+            err!(NotContainer, "")
+        } else {
+            Ok(())
         }
-        *inner_type = p.type_;
-        return Ok(());
     }
-    err!(NotContainer, "")
-}
-fn container_size_field(field: &StructField, offset: &mut usize) -> Result<()> {
-    let t = container_unravel_pointer_or_size_field(field, offset)?;
-    if let Some(p) = t.t.as_primitive() {
-        // Allow u64 and i64.
-        if p.intersects(PrimitiveFlags::FLOAT | PrimitiveFlags::CHAR | PrimitiveFlags::UNSPECIFIED) {
-            return err!(NotContainer, "");
-        }
-        return Ok(());
+    fn clear_used(&mut self) {
+        self.used_fields_mask = 0;
     }
-    err!(NotContainer, "")
 }
 
-fn read_container_struct<'a>(value: &'a Value, scratch: &'a mut [u8], memory: &MemReader) -> Result<&'a [u8]> {
+fn find_field(names: &[&str], substruct: &mut ContainerSubstruct) -> Result<StructField> {
+    for (i, f) in substruct.fields.iter().enumerate() {
+        let name = trim_field_name(f.name);
+        if names.iter().position(|n| *n == name).is_some() {
+            if i < 64 {
+                substruct.used_fields_mask |= 1usize << i as u32;
+            }
+            return Ok(f.clone());
+        }
+    }
+    err!(NoField, "")
+}
+
+// Container begin/end/size/capacity fields are often wrapped in more structs. Peel them.
+fn unravel_container_field(field: &StructField, substruct: &mut ContainerSubstruct, primitive: bool) -> Result<(&'static TypeInfo, Range<usize>)> {
+    let mut t = unsafe {&*field.type_};
+    let mut bit_offset = substruct.bit_offset + field.bit_offset;
+    let mut bit_size = if field.flags.contains(FieldFlags::SIZE_KNOWN) {field.bit_size} else {t.calculate_size()*8};
+    if let Type::Struct(s) = &t.t {
+        let mut fields = Cow::Borrowed(s.fields());
+        unravel_struct(&mut fields, None);
+        if fields.len() != 1 {
+            return err!(NoField, "");
+        }
+        let field = &fields[0];
+        t = unsafe {&*field.type_};
+        bit_offset += field.bit_offset;
+        bit_size = if field.flags.contains(FieldFlags::SIZE_KNOWN) {field.bit_size} else {t.calculate_size()*8};
+    }
+    if primitive {
+        if bit_size == 0 {
+            return err!(NotContainer, "");
+        }
+        if bit_size > 64 {
+            return err!(NoField, "");
+        }
+    }
+    Ok((t, bit_offset..bit_offset+bit_size))
+}
+
+fn find_struct_field<'a>(names: &[&str], substruct: &mut ContainerSubstruct<'a>) -> Result<ContainerSubstruct<'a>> {
+    let f = find_field(names, substruct)?;
+    let t = unsafe {&*f.type_};
+    match &t.t {
+        Type::Struct(s) => {
+            if f.flags.contains(FieldFlags::SIZE_KNOWN) && f.bit_size != t.size * 8 {
+                return err!(NotContainer, "");
+            }
+            let mut fields = Cow::Borrowed(s.fields());
+            unravel_struct(&mut fields, None);
+            Ok(ContainerSubstruct {fields, bit_offset: substruct.bit_offset + f.bit_offset, used_fields_mask: 0})
+        }
+        _ => err!(NoField, ""),
+    }
+}
+fn find_int_field(names: &[&str], substruct: &mut ContainerSubstruct) -> Result<Range<usize>> {
+    let f = find_field(names, substruct)?;
+    let (t, r) = unravel_container_field(&f, substruct, true)?;
+    match &t.t {
+        Type::Primitive(p) => {
+            if p.intersects(PrimitiveFlags::FLOAT | PrimitiveFlags::UNSPECIFIED) {
+                return err!(NotContainer, "");
+            }
+            if p.contains(PrimitiveFlags::SIGNED) && r.len() != 64 { // we'd need to sign-extend in this case
+                return err!(NotContainer, "");
+            }
+            Ok(r)
+        }
+        _ => err!(NoField, ""),
+    }
+}
+fn find_pointer_field(names: &[&str], substruct: &mut ContainerSubstruct, inner_type: &mut *const TypeInfo) -> Result<Range<usize>> {
+    let f = find_field(names, substruct)?;
+    let (t, r) = unravel_container_field(&f, substruct, true)?;
+    match &t.t {
+        Type::Pointer(p) => {
+            if *inner_type != ptr::null() && *inner_type != p.type_ {
+                return err!(NotContainer, "");
+            }
+            *inner_type = p.type_;
+            Ok(r)
+        }
+        _ => err!(NoField, ""),
+    }
+}
+fn find_array_field(names: &[&str], substruct: &mut ContainerSubstruct, inner_type: &mut *const TypeInfo) -> Result<(Range<usize>, usize)> {
+    let f = find_field(names, substruct)?;
+    let (t, r) = unravel_container_field(&f, substruct, false)?;
+    match &t.t {
+        Type::Array(a) => {
+            if r.start % 8 != 0 {
+                return err!(NotContainer, "");
+            }
+            if !a.flags.contains(ArrayFlags::LEN_KNOWN) {
+                return err!(NotContainer, "");
+            }
+            if *inner_type != ptr::null() && *inner_type != a.type_ {
+                return err!(NotContainer, "");
+            }
+            *inner_type = a.type_;
+            let t = unsafe {&*a.type_};
+            let inner_size = t.calculate_size();
+            if a.stride != 0 && a.stride != inner_size {
+                return err!(NotContainer, "");
+            }
+            if r.len() != inner_size*a.len*8 {
+                return err!(NotContainer, "");
+            }
+            Ok((r, a.len))
+        }
+        _ => err!(NoField, ""),
+    }
+}
+
+fn get_container_usize_field(bit_offset: Range<usize>, slice: &[u8]) -> Result<usize> {
+    assert!(bit_offset.len() <= 64);
+    if bit_offset.end > slice.len() * 64 {
+        return err!(NotContainer, "");
+    }
+    let mut a = [0u8; 8];
+    let byte_offset = bit_offset.start/8..bit_offset.end/8;
+    a[..byte_offset.len()].copy_from_slice(&slice[byte_offset.clone()]);
+    let mut r = usize::from_le_bytes(a);
+
+    if bit_offset.start%8 != 0 {
+        r >>= (bit_offset.start%8) as u32;
+    }
+    if bit_offset.end%8 != 0 {
+        let e = slice[bit_offset.end/8];
+        let e = e & ((1u8 << (bit_offset.end%8) as u32) - 1);
+        r |= (e as usize) << (bit_offset.len() - bit_offset.end%8) as u32;
+    }
+
+    Ok(r)
+}
+
+fn read_container_struct<'a>(value: &'a Value, scratch: &'a mut [MaybeUninit<u8>], memory: &MemReader) -> Result<&'a [u8]> {
     let t = unsafe {&*value.type_};
     if t.size > scratch.len() {
         return err!(NotContainer, "");
@@ -493,19 +607,17 @@ fn read_container_struct<'a>(value: &'a Value, scratch: &'a mut [u8], memory: &M
     match &value.val {
         AddrOrValueBlob::Blob(b) => Ok(b.as_slice()),
         &AddrOrValueBlob::Addr(addr) => {
-            memory.read(addr, &mut scratch[..t.size])?;
-            Ok(&scratch[..t.size])
+            Ok(memory.read_uninit(addr, &mut scratch[..t.size])?)
         }
     }
 }
 
-fn get_container_usize_field(offset: usize, slice: &[u8]) -> Result<usize> {
-    if offset + 8 > slice.len() {
-        return err!(NotContainer, "");
+fn optional_field<T>(r: Result<T>) -> Result<Option<T>> {
+    match r {
+        Ok(x) => Ok(Some(x)),
+        Err(e) if e.is_no_field() => Ok(None),
+        Err(e) => Err(e),
     }
-    let mut a = [0u8; 8];
-    a.copy_from_slice(&slice[offset..offset+8]);
-    Ok(usize::from_le_bytes(a))
 }
 
 fn one_container_name_looks_like_string(s: &str) -> bool {
@@ -515,8 +627,8 @@ fn one_container_name_looks_like_string(s: &str) -> bool {
     s.find("str").is_some() || s.find("Str").is_some()
 }
 
-fn container_name_looks_like_string(t: &TypeInfo, additional_names: &[&str]) -> bool {
-    if one_container_name_looks_like_string(t.name) {
+fn container_name_looks_like_string(t: *const TypeInfo, additional_names: &[&str]) -> bool {
+    if one_container_name_looks_like_string(unsafe {(*t).name}) {
         return true;
     }
     additional_names.iter().any(|s| one_container_name_looks_like_string(*s))
@@ -537,193 +649,249 @@ fn trim_field_name(mut name: &str) -> &str {
     name
 }
 
-// Rust RawVec: {ptr: *T, cap: usize}
-fn recognize_raw_vec(type_: *const TypeInfo, inner_type: &mut *const TypeInfo, out_ptr_offset: &mut usize, out_cap_offset: &mut usize) -> Result<()> {
-    let type_ = unsafe {&*type_};
-    if type_.size != 16 {
-        return err!(NotContainer, "");
-    }
-    if let Type::Struct(s) = &type_.t {
-        let mut fields = Cow::Borrowed(s.fields());
-        unravel_struct(&mut fields, None);
-        if fields.len() != 2 {
-            return err!(NotContainer, "");
-        }
-        let mut found = 0usize;
-        for f in fields.iter() {
-            if f.bit_offset % 8 != 0 {
-                return err!(NotContainer, "");
-            }
-            match trim_field_name(f.name) {
-                "ptr" => {
-                    found |= 1;
-                    container_pointer_field(f, inner_type, out_ptr_offset)?;
-                }
-                "cap" => {
-                    found |= 2;
-                    container_size_field(f, out_cap_offset)?;
-                }
-                _ => return err!(NotContainer, ""),
-            }
-        }
-        if found == 3 {
-            return Ok(());
-        }
-    }
-    err!(NotContainer, "")
-}
-
-// Fields we're looking for to recognize standard library containers.
-bitflags! { pub struct ContainerFields: u64 {
-    const BEGIN = 0x1;
-    const END = 0x2;
-    const END_OF_STORAGE = 0x4;
-    const LEN = 0x8;
-    const CAPACITY = 0x10;
-    const DATA = 0x20;
-    const PTR = 0x40;
-    const STR = 0x80;
-    const REFCOUNT = 0x100;
-    const BUF = 0x200;
-    const HEAD = 0x400;
-}}
-const CONTAINER_FIELD_NAMES: [(&'static str, ContainerFields); 20] = [
-    ("begin", ContainerFields::BEGIN),
-    ("start", ContainerFields::BEGIN),
-    ("data_ptr", ContainerFields::BEGIN),
-    ("end", ContainerFields::END),
-    ("finish", ContainerFields::END),
-    ("end_of_storage", ContainerFields::END_OF_STORAGE),
-    ("end_cap", ContainerFields::END_OF_STORAGE),
-    ("len", ContainerFields::LEN),
-    ("length", ContainerFields::LEN),
-    ("size", ContainerFields::LEN),
-    ("extent", ContainerFields::LEN),
-    ("cap", ContainerFields::CAPACITY),
-    ("capacity", ContainerFields::CAPACITY),
-    ("data", ContainerFields::DATA),
-    ("ptr", ContainerFields::PTR),
-    ("str", ContainerFields::STR),
-    ("refcount", ContainerFields::REFCOUNT),
-    ("ctrl", ContainerFields::REFCOUNT),
-    ("buf", ContainerFields::BUF),
-    ("head", ContainerFields::HEAD),
-];
-
 // Guess the common C++ and Rust containers. Turn them into slices/arrays/pointers as needed.
 // The input Value already went through do_general_transformations(), so wrappers and inheritance are mostly gone.
-// Returns true if the whole Value was replaced and doesn't need any further transformations.
-// May modify `fields` and return false, e.g. remove refcount field from shared_ptr expecting the caller to unwrap the remaining single-field struct into a plain pointer.
-// Returning NotContainer error is equivalent to Ok(false) - just for convenience.
-pub fn recognize_containers(val: &mut Cow<Value>, fields: &mut Cow<[StructField]>, additional_names: &[&str], warning: &mut Option<Error>, state: &mut EvalState, context: &EvalContext) -> Result<bool> {
+// Returns Ok if the whole Value was replaced and doesn't need any further transformations.
+// Returns NotContainer error if the value wasn't replaced (but `fields` may have been mutated, e.g. removing refcount field from shared_ptr).
+// Returns other errors if we should fail the whole prettification (e.g. failed to read the struct from memory).
+fn recognize_containers(val: &mut Cow<Value>, fields: &mut Cow<[StructField]>, additional_names: &[&str], warning: &mut Option<Error>, state: &mut EvalState, context: &EvalContext) -> Result<()> {
     let t = unsafe {&*val.type_};
     let language = match t.language {
-        LanguageFamily::Internal => return Ok(false),
+        LanguageFamily::Internal => return err!(NotContainer, ""),
         LanguageFamily::Rust => LanguageFamily::Rust,
         LanguageFamily::Cpp | LanguageFamily::Other | LanguageFamily::Unknown => LanguageFamily::Cpp,
     };
 
-    // We recognize containers in a duck-typed way, by approximate field names, after do_general_transformations().
+    // We recognize containers in a duck-typed way, by approximate field names, after unraveling the struct.
     // This way we're not too sensitive to small changes in implementation, and sometimes recognize custom containers along the way.
     // This may have some false positives, but that's not catastrophic, the user can always use .#r to see raw struct.
 
-    const max_fields: usize = 5;
-    if fields.len() > max_fields {
-        return Ok(false);
+    match recognize_shared_ptr(fields) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.is_no_field() => (),
+        Err(e) => return Err(e),
     }
 
-    // Map field names to a bitset. If there are any unrecognized names, assume it's not a container.
-    // We should make this part reasonably fast.
-    let mut seen_fields = ContainerFields::empty();
-    let mut field_kinds = [ContainerFields::empty(); max_fields];
-    for (i, f) in fields.iter().enumerate() {
-        let name = trim_field_name(f.name);
-        let mut found = false;
-        for &(n, f) in &CONTAINER_FIELD_NAMES {
-            if name == n {
-                found = true;
-                field_kinds[i] = f;
-                seen_fields.insert(f);
-                break;
-            }
-        }
-        if !found {
-            return Ok(false);
-        }
+    let mut substruct = ContainerSubstruct {fields: fields.clone(), bit_offset: 0, used_fields_mask: 0};
+
+    match recognize_slice_or_vec(&mut substruct, val, additional_names, warning, state, context) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.is_no_field() => substruct.clear_used(),
+        Err(e) => return Err(e),
+    }
+    match recognize_rust_vec(&mut substruct, val, additional_names, warning, state, context) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.is_no_field() => substruct.clear_used(),
+        Err(e) => return Err(e),
+    }
+    match recognize_libcpp_string(&mut substruct, val, additional_names, warning, state, context) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.is_no_field() => substruct.clear_used(),
+        Err(e) => return Err(e),
     }
 
-    // Slice or vector.
-    // Something like: {start: *T, len: usize} or {begin: *T, end: *T, end_of_storage: *T}, or {buf: {ptr: *T, cap: usize}, len: usize}.
-    let begin_like: ContainerFields = ContainerFields::BEGIN | ContainerFields::DATA | ContainerFields::PTR | ContainerFields::STR | ContainerFields::BUF;
-    let len_like: ContainerFields = ContainerFields::END | ContainerFields::LEN;
-    let capacity_like: ContainerFields = ContainerFields::END_OF_STORAGE | ContainerFields::CAPACITY;
-    if seen_fields.intersects(begin_like) && seen_fields.intersects(len_like) && (begin_like | len_like | capacity_like).contains(seen_fields) {
-        // Find field offsets.
-        let (mut begin_field, mut end_field, mut len_field, mut end_of_storage_field, mut capacity_field) = (usize::MAX, usize::MAX, usize::MAX, usize::MAX, usize::MAX);
-        let mut inner_type: *const TypeInfo = ptr::null();
-        for (i, f) in fields.iter().enumerate() {
-            if field_kinds[i] == ContainerFields::BUF {
-                if f.bit_offset % 8 != 0 {
-                    return Ok(false);
-                }
-                recognize_raw_vec(f.type_, &mut inner_type, &mut begin_field, &mut capacity_field)?;
-                begin_field += f.bit_offset / 8;
-                capacity_field += f.bit_offset / 8;
-                continue;
-            }
-            if begin_like.contains(field_kinds[i]) {
-                container_pointer_field(f, &mut inner_type, &mut begin_field)?;
-                continue;
-            }
-            match field_kinds[i] {
-                ContainerFields::END => container_pointer_field(f, &mut inner_type, &mut end_field)?,
-                ContainerFields::END_OF_STORAGE => container_pointer_field(f, &mut inner_type, &mut end_of_storage_field)?,
-                ContainerFields::LEN => container_size_field(f, &mut len_field)?,
-                ContainerFields::CAPACITY => container_size_field(f, &mut capacity_field)?,
-                _ => panic!("huh"),
-            }
+    err!(NotContainer, "")
+}
+
+// Slice or vector.
+// Something like: {start: *T, len: usize} or {begin: *T, end: *T, end_of_storage: *T}, or {buf: {ptr: *T, cap: usize}, len: usize}.
+fn recognize_slice_or_vec(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, additional_names: &[&str], warning: &mut Option<Error>, state: &mut EvalState, context: &EvalContext) -> Result<()> {
+    // Find field offsets.
+    // (We first analyze the fields, then look at data. Not necessarily the simplest way to do this right now, but a sort of rehearsal of compiling to bytecode.)
+    let mut inner_type: *const TypeInfo = ptr::null();
+    let begin_field = find_pointer_field(&["begin", "start", "data_ptr", "ptr", "str", "data", "dataplus"], substruct, &mut inner_type)?;
+    let len_field = optional_field(find_int_field(&["len", "length", "size", "extent", "string_length"], substruct))?;
+    let end_field = optional_field(find_pointer_field(&["end", "finish"], substruct, &mut inner_type))?;
+    if len_field.is_some() == end_field.is_some() {
+        return err!(NoField, "");
+    }
+    optional_field(find_field(&["end_of_storage", "end_cap", "capacity", "cap"], substruct))?;
+    if let Some(mut anon) = optional_field(find_struct_field(&[""], substruct))? {
+        // libstdc++ string: {string_length, dataplus, union {local_buf, allocated_capacity}}
+        optional_field(find_int_field(&["local_buf"], &mut anon))?;
+    }
+    substruct.check_all_fields_used()?;
+
+    let inner_size = (unsafe {&*inner_type}).calculate_size();
+
+    // Read the struct into temp buffer (instead of reading fields one by one using multiple syscalls).
+    let mut scratch: [MaybeUninit<u8>; 40] = unsafe {MaybeUninit::uninit().assume_init()};
+    let slice = read_container_struct(val, &mut scratch, &context.memory)?;
+
+    // Parse the field values.
+    let start = get_container_usize_field(begin_field, slice)?;
+    let len = if let Some(r) = len_field {
+        get_container_usize_field(r, slice)?
+    } else {
+        if inner_size == 0 {
+            *warning = Some(error!(NotContainer, "element size is 0"));
+            return err!(NotContainer, "");
         }
-        let inner_size = (unsafe {&*inner_type}).calculate_size();
+        let end = get_container_usize_field(end_field.unwrap(), slice)?;
+        if end < start {
+            *warning = Some(error!(ProcessState, "end < start"));
+            return err!(NotContainer, "");
+        }
+        let bytes = end - start;
+        if bytes % inner_size != 0 {
+            *warning = Some(error!(ProcessState, "slice size not divisible by element size"));
+            return err!(NotContainer, "");
+        }
+        bytes / inner_size
+    };
 
-        // Read the struct into temp buffer (instead of reading fields one by one using multiple syscalls).
-        let mut scratch = [0u8; 40];
-        let slice = read_container_struct(val, &mut scratch, &context.memory)?;
+    // Guess whether this is a string.
+    let mut flags = SliceFlags::empty();
+    if inner_size == 1 && container_name_looks_like_string(val.type_, additional_names) {
+        flags.insert(SliceFlags::UTF_STRING);
+    }
 
-        // Parse the field values.
-        let start = get_container_usize_field(begin_field, slice)?;
-        let len = if len_field != usize::MAX {
-            get_container_usize_field(len_field, slice)?
-        } else {
-            if inner_size == 0 {
-                *warning = Some(error!(NotContainer, "element size is 0"));
-                return Ok(false);
-            }
-            let end = get_container_usize_field(end_field, slice)?;
-            if end < start {
-                *warning = Some(error!(ProcessState, "end < start"));
-                return Ok(false);
-            }
-            let bytes = end - start;
-            if bytes % inner_size != 0 {
-                *warning = Some(error!(ProcessState, "slice size not divisible by element size"));
-                return Ok(false);
-            }
-            bytes / inner_size
-        };
+    // Return a slice.
+    let type_ = state.types.add_slice(inner_type, flags);
+    let v = AddrOrValueBlob::Blob(ValueBlob::from_two_usizes([start, len]));
+    let new_val = Value {val: v, type_, flags: val.flags};
+    *val = Cow::Owned(new_val);
+    Ok(())
+}
 
-        // Guess whether this is a string.
+// {len, buf: {ptr, cap}}
+// Or VecDeque: {head, len, buf: {ptr, cap}}
+fn recognize_rust_vec(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, additional_names: &[&str], warning: &mut Option<Error>, state: &mut EvalState, context: &EvalContext) -> Result<()> {
+    let mut buf = find_struct_field(&["buf"], substruct)?;
+    let mut inner_type: *const TypeInfo = ptr::null();
+    let ptr_field = find_pointer_field(&["ptr"], &mut buf, &mut inner_type)?;
+    let cap_field = find_int_field(&["cap"], &mut buf)?;
+    buf.check_all_fields_used()?;
+    let len_field = find_int_field(&["len"], substruct)?;
+    let head_field = optional_field(find_int_field(&["head"], substruct))?;
+    substruct.check_all_fields_used()?;
+
+    let mut scratch: [MaybeUninit<u8>; 40] = unsafe {MaybeUninit::uninit().assume_init()};
+    let slice = read_container_struct(val, &mut scratch, &context.memory)?;
+
+    let len = get_container_usize_field(len_field, slice)?;
+    let ptr = get_container_usize_field(ptr_field, slice)?;
+    let cap = get_container_usize_field(cap_field, slice)?;
+
+    let inner_size = (unsafe {&*inner_type}).calculate_size();
+    let new_val = if let Some(f) = head_field {
+        // VecDeque.
+        let head = get_container_usize_field(f, slice)?;
+        if head > cap || len > cap {
+            return err!(Runtime, "VecDeque out of bounds");
+        }
+        let mut builder = StructBuilder::default();
+        builder.add_slice_field("part1", ptr + head*inner_size, len.min(cap - head), inner_type, SliceFlags::empty(), &mut state.types);
+        builder.add_slice_field("part2", ptr, len.saturating_sub(cap - head), inner_type, SliceFlags::empty(), &mut state.types);
+        builder.finish("VecDeque#pretty", val.flags, &mut state.types)
+    } else {
         let mut flags = SliceFlags::empty();
-        if inner_size == 1 && container_name_looks_like_string(t, additional_names) {
+        if inner_size == 1 && container_name_looks_like_string(val.type_, additional_names) {
             flags.insert(SliceFlags::UTF_STRING);
         }
 
-        // Return a slice.
-        let type_ = state.types.add_slice(inner_type, flags);
-        let v = AddrOrValueBlob::Blob(ValueBlob::from_two_usizes([start, len]));
-        let new_val = Value {val: v, type_, flags: val.flags};
-        *val = Cow::Owned(new_val);
-        return Ok(true);
+        let slice_type = state.types.add_slice(inner_type, flags);
+        let v = AddrOrValueBlob::Blob(ValueBlob::from_two_usizes([ptr, len]));
+        Value {val: v, type_: slice_type, flags: val.flags}
+    };
+    *val = Cow::Owned(new_val);
+    Ok(())
+}
+
+// shared_ptr: {ptr, refcount} - just remove refcount, so that field unwrapping turns this into plain pointer
+fn recognize_shared_ptr(fields: &mut Cow<[StructField]>) -> Result<()> {
+    if fields.len() != 2 {
+        return err!(NoField, "");
+    }
+    let mut refcount_idx: Option<usize> = None;
+    let mut found_ptr = false;
+    for (i, f) in fields.iter().enumerate() {
+        match trim_field_name(f.name) {
+            "cntrl" | "refcount" => refcount_idx = Some(i),
+            "ptr" => found_ptr = true,
+            _ => return err!(NoField, ""),
+        }
+    }
+    if let Some(i) = refcount_idx {
+        if found_ptr {
+            fields.to_mut().remove(i);
+            return err!(NotContainer, ""); // didn't replace the value
+        }
+    }
+    err!(NoField, "")
+}
+
+// libc++ string
+// union {
+//   s: {0: {is_long: 1 bit, size: 7 bits}, padding: [u8; 0], data: [u8; 23]},
+//   l: {0: {is_long: 1 bit, cap: 63 bits}, size: usize, data: *u8},
+//   r
+// }
+// (actual capacity is `cap * 2`, where 2 is `__endian_factor`)
+// (ifdef _LIBCPP_ABI_ALTERNATE_STRING_LAYOUT then the fields are shuffled around a little)
+fn recognize_libcpp_string(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, additional_names: &[&str], warning: &mut Option<Error>, state: &mut EvalState, context: &EvalContext) -> Result<()> {
+    let mut s = find_struct_field(&["s"], substruct)?;
+    let mut l = find_struct_field(&["l"], substruct)?;
+    let _ = optional_field(find_field(&["r"], substruct))?;
+    substruct.check_all_fields_used()?;
+
+    let mut s_anon = find_struct_field(&[""], &mut s)?;
+    let _ = optional_field(find_field(&["padding"], &mut s))?;
+    let mut inner_type: *const TypeInfo = ptr::null();
+    let (short_data_field, short_capacity) = find_array_field(&["data"], &mut s, &mut inner_type)?;
+    s.check_all_fields_used()?;
+
+    let s_is_long_field = find_int_field(&["is_long"], &mut s_anon)?;
+    let short_len_field = find_int_field(&["size"], &mut s_anon)?;
+    s_anon.check_all_fields_used()?;
+
+    let mut l_anon = find_struct_field(&[""], &mut l)?;
+    let long_len_field = find_int_field(&["size"], &mut l)?;
+    let long_ptr_field = find_pointer_field(&["data"], &mut l, &mut inner_type)?;
+    l.check_all_fields_used()?;
+
+    let l_is_long_field = find_int_field(&["is_long"], &mut l_anon)?;
+    let _ = optional_field(find_int_field(&["cap"], &mut l_anon))?;
+    l_anon.check_all_fields_used()?;
+
+
+    let mut scratch: [MaybeUninit<u8>; 256] = unsafe {MaybeUninit::uninit().assume_init()};
+    let slice = read_container_struct(val, &mut scratch, &context.memory)?;
+
+    let s_is_long = get_container_usize_field(s_is_long_field, slice)?;
+    if s_is_long > 1 {
+        return err!(Runtime, "bad is_long: {}", s_is_long);
+    }
+    let l_is_long = get_container_usize_field(l_is_long_field, slice)?;
+    if s_is_long != l_is_long {
+        return err!(Runtime, "s.is_long != l.is_long: {} {}", s_is_long, l_is_long);
     }
 
-    Ok(false)
+    let is_str = unsafe {(*inner_type).calculate_size()} == 1;
+
+    let (ptr, len) = if l_is_long != 0 {
+        (get_container_usize_field(long_ptr_field, slice)?, get_container_usize_field(long_len_field, slice)?)
+    } else {
+        let len = get_container_usize_field(short_len_field, slice)?;
+        if len > short_capacity {
+            return err!(Runtime, "short len > capacity: {} {}", len, short_capacity);
+        }
+
+        match &val.val {
+            AddrOrValueBlob::Addr(addr) => (addr + short_data_field.start/8, len),
+            AddrOrValueBlob::Blob(blob) => {
+                let array_type = state.types.add_array(inner_type, len, if is_str {ArrayFlags::UTF_STRING} else {ArrayFlags::empty()});
+                let r = short_data_field.start/8..short_data_field.end/8;
+                let new_val = Value {val: AddrOrValueBlob::Blob(blob.byte_range(r)?), type_: array_type, flags: val.flags};
+                *val = Cow::Owned(new_val);
+                return Ok(());
+            }
+        }
+    };
+
+    let slice_type = state.types.add_slice(inner_type, if is_str {SliceFlags::UTF_STRING} else {SliceFlags::empty()});
+    let v = AddrOrValueBlob::Blob(ValueBlob::from_two_usizes([ptr, len]));
+    let new_val = Value {val: v, type_: slice_type, flags: val.flags};
+    *val = Cow::Owned(new_val);
+    Ok(())
 }

@@ -1,6 +1,6 @@
 use crate::{*, error::*, elf::*, util::*, log::*};
 use std::io::{BufReader, BufRead};
-use std::{fs, fs::File, os::fd::{OwnedFd, AsRawFd}, str::FromStr, ops::Range, cmp::Ordering, collections::HashSet};
+use std::{fs, fs::File, os::fd::{OwnedFd, AsRawFd}, str::FromStr, ops::Range, cmp::Ordering, collections::HashSet, mem::MaybeUninit};
 use bitflags::*;
 use libc::{pid_t, c_void};
 
@@ -270,7 +270,7 @@ impl MemReader {
         MemReader {pid: 0}
     }
 
-    pub fn read(&self, offset: usize, buf: &mut [u8]) -> Result<()> {
+    pub fn read_uninit<'a>(&self, offset: usize, buf: &'a mut [MaybeUninit<u8>]) -> Result<&'a mut [u8]> {
         unsafe {
             let local_iov = libc::iovec {iov_base: buf.as_mut_ptr() as *mut c_void, iov_len: buf.len()};
             let mut remote_iov = libc::iovec {iov_base: offset as *mut c_void, iov_len: buf.len()};
@@ -282,9 +282,16 @@ impl MemReader {
                     return errno_err!("process_vm_readv failed");
                 }
             }
-            if r != buf.len() as isize { return err!(ProcessState, "unexpected EOF in mem @{:x}:0x{:x}", offset, buf.len()); }
-            Ok(())
+            if r != buf.len() as isize {
+                return err!(ProcessState, "unexpected EOF in mem @{:x}:0x{:x}", offset, buf.len());
+            }
+            Ok(std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len()))
         }
+    }
+
+    pub fn read(&self, offset: usize, buf: &mut [u8]) -> Result<()> {
+        unsafe {self.read_uninit(offset, std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut MaybeUninit<u8>, buf.len()))}?;
+        Ok(())
     }
 
     pub fn read_u8(&self, offset: usize) -> Result<u8> {

@@ -19,10 +19,10 @@ fn main() {
     let slice: &[i32] = &[1, 2, 3];                            // yes
     let mut_slice: &mut [i32] = &mut [1, 2, 3];                // yes
     let v: Vec<i32> = vec![1, 2, 3];                           // yes
-    let mut empty_v: Vec<i32> = Vec::new();                    // yes
+    let mut empty_v: Vec<i32> = Vec::new();
     let bh: BinaryHeap<i32> = BinaryHeap::from(vec![1, 2, 3]); // good enough
 
-    let vd: VecDeque<i32> = VecDeque::from(vec![1, 2, 3]);     // no
+    let vd: VecDeque<i32> = VecDeque::from(vec![1, 2, 3]);     // yes
 
     let string = String::from("hello");                        // yes
     let str_slice: &str = "world";                             // yes

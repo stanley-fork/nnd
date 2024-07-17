@@ -572,7 +572,7 @@ pub fn my_pid() -> pid_t {
     unsafe {MY_PID}
 }
 
-pub fn precalc_global_constants() {
+pub fn precalc_globals_util() {
     let assert_nonzero = |x: usize| -> usize {
         assert!(x != 0);
         x

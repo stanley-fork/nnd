@@ -27,7 +27,8 @@ pub enum ErrorCode {
     NoFunction = 25,
     Environment = 26,
     NotCalculated = 27,
-    NotContainer = 28,
+    NoField = 28,
+    NotContainer = 29,
 }
 
 #[derive(Debug)]
@@ -66,6 +67,7 @@ impl Error {
     pub fn is_io_not_found(&self) -> bool { match &self.error { ErrorEnum::IO(e) if e.kind() == io::ErrorKind::NotFound => true, _ => false, } }
     pub fn is_io_permission_denied(&self) -> bool { match &self.error { ErrorEnum::IO(e) if e.kind() == io::ErrorKind::PermissionDenied => true, _ => false, } }
     pub fn is_not_calculated(&self) -> bool { match &self.error { ErrorEnum::Code(ErrorCode::NotCalculated) => true, _ => false, } }
+    pub fn is_no_field(&self) -> bool { match &self.error { ErrorEnum::Code(ErrorCode::NoField) => true, _ => false, } }
     pub fn is_not_container(&self) -> bool { match &self.error { ErrorEnum::Code(ErrorCode::NotContainer) => true, _ => false, } }
 }
 

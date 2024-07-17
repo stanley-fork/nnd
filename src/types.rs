@@ -108,7 +108,7 @@ bitflags! { pub struct FieldFlags: u8 {
     const DEFAULT_VARIANT = 0x40;
 }}
 
-#[derive(Hash, PartialEq, Eq, Clone, Debug)]
+#[derive(Hash, PartialEq, Eq, Clone, Copy, Debug)]
 pub struct StructField {
     pub name: &'static str, // not actually static
     pub flags: FieldFlags,

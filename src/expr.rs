@@ -1,5 +1,5 @@
 use crate::{*, error::{*, Result, Error}, util::*, registers::*, types::*, procfs::*, symbols_registry::*, process_info::*, unwind::*, symbols::*, arena::*, pretty::*, settings::*, common_ui::*};
-use std::{fmt, fmt::Write, mem, collections::{HashMap, HashSet}, io::Write as ioWrite, borrow::Cow};
+use std::{fmt, fmt::Write, mem, collections::{HashMap, HashSet}, io::Write as ioWrite, borrow::Cow, ops::Range};
 use gimli::{Operation, EndianSlice, LittleEndian, Expression, Encoding, EvaluationResult, ValueType, DieReference, DW_AT_location, Location, DebugInfoOffset};
 use bitflags::*;
 
@@ -192,6 +192,14 @@ impl ValueBlob {
             res.zero_upper_bits(bit_size);
         }
         Ok(res)
+    }
+
+    pub fn byte_range(&self, r: Range<usize>) -> Result<Self> {
+        let slice = self.as_slice();
+        if r.end > slice.len() {
+            return err!(Runtime, "blob slice out of bounds: [{}, {}) > {}", r.start, r.end, slice.len());
+        }
+        Ok(Self::from_slice(&slice[r]))
     }
 }
 
@@ -1202,6 +1210,13 @@ impl StructBuilder {
     pub fn add_str_field(&mut self, name: &'static str, value: &str, types: &mut Types, builtin_types: &BuiltinTypes) {
         let array_type = types.add_array(builtin_types.char8, value.len(), ArrayFlags::UTF_STRING);
         self.add_blob_field(name, value.as_bytes(), array_type);
+    }
+    pub fn add_slice_field(&mut self, name: &'static str, ptr: usize, len: usize, type_: *const TypeInfo, flags: SliceFlags, types: &mut Types) {
+        let slice_type = types.add_slice(type_, flags);
+        let mut a = [0u8; 16];
+        a[..8].copy_from_slice(&ptr.to_le_bytes());
+        a[8..].copy_from_slice(&len.to_le_bytes());
+        self.add_blob_field(name, &a, slice_type);
     }
 
     pub fn finish(mut self, name: &'static str, flags: ValueFlags, types: &mut Types) -> Value {

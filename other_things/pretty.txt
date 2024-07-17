@@ -37,6 +37,10 @@ Rust
 
 
 
+absl::InlinedVector:
+{metadata_: usize, data_: union {allocated: {allocated_data: *T, allocated_capacity: *T}, inlined: {inlined_data: [i8; cap]}}}
+metadata_ & 1 - is_allocated
+metadata_ >> 1 - len
 
 
 Rust to do:
