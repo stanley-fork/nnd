@@ -1,5 +1,7 @@
 /DWARF5.pdf
 /ignored_in_dropbox.txt
 /target
-/testprogs/build/*
+/testprogs/build
+/testprogs/absl/build
+/testprogs/absl/lib
 /strategy_post_draft.txt

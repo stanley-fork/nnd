@@ -689,8 +689,21 @@ fn recognize_containers(val: &mut Cow<Value>, fields: &mut Cow<[StructField]>, a
         Err(e) if e.is_no_field() => substruct.clear_used(),
         Err(e) => return Err(e),
     }
+    match recognize_absl_inlined_vector(&mut substruct, val, additional_names, warning, state, context) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.is_no_field() => substruct.clear_used(),
+        Err(e) => return Err(e),
+    }
 
     err!(NotContainer, "")
+}
+
+fn make_slice(val: &mut Cow<Value>, ptr: usize, len: usize, inner_type: *const TypeInfo, is_string: bool, state: &mut EvalState) {
+    let flags = if is_string {SliceFlags::UTF_STRING} else {SliceFlags::empty()};
+    let slice_type = state.types.add_slice(inner_type, flags);
+    let v = AddrOrValueBlob::Blob(ValueBlob::from_two_usizes([ptr, len]));
+    let new_val = Value {val: v, type_: slice_type, flags: val.flags};
+    *val = Cow::Owned(new_val);
 }
 
 // Slice or vector.
@@ -741,16 +754,10 @@ fn recognize_slice_or_vec(substruct: &mut ContainerSubstruct, val: &mut Cow<Valu
     };
 
     // Guess whether this is a string.
-    let mut flags = SliceFlags::empty();
-    if inner_size == 1 && container_name_looks_like_string(val.type_, additional_names) {
-        flags.insert(SliceFlags::UTF_STRING);
-    }
+    let is_string = inner_size == 1 && container_name_looks_like_string(val.type_, additional_names);
 
     // Return a slice.
-    let type_ = state.types.add_slice(inner_type, flags);
-    let v = AddrOrValueBlob::Blob(ValueBlob::from_two_usizes([start, len]));
-    let new_val = Value {val: v, type_, flags: val.flags};
-    *val = Cow::Owned(new_val);
+    make_slice(val, start, len, inner_type, is_string, state);
     Ok(())
 }
 
@@ -774,7 +781,7 @@ fn recognize_rust_vec(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, 
     let cap = get_container_usize_field(cap_field, slice)?;
 
     let inner_size = (unsafe {&*inner_type}).calculate_size();
-    let new_val = if let Some(f) = head_field {
+    if let Some(f) = head_field {
         // VecDeque.
         let head = get_container_usize_field(f, slice)?;
         if head > cap || len > cap {
@@ -783,19 +790,14 @@ fn recognize_rust_vec(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, 
         let mut builder = StructBuilder::default();
         builder.add_slice_field("part1", ptr + head*inner_size, len.min(cap - head), inner_type, SliceFlags::empty(), &mut state.types);
         builder.add_slice_field("part2", ptr, len.saturating_sub(cap - head), inner_type, SliceFlags::empty(), &mut state.types);
-        builder.finish("VecDeque#pretty", val.flags, &mut state.types)
+        let new_val = builder.finish("VecDeque#pretty", val.flags, &mut state.types);
+        *val = Cow::Owned(new_val);
     } else {
-        let mut flags = SliceFlags::empty();
-        if inner_size == 1 && container_name_looks_like_string(val.type_, additional_names) {
-            flags.insert(SliceFlags::UTF_STRING);
-        }
-
-        let slice_type = state.types.add_slice(inner_type, flags);
-        let v = AddrOrValueBlob::Blob(ValueBlob::from_two_usizes([ptr, len]));
-        Value {val: v, type_: slice_type, flags: val.flags}
-    };
-    *val = Cow::Owned(new_val);
+        let is_string = inner_size == 1 && container_name_looks_like_string(val.type_, additional_names);
+        make_slice(val, ptr, len, inner_type, is_string, state);
+    }
     Ok(())
+
 }
 
 // shared_ptr: {ptr, refcount} - just remove refcount, so that field unwrapping turns this into plain pointer
@@ -867,31 +869,71 @@ fn recognize_libcpp_string(substruct: &mut ContainerSubstruct, val: &mut Cow<Val
         return err!(Runtime, "s.is_long != l.is_long: {} {}", s_is_long, l_is_long);
     }
 
-    let is_str = unsafe {(*inner_type).calculate_size()} == 1;
+    let inner_size = unsafe {(*inner_type).calculate_size()};
+    let is_string = inner_size == 1;
 
-    let (ptr, len) = if l_is_long != 0 {
-        (get_container_usize_field(long_ptr_field, slice)?, get_container_usize_field(long_len_field, slice)?)
+    if l_is_long != 0 {
+        let (ptr, len) = (get_container_usize_field(long_ptr_field, slice)?, get_container_usize_field(long_len_field, slice)?);
+        make_slice(val, ptr, len, inner_type, is_string, state);
+        Ok(())
     } else {
         let len = get_container_usize_field(short_len_field, slice)?;
         if len > short_capacity {
             return err!(Runtime, "short len > capacity: {} {}", len, short_capacity);
         }
+        return make_array_or_slice(val, short_data_field.start/8, len, inner_type, is_string, state);
+    }
+}
 
-        match &val.val {
-            AddrOrValueBlob::Addr(addr) => (addr + short_data_field.start/8, len),
-            AddrOrValueBlob::Blob(blob) => {
-                let array_type = state.types.add_array(inner_type, len, if is_str {ArrayFlags::UTF_STRING} else {ArrayFlags::empty()});
-                let r = short_data_field.start/8..short_data_field.end/8;
-                let new_val = Value {val: AddrOrValueBlob::Blob(blob.byte_range(r)?), type_: array_type, flags: val.flags};
-                *val = Cow::Owned(new_val);
-                return Ok(());
-            }
+fn make_array_or_slice(val: &mut Cow<Value>, byte_offset: usize, len: usize, inner_type: *const TypeInfo, is_string: bool, state: &mut EvalState) -> Result<()> {
+    let new_val = match &val.val {
+        AddrOrValueBlob::Addr(addr) => {
+            let slice_type = state.types.add_slice(inner_type, if is_string {SliceFlags::UTF_STRING} else {SliceFlags::empty()});
+            let v = AddrOrValueBlob::Blob(ValueBlob::from_two_usizes([addr + byte_offset, len]));
+            Value {val: v, type_: slice_type, flags: val.flags}
+        }
+        AddrOrValueBlob::Blob(blob) => {
+            let array_type = state.types.add_array(inner_type, len, if is_string {ArrayFlags::UTF_STRING} else {ArrayFlags::empty()});
+            let inner_size = unsafe {(*inner_type).calculate_size()};
+            Value {val: AddrOrValueBlob::Blob(blob.byte_range(byte_offset..byte_offset + len*inner_size)?), type_: array_type, flags: val.flags}
         }
     };
-
-    let slice_type = state.types.add_slice(inner_type, if is_str {SliceFlags::UTF_STRING} else {SliceFlags::empty()});
-    let v = AddrOrValueBlob::Blob(ValueBlob::from_two_usizes([ptr, len]));
-    let new_val = Value {val: v, type_: slice_type, flags: val.flags};
     *val = Cow::Owned(new_val);
     Ok(())
+}
+
+// absl::InlinedVector: {metadata_: usize, data_: union {allocated: {allocated_data: *T, allocated_capacity: usize}, inlined: {inlined_data: [i8; cap]}}}
+// metadata_ & 1 - is_allocated
+// metadata_ >> 1 - len
+fn recognize_absl_inlined_vector(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, additional_names: &[&str], warning: &mut Option<Error>, state: &mut EvalState, context: &EvalContext) -> Result<()> {
+    let metadata_field = find_int_field(&["metadata"], substruct)?;
+    let mut data = find_struct_field(&["data"], substruct)?;
+    substruct.check_all_fields_used()?;
+    let mut allocated = find_struct_field(&["allocated"], &mut data)?;
+    let mut inlined_type: *const TypeInfo = ptr::null();
+    let (inlined_field, inlined_capacity) = find_array_field(&["inlined"], &mut data, &mut inlined_type)?;
+    data.check_all_fields_used()?;
+    let mut inner_type: *const TypeInfo = ptr::null();
+    let allocated_data_field = find_pointer_field(&["allocated_data"], &mut allocated, &mut inner_type)?;
+    let _ = find_int_field(&["allocated_capacity"], &mut allocated)?;
+    allocated.check_all_fields_used()?;
+
+
+    let mut scratch: [MaybeUninit<u8>; 1024] = unsafe {MaybeUninit::uninit().assume_init()};
+    let slice = read_container_struct(val, &mut scratch, &context.memory)?;
+
+    let metadata = get_container_usize_field(metadata_field, slice)?;
+    let (is_long, len) = (metadata & 1 != 0, metadata >> 1);
+    if is_long {
+        let ptr = get_container_usize_field(allocated_data_field, slice)?;
+        make_slice(val, ptr, len, inner_type, false, state);
+        Ok(())
+    } else {
+        let inner_size = unsafe {(*inner_type).calculate_size()};
+        let inlined_size = unsafe {(*inlined_type).calculate_size()};
+        if len * inner_size > inlined_capacity * inlined_size {
+            return err!(Runtime, "short len > capacity: {}*{} > {}*{}", len, inner_size, inlined_capacity, inlined_size);
+        }
+        return make_array_or_slice(val, inlined_field.start/8, len, inner_type, false, state);
+    }
 }

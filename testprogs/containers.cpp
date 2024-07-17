@@ -47,9 +47,9 @@ int main() {
     std::string long_str(100, '.');
 
     // Wide strings.
-    std::wstring wstr = L"hello";          // [no, no]
-    std::u16string u16str = u"hello";      // [no, no]
-    std::u32string u32str = U"hello";      // [no, no]
+    std::wstring wstr = L"hello";          // [good enough, good enough]
+    std::u16string u16str = u"hello";      // [good enough, good enough]
+    std::u32string u32str = U"hello";      // [good enough, good enough]
 
     // Deque.
     std::deque<int> deq = {1, 2, 3};     // [no, no]

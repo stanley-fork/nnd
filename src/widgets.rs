@@ -766,6 +766,8 @@ impl Tabs {
                 };
                 res.push((idx, suffix));
             }
+
+            start = end;
         }
         for (idx, suffix) in res {
             self.tabs[idx].disambiguation_suffix = suffix;
