@@ -1,25 +1,12 @@
-built-in pretty printers
-  strings in libstdc++:
-    std::string: std::__cxx11::basic_string<...>, ._M_dataplus._M_p, ._M_string_length, .2._M_local_buf, .2._M_allocated_capacity
-    std::string_view: std::basic_string_view<...>, ._M_str, ._M_len
-  libc++: ?
-  strings in Rust:
-    &str: data_ptr, length; by name?
-    alloc::string::String: .vec is Vec<u8>; detect by name suffix and field name+type?
-    &std::ffi::os_str::OsStr: data_ptr (of some complicated type, ignore?), length; detect by name and fields?
-    std::ffi::os_str::OsString: .inner.inner is a Vec<u8>
-    &std::path::Path: data_ptr (complicated type), length
-    std::path::PathBuf: .inner.inner.inner is a Vec<u8>
-    &[usize] (not string): data_ptr, length
-investigate unbounded pointer expansion in forward_list
 optimize simple things found by profiler (samply is nice)
+do something to prevent stopping again on the same line when continuing from a breakpoint, when there are multiple locations on the same line (e.g. function args)
+search and go-to-line in code window
+add watch on pressing enter on non-root value tree node
 fix empty symbols loading stage name near the end
-make u8 always be non-ambiguous non-char
 key to send SIGINT to the program
 ignore anon executable mmaps, don't treat them as "binaries" (currently visible in binaries window)
 show last seen cpu usage for threads when suspended; update it when suspending (based on last 2 buckets)
 fix picking up updated binary unnecessarily
-search and go-to-line in code window
 make search auto-case-sensitive (insensitive if all lowercase, sensitive otherwise)
 key to sort by cpu usage in threads window
 key to follow a jump in disas
@@ -28,7 +15,6 @@ instruction breakpoints
 option to load symbols from another file (unstripped executable) - will make it usable in ch cloud
 look at profiler on ch server (1500 threads)
 make return key do something in each window: go from threads to stack -> code -> disassembly -> code; from locals create a watch; from watch sub-value create another watch for that field/element; from breakpoints to code/disassembly/watch (depending on breakpoint type)
-color threads based on stack hash
 "unexpectedly big memory read" (16 bytes) for f64 local variables on the stack in rust
 floating point and simd registers
 allow to put breakpoint on a whole file
@@ -38,7 +24,6 @@ test with 10k threads
   waitpid is suspiciously slow; does it iterate over threads? can partially avoid it by anticipating which threads will get events?
   if there are enough free hw breakpoints, activate new breakpoints as hw and thread-specific right away without waiting for them to be spuriously hit by other threads
   maybe avoid duplicate POKEUSER calls for debug registers if the thread already had them assigned
-do something to prevent stopping again on the same line when continuing from a breakpoint, when there are multiple locations on the same line (e.g. function args)
 "warning: DW_AT_encoding = DW_ATE_complex_float on DW_TAG_base_type is not supported" (/usr/lib/x86_64-linux-gnu/libm.so.6)
 find function by address (like addr2line)
 show number of function inlined sites in disassembly window, allow setting breakpoint on it, allow opening inline-only functions
@@ -47,20 +32,17 @@ jump to type decl location in source window when selecting it in watches window
 type search in watches window (when found, add a watch "type(`<name>`)"
 global variables, search dialog for them in watches window; research .debug_pubtypes and .debug_pubnames
 profiling per dwarf tag
+rearranging windows, reordering tabs
 show stop reason in status window, next to "suspended"
 allow cast `foo as typeof(bar)`
 welcome/help screen, '?' to open, show on first start and save to PersistentState; mention email for reporting bugs, and to include log and preferably binary; document all features of watch expression language; mention hidden profiler hotkey
 deal with exceptions
 avoid flickering when stepping rapidly: show last seen disassembly, code, maybe variables and stack
-in code window, distinguish files that are different in symbols but map to the same local file (this actually happens)
 investigate why many types are not deduped, e.g. there's DB::Block#441
-put common colors/styles in a struct Palette (e.g. style for addresses, function names, variable names, file names, line numbers, dubious values, etc) instead of using specific colors all the time
 show argument values in stack trace
-detect dynamic library loads using r_debug protocol
+detect dynamic library loads using r_debug thing
 hotkey to step to end of basic block or next call/ret
 unwinding stack out of signal handler, e.g. clickhouse's sampling profiler
-merge threads and stack windows, with expandable threads
-command line options, use some library
 make stack unwinding work when control is in .plt or .plt.got, see "Recognise PLT entries such as" in libunwind code
 allow line-based steps in .plt* (maybe by just turning them into single-instruction-steps)
 in disassembly window, make 'left' key jump to the start of inlined function
@@ -73,6 +55,9 @@ slice type, use it for pretty-printing rust strings
 -v for build datetime
 handle partially-optimized-out struct values (common in rust)
 better tab names in disas window for rust functions like "ui_prototype::ScreenBuffer::fill::h7933f74b1510f938" - take function name instead of the hash at the end (there's no formal indication, just detect 16-digit hexadecimal string)
+more built-in pretty printers: hash tables (std, sparsehash, absl, Rust), rb trees, deque, linked lists
+color threads based on stack hash
+hotkey to run to cursor
 
 watches, expressions
   first, implement simple expression watches
@@ -88,6 +73,7 @@ watches, expressions
   format matrices prettily
   format options for simd registers to show as vectors of given type and length (expandable)
   make basic types like u16 available without big search, with consistent names
+  also consider subset of the language for injecting conditional breakpoint code
 table widget
   line wrapping (togglable)
   variable number of lines per row (use for progress bar and error messages)
@@ -100,22 +86,17 @@ table widget
   make sure line wrapping enables dense display of arrays/srings/hexdumps in watches window; for hexdumps, consider more rounded grouping with starting index on each line
 
 opening core dumps
-truncate long table cells on the right side (binary paths, function names in stack, function names in threads, file:line)
-more sophisticated render throttling: after an event, set render timer to 1ms if no renders happened in the last 1/fps seconds
 show disassembly even if symbols are missing
 group threads by stack trace, to make it easy to exclude pool threads waiting for work
 show return value after step-out (and other steps that happened to step out)
 special breakpoints: on exception, on dynamic library load, on program start, on main function entry, on signal
 data breakpoints (added by pressing 'b' on a watch, the breakpoint would use the address of the watched value at the time of setting the breakpoint, with some indication if it's different from current); maybe added as a new watch with address as a literal; or added in breakpoints window and focus jumps there
 thread-specific breakpoints (controlled in breakpoints window), a key to lock all breakpoints to current thread
-allow changing window layout dynamically
 hotkeys for switching to specific windows
 resolve dynamic library call targets in disassembly, instead of showing them as "call .plt.sec+1234h"
 research symtab function range overlaps, don't ignore lengths (e.g. in ld-linux-x86-64.so.2, entry point is a NOTYPE symbol _start, which we incorrectly attribute to previous function _dl_help that ends just before the program entry point)
-hotkey to run to cursor
 pretty print variable locations (inline frame base and cfa, turn simple expressions from postfix to infix notation)
 handle subset of fields being optimized out (seen e.g. for metric_active_threads in ThreadPoolImpl<std::__1::thread>::worker)
-allow multiline watch expressions, collapsed when not edited
 maybe show various stop conditions (program start, crashing signals, stepping) uniformly as virtual breakpoints in breakpoints window
 test symbols loader with TSAN (for the sketchy bespoke locking in types traversal)
 parse and colorize function names, especially the template stuff
@@ -134,8 +115,4 @@ if a step is interrupted, focus on the stack frame of the step, not the top fram
 allow writing to registers and memory
 allow calling functions
 refactor loader stack to not contain leaves
-get rid of tui-rs
-  avoid double-borders: https://ratatui.rs/how-to/layout/collapse-borders.html
-  avoid String in each Cell
-  shorter syntax for styles
 snapshots and "step back"; probably don't actually revert the process state, just allow inspecting snapshot of memory+registers

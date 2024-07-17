@@ -1351,12 +1351,17 @@ pub struct SearchBar {
     pub text: TextInput,
     pub visible: bool,
     pub editing: bool,
+    pub close_on_enter: bool,
 }
 impl SearchBar {
-    pub fn build(&mut self, left_text: Option<usize>, right_text: Option<usize>, ui: &mut UI) {
-        assert!(self.visible);
-        if self.editing && ui.check_key(KeyAction::Enter) {
+    // Sets cur_parent's height to 0 or 1. Returns true if close_on_enter, and Enter was pressed.
+    pub fn build(&mut self, left_text: Option<usize>, right_text: Option<usize>, ui: &mut UI) -> bool {
+        let enter = self.editing && ui.check_key(KeyAction::Enter);
+        if enter {
             self.editing = false;
+            if self.close_on_enter {
+                self.visible = false;
+            }
         }
         if self.visible && ui.check_key(KeyAction::Cancel) {
             self.editing = false;
@@ -1369,10 +1374,11 @@ impl SearchBar {
             self.visible = false;
         }
         if !self.visible {
-            ui.should_redraw = true;
-            return;
+            ui.cur_mut().set_fixed_height(0);
+            return enter;
         }
 
+        ui.cur_mut().set_fixed_height(1);
         ui.cur_mut().axes[Axis::X].flags.insert(AxisFlags::STACK);
         if let Some(l) = left_text {
             ui.add(widget!().width(AutoSize::Text).text(l));
@@ -1392,6 +1398,8 @@ impl SearchBar {
                 ui.cur_mut().draw_text = Some(l..l+1);
             }
         });
+
+        false
     }
 
     pub fn start_editing(&mut self) {

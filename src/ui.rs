@@ -2279,12 +2279,10 @@ impl WindowContent for ThreadsWindow {
         if ui.check_key(KeyAction::Find) {
             self.filter.bar.start_editing();
         }
-        with_parent!(ui, ui.add(widget!().identity(&'s').fixed_height(if self.filter.bar.visible {1} else {0})), {
+        with_parent!(ui, ui.add(widget!().identity(&'s')), {
             ui.focus();
-            if self.filter.bar.visible {
-                let l = ui_writeln!(ui, default_dim, "filter: ");
-                self.filter.bar.build(Some(l), None, ui);
-            }
+            let l = ui_writeln!(ui, default_dim, "filter: ");
+            self.filter.bar.build(Some(l), None, ui);
         });
         let table_widget = ui.add(widget!().identity(&'t').height(AutoSize::Remainder(1.0)));
         with_parent!(ui, table_widget, {
@@ -2714,12 +2712,24 @@ struct SourceFile {
 }
 
 #[derive(Default)]
+struct CodeSearchResults {
+    query: String,
+    tab_identity: usize,
+
+    matches: Vec<(/*line*/ usize, /*column*/ Range<usize>)>,
+}
+
+#[derive(Default)]
 struct CodeWindow {
     tabs: Vec<CodeTab>,
     tabs_state: TabsState,
     file_cache: HashMap<(PathBuf, FileVersionInfo), SourceFile>,
 
     search_dialog: Option<SearchDialog>,
+
+    search_bar: SearchBar,
+    search_results: CodeSearchResults,
+    go_to_line_bar: Option<SearchBar>,//asdqwe use all that
 
     // When this changes (usually because the user moved the cursor around the file), we scroll disassembly to the address corresponding to the selected line.
     disassembly_scrolled_to: Option<(PathBuf, FileVersionInfo, /*cursor*/ usize)>,

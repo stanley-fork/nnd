@@ -104,6 +104,14 @@ fn main() {
             settings.fixed_fps = true;
         } else if let Some(path) = parse_arg(&mut args, "--dir", "-d", false) {
             settings.code_dirs.push(PathBuf::from(path));
+        } else if let Some(s) = parse_arg(&mut args, "--period", "", false) {
+            settings.periodic_timer_seconds = match s.parse::<f64>() {
+                Ok(p) if p >= 0.0 && p <= 4e9 => p,
+                _ => {
+                    eprintln!("invalid --period: '{}', expected real number in [0, 4e9] (in seconds)", s);
+                    process::exit(1);
+                }
+            };
         } else if print_help_chapter(&args[0], &all_args[0]) {
             process::exit(0);
         } else {
