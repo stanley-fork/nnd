@@ -120,7 +120,7 @@ pub struct Debugger {
     pub threads: HashMap<pid_t, Thread>,
 
     pub info: ProcessInfo,
-    pub my_resource_stats: ResourceStats, // for debugger itself, as opposed to info.resource_stats
+    pub my_resource_stats: ResourceStats, // for debugger itself, as opposed to info.total_resource_stats
     pub symbols: SymbolsRegistry,
 
     pub memory: MemReader,
@@ -285,13 +285,13 @@ pub enum StopReason {
 
 impl Thread {
     fn new(idx: usize, tid: pid_t, state: ThreadState) -> Self {
-        Thread {idx: idx, tid: tid, state: state, single_stepping: false, ignore_next_hw_breakpoint_hit_at_addr: None, stop_reasons: Vec::new(), info: ThreadInfo::new(), pending_signal: None, waiting_for_initial_stop: true, sent_interrupt: false, stop_count: 0, attached_late: false, exiting: false, subframe_to_select: None}
+        Thread {idx: idx, tid: tid, state: state, single_stepping: false, ignore_next_hw_breakpoint_hit_at_addr: None, stop_reasons: Vec::new(), info: ThreadInfo::default(), pending_signal: None, waiting_for_initial_stop: true, sent_interrupt: false, stop_count: 0, attached_late: false, exiting: false, subframe_to_select: None}
     }
 }
 
 impl Debugger {
     fn new(mode: RunMode, command_line: Vec<String>, context: Arc<Context>, symbols: SymbolsRegistry, breakpoints: Pool<Breakpoint>, persistent: PersistentState, my_resource_stats: ResourceStats, prof: Profiling) -> Self {
-        Debugger {mode, command_line, context, pid: 0, target_state: ProcessState::NoProcess, log: Log::new(), prof, threads: HashMap::new(), pending_wait_events: VecDeque::new(), next_thread_idx: 1, info: ProcessInfo::new(), my_resource_stats, symbols, memory: MemReader::invalid(), waiting_for_initial_sigstop: false, stepping: None, breakpoint_locations: Vec::new(), breakpoints, stopping_to_handle_breakpoints: false, hardware_breakpoints: std::array::from_fn(|_| HardwareBreakpoint {active: false, thread_specific: None, addr: 0}), persistent}
+        Debugger {mode, command_line, context, pid: 0, target_state: ProcessState::NoProcess, log: Log::new(), prof, threads: HashMap::new(), pending_wait_events: VecDeque::new(), next_thread_idx: 1, info: ProcessInfo::default(), my_resource_stats, symbols, memory: MemReader::invalid(), waiting_for_initial_sigstop: false, stepping: None, breakpoint_locations: Vec::new(), breakpoints, stopping_to_handle_breakpoints: false, hardware_breakpoints: std::array::from_fn(|_| HardwareBreakpoint {active: false, thread_specific: None, addr: 0}), persistent}
     }
 
     pub fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {
@@ -316,11 +316,11 @@ impl Debugger {
     }
 
     pub fn from_command_line(args: &[String], context: Arc<Context>, persistent: PersistentState) -> Self {
-        Self::new(RunMode::Run, args.into(), context.clone(), SymbolsRegistry::new(context), Pool::new(), persistent, ResourceStats::new(), Profiling::new())
+        Self::new(RunMode::Run, args.into(), context.clone(), SymbolsRegistry::new(context), Pool::new(), persistent, ResourceStats::default(), Profiling::new())
     }
 
     pub fn attach(pid: pid_t, context: Arc<Context>, persistent: PersistentState) -> Result<Self> {
-        let mut r = Self::new(RunMode::Attach, Vec::new(), context.clone(), SymbolsRegistry::new(context), Pool::new(), persistent, ResourceStats::new(), Profiling::new());
+        let mut r = Self::new(RunMode::Attach, Vec::new(), context.clone(), SymbolsRegistry::new(context), Pool::new(), persistent, ResourceStats::default(), Profiling::new());
         r.pid = pid;
         r.target_state = ProcessState::Running;
         r.memory = MemReader::new(pid);
@@ -359,7 +359,7 @@ impl Debugger {
 
         refresh_maps_and_binaries_info(&mut r);
         for t in r.threads.values_mut() {
-            refresh_thread_info(pid, t, &mut r.prof.bucket);
+            refresh_thread_info(pid, t, &mut r.prof.bucket, &r.context.settings);
         }
 
         Ok(r)
@@ -378,7 +378,7 @@ impl Debugger {
             let context = mem::replace(&mut self.context, Context::invalid());
             let symbols = mem::replace(&mut self.symbols, SymbolsRegistry::new(Context::invalid()));
             let persistent = mem::replace(&mut self.persistent, PersistentState::empty());
-            let my_resource_stats = mem::replace(&mut self.my_resource_stats, ResourceStats::new());
+            let my_resource_stats = mem::replace(&mut self.my_resource_stats, ResourceStats::default());
             let mut breakpoints = mem::replace(&mut self.breakpoints, Pool::new());
             let prof = mem::replace(&mut self.prof, Profiling::new());
             for (id, b) in breakpoints.iter_mut() {
@@ -712,7 +712,7 @@ impl Debugger {
                     } else {
                         let t = self.threads.get_mut(&tid).unwrap();
                         t.stop_count += 1;
-                        refresh_thread_info(self.pid, t, &mut self.prof.bucket);
+                        refresh_thread_info(self.pid, t, &mut self.prof.bucket, &self.context.settings);
                     }
                 } else {
                     return err!(Internal, "waitpid() returned unexpected status: {}", wstatus);
@@ -789,17 +789,9 @@ impl Debugger {
         Ok(drop_caches)
     }
 
-    pub fn refresh_resource_stats(&mut self) {
-        match refresh_resource_stats(self.pid, &mut self.my_resource_stats, &mut self.info.resource_stats, &mut self.threads, &mut self.prof.bucket) {
-            Ok(()) => (),
-            Err(e) => {
-                eprintln!("failed to refresh resource stats: {}", e);
-                self.my_resource_stats = ResourceStats::new();
-                self.info.resource_stats = ResourceStats::new();
-                for (_, t) in &mut self.threads {
-                    t.info.resource_stats = ThreadResourceStats::new();
-                }
-            }
+    pub fn refresh_all_resource_stats(&mut self) {
+        if let Some(error) = refresh_all_resource_stats(self.pid, &mut self.my_resource_stats, &mut self.info.total_resource_stats, &mut self.threads, &mut self.prof.bucket, &self.context.settings) {
+            eprintln!("failed to refresh resource stats: {}", error);
         }
     }
 
@@ -838,7 +830,7 @@ impl Debugger {
         refresh_maps_and_binaries_info(self);
         for t in self.threads.values_mut() {
             t.info.invalidate();
-            refresh_thread_info(self.pid, t, &mut self.prof.bucket);
+            refresh_thread_info(self.pid, t, &mut self.prof.bucket, &self.context.settings);
         }
 
         // Retry resolving breakpoints into addresses after symbols are loaded. Particularly useful for breakpoints loaded from state file on startup.
@@ -1326,7 +1318,7 @@ impl Debugger {
         thread.stop_reasons.clear();
 
         if refresh_info {
-            refresh_thread_info(self.pid, thread, &mut self.prof.bucket);
+            refresh_thread_info(self.pid, thread, &mut self.prof.bucket, &self.context.settings);
         }
         
         Ok(())

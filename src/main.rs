@@ -105,13 +105,14 @@ fn main() {
         } else if let Some(path) = parse_arg(&mut args, "--dir", "-d", false) {
             settings.code_dirs.push(PathBuf::from(path));
         } else if let Some(s) = parse_arg(&mut args, "--period", "", false) {
-            settings.periodic_timer_seconds = match s.parse::<f64>() {
+            let seconds = match s.parse::<f64>() {
                 Ok(p) if p >= 0.0 && p <= 4e9 => p,
                 _ => {
                     eprintln!("invalid --period: '{}', expected real number in [0, 4e9] (in seconds)", s);
                     process::exit(1);
                 }
             };
+            settings.periodic_timer_ns = (seconds * 1e9) as usize;
         } else if print_help_chapter(&args[0], &all_args[0]) {
             process::exit(0);
         } else {
@@ -253,7 +254,8 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, command_line: Option<Vec<S
 
     // Timer for various periodic tasks.
     let periodic_timer = TimerFD::new();
-    periodic_timer.set(1, (context.settings.periodic_timer_seconds * 1e9) as usize);
+    // 0 means no periodic timer.
+    periodic_timer.set(1, context.settings.periodic_timer_ns);
 
     epoll.add(STDIN_FILENO, libc::EPOLLIN, STDIN_FILENO as u64)?;
     epoll.add(render_timer.fd, libc::EPOLLIN, render_timer.fd as u64)?;
@@ -344,7 +346,7 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, command_line: Option<Vec<S
                 debugger.prof.bucket.other_tsc += prof.finish(&debugger.prof.bucket);
             } else if fd == periodic_timer.fd {
                 periodic_timer.read();
-                debugger.refresh_resource_stats();
+                debugger.refresh_all_resource_stats();
                 PersistentState::try_to_save_state_if_changed(&mut debugger, &mut ui);
                 debugger.prof.bucket.other_tsc += prof.finish(&debugger.prof.bucket);
                 debugger.prof.advance_bucket();

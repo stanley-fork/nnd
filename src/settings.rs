@@ -11,7 +11,7 @@ pub struct Settings {
     //  * saving state to file (watches, breakpoints, etc) if changed (state is also saved on clean exit, but not on panic or crash),
     //  * rendering progress bar movement, // TODO: use animation system instead (after implementing animation system)
     //  * rotating profiling time series buckets.
-    pub periodic_timer_seconds: f64,
+    pub periodic_timer_ns: usize,
     pub mouse_mode: MouseMode,
     pub code_dirs: Vec<PathBuf>,
 
@@ -28,7 +28,7 @@ impl Default for Settings {
         stop_on_initial_exec: true,
         fps: 144.0,
         max_threads: 128,
-        periodic_timer_seconds: 0.25,
+        periodic_timer_ns: 250_000_000,
         mouse_mode: MouseMode::Full,
         code_dirs: Vec::new(),
 

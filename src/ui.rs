@@ -1087,7 +1087,6 @@ impl WindowContent for WatchesWindow {
     }
 }
 
-// TODO: Add Type::MetaVariable instead and allow inspecting variables in watches window like types and fields.
 #[derive(Default)]
 struct LocationsWindow {
     table_state: TableState,
@@ -1252,10 +1251,8 @@ impl DisassemblyWindow {
         Ok(())
     }
 
-    fn make_title(demangled_name: &str) -> String {
-        if demangled_name.len() <= 30 {
-            return demangled_name.to_string();
-        }
+    fn make_title(mut demangled_name: &str) -> String {
+        rust_remove_function_name_hash_suffix(&mut demangled_name);
         // Some crude approximation of removing namespaces and parent classes.
         let mut res = demangled_name;
         let first_template = demangled_name.char_indices().find(|(_, c)| *c == '<');
@@ -1858,11 +1855,11 @@ impl WindowContent for StatusWindow {
         if debugger.target_state != ProcessState::NoProcess {
             ui_write!(ui, default_dim, "pid: ");
             ui_write!(ui, default, "{}", debugger.pid);
-            ui_writeln!(ui, default_dim, " cpu {:.0}% mem {}", debugger.info.resource_stats.cpu_percentage(), PrettySize(debugger.info.resource_stats.rss_bytes));
+            ui_writeln!(ui, default_dim, " cpu {:.0}% mem {}", debugger.info.total_resource_stats.cpu_percentage(debugger.context.settings.periodic_timer_ns), PrettySize(debugger.info.total_resource_stats.latest.rss_bytes()));
         } else {
             ui_writeln!(ui, default_dim, "pid: none");
         }
-        ui_writeln!(ui, default_dim, "nnd pid: {} cpu {:.0}% mem {}", my_pid(), debugger.my_resource_stats.cpu_percentage(), PrettySize(debugger.my_resource_stats.rss_bytes));
+        ui_writeln!(ui, default_dim, "nnd pid: {} cpu {:.0}% mem {}", my_pid(), debugger.my_resource_stats.cpu_percentage(debugger.context.settings.periodic_timer_ns), PrettySize(debugger.my_resource_stats.latest.rss_bytes()));
         match &debugger.persistent.path {
             Ok(p) => ui_writeln!(ui, default_dim, "{}/", p.display()),
             Err(e) => ui_writeln!(ui, error, "{}", e),
@@ -1908,7 +1905,7 @@ impl HintsWindow {
         let content_widget = ui.add(widget!().parent(viewport).fixed_y(0).height(AutoSize::Children).vstack());
 
         with_parent!(ui, content_widget, {
-            styled_write!(ui.text, ui.palette.default, "frame: {:<10} widgets: {:<10} bucket: {:<10}", ui.frame_idx, ui.prev_tree.len(), PrettyDuration(debugger.context.settings.periodic_timer_seconds));
+            styled_write!(ui.text, ui.palette.default, "frame: {:<10} widgets: {:<10} bucket: {:<10}", ui.frame_idx, ui.prev_tree.len(), PrettyDuration(debugger.context.settings.periodic_timer_ns as f64 / 1e9));
             let l = ui.text.close_line();
             ui.add(widget!().height(AutoSize::Text).text(l));
 
@@ -2376,22 +2373,24 @@ impl WindowContent for ThreadsWindow {
             table.text_cell(ui);
 
             let is_filtered_out = selected_thread_filtered_out && tid == state.selected_thread;
-            match t.info.name.clone() {
-                Ok(name) => styled_writeln!(ui.text, if is_filtered_out {ui.palette.default_dim} else {ui.palette.default}, "{}", name),
-                Err(e) => ui_writeln!(ui, error, "{}", e),
-            };
+            if let Some(e) = &t.info.resource_stats.error {
+                ui_writeln!(ui, error, "{}", e);
+            } else {
+                let name = t.info.resource_stats.latest.comm();
+                styled_writeln!(ui.text, if is_filtered_out {ui.palette.default_dim} else {ui.palette.default}, "{}", name);
+            }
             table.text_cell(ui);
 
-            let style = match t.info.resource_stats.state {
+            let style = match t.info.resource_stats.latest.state {
                 'R' | 'D' => ui.palette.running,
                 'S' | 'T' | 't' => ui.palette.suspended,
                 'Z' | 'X' | 'x' => ui.palette.error,
                 _ => ui.palette.state_other,
             };
-            styled_writeln!(ui.text, style, "{}", t.info.resource_stats.state);
+            styled_writeln!(ui.text, style, "{}", t.info.resource_stats.latest.state);
             table.text_cell(ui);
 
-            ui_writeln!(ui, default_dim, "{:.0}%", t.info.resource_stats.cpu_percentage(debugger.info.resource_stats.period_ns));
+            ui_writeln!(ui, default_dim, "{:.0}%", t.info.resource_stats.cpu_percentage(debugger.context.settings.periodic_timer_ns));
             table.text_cell(ui);
 
             match t.state {
@@ -2691,6 +2690,26 @@ fn rust_fake_path_to_url(path: &str) -> Option<String> {
     let mut res = "https://github.com/rust-lang/rust/blob/".to_string();
     res.push_str(&path[7..]);
     Some(res)
+}
+// Rust function names in debug info look like this: nnd::pretty::prettify_value::hf586ae10d8ed2bb6
+// Remove that last suffix.
+fn rust_remove_function_name_hash_suffix(name: &mut &str) {
+    if name.len() < 19 {
+        return;
+    }
+    let i = name.len() - 19;
+    if !name.is_char_boundary(i) {
+        return;
+    }
+    let suf = &name[i..];
+    if !suf.starts_with("::h") {
+        return;
+    }
+    let suf = &suf[3..];
+    if suf.chars().any(|c| !c.is_ascii_hexdigit()) {
+        return;
+    }
+    *name = &name[..i];
 }
 
 #[derive(Default)]

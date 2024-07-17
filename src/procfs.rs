@@ -201,11 +201,12 @@ impl MemMapsInfo {
 
             let mut binary_id: Option<BinaryId> = None;
             if let Some(p) = &path {
-                if !p.starts_with('[') {
-                    binary_id = Some(BinaryId {path: p.clone(), inode, special: SpecialSegmentId::None});
-                } else if p == "[vdso]" && permissions.contains(MemMapPermissions::EXECUTE) {
+                if p == "[vdso]" && permissions.contains(MemMapPermissions::EXECUTE) {
                     binary_id = Some(BinaryId {path: p.clone(), inode: pid as u64, special: SpecialSegmentId::Vdso(start..end)});
+                } else if !p.is_empty() && !p.starts_with('[') {
+                    binary_id = Some(BinaryId {path: p.clone(), inode, special: SpecialSegmentId::None});
                 }
+                // We currently ignore executable anon (p.is_empty()) mappings, e.g. JITted code.
             }
             if permissions.contains(MemMapPermissions::EXECUTE) {
                 if let Some(id) = &binary_id {
@@ -355,8 +356,9 @@ pub struct ProcStat {
     pub state: char,
     pub utime: usize, // in _SC_CLK_TCK units
     pub stime: usize,
-    pub rss: usize, // in pages
+    rss: usize, // in pages
 }
+impl Default for ProcStat { fn default() -> Self { Self {comm: [0; 33], state: '?', utime: 0, stime: 0, rss: 0} } }
 impl ProcStat {
     pub fn parse(path: &str, prof: &mut ProfileBucket) -> Result<ProcStat> {
         let timer = TscScope::new();
@@ -386,8 +388,13 @@ impl ProcStat {
         Ok(ProcStat {comm, state, utime, stime, rss})
     }
 
-    pub fn comm(&self) -> Result<&str> {
-        Ok(std::str::from_utf8(&self.comm[1..1+self.comm[0] as usize])?)
+    // Thread name.
+    pub fn comm(&self) -> &str {
+        std::str::from_utf8(&self.comm[1..1+self.comm[0] as usize]).unwrap() // valid by construction
+    }
+
+    pub fn rss_bytes(&self) -> usize {
+        self.rss * sysconf_PAGE_SIZE()
     }
 }
 

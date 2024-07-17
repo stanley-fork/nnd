@@ -1,63 +1,60 @@
-optimize simple things found by profiler (samply is nice)
-do something to prevent stopping again on the same line when continuing from a breakpoint, when there are multiple locations on the same line (e.g. function args)
 search and go-to-line in code window
+do something to prevent stopping again on the same line when continuing from a breakpoint, when there are multiple locations on the same line (e.g. function args)
 add watch on pressing enter on non-root value tree node
+sorting tables, especially threads by cpu usage
+hotkey to run to cursor
+reordering tabs
+rearranging windows
+maximizing windows
+
 fix empty symbols loading stage name near the end
-key to send SIGINT to the program
-ignore anon executable mmaps, don't treat them as "binaries" (currently visible in binaries window)
-show last seen cpu usage for threads when suspended; update it when suspending (based on last 2 buckets)
 fix picking up updated binary unnecessarily
-make search auto-case-sensitive (insensitive if all lowercase, sensitive otherwise)
-key to sort by cpu usage in threads window
-key to follow a jump in disas
 investigate regression in symbols loading speed (stuck on "parsing drawf" for ~10 seconds)
-instruction breakpoints
-option to load symbols from another file (unstripped executable) - will make it usable in ch cloud
+investigate why many types are not deduped, e.g. there's DB::Block#441
+unwinding stack out of signal handler, e.g. clickhouse's sampling profiler
+make stack unwinding work when control is in .plt or .plt.got, see "Recognise PLT entries such as" in libunwind code
+
+optimize simple things found by profiler (samply is nice)
 look at profiler on ch server (1500 threads)
-make return key do something in each window: go from threads to stack -> code -> disassembly -> code; from locals create a watch; from watch sub-value create another watch for that field/element; from breakpoints to code/disassembly/watch (depending on breakpoint type)
-"unexpectedly big memory read" (16 bytes) for f64 local variables on the stack in rust
-floating point and simd registers
-allow to put breakpoint on a whole file
 test with 10k threads
   fix O(n^2) stuff until syscalls are the slowest part
   time waitpid separately
   waitpid is suspiciously slow; does it iterate over threads? can partially avoid it by anticipating which threads will get events?
   if there are enough free hw breakpoints, activate new breakpoints as hw and thread-specific right away without waiting for them to be spuriously hit by other threads
   maybe avoid duplicate POKEUSER calls for debug registers if the thread already had them assigned
+
+key to send SIGINT to the program
+instruction breakpoints
+option to load symbols from another file (unstripped executable) - will make it usable in ch cloud
+make return key do something in each window: go from threads to stack -> code -> disassembly -> code; from locals create a watch; from watch sub-value create another watch for that field/element; from breakpoints to code/disassembly/watch (depending on breakpoint type)
+"unexpectedly big memory read" (16 bytes) for f64 local variables on the stack in rust
+floating point and simd registers
+allow to put breakpoint on a whole file
 "warning: DW_AT_encoding = DW_ATE_complex_float on DW_TAG_base_type is not supported" (/usr/lib/x86_64-linux-gnu/libm.so.6)
 find function by address (like addr2line)
 show number of function inlined sites in disassembly window, allow setting breakpoint on it, allow opening inline-only functions
-add decl location to TypeInfo and type inspection in watch expressions
+add decl location to TypeInfo and MetaType
 jump to type decl location in source window when selecting it in watches window
+more built-in pretty printers: hash tables (std, sparsehash, absl, Rust), rb trees, deque, linked lists
 type search in watches window (when found, add a watch "type(`<name>`)"
 global variables, search dialog for them in watches window; research .debug_pubtypes and .debug_pubnames
-profiling per dwarf tag
-rearranging windows, reordering tabs
 show stop reason in status window, next to "suspended"
 allow cast `foo as typeof(bar)`
 welcome/help screen, '?' to open, show on first start and save to PersistentState; mention email for reporting bugs, and to include log and preferably binary; document all features of watch expression language; mention hidden profiler hotkey
 deal with exceptions
-avoid flickering when stepping rapidly: show last seen disassembly, code, maybe variables and stack
-investigate why many types are not deduped, e.g. there's DB::Block#441
 show argument values in stack trace
 detect dynamic library loads using r_debug thing
 hotkey to step to end of basic block or next call/ret
-unwinding stack out of signal handler, e.g. clickhouse's sampling profiler
-make stack unwinding work when control is in .plt or .plt.got, see "Recognise PLT entries such as" in libunwind code
+key to follow a jump in disas
 allow line-based steps in .plt* (maybe by just turning them into single-instruction-steps)
 in disassembly window, make 'left' key jump to the start of inlined function
-key to make watches window fullscreen
-if locations window shows variables at non-current address, indicate it somehow, e.g. turn the whole window green
-maximizing watches window
-stop on panic when debugging rust programs
+maximizing windows (hot key and button in a corner)
+make search auto-case-sensitive (insensitive if all lowercase, sensitive otherwise)
+special breakpoints: panic, exception, signal, program start (replacing -c), main function entry, dynamic library load
 make source window autoscroll horizontally in addition to vertically
-slice type, use it for pretty-printing rust strings
 -v for build datetime
 handle partially-optimized-out struct values (common in rust)
-better tab names in disas window for rust functions like "ui_prototype::ScreenBuffer::fill::h7933f74b1510f938" - take function name instead of the hash at the end (there's no formal indication, just detect 16-digit hexadecimal string)
-more built-in pretty printers: hash tables (std, sparsehash, absl, Rust), rb trees, deque, linked lists
 color threads based on stack hash
-hotkey to run to cursor
 
 watches, expressions
   first, implement simple expression watches
@@ -89,7 +86,6 @@ opening core dumps
 show disassembly even if symbols are missing
 group threads by stack trace, to make it easy to exclude pool threads waiting for work
 show return value after step-out (and other steps that happened to step out)
-special breakpoints: on exception, on dynamic library load, on program start, on main function entry, on signal
 data breakpoints (added by pressing 'b' on a watch, the breakpoint would use the address of the watched value at the time of setting the breakpoint, with some indication if it's different from current); maybe added as a new watch with address as a literal; or added in breakpoints window and focus jumps there
 thread-specific breakpoints (controlled in breakpoints window), a key to lock all breakpoints to current thread
 hotkeys for switching to specific windows
