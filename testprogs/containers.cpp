@@ -51,6 +51,8 @@ int main() {
     std::u16string u16str = u"hello";      // [good enough, good enough]
     std::u32string u32str = U"hello";      // [good enough, good enough]
 
+    auto pv = std::make_shared<std::vector<int>>(std::vector<int>({10, 20, 30}));
+    
     // Deque.
     std::deque<int> deq = {1, 2, 3};     // [no, no]
     std::stack<int> stk;                 // [no, no]
@@ -107,7 +109,7 @@ int main() {
     volatile int dummy = vec[0] + arr[0] + *uptr + *sptr + short_str[0] + long_str[0] + pair.first + std::get<0>(tuple) + 
         *opt + (int)std::get<double>(var) + std::any_cast<int>(any_val) + func(1) + 
         bits.count() + c.real() + va[0] + sp[0] + *range.begin() + strview[0] + 
-        wstr[0] + u16str[0] + u32str[0];
+        wstr[0] + u16str[0] + u32str[0] + (*pv)[0];
     (void)dummy;
 
     t.join();

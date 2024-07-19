@@ -398,6 +398,9 @@ struct ValueTreeNode {
     dubious: bool,
     special: Option<SpecialWatch>,
 
+    child_kind: ValueChildKind,
+    deref: usize,
+
     // Unique identifier of this node. Hash of identities (field names or array indices or similar) of nodes on the path from the root to here.
     // For remembering which subtrtees were expanded and where the cursor was, in a way that survives recalculation or partial change of the values.
     identity: usize,
@@ -420,7 +423,7 @@ struct ValueTreeNode {
     layout_frame_idx: usize, // when this node's layout information was updated
     name_line_wrap_width: usize, // what width was used for line_wrapped_name
 }
-impl Default for ValueTreeNode { fn default() -> Self { Self {name: 0..0, line_wrapped_name: None, value: err!(ValueTreePlaceholder, ""), dubious: false, special: None, identity: 0, depth: 0, parent: ValueTreeNodeIdx::invalid(), formatted_value: [None, None, None], has_children: false, children: 0..0, start_y: 0, node_end_y: 0, subtree_end_y: 0, expanded: false, is_text_input: false, layout_frame_idx: 0, name_line_wrap_width: 0} } }
+impl Default for ValueTreeNode { fn default() -> Self { Self {name: 0..0, line_wrapped_name: None, value: err!(ValueTreePlaceholder, ""), dubious: false, special: None, child_kind: ValueChildKind::Other, deref: 0, identity: 0, depth: 0, parent: ValueTreeNodeIdx::invalid(), formatted_value: [None, None, None], has_children: false, children: 0..0, start_y: 0, node_end_y: 0, subtree_end_y: 0, expanded: false, is_text_input: false, layout_frame_idx: 0, name_line_wrap_width: 0} } }
 
 #[derive(Default)]
 struct ValueTree {
@@ -625,7 +628,7 @@ impl WatchesWindow {
                     let dubious = node.dubious;
                     let start = self.tree.nodes.len();
                     for c in children {
-                        self.tree.add(ValueTreeNode {name: c.name_line..c.name_line+1, identity: c.identity, value: c.value, dubious, parent: node_idx, ..D!()});
+                        self.tree.add(ValueTreeNode {name: c.name_line..c.name_line+1, identity: c.identity, value: c.value, child_kind: c.kind, deref: c.deref, dubious, parent: node_idx, ..D!()});
                     }
                     let end = self.tree.nodes.len();
                     self.tree.nodes[node_idx.0].children = start..end;
@@ -848,6 +851,57 @@ impl WatchesWindow {
         }
         self.cursor_path.reverse();
     }
+
+    fn make_expression_for_tree_node(&self, mut node_idx: ValueTreeNodeIdx) -> Option<String> {
+        let mut components: Vec<(/*deref*/ usize, /*suffix*/ String)> = Vec::new();
+        loop {
+            let node = &self.tree.nodes[node_idx.0];
+            if node.name.is_empty() {
+                return None;
+            }
+            let name = self.tree.text.get_line_str(node.name.start);
+            if node.depth == 0 {
+                if node.special.is_some() {
+                    return None;
+                }
+                match adjust_expression_for_appending_child_path(name) {
+                    Err(_) => return None,
+                    Ok(s) => components.push((0, s)),
+                }
+                break;
+            }
+            let parent = &self.tree.nodes[node.parent.0];
+            match &parent.special {
+                Some(SpecialWatch::Locals) => {
+                    components.push((0, make_expression_for_local_variable(name)));
+                    break;
+                }
+                Some(SpecialWatch::Registers) => {
+                    components.push((0, format!("{}.#x", name)));
+                    break;
+                }
+                Some(SpecialWatch::AddWatch) => return None,
+                None => (),
+            }
+            match node.child_kind {
+                ValueChildKind::StructField => components.push((0, format!(".{}", name))),
+                ValueChildKind::ArrayElement(i) => components.push((node.deref, format!("[{}]", i))),
+                ValueChildKind::ArrayTail(i) => return None, // TODO: add [i..] syntax
+                ValueChildKind::Other => return None,
+            }
+
+            node_idx = node.parent;
+        }
+        components.reverse();
+        let mut res = components[0].1.clone();
+        for (deref, suffix) in &components[1..] {
+            if *deref != 0 {
+                res = format!("({}{})", "*".to_string().repeat(*deref), res);
+            }
+            res.push_str(suffix);
+        }
+        Some(res)
+    }
 }
 
 impl WindowContent for WatchesWindow {
@@ -887,7 +941,6 @@ impl WindowContent for WatchesWindow {
                         self.expanded_nodes.remove(&self.tree.nodes[node.parent.0].identity);
                     }
                 }
-                // TODO: For non-root nodes, on Enter add a new watch for the corresponding field/element.
                 KeyAction::Enter if expr_idx.is_some_and(|i| self.expressions[i].is_editable()) => {
                     let expr = &mut self.expressions[expr_idx.unwrap()];
                     if let Some((identity, _, input)) = &mut self.text_input {
@@ -912,6 +965,18 @@ impl WindowContent for WatchesWindow {
                         let height_estimate = (node.node_end_y - node.start_y).max(1) as usize;
                         let text = if expr.special.is_some() {String::new()} else {expr.text.clone()};
                         self.text_input = Some((node.identity, height_estimate, TextInput::new_multiline(text)));
+                    }
+                }
+                KeyAction::Enter => {
+                    if let Some(s) = self.make_expression_for_tree_node(node_idx) {
+                        let mut i = self.expressions.len();
+                        if self.expressions.last().is_some_and(|e| &e.special == &Some(SpecialWatch::AddWatch)) {
+                            i -= 1;
+                        }
+                        let identity: usize = random();
+                        self.expressions.insert(i, WatchExpression {identity, text: s, special: None});
+                        self.cursor_path = vec![identity];
+                        refresh_data = true;
                     }
                 }
                 KeyAction::DeleteRow if expr_idx.is_some_and(|i| self.expressions[i].special.is_none()) => {
@@ -1058,7 +1123,7 @@ impl WindowContent for WatchesWindow {
 
     fn get_key_hints(&self, out: &mut Vec<KeyHint>) {
         out.extend([
-            KeyHint::key(KeyAction::Enter, "edit"),
+            KeyHint::key(KeyAction::Enter, "edit/add"),
             KeyHint::key(KeyAction::DuplicateRow, "duplicate"),
             KeyHint::key(KeyAction::DeleteRow, "delete"),
             KeyHint::keys(&[KeyAction::CursorRight, KeyAction::CursorLeft], "expand/collapse"),

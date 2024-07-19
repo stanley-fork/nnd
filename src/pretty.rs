@@ -837,25 +837,41 @@ fn recognize_libcpp_string(substruct: &mut ContainerSubstruct, val: &mut Cow<Val
     let _ = optional_field(find_field(&["r"], substruct))?;
     substruct.check_all_fields_used()?;
 
-    let mut s_anon = find_struct_field(&[""], &mut s)?;
-    let _ = optional_field(find_field(&["padding"], &mut s))?;
     let mut inner_type: *const TypeInfo = ptr::null();
-    let (short_data_field, short_capacity) = find_array_field(&["data"], &mut s, &mut inner_type)?;
+    let (s_is_long_field, short_len_field);
+    // Some fields are either wrapped or not wrapped in anon struct.
+    match find_struct_field(&[""], &mut s) {
+        Ok(mut s_anon) => {
+            s_is_long_field = find_int_field(&["is_long"], &mut s_anon)?;
+            short_len_field = find_int_field(&["size"], &mut s_anon)?;
+            s_anon.check_all_fields_used()?;
+        }
+        Err(e) if e.is_no_field() => {
+            s_is_long_field = find_int_field(&["is_long"], &mut s)?;
+            short_len_field = find_int_field(&["size"], &mut s)?;
+        }
+        Err(e) => return Err(e),
+    }
+    let _ = optional_field(find_field(&["padding"], &mut s))?;
+    let (short_data_field, short_capacity)= find_array_field(&["data"], &mut s, &mut inner_type)?;
     s.check_all_fields_used()?;
 
-    let s_is_long_field = find_int_field(&["is_long"], &mut s_anon)?;
-    let short_len_field = find_int_field(&["size"], &mut s_anon)?;
-    s_anon.check_all_fields_used()?;
-
-    let mut l_anon = find_struct_field(&[""], &mut l)?;
+    let l_is_long_field;
+    match find_struct_field(&[""], &mut l) {
+        Ok(mut l_anon) => {
+            l_is_long_field = find_int_field(&["is_long"], &mut l_anon)?;
+            let _ = optional_field(find_int_field(&["cap"], &mut l_anon))?;
+            l_anon.check_all_fields_used()?;
+        }
+        Err(e) if e.is_no_field() => {
+            l_is_long_field = find_int_field(&["is_long"], &mut l)?;
+            let _ = optional_field(find_int_field(&["cap"], &mut l))?;
+        }
+        Err(e) => return Err(e),
+    }
     let long_len_field = find_int_field(&["size"], &mut l)?;
     let long_ptr_field = find_pointer_field(&["data"], &mut l, &mut inner_type)?;
     l.check_all_fields_used()?;
-
-    let l_is_long_field = find_int_field(&["is_long"], &mut l_anon)?;
-    let _ = optional_field(find_int_field(&["cap"], &mut l_anon))?;
-    l_anon.check_all_fields_used()?;
-
 
     let mut scratch: [MaybeUninit<u8>; 256] = unsafe {MaybeUninit::uninit().assume_init()};
     let slice = read_container_struct(val, &mut scratch, &context.memory)?;

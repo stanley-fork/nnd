@@ -25,6 +25,46 @@ pub fn eval_watch_expression(expr_str: &str, state: &mut EvalState, context: &Ev
     Ok((eval_expression(&expr, expr.root, state, context, false)?, state.currently_evaluated_value_dubious))
 }
 
+// Make expression suitable for appending things like "[5]" or ".foo" to it. Used when adding a watch from a node in value tree.
+// I.e. surround it with parentheses if needed, replace assignment with just the variable name.
+pub fn adjust_expression_for_appending_child_path(expr_str: &str) -> Result<String> {
+    let expr = parse_watch_expression(expr_str)?;
+    let node = &expr.ast[expr.root.0];
+    let parentheses = match &node.a {
+        // These don't need parentheses.
+        AST::Literal(_) | AST::Variable {..} | AST::Field {..} | AST::Array | AST::Tuple | AST::StructExpression(_) | AST::TupleIndexing(_) | AST::Call(_) | AST::Block | AST::TypeInfo => false,
+        AST::BinaryOperator(BinaryOperator::Index) | AST::BinaryOperator(BinaryOperator::Slicify) => false,
+        // These are unexpected at top level of a watch expression.
+        AST::Type {..} | AST::PointerType | AST::Continue | AST::Break | AST::Return => false,
+
+        // For variable assignment, just use the variable name.
+        AST::BinaryOperator(BinaryOperator::Assign) => {
+            if let AST::Variable {name, quoted, from_any_frame, global} = &expr.ast[node.children[0].0].a {
+                if !quoted && !from_any_frame && !global {
+                    return Ok(name.clone());
+                }
+            }
+            true
+        }
+
+        // These need parentheses.
+        AST::UnaryOperator(_) | AST::BinaryOperator(_) | AST::TypeCast | AST::While | AST::For(_) | AST::If | AST::Let {..} | AST::FunctionDefinition {..} | AST::StructDefinition {..} => true,
+    };
+    if parentheses {
+        Ok(format!("({})", expr_str))
+    } else {
+        Ok(expr_str.to_string())
+    }
+}
+
+pub fn make_expression_for_local_variable(name: &str) -> String {
+    if RegisterIdx::parse_ignore_case(name).is_some() {
+        format!("`{}`", name)
+    } else {
+        name.to_string()
+    }
+}
+
 // Slow dumb interpreter that walks the AST directly.
 // Maybe at some point we should redesign the expression language more carefully, based on usage experience and on
 // sketching custom pretty printers for lots of types in an imaginary expression language. It would probably be
@@ -234,14 +274,20 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                         }
                     }
                     Type::Array(a) if op == BinaryOperator::Index => {
-                        let stride = unsafe {(*a.type_).calculate_size()};
+                        let stride = if a.stride == 0 {unsafe {(*a.type_).calculate_size()}} else {a.stride};
                         let val = match lhs.val {
                             AddrOrValueBlob::Addr(addr) => AddrOrValueBlob::Addr(addr + idx * stride),
                             AddrOrValueBlob::Blob(blob) => AddrOrValueBlob::Blob(blob.bit_range(idx * stride * 8, stride * 8)?),
                         };
                         Value {val, type_: a.type_, flags: lhs.flags.inherit()}
                     }
-                    _ => return err!(TypeMismatch, "can't index/slicify {}", t.t.kind_name()),
+                    Type::Slice(s) if op == BinaryOperator::Index => {
+                        let stride = unsafe {(*s.type_).calculate_size()};
+                        let blob = lhs.val.into_value(16, context.memory)?;
+                        let addr = blob.get_usize_prefix();
+                        Value {val: AddrOrValueBlob::Addr(addr + idx * stride), type_: s.type_, flags: lhs.flags.inherit()}
+                    }
+                    _ => return err!(TypeMismatch, "can't {} {}", if op == BinaryOperator::Index {"index"} else {"slicify"}, t.t.kind_name()),
                 });
             }
             if op == BinaryOperator::Range {

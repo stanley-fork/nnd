@@ -507,6 +507,7 @@ pub struct ValueChildInfo {
     pub identity: usize,
     pub name_line: usize, // line in `names_out` given to format_value()
     pub kind: ValueChildKind,
+    pub deref: usize, // how many layers of pointers (but not references) we dereferenced between the parent and this child; kind of an extension of `kind`
     pub value: Result<Value>,
 }
 
@@ -565,7 +566,7 @@ fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut Form
                 Ok(val) => Ok(Value {val, type_: field.type_, flags: flags.inherit()}),
                 Err(e) => Err(e),
             };
-            ValueChildInfo {identity: field_idx, name_line, kind: ValueChildKind::StructField, value}
+            ValueChildInfo {identity: field_idx, name_line, kind: ValueChildKind::StructField, deref: 0, value}
         }).collect()
     };
 
@@ -665,6 +666,9 @@ fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut Form
                 if !try_format_as_string(Some(x), None, p.type_, None, false, v.flags, state.context.memory, "", state.out, state.palette) {
                     // If expanded, act like a reference, i.e. expand the pointee.
                     (_, children) = format_value_recurse(&Value {val: AddrOrValueBlob::Addr(x), type_: p.type_, flags: v.flags.inherit()}, true, state);
+                    for c in &mut children {
+                        c.deref += 1;
+                    }
                 }
                 return (true, children);
             }
@@ -819,7 +823,7 @@ fn format_array(inner_type: *const TypeInfo, len: Option<usize>, stride: usize, 
         for i in 0..len.unwrap_or(1) {
             if i > 1000 {
                 let name_line = styled_writeln!(state.names_out, state.palette.value_misc, "…");
-                children.push(ValueChildInfo {identity: i, name_line, kind: ValueChildKind::ArrayTail(i), value: err!(TooLong, "{} more elements", len.unwrap() - i)});
+                children.push(ValueChildInfo {identity: i, name_line, kind: ValueChildKind::ArrayTail(i), deref: 0, value: err!(TooLong, "{} more elements", len.unwrap() - i)});
                 break;
             }
             let value = get_val(i);
@@ -827,7 +831,7 @@ fn format_array(inner_type: *const TypeInfo, len: Option<usize>, stride: usize, 
             styled_write!(state.names_out, state.palette.value_misc, "[");
             styled_write!(state.names_out, state.palette.value, "{}", i);
             let name_line = styled_writeln!(state.names_out, state.palette.value_misc, "]");
-            children.push(ValueChildInfo {identity: i, name_line, kind: ValueChildKind::ArrayElement(i), value});
+            children.push(ValueChildInfo {identity: i, name_line, kind: ValueChildKind::ArrayElement(i), deref: 0, value});
             if err {
                 break;
             }
