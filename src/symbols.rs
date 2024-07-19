@@ -593,6 +593,24 @@ impl Symbols {
         &self.shards[shard_idx].local_variables[subfunction.local_variables_range()]
     }
 
+    pub fn containing_subfunction_at_level(&self, addr: usize, level: u16, function: &FunctionInfo) -> Option<usize> {
+        let range = if level == u16::MAX {
+            0..function.num_levels()
+        } else {
+            level as usize..level as usize + 1
+        };
+        let mut res: Option<usize> = None;
+        for level in range {
+            let ranges = self.subfunction_ranges_at_level(level, function);
+            let i = ranges.partition_point(|r| r.range.end <= addr);
+            if i == ranges.len() || ranges[i].range.start > addr  {
+                break;
+            }
+            res = Some(ranges[i].subfunction_idx);
+        }
+        res
+    }
+
     // Iterator that merges and deduplicates sorted addr_to_line arrays from all shards on the fly.
     // The first element (if any) either covers `addr` or is above `addr`; its file_idx() may be None.
     pub fn addr_to_line_iter<'a>(&'a self, addr: usize) -> impl Iterator<Item = LineInfo> + 'a {

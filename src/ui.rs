@@ -2744,8 +2744,9 @@ struct CodeSearch {
 }
 impl CodeSearch {
     // Does the search if needed, moves the cursor if needed.
-    fn update(&mut self, tab: &mut CodeTab, text: &StyledText, select_match: isize) {
+    fn update(&mut self, tab: &mut CodeTab, text: &StyledText, mut select_match: isize) {
         let query = SearchQuery::parse(&self.bar.text.text);
+        let query_changed = self.query != query;
         if (&self.query, self.tab_identity) != (&query, tab.identity) {
             (self.query, self.tab_identity) = (query, tab.identity);
             self.match_ranges.clear();
@@ -2769,6 +2770,9 @@ impl CodeSearch {
             }
         }
         (self.match_idx, self.cursor_is_on_a_match) = self.calculate_match_idx(tab.area_state.cursor);
+        if query_changed && !self.cursor_is_on_a_match && select_match == 0 {
+            select_match = 1;
+        }
         if select_match != 0 && !self.matches.is_empty() {
             let mut i = self.match_idx;
             if !self.cursor_is_on_a_match {
@@ -3499,6 +3503,9 @@ impl WindowContent for CodeWindow {
             KeyHint::key(KeyAction::CloseTab, "close/pin tab"),
             KeyHint::keys(&[KeyAction::ToggleBreakpoint, KeyAction::DisableBreakpoint], "toggle/disable breakpoint"),
             KeyHint::keys(&[KeyAction::PreviousLocation, KeyAction::NextLocation], "cycle disasm addrs"),
+            KeyHint::key(KeyAction::GoToLine, "go to line"),
+            KeyHint::key(KeyAction::Find, "find"),
+            KeyHint::keys(&[KeyAction::NextMatch, KeyAction::PreviousMatch], "find next/previous"),
         ]);
     }
 

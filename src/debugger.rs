@@ -132,6 +132,7 @@ pub struct Debugger {
     pub stopping_to_handle_breakpoints: bool,
 
     pub stepping: Option<StepState>,
+
     pub breakpoint_locations: Vec<BreakpointLocation>, // sorted by address
     pub breakpoints: Pool<Breakpoint>,
     pub hardware_breakpoints: [HardwareBreakpoint; 4],
@@ -163,6 +164,7 @@ pub enum StepKind {
 pub struct StepState {
     pub tid: pid_t,
     pub keep_other_threads_suspended: bool, // must stay constant for the duration of the step (we rely on it for a small optimization in process_events())
+    pub disable_breakpoints: bool,
 
     // How to determine if the step is complete:
     //  * Into && by_instructions: addr not in step.addr_ranges
@@ -560,7 +562,7 @@ impl Debugger {
                 let mut skip_refresh = false;
 
                 if libc::WIFEXITED(wstatus) || libc::WIFSIGNALED(wstatus) {
-                    let stepping_this_thread = self.stepping.as_ref().map_or(false, |s| s.tid == tid);
+                    let stepping_this_thread = self.stepping.as_ref().is_some_and(|s| s.tid == tid);
                     if libc::WIFEXITED(wstatus) {
                         let exit_code = libc::WEXITSTATUS(wstatus);
                         eprintln!("trace: thread {} exited with status {}", tid, exit_code);
@@ -847,7 +849,7 @@ impl Debugger {
             ProcessState::Stepping => self.cancel_stepping(),
             _ => return err!(Usage, "not suspended, can't resume") }
         eprintln!("trace: resume");
-
+        
         self.target_state = ProcessState::Running;
         let tids: Vec<pid_t> = self.threads.keys().copied().collect();
         for tid in tids {
@@ -861,10 +863,10 @@ impl Debugger {
 
     pub fn suspend(&mut self) -> Result<()> {
         match self.target_state {
-            ProcessState::Running => (),
-            ProcessState::Stepping => self.cancel_stepping(),
+            ProcessState::Running | ProcessState::Stepping => (),
             _ => return err!(Usage, "not running, can't suspend") }
         eprintln!("trace: suspend");
+        self.cancel_stepping();
 
         self.target_state = ProcessState::Suspended;
         self.ptrace_interrupt_all_running_threads()?;
@@ -953,7 +955,7 @@ impl Debugger {
         }
 
         let mut buf: Vec<u8> = Vec::new();
-        let mut step = StepState {tid, keep_other_threads_suspended: true, internal_kind: kind, by_instructions, addr_ranges: Vec::new(), cfa: 0, single_steps: false, stack_digest: Vec::new()};
+        let mut step = StepState {tid, keep_other_threads_suspended: true, disable_breakpoints: true, internal_kind: kind, by_instructions, addr_ranges: Vec::new(), cfa: 0, single_steps: false, stack_digest: Vec::new()};
         let mut breakpoint_types: Vec<StepBreakpointType> = Vec::new();
 
         // There are 2 things that can be missing:
@@ -1635,9 +1637,32 @@ impl Debugger {
                     if addrs[0].0.line() < res.0 {
                         res = (addrs[0].0.line(), Vec::new());
                     }
-                    for (line, subfunction_level) in addrs {
-                        let addr = binary.addr_map.static_to_dynamic(line.addr());
-                        res.1.push((addr, subfunction_level));
+
+                    // There are often multiple nearby addresses for the same line, usually with different column numbers.
+                    // E.g. if the line contains a function call where some arguments are function calls too, there would usually be an address for each of the arguments and a location for the outer function call.
+                    // We want to set breakpoint on only the first of those addresses. Otherwise continuing from such breakpoint is very confusing: you continue and immediately stop without leaving the line.
+                    // On the other hand, a line can have multiple addresses corresponding to different inlining sites of the containing function; we don't want to deduplicate those.
+                    // So we group addresses by the containing (sub)function and keep the lowest address in each.
+                    let mut subfuncs_and_addrs: Vec<(/*function_idx*/ usize, /*subfunction_idx*/ usize, /*addr*/ usize, u16)> = addrs.iter().map(|(line, level)| {
+                        let addr = line.addr();
+                        if let Ok((function, function_idx)) = symbols.addr_to_function(addr) {
+                            if let Some(sf) = symbols.containing_subfunction_at_level(addr, *level, function) {
+                                return (function_idx, sf, addr, *level);
+                            }
+                        }
+                        (usize::MAX, addr, addr, *level)
+                    }).collect();
+                    subfuncs_and_addrs.sort_unstable();
+                    for (i, &(f, sf, addr, level)) in subfuncs_and_addrs.iter().enumerate() {
+                        if i > 0 {
+                            let &(prev_f, prev_sf, _, _) = &subfuncs_and_addrs[i-1];
+                            if (prev_f, prev_sf) == (f, sf) {
+                                continue;
+                            }
+                        }
+
+                        let addr = binary.addr_map.static_to_dynamic(addr);
+                        res.1.push((addr, level));
                     }
                 }
                 if res.1.is_empty() {
@@ -1832,6 +1857,8 @@ impl Debugger {
             StepBreakpointType::AfterRange | StepBreakpointType::AfterRet => (),
         }
     }
+
+    // Returns whether the step completed.
     fn handle_step_stop(&mut self, spurious_stop: bool, regs: &Registers) -> bool {
         let addr = regs.get_int(RegisterIdx::Rip).unwrap().0 as usize;
         let step = self.stepping.as_ref().unwrap();
@@ -1844,8 +1871,8 @@ impl Debugger {
             }
             return !in_ranges;
         }
-        let cfa = self.get_cfa_for_step(addr, regs);
         let step = self.stepping.as_ref().unwrap();
+        let cfa = Self::get_cfa_for_step(&self.info, &mut self.log, &self.memory, addr, regs);
         let cfa = match cfa {
             None => return step.internal_kind == StepKind::Into,
             Some(c) => c };
@@ -1879,35 +1906,35 @@ impl Debugger {
         Some(stack.subframes.len() - suf)
     }
 
-    fn get_cfa_for_step(&mut self, addr: usize, regs: &Registers) -> Option<usize> {
+    fn get_cfa_for_step(info: &ProcessInfo, log: &mut Log, memory: &MemReader, addr: usize, regs: &Registers) -> Option<usize> {
         // This is called while handling SIGTRAP, when `info` is not necessarily up-to-date, so this
         // in theory may incorrectly fail if a dynamic library was loaded during a step, and the step ended up hitting it (not sure how).
-        let map = match self.info.maps.addr_to_map(addr) {
+        let map = match info.maps.addr_to_map(addr) {
             None => {
-                log!(self.log, "address 0x{:x} not mapped", addr);
+                log!(log, "address 0x{:x} not mapped", addr);
                 eprintln!("warning: address 0x{:x} not mapped (when determining cfa for step)", addr);
                 return None;
             }
             Some(m) => m };
         let binary_id = match &map.binary_id {
             None => {
-                log!(self.log, "address 0x{:x} not mapped to a binary", addr);
+                log!(log, "address 0x{:x} not mapped to a binary", addr);
                 eprintln!("warning: address 0x{:x} not mapped to a binary (when determining cfa for step)", addr);
                 return None;
             }
             Some(b) => b };
-        let binary = self.info.binaries.get(binary_id).unwrap();
+        let binary = info.binaries.get(binary_id).unwrap();
         let unwind = match &binary.unwind {
             Err(e) => {
-                log!(self.log, "no unwind: {}", e);
+                log!(log, "no unwind: {}", e);
                 eprintln!("warning: no unwind for address 0x{:x} (when determining cfa for step)", addr);
                 return None;
             }
             Ok(u) => u };
         let mut scratch = UnwindScratchBuffer::default();
-        match unwind.find_row_and_eval_cfa(&self.memory, &binary.addr_map, &mut scratch, addr, regs) {
+        match unwind.find_row_and_eval_cfa(memory, &binary.addr_map, &mut scratch, addr, regs) {
             Err(e) => {
-                log!(self.log, "no frame for addr 0x{:x}: {}", addr, e);
+                log!(log, "no frame for addr 0x{:x}: {}", addr, e);
                 eprintln!("warning: no frame for addr 0x{:x} (when determining cfa for step): {}", addr, e);
                 return None;
             }
@@ -1925,7 +1952,7 @@ impl Debugger {
         // There's a very unfortunate detail in how the 0xcc (INT 3) instruction is handled (at least in Linux). After hitting 0xcc at address X,
         // the thread is stopped with its RIP = X+1, not X. When we see a SIGTRAP and RIP = X+1, it can mean two things:
         //  (a) The 0xcc instruction was hit. We're stopped at breakpoint X. When resuming the thread, we must remove the breakpoint *and decrement RIP*.
-        //  (b) The thread jumped to X+1, then got a SIGTRAP, unrelated to our breakpoint. When resuming the thread we must *leave RIP unchanged*.
+        //  (b) The thread jumped to X+1, then got a SIGTRAP unrelated to our breakpoint. When resuming the thread we must *leave RIP unchanged*.
         // (In contrast, if 0xcc suspended with RIP = X, there would be no such ambiguity. There also wouldn't be any of the "Interaction between
         // SINGLESTEP and breakpoints" nonsense. Ugh.)
         //
@@ -1986,10 +2013,12 @@ impl Debugger {
                             eprintln!("trace: ignoring spurious stop on hw breakpoint {:x}", addr);
                             continue;
                         }
-                        if self.stepping.is_some() {
-                            // Ignore regular breakpoints when stepping. (Maybe it would be better for performance to also deactivate them as we go, then reactivate after the step completes.)
-                            // We can add a setting to disable this behavior.
-                            continue;
+                        if let Some(step) = &self.stepping {
+                            if step.disable_breakpoints {
+                                // Ignore regular breakpoints when stepping. (Maybe it would be better for performance to also deactivate them as we go, then reactivate after the step completes.)
+                                // We can add a setting to disable this behavior.
+                                continue;
+                            }
                         }
 
                         let bp = self.breakpoints.get_mut(*id);
@@ -2017,15 +2046,14 @@ impl Debugger {
         }
 
         if let Some(step) = &self.stepping {
-            if tid == step.tid {
-                assert!(!hit);
-                hit = self.handle_step_stop(spurious_stop, &regs);
-                if hit {
-                    let step = self.stepping.as_mut().unwrap();
-                    stack_digest_to_select = Some((mem::take(&mut step.stack_digest), step.internal_kind == StepKind::Into, u16::MAX));
-                    stop_reasons.push(StopReason::Step);
-                    self.cancel_stepping();
-                }
+            if hit {
+                self.cancel_stepping();
+            } else if tid == step.tid && self.handle_step_stop(spurious_stop, &regs) {
+                let step = self.stepping.as_mut().unwrap();
+                stack_digest_to_select = Some((mem::take(&mut step.stack_digest), step.internal_kind == StepKind::Into, u16::MAX));
+                stop_reasons.push(StopReason::Step);
+                self.cancel_stepping();
+                hit = true;
             }
         }
 
