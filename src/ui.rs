@@ -1166,10 +1166,10 @@ impl WindowContent for LocationsWindow {
 
         with_parent!(ui, table_widget, {
             let mut table = Table::new(mem::take(&mut self.table_state), ui, vec![
-                Column::new("name", AutoSize::Remainder(0.25)),
-                Column::new("type", AutoSize::Remainder(0.3)),
-                Column::new("expression", AutoSize::Remainder(0.3)),
-                Column::new("die", AutoSize::Fixed(9)),
+                Column::new("name", AutoSize::Remainder(0.25), false),
+                Column::new("type", AutoSize::Remainder(0.3), false),
+                Column::new("expression", AutoSize::Remainder(0.3), false),
+                Column::new("die", AutoSize::Fixed(9), false),
             ]);
             if let Err(e) = self.fill_table(&mut table, state, debugger, ui) {
                 table.start_row(hash(&'e'), ui);
@@ -2179,7 +2179,12 @@ impl WindowContent for BinariesWindow {
             }
         }
 
-        let mut table = Table::new(mem::take(&mut self.table_state), ui, vec![Column::new("idx", AutoSize::Fixed(3)), Column::new("name", AutoSize::Remainder(1.0)), Column::new("offset", AutoSize::Fixed(12)), Column::new("file", AutoSize::Fixed(PrettySize::MAX_LEN))]);
+        let mut table = Table::new(mem::take(&mut self.table_state), ui, vec![
+            Column::new("idx", AutoSize::Fixed(3), false),
+            Column::new("name", AutoSize::Remainder(1.0), false),
+            Column::new("offset", AutoSize::Fixed(12), false),
+            Column::new("file", AutoSize::Fixed(PrettySize::MAX_LEN), false),
+        ]);
         table.hide_cursor_if_unfocused = true;
         for (idx, id) in state.binaries.iter().enumerate() {
             let binary = debugger.symbols.get_if_present(id).unwrap();
@@ -2260,11 +2265,13 @@ impl WindowContent for BinariesWindow {
 struct ThreadsFilter {
     bar: SearchBar,
     cache_key: String, // when this changes, drop cached_results
-    cached_results: Vec<(/*thread_idx*/ usize, /*stop_count*/ usize, /*passes_filter*/ bool)>, // sorted by thread_idx
+    // Cached information about previously seen threads. We re-check each thread's stop_count each frame. Sorted by thread_idx.
+    cached_results: Vec<(/*thread_idx*/ usize, /*stop_count*/ usize, /*passes_filter*/ bool)>,
 }
 impl ThreadsFilter {
-    // tids must be sorted
-    fn filter(&mut self, tids: Vec<(usize, usize, pid_t)>, debugger: &mut Debugger) -> Vec<pid_t> {
+    fn get_filtered_tids(&mut self, debugger: &mut Debugger) -> Vec<pid_t> {
+        let mut tids: Vec<(usize, usize, pid_t)> = debugger.threads.values().map(|t| (t.idx, t.stop_count, t.tid)).collect();
+        tids.sort_unstable_by_key(|t| t.0);
         let query = if self.bar.visible {self.bar.text.text.clone()} else {String::new()};
         if query != self.cache_key {
             self.cache_key = query.clone();
@@ -2338,8 +2345,20 @@ struct ThreadsWindow {
 impl WindowContent for ThreadsWindow {
     fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
         ui.cur_mut().set_vstack();
-        if ui.check_key(KeyAction::Find) {
-            self.filter.bar.start_editing();
+        for action in ui.check_keys(&[KeyAction::Find, KeyAction::ToggleSort]) {
+            match action {
+                KeyAction::Find => self.filter.bar.start_editing(),
+                KeyAction::ToggleSort => {
+                    (self.table_state.sort_column, self.table_state.sort_descending) =
+                        if (self.table_state.sort_column, self.table_state.sort_descending) == (0, false) {
+                            (4, true)
+                        } else {
+                            (0, false)
+                        };
+                    self.table_state.scroll_to_cursor = true;
+                }
+                _ => (),
+            }
         }
         with_parent!(ui, ui.add(widget!().identity(&'s')), {
             ui.focus();
@@ -2354,20 +2373,38 @@ impl WindowContent for ThreadsWindow {
 
         let mut table = with_parent!(ui, table_widget, {
             Table::new(mem::take(&mut self.table_state), ui, vec![
-                Column::new("idx", AutoSize::Fixed(5)),
-                Column::new("tid", AutoSize::Fixed(10)),
-                Column::new("name", AutoSize::Fixed(15)),
-                Column::new("s", AutoSize::Fixed(1)),
-                Column::new("cpu", AutoSize::Fixed(4)),
-                Column::new("function", AutoSize::Remainder(1.0)),
-                Column::new("addr", AutoSize::Fixed(12)),
-                Column::new("bin", AutoSize::Fixed(3)),
+                Column::new("idx", AutoSize::Fixed(5), true),
+                Column::new("tid", AutoSize::Fixed(10), true),
+                Column::new("name", AutoSize::Fixed(15), true),
+                Column::new("s", AutoSize::Fixed(1), true),
+                Column::new("cpu", AutoSize::Fixed(4), true),
+                Column::new("function", AutoSize::Remainder(1.0), false),
+                Column::new("addr", AutoSize::Fixed(12), true),
+                Column::new("bin", AutoSize::Fixed(3), false),
             ])
         });
 
-        let mut tids: Vec<(usize, usize, pid_t)> = debugger.threads.values().map(|t| (t.idx, t.stop_count, t.tid)).collect();
-        tids.sort_by_key(|t| t.0);
-        let mut filtered_tids: Vec<pid_t> = self.filter.filter(tids, debugger);
+        let tids = self.filter.get_filtered_tids(debugger);
+        let mut threads: Vec<&Thread> = tids.iter().map(|t| debugger.threads.get(t).unwrap()).collect();
+        if (table.state.sort_column, table.state.sort_descending) != (0, false) {
+            // This probably generates a ton of machine code. There's probably a better way to do this.
+            // Doing an indirect function call for each comparison sounds slow. Maybe put field offset into a variable, for integer fields; the hard part is figuring out how to do this in a way that doesn't offend the sensibilities of the authors of the Optimizing Compiler.
+            match (table.state.sort_column, table.state.sort_descending) {
+                (0, false) => threads.sort_unstable_by_key(|t|  t.idx),
+                (0, true ) => threads.sort_unstable_by_key(|t| !t.idx),
+                (1, false) => threads.sort_unstable_by_key(|t|  t.tid),
+                (1, true ) => threads.sort_unstable_by_key(|t| !t.tid),
+                (2, false) => threads.sort_unstable_by_key(|t| (                  t.info.resource_stats.latest.comm() , t.idx)),
+                (2, true ) => threads.sort_unstable_by_key(|t| (std::cmp::Reverse(t.info.resource_stats.latest.comm()), t.idx)),
+                (3, false) => threads.sort_unstable_by_key(|t| (                  t.info.resource_stats.latest.state , t.tid)),
+                (3, true ) => threads.sort_unstable_by_key(|t| (std::cmp::Reverse(t.info.resource_stats.latest.state), t.tid)),
+                (4, false) => threads.sort_unstable_by_key(|t| ( (t.info.resource_stats.cpu_percentage(debugger.context.settings.periodic_timer_ns) * 1000.0) as isize, t.idx)),
+                (4, true ) => threads.sort_unstable_by_key(|t| (-(t.info.resource_stats.cpu_percentage(debugger.context.settings.periodic_timer_ns) * 1000.0) as isize, t.idx)),
+                (6, false) => threads.sort_unstable_by_key(|t| ( t.info.regs.get_int(RegisterIdx::Rip).map_or(0, |(r, _)| r), t.idx)),
+                (6, true ) => threads.sort_unstable_by_key(|t| (!t.info.regs.get_int(RegisterIdx::Rip).map_or(0, |(r, _)| r), t.idx)),
+                _ => (),
+            }
+        }
 
         // If some thread hit a breakpoint or fatal signal, switch to it.
         self.seen_stop_counts.retain(|tid, _| debugger.threads.contains_key(tid));
@@ -2390,16 +2427,16 @@ impl WindowContent for ThreadsWindow {
             state.selected_thread = *tid;
         }
 
-        // If selected thread doesn't pass the filter, awkwardly add it to the list anyway, greyed out.
         let mut selected_thread_filtered_out = false;
         let mut cursor = table.state.cursor;
-        if debugger.threads.get(&state.selected_thread).is_some() {
-            if let Some(i) = filtered_tids.iter().position(|x| *x == state.selected_thread) {
+        if let Some(thread) = debugger.threads.get(&state.selected_thread) {
+            if let Some(i) = threads.iter().position(|t| t.tid == state.selected_thread) {
                 cursor = i;
             } else {
+                // If selected thread doesn't pass the filter, awkwardly add it to the list anyway, greyed out.
                 selected_thread_filtered_out = true;
-                filtered_tids.push(state.selected_thread);
-                cursor = filtered_tids.len() - 1;
+                threads.push(thread);
+                cursor = threads.len() - 1;
             }
         }
 
@@ -2414,19 +2451,19 @@ impl WindowContent for ThreadsWindow {
             }
         });
 
-        if cursor != table.state.cursor {
-            table.state.select(cursor);
-        }
+        // When the program is running, keep the cursor on the selected tid, but don't auto-scroll to cursor if that tid moves around (e.g. if the table is sorted by cpu%).
+        table.state.cursor = cursor;
 
-        let range = table.lazy(filtered_tids.len(), 1, ui);
+        let range = table.lazy(threads.len(), 1, ui);
 
-        state.selected_thread = filtered_tids.get(table.state.cursor).copied().unwrap_or(0);
-        if selected_thread_filtered_out && state.selected_thread != *filtered_tids.last().unwrap() {
+        state.selected_thread = threads.get(table.state.cursor).map_or(0, |t| t.tid);
+        if selected_thread_filtered_out && state.selected_thread != threads.last().unwrap().tid {
             ui.should_redraw = true;
         }
 
-        for i in range {
-            let tid = filtered_tids[i];
+        let visible_tids: Vec<pid_t> = threads[range.clone()].iter().map(|t| t.tid).collect();
+        for i in range.clone() {
+            let tid = visible_tids[i - range.start];
             let stack = debugger.get_stack_trace(tid, /* partial */ true);
             let t = debugger.threads.get(&tid).unwrap();
             let row_widget = table.start_row(hash(&tid), ui);
@@ -2526,7 +2563,10 @@ impl WindowContent for ThreadsWindow {
     }
 
     fn get_key_hints(&self, out: &mut Vec<KeyHint>) {
-        out.push(KeyHint::key(KeyAction::Find, "filter"));
+        out.extend([
+            KeyHint::key(KeyAction::Find, "filter"),
+            KeyHint::key(KeyAction::ToggleSort, "sort by cpu"),
+        ]);
     }
 }
 
@@ -2621,10 +2661,10 @@ impl WindowContent for StackWindow {
         });
 
         let mut table = Table::new(mem::take(&mut self.table_state), ui, vec![
-            Column::new("idx", AutoSize::Fixed(3)),
-            Column::new("location", AutoSize::Remainder(1.0)),
-            Column::new("address", AutoSize::Fixed(12)),
-            Column::new("bin", AutoSize::Fixed(3)),
+            Column::new("idx", AutoSize::Fixed(3), false),
+            Column::new("location", AutoSize::Remainder(1.0), false),
+            Column::new("address", AutoSize::Fixed(12), false),
+            Column::new("bin", AutoSize::Fixed(3), false),
         ]);
 
         let write_stack_truncated_error = |e: &Error, ui: &mut UI| -> usize {
@@ -3641,11 +3681,11 @@ impl WindowContent for BreakpointsWindow {
         hit_breakpoints.dedup();
 
         let mut table = Table::new(mem::take(&mut self.table_state), ui, vec![
-            Column::new("idx", AutoSize::Text),
-            Column::new("", AutoSize::Fixed(2)),
-            Column::new("on", AutoSize::Remainder(1.0)),
-            Column::new("locs", AutoSize::Text),
-            Column::new("hits", AutoSize::Text),
+            Column::new("idx", AutoSize::Text, false),
+            Column::new("", AutoSize::Fixed(2), false),
+            Column::new("on", AutoSize::Remainder(1.0), false),
+            Column::new("locs", AutoSize::Text, false),
+            Column::new("hits", AutoSize::Text, false),
         ]);
         table.hide_cursor_if_unfocused = true;
 

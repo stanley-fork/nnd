@@ -224,12 +224,12 @@ pub fn cursorless_scrolling_navigation(scroll: &mut isize, scroll_to: Option<Ran
 pub struct Column {
     pub title: &'static str,
     pub auto_width: AutoSize, // Fixed, Text, Children, Remainder are supported
+    pub sortable: bool,
     width: usize,
     pos: isize,
-    // TODO: sortable: bool,
 }
 impl Column {
-    pub fn new(title: &'static str, auto_width: AutoSize) -> Self { Self {auto_width, title, width: str_width(title), pos: 0} }
+    pub fn new(title: &'static str, auto_width: AutoSize, sortable: bool) -> Self { Self {auto_width, title, sortable, width: str_width(title) + sortable as usize, pos: 0} }
 }
 
 #[derive(Default, Clone)]
@@ -238,7 +238,8 @@ pub struct TableState {
     pub scroll: isize,
     pub scroll_to_cursor: bool,
     pub did_scroll_to_cursor: bool, // whether the latest finish() had a reason to auto-scroll (because of keyboard input or mouse click or because scroll_to_cursor was set from outside).
-    // TODO: sort_by: Vec<usize>,
+    pub sort_column: usize,
+    pub sort_descending: bool,
 }
 impl TableState {
     pub fn select(&mut self, cursor: usize) {
@@ -278,7 +279,7 @@ pub struct Table {
     fixed_row_height: usize,
 }
 impl Table {
-    pub fn new(state: TableState, ui: &mut UI, columns: Vec<Column>) -> Self {
+    pub fn new(mut state: TableState, ui: &mut UI, columns: Vec<Column>) -> Self {
         let root = ui.cur_parent;
         let w = ui.get_mut(root);
         w.axes[Axis::Y].flags.insert(AxisFlags::STACK);
@@ -289,9 +290,32 @@ impl Table {
         with_parent!(ui, root, {
             // Header.
             with_parent!(ui, ui.add(widget!().hstack().fixed_height(1)), {
-                for i in 0..columns.len() {
-                    let l = ui_writeln!(ui, table_header, "{}", columns[i].title);
-                    ui.add(widget!().width(AutoSize::Text).fixed_height(1).text(l));
+                for (i, col) in columns.iter().enumerate() {
+                    with_parent!(ui, ui.add(widget!().width(AutoSize::Text).fixed_height(1)), {
+                        ui_write!(ui, table_header, "{}", col.title);
+                        if col.sortable {
+                            ui.cur_mut().flags.insert(WidgetFlags::HIGHLIGHT_ON_HOVER);
+                            if ui.check_mouse(MouseActions::CLICK) {
+                                if state.sort_column == i {
+                                    state.sort_descending ^= true;
+                                } else {
+                                    state.sort_column = i;
+                                    state.sort_descending = false;
+                                }
+                                state.scroll_to_cursor = true;
+                            }
+                            let c = if state.sort_column != i {
+                                '·'
+                            } else if state.sort_descending {
+                                '↑'
+                            } else {
+                                '↓'
+                            };
+                            ui_write!(ui, table_header, "{}", c);
+                        }
+                        let l = ui.text.close_line();
+                        ui.cur_mut().draw_text = Some(l..l+1);
+                    });
                 }
             });
 
@@ -1316,7 +1340,7 @@ impl SearchDialog {
         ui.layout_children(Axis::Y);
         with_parent!(ui, table_widget, {
             ui.multifocus();
-            let mut table = Table::new(mem::take(&mut self.table_state), ui, vec![Column::new("", AutoSize::Remainder(1.0))]);
+            let mut table = Table::new(mem::take(&mut self.table_state), ui, vec![Column::new("", AutoSize::Remainder(1.0), false)]);
             let range = table.lazy(res.results.len(), lines_per_result, ui);
             for (i, r) in self.search.format_results(&res.results[range]).iter().enumerate() {
                 table.start_row(i, ui);

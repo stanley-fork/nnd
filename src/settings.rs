@@ -286,6 +286,7 @@ pub enum KeyAction {
     PreviousLocation,
     NextMatch,
     PreviousMatch,
+    ToggleSort,
 
     Open,
     ToggleBreakpoint,
@@ -412,6 +413,7 @@ impl Default for KeyBinds {
             (Key::Char(',').plain(), KeyAction::PreviousLocation),
             (Key::F(3).plain(), KeyAction::NextMatch),
             (Key::F(3).shift(), KeyAction::PreviousMatch),
+            (Key::Char('+').plain(), KeyAction::ToggleSort),
             (Key::Char('o').plain(), KeyAction::Open),
             (Key::Char('b').plain(), KeyAction::ToggleBreakpoint),
             (Key::Char('B').plain(), KeyAction::DisableBreakpoint),
