@@ -282,6 +282,9 @@ pub struct FunctionSearcher;
 
 impl Searcher for FunctionSearcher {
     fn search(&self, symbols: &Symbols, symbols_idx: usize, shard_idx: usize, query: &SearchQuery, cancel: &AtomicBool, callback: &mut SearchCallback) {
+        let modified_query_str: String = query.s.get().chars().filter(|&c| c.is_ascii_alphanumeric() || c == '_').collect();
+        let query = SearchQuery::parse(&modified_query_str);
+
         let range = (symbols.functions.len()*shard_idx/symbols.shards.len())..(symbols.functions.len()*(shard_idx+1)/symbols.shards.len());
         callback(Vec::new(), 0, range.len(), 0);
         let mut items_done = 0usize;
@@ -296,7 +299,7 @@ impl Searcher for FunctionSearcher {
                 continue;
             }
             let slice = function.mangled_name();
-            if let Some(score) = fuzzy_match(slice, query) {
+            if let Some(score) = fuzzy_match(slice, &query) {
                 res.push(SearchResult {score, id: idx, symbols_idx});
             }
             items_done += 1;

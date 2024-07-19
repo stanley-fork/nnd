@@ -1,4 +1,3 @@
-make function search ignore characters like :<>, (research whether it's possible to actually match some of them without full demangling)
 add watch on pressing enter on non-root value tree node
 test on mac, make sure copying text out of the terminal is possible
 revise documentation
