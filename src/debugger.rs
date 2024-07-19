@@ -151,6 +151,8 @@ pub enum StepKind {
     Into,
     Over,
     Out,
+    // Run-to-cursor.
+    Cursor,
 }
 
 // TODO: Uh oh, exceptions ruin step-over/step-out, even at instruction level. Detecting when an exception is thrown out of a function is super hard for some reason.
@@ -192,10 +194,11 @@ pub struct StepState {
 
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone, Copy)]
 pub enum StepBreakpointType {
-    Call = 0,
-    JumpOut = 1,
-    AfterRet = 2,
-    AfterRange = 3,
+    Call,
+    JumpOut,
+    AfterRet,
+    AfterRange,
+    Cursor(/*subfunction_level*/ u16),
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Copy)]
@@ -229,6 +232,7 @@ pub struct HardwareBreakpoint {
     pub addr: usize,
 }
 
+#[derive(Debug)]
 pub struct LineBreakpoint {
     pub path: PathBuf,
     pub file_version: FileVersionInfo,
@@ -238,6 +242,7 @@ pub struct LineBreakpoint {
     pub adjusted_line: Option<usize>,
 }
 
+#[derive(Debug)]
 pub enum BreakpointOn {
     Line(LineBreakpoint),
     // Could add address breakpoints, data breakpoints, function entry, syscall, signal, etc.
@@ -1294,6 +1299,47 @@ impl Debugger {
         Ok(())
     }
 
+    pub fn step_to_cursor(&mut self, tid: pid_t, cursor: BreakpointOn) -> Result<()> {
+        match self.target_state {
+            ProcessState::Suspended | ProcessState::Running | ProcessState::Stepping => (),
+            ProcessState::NoProcess | ProcessState::Starting | ProcessState::Exiting => return err!(Usage, "no process"),
+        }
+        if self.threads.get(&tid).is_none() {
+            return err!(Usage, "no thread");
+        }
+
+        let mut breakpoint = Breakpoint {on: cursor, hits: 0, addrs: err!(NotCalculated, ""), enabled: true, active: false};
+        Self::determine_locations_for_breakpoint(&self.info, &mut breakpoint);
+        let addrs = breakpoint.addrs?;
+
+        eprintln!("trace: step to cursor thread {} cursor {:?}", tid, breakpoint.on);
+
+        self.cancel_stepping();
+        assert!(self.stepping.is_none());
+        assert!(self.breakpoint_locations.iter().all(|loc| loc.breakpoints.iter().all(|b| match b { BreakpointRef::Step(_) => false, _ => true })));
+
+        let step = StepState {tid, keep_other_threads_suspended: false, disable_breakpoints: true, internal_kind: StepKind::Cursor, by_instructions: false, addr_ranges: Vec::new(), cfa: 0, single_steps: false, stack_digest: Vec::new()};
+        self.stepping = Some(step);
+        let was_running = self.target_state == ProcessState::Running;
+        self.target_state = ProcessState::Stepping;
+
+        for (addr, subfunction_level) in addrs {
+            self.add_breakpoint_location(BreakpointRef::Step(StepBreakpointType::Cursor(subfunction_level)), addr);
+        }
+        self.arrange_handle_breakpoints()?;
+
+        if !was_running {
+            let tids: Vec<pid_t> = self.threads.keys().copied().collect();
+            for t in tids {
+                if self.target_state_for_thread(t) == ThreadState::Running {
+                    self.resume_thread(t, true)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn any_thread_in_state(&self, state: ThreadState) -> Option<pid_t> {
         for (tid, t) in &self.threads {
             if t.state == state {
@@ -1854,14 +1900,17 @@ impl Debugger {
     fn handle_step_breakpoint_hit(step: &StepState, type_: StepBreakpointType, request_single_step: &mut bool) {
         match type_ {
             StepBreakpointType::Call | StepBreakpointType::JumpOut => *request_single_step = true,
-            StepBreakpointType::AfterRange | StepBreakpointType::AfterRet => (),
+            StepBreakpointType::AfterRange | StepBreakpointType::AfterRet | StepBreakpointType::Cursor(_) => (),
         }
     }
 
     // Returns whether the step completed.
-    fn handle_step_stop(&mut self, spurious_stop: bool, regs: &Registers) -> bool {
-        let addr = regs.get_int(RegisterIdx::Rip).unwrap().0 as usize;
+    fn handle_step_stop(&mut self, spurious_stop: bool, hit_step_breakpoint: bool, regs: &Registers) -> bool {
         let step = self.stepping.as_ref().unwrap();
+        if step.internal_kind == StepKind::Cursor {
+            return hit_step_breakpoint;
+        }
+        let addr = regs.get_int(RegisterIdx::Rip).unwrap().0 as usize;
         let i = step.addr_ranges.partition_point(|r| r.end <= addr);
         let in_ranges = i < step.addr_ranges.len() && step.addr_ranges[i].start <= addr;
         if step.internal_kind == StepKind::Into && step.by_instructions {
@@ -1880,6 +1929,7 @@ impl Debugger {
             StepKind::Into => cfa != step.cfa || !in_ranges,
             StepKind::Over => cfa > step.cfa || (cfa == step.cfa && !in_ranges),
             StepKind::Out => cfa > step.cfa,
+            StepKind::Cursor => panic!("huh"),
         }
     }
 
@@ -1991,6 +2041,7 @@ impl Debugger {
         let mut request_single_step = false;
         let mut stop_reasons: Vec<StopReason> = Vec::new();
         let mut stack_digest_to_select: Option<(Vec<usize>, bool, u16)> = None;
+        let mut hit_step_breakpoint = false;
 
         if let Some(idx) = self.find_breakpoint_location(addr) {
             let location = &mut self.breakpoint_locations[idx];
@@ -2005,6 +2056,13 @@ impl Debugger {
                         let step = self.stepping.as_ref().unwrap();
                         if tid == step.tid {
                             Self::handle_step_breakpoint_hit(step, *t, &mut request_single_step);
+
+                            hit_step_breakpoint = true;
+                            if let &StepBreakpointType::Cursor(subfunction_level) = t {
+                                if subfunction_level != u16::MAX {
+                                    stack_digest_to_select = Some((Vec::new(), false, subfunction_level));
+                                }
+                            }
                         }
                     }
                     BreakpointRef::Id {id, subfunction_level} => {
@@ -2048,9 +2106,11 @@ impl Debugger {
         if let Some(step) = &self.stepping {
             if hit {
                 self.cancel_stepping();
-            } else if tid == step.tid && self.handle_step_stop(spurious_stop, &regs) {
+            } else if tid == step.tid && self.handle_step_stop(spurious_stop, hit_step_breakpoint, &regs) {
                 let step = self.stepping.as_mut().unwrap();
-                stack_digest_to_select = Some((mem::take(&mut step.stack_digest), step.internal_kind == StepKind::Into, u16::MAX));
+                if step.internal_kind != StepKind::Cursor {
+                    stack_digest_to_select = Some((mem::take(&mut step.stack_digest), step.internal_kind == StepKind::Into, u16::MAX));
+                }
                 stop_reasons.push(StopReason::Step);
                 self.cancel_stepping();
                 hit = true;

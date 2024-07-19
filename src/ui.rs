@@ -1894,7 +1894,7 @@ struct HintsWindow {
 }
 
 impl HintsWindow {
-    const NORMAL_HEIGHT: usize = 8;
+    const NORMAL_HEIGHT: usize = 10;
     const PROFILER_HEIGHT: usize = 17;
 
     fn build_profiling_charts(&mut self, debugger: &mut Debugger, ui: &mut UI) {
@@ -3038,11 +3038,7 @@ impl CodeWindow {
         self.tabs_state.select(self.tabs.len() - 1);
     }
 
-    fn toggle_breakpoint(&mut self, disable: bool, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
-        if self.tabs.is_empty() {
-            return;
-        }
-        let tab = &self.tabs[self.tabs_state.selected];
+    fn toggle_breakpoint(tab: &CodeTab, disable: bool, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
         if tab.path_in_symbols.as_os_str().is_empty() {
             return;
         }
@@ -3067,9 +3063,22 @@ impl CodeWindow {
         if disable {
             state.last_error = "no breakpoint".to_string();
         } else {
-            let r = debugger.add_breakpoint(BreakpointOn::Line(LineBreakpoint {path: tab.path_in_symbols.clone(), file_version: tab.version_in_symbols.clone(), line: tab.area_state.cursor + 1, adjusted_line: None}));
+            let r = debugger.add_breakpoint(Self::make_breakpoint_for_current_line(tab));
             report_result(state, &r);
         }
+    }
+
+    fn run_to_cursor(tab: &CodeTab, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
+        if tab.path_in_symbols.as_os_str().is_empty() {
+            return;
+        }
+        ui.should_redraw = true;
+        let r = debugger.step_to_cursor(state.selected_thread, Self::make_breakpoint_for_current_line(tab));
+        report_result(state, &r);
+    }
+
+    fn make_breakpoint_for_current_line(tab: &CodeTab) -> BreakpointOn {
+        BreakpointOn::Line(LineBreakpoint {path: tab.path_in_symbols.clone(), file_version: tab.version_in_symbols.clone(), line: tab.area_state.cursor + 1, adjusted_line: None})
     }
 
     fn evict_cache(&mut self) {
@@ -3268,17 +3277,6 @@ impl WindowContent for CodeWindow {
             _ => None,
         };
 
-        let mut select_disassembly_address: isize = 0;
-        for action in ui.check_keys(&[KeyAction::ToggleBreakpoint, KeyAction::DisableBreakpoint, KeyAction::PreviousLocation, KeyAction::NextLocation]) {
-            match action {
-                KeyAction::ToggleBreakpoint => self.toggle_breakpoint(false, state, debugger, ui),
-                KeyAction::DisableBreakpoint => self.toggle_breakpoint(true, state, debugger, ui),
-                KeyAction::PreviousLocation => select_disassembly_address -= 1,
-                KeyAction::NextLocation => select_disassembly_address += 1,
-                _ => (),
-            }
-        }
-
         match switch_to {
             None => (),
             Some(None) => self.switch_to_file(Path::new(""), &FileVersionInfo::default(), debugger),
@@ -3311,6 +3309,18 @@ impl WindowContent for CodeWindow {
             None => return,
             Some(t) => t };
         let file = Self::find_or_open_file(&mut self.file_cache, &tab.path_in_symbols, &tab.version_in_symbols, debugger, &ui.palette);
+
+        let mut select_disassembly_address: isize = 0;
+        for action in ui.check_keys(&[KeyAction::ToggleBreakpoint, KeyAction::DisableBreakpoint, KeyAction::PreviousLocation, KeyAction::NextLocation, KeyAction::StepToCursor]) {
+            match action {
+                KeyAction::PreviousLocation => select_disassembly_address -= 1,
+                KeyAction::NextLocation => select_disassembly_address += 1,
+                KeyAction::ToggleBreakpoint => Self::toggle_breakpoint(tab, false, state, debugger, ui),
+                KeyAction::DisableBreakpoint => Self::toggle_breakpoint(tab, true, state, debugger, ui),
+                KeyAction::StepToCursor => Self::run_to_cursor(tab, state, debugger, ui),
+                _ => (),
+            }
+        }
 
         let header_widget = ui.add(widget!().fixed_height(file.header.num_lines()));
         let search_bar = ui.add(widget!());
@@ -3506,6 +3516,7 @@ impl WindowContent for CodeWindow {
             KeyHint::key(KeyAction::GoToLine, "go to line"),
             KeyHint::key(KeyAction::Find, "find"),
             KeyHint::keys(&[KeyAction::NextMatch, KeyAction::PreviousMatch], "find next/previous"),
+            KeyHint::key(KeyAction::StepToCursor, "run to cursor"),
         ]);
     }
 

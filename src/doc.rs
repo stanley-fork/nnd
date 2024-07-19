@@ -67,7 +67,6 @@ When running the debugger for the first time, notice:
 This information should be enough to discover most features by trial and error, which is recommended. Additionally, reading --help-known-problems and --help-watches is recommended.
 
 Tips and caveats:
- * The source code window shows the current line with a green arrow, and the current column with an underlined character.
  * The highlighted characters in the source code window are locations of statements and inlined function calls, as listed in the debug info.
    These are all the places where the control can stop, e.g. if you step repeatedly.
  * 'Step over column' ('m' key by default) runs until the control moves to a different line+column location. Similar to how 'step over line' runs until the control moves to a different line.
@@ -79,8 +78,8 @@ Tips and caveats:
  * While a step is in progress, breakpoints are automatically disabled for the duration of the step.
  * Step-into-instruction ('S' key by default) works no matter what, even if there's no debug info or if disassembly or stack unwinding fails. Use it when other steps fail.
  * Stepping can be interrupted with the suspend key ('C' by default). Useful e.g. if you try to step-over a function, but the function turns out to be too slow.
- * Breakpoints are preserved across debugger restarts, but they're put into disabled state on startup;
-   'B' is the default key to re-enable a breakpoint (in the breakpoints window or the source code window).
+ * Run-to-cursor works like a step: it runs until the selected (not any) thread hits the requested like, and it disables other breakpoints for the duration of the step.
+ * Breakpoints are preserved across debugger restarts, but they're put into disabled state on startup. Use Enter key in breakpoints window to reactivate.
  * The function search (in disassembly window, 'o' key by default) does fuzzy search over *mangled* function names, for now (for peformance reasons).
    Omit '::' in the search query. E.g. to search for 'std::foo::bar(int)' try typing 'stdfoobar'.
    The search results display demangled names, i.e. slightly different from what's actually searched.
@@ -210,9 +209,9 @@ Files inside ~/.nnd/<number>/:
    On crash, error message and stack trace goes to this file. Please include this file when reporting bugs, especially crashes.
  * lock - prevents multiple nnd processes from using the same directory simultaneously."###),
         "--help-tty" => println!(r###"The debugger occupies the whole terminal with its TUI. How to debug a program that also wants to use the terminal in an interactive way?
-E.g. using nnd to debug itself.
+E.g. how to use nnd to debug itself?
 
-One way is to just attach using -p
+One way is to just attach using -p <pid>.
 
 But what if you need to set breakpoints before the program starts, e.g. to debug a crash on startup? Then you can do the following:
  1. Open a terminal window (in xterm or tmux or whatever). Let's call this window A. This is where you'll be able interact with the debugged program.

@@ -373,6 +373,7 @@ pub struct FileVersionInfo {
     pub md5: Option<[u8; 16]>,
 }
 impl Default for FileVersionInfo { fn default() -> Self { Self {timestamp: 0, size: 0, md5: None} } }
+impl fmt::Debug for FileVersionInfo { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> std::result::Result<(), fmt::Error> { write!(f, "({}, {}, {:?})", self.timestamp, self.size, self.md5.as_ref().map(|a| a[0])) } }
 impl FileVersionInfo {
     pub fn save_state(&self, out: &mut Vec<u8>) -> io::Result<()> {
         out.write_u64(self.timestamp)?;

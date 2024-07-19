@@ -253,6 +253,7 @@ pub enum KeyAction {
     StepOverInstruction,
     StepOut,
     StepOutNoInline,
+    StepToCursor,
 
     WindowUp,
     WindowDown,
@@ -398,6 +399,7 @@ impl Default for KeyBinds {
             (Key::Char('N').plain(), KeyAction::StepOverInstruction),
             (Key::Char('f').plain(), KeyAction::StepOut),
             (Key::Char('F').plain(), KeyAction::StepOutNoInline),
+            (Key::Char('C').plain(), KeyAction::StepToCursor),
             // (Ctrl+tab and ctrl+shift+tab are unrepresentable in ansi escape codes.)
             (Key::Char('t').ctrl(), KeyAction::NextTab),
             (Key::Char('b').ctrl(), KeyAction::PreviousTab),
