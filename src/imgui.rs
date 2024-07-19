@@ -241,6 +241,8 @@ impl Widget {
     pub fn set_vstack(&mut self) -> &mut Self { self.axes[1].flags.insert(AxisFlags::STACK); self }
     pub fn fixed_x(mut self, x: isize) -> Self { self.axes[Axis::X].rel_pos = x; self.axes[0].flags.insert(AxisFlags::POS_KNOWN); self }
     pub fn fixed_y(mut self, y: isize) -> Self { self.axes[Axis::Y].rel_pos = y; self.axes[1].flags.insert(AxisFlags::POS_KNOWN); self }
+    pub fn set_fixed_x(&mut self, x: isize) -> &mut Self { self.axes[Axis::X].set_fixed_pos(x); self }
+    pub fn set_fixed_y(&mut self, y: isize) -> &mut Self { self.axes[Axis::Y].set_fixed_pos(y); self }
     pub fn fixed_rect(mut self, r: Rect) -> Self { for ax in 0..2 { let axis = &mut self.axes[ax]; axis.flags.insert(AxisFlags::POS_KNOWN | AxisFlags::SIZE_KNOWN); axis.rel_pos = r.pos[ax]; axis.size = r.size[ax]; } self }
     pub fn hcenter(mut self) -> Self { self.axes[Axis::X].flags.insert(AxisFlags::CENTER); self }
     pub fn vcenter(mut self) -> Self { self.axes[Axis::Y].flags.insert(AxisFlags::CENTER); self }
@@ -255,6 +257,8 @@ impl Widget {
     pub fn get_fixed_width(&self) -> usize { self.axes[Axis::X].get_fixed_size() }
     pub fn get_fixed_height(&self) -> usize { self.axes[Axis::Y].get_fixed_size() }
     pub fn get_fixed_rect(&self) -> Rect { Rect {pos: [self.axes[Axis::X].get_fixed_pos(), self.axes[Axis::Y].get_fixed_pos()], size: [self.axes[Axis::X].get_fixed_size(), self.axes[Axis::Y].get_fixed_size()]} }
+    pub fn get_fixed_x(&self) -> isize { self.axes[Axis::X].get_fixed_pos() }
+    pub fn get_fixed_y(&self) -> isize { self.axes[Axis::Y].get_fixed_pos() }
 
     pub fn set_fixed_width(&mut self, s: usize) -> &mut Self { self.axes[0].set_fixed_size(s); self }
     pub fn set_fixed_height(&mut self, s: usize) -> &mut Self { self.axes[1].set_fixed_size(s); self }

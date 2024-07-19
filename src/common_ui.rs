@@ -278,6 +278,46 @@ impl StyledText {
         res_start..self.num_spans()
     }
 
+    // Adjust styles for given ranges of bytes (counting from the start of the line). The ranges are not necessarily aligned with spans, or even with char boundaries.
+    // The ranges must be sorted by `start`. The ranges may overlap, but not very much or this gets slow.
+    pub fn import_line_with_adjustments(&mut self, from: &StyledText, line_idx: usize, adjustments: &[(Range<usize>, StyleAdjustment)]) -> usize {
+        let spans = from.get_line(line_idx);
+        let to_chars_start = self.chars.len();
+        self.chars.push_str(from.get_line_str(line_idx));
+        let from_chars_start = from.spans[spans.start].0;
+        let mut i = 0usize;
+        for span_idx in spans {
+            let span_style = from.spans[span_idx+1].1;
+            let mut r = from.spans[span_idx].0..from.spans[span_idx+1].0;
+            r = r.start-from_chars_start..r.end-from_chars_start;
+            while !r.is_empty() {
+                while i < adjustments.len() && adjustments[i].0.end <= r.start {
+                    i += 1;
+                }
+                let mut style = span_style;
+                let mut end = r.end;
+                for j in i..adjustments.len() {
+                    let a = &adjustments[j];
+                    if a.0.start > r.start {
+                        end = end.min(a.0.start);
+                        break;
+                    }
+                    if a.0.end > r.start {
+                        end = end.min(a.0.end);
+                        style = a.1.apply(style);
+                    }
+                }
+                while !self.chars.is_char_boundary(to_chars_start + end) {
+                    assert!(to_chars_start + end < self.chars.len());
+                    end += 1;
+                }
+                self.spans.push((to_chars_start + end, style));
+                r.start = end;
+            }
+        }
+        self.close_line()
+    }
+
     pub fn adjust_spans_style(&mut self, spans: Range<usize>, a: StyleAdjustment) {
         for i in spans {
             self.spans[i+1].1 = a.apply(self.spans[i+1].1);
@@ -389,5 +429,9 @@ impl StyledText {
         do_close_line(self, self.spans[self.lines[line+1]].0);
 
         res_lines_start..self.num_lines()
+    }
+
+    pub fn ensure_padded(&mut self) {
+        self.chars.reserve(64);
     }
 }

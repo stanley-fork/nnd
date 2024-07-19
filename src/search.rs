@@ -1,5 +1,7 @@
 use crate::{*, symbols::*, arena::*, procfs::*, symbols_registry::*, util::*, context::*, executor::*};
 use std::{mem, path::PathBuf, sync::{Arc, Mutex, atomic::{AtomicBool, AtomicUsize, Ordering}}, collections::HashSet, cmp, ops::Range, os::unix::ffi::OsStrExt, path::Path};
+use std::arch::x86_64::*;
+use rand::{random, distributions::Alphanumeric, thread_rng, Rng};
 
 pub struct SymbolSearcher {
     pub searcher: Arc<dyn Searcher>,
@@ -60,14 +62,43 @@ pub struct SearchResultInfo {
     pub line: LineInfo,
 }
 
-#[derive(PartialEq, Eq, Debug, Clone)]
+// String with at least 32 bytes of readable memory before and after it, unless empty.
+#[derive(Default, Eq, PartialEq, Debug, Clone)]
+pub struct PaddedString {
+    s: String,
+}
+impl PaddedString {
+    pub fn new(a: &str) -> Self {
+        let mut s = String::with_capacity(64 + a.len());
+        s.push_str(unsafe {std::str::from_utf8_unchecked(&[0; 32])});
+        s.push_str(a);
+        s.push_str(unsafe {std::str::from_utf8_unchecked(&[0; 32])});
+        Self {s}
+    }
+
+    pub fn get(&self) -> &str {
+        if self.s.is_empty() {
+            &self.s
+        } else {
+            &self.s[32..self.s.len()-32]
+        }
+    }
+}
+
+#[derive(PartialEq, Eq, Debug, Clone, Default)]
 pub struct SearchQuery {
-    subsequence: String,
-    // TODO: Add searching by declaration filename + optional line number (syntax: "@foo.cpp:42" in the search bar)
+    pub s: PaddedString,
+    pub case_sensitive: bool,
 }
 impl SearchQuery {
-    fn new() -> Self { Self {subsequence: String::new()} }
-    fn parse(s: &str) -> Self { Self {subsequence: s.to_string()} }
+    pub fn parse(s: &str) -> Self {
+        let case_sensitive = s.chars().any(|c| c.is_ascii_uppercase());
+        Self {s: PaddedString::new(s), case_sensitive}
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.s.get().is_empty()
+    }
 }
 
 struct SearchState {
@@ -80,7 +111,7 @@ impl SearchState {
 }
 
 fn search_task(state: Arc<SearchState>, query: SearchQuery, symbols: Arc<Symbols>, symbols_idx: usize, shard_idx: usize, searcher: Arc<dyn Searcher>, context: Arc<Context>) {
-    searcher.search(&symbols, symbols_idx, shard_idx, &query, &mut |mut res: Vec<SearchResult>, delta_items_done: usize, delta_items_total: usize, delta_bytes_done: usize| -> bool {
+    searcher.search(&symbols, symbols_idx, shard_idx, &query, &state.cancel, &mut |mut res: Vec<SearchResult>, delta_items_done: usize, delta_items_total: usize, delta_bytes_done: usize| -> bool {
         if state.cancel.load(Ordering::SeqCst) {
             return false;
         }
@@ -119,7 +150,7 @@ fn sort_and_truncate_results(v: &mut Vec<SearchResult>) {
 
 impl SymbolSearcher {
     pub fn new(searcher: Arc<dyn Searcher>, context: Arc<Context>) -> Self {
-        let s = SymbolSearcher {searcher, context, symbols: Vec::new(), waiting_for_symbols: false, state: Arc::new(SearchState::new()), searched_query: SearchQuery::new(), searched_num_symbols: 0};
+        let s = SymbolSearcher {searcher, context, symbols: Vec::new(), waiting_for_symbols: false, state: Arc::new(SearchState::new()), searched_query: SearchQuery::default(), searched_num_symbols: 0};
         s.state.results.lock().unwrap().complete = true;
         s
     }
@@ -213,7 +244,7 @@ pub struct SearcherProperties {
 }
 
 pub trait Searcher: Sync + Send {
-    fn search(&self, symbols: &Symbols, symbols_idx: usize, shard_idx: usize, query: &SearchQuery, callback: &mut SearchCallback);
+    fn search(&self, symbols: &Symbols, symbols_idx: usize, shard_idx: usize, query: &SearchQuery, cancel: &AtomicBool, callback: &mut SearchCallback);
     fn format_result(&self, binary: BinaryId, symbols: &Arc<Symbols>, query: &SearchQuery, res: &SearchResult) -> SearchResultInfo;
     fn properties(&self) -> SearcherProperties;
 }
@@ -221,14 +252,17 @@ pub trait Searcher: Sync + Send {
 pub struct FileSearcher;
 
 impl Searcher for FileSearcher {
-    fn search(&self, symbols: &Symbols, symbols_idx: usize, shard_idx: usize, query: &SearchQuery, callback: &mut SearchCallback) {
+    fn search(&self, symbols: &Symbols, symbols_idx: usize, shard_idx: usize, query: &SearchQuery, cancel: &AtomicBool, callback: &mut SearchCallback) {
         let items_total = symbols.path_to_used_file.len();
         callback(Vec::new(), 0, items_total, 0);
         let mut res: Vec<SearchResult> = Vec::new();
         let mut bytes_done = 0usize;
         for (path, &id) in &symbols.path_to_used_file {
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
             let slice = path.as_os_str().as_bytes();
-            if let Some(score) = fuzzy_match(slice, &query.subsequence) {
+            if let Some(score) = fuzzy_match(slice, query) {
                 res.push(SearchResult {score, id, symbols_idx});
             }
             bytes_done += slice.len();
@@ -247,19 +281,22 @@ impl Searcher for FileSearcher {
 pub struct FunctionSearcher;
 
 impl Searcher for FunctionSearcher {
-    fn search(&self, symbols: &Symbols, symbols_idx: usize, shard_idx: usize, query: &SearchQuery, callback: &mut SearchCallback) {
+    fn search(&self, symbols: &Symbols, symbols_idx: usize, shard_idx: usize, query: &SearchQuery, cancel: &AtomicBool, callback: &mut SearchCallback) {
         let range = (symbols.functions.len()*shard_idx/symbols.shards.len())..(symbols.functions.len()*(shard_idx+1)/symbols.shards.len());
         callback(Vec::new(), 0, range.len(), 0);
         let mut items_done = 0usize;
         let mut bytes_done = 0usize;
         let mut res: Vec<SearchResult> = Vec::new();
         for idx in range {
+            if idx & 127 == 0 && cancel.load(Ordering::Relaxed) {
+                return;
+            }
             let function = &symbols.functions[idx];
             if function.flags.contains(FunctionFlags::SENTINEL) {
                 continue;
             }
             let slice = function.mangled_name();
-            if let Some(score) = fuzzy_match(slice, &query.subsequence) {
+            if let Some(score) = fuzzy_match(slice, query) {
                 res.push(SearchResult {score, id: idx, symbols_idx});
             }
             items_done += 1;
@@ -288,7 +325,8 @@ impl Searcher for FunctionSearcher {
     fn properties(&self) -> SearcherProperties { SearcherProperties {have_names: true, have_files: true, parallel: true} }
 }
 
-fn fuzzy_match(haystack: &[u8], needle: &str) -> Option<i64> {
+// The caller must ensure that `haystack` has at least 31 bytes of readable memory after it.
+fn fuzzy_match(haystack: &[u8], query: &SearchQuery) -> Option<i64> {
     // Scoring:
     //  * Score 3 if the string is exactly equal to the query string.
     //  * Score 2 if the query string is a suffix of the string.
@@ -298,12 +336,17 @@ fn fuzzy_match(haystack: &[u8], needle: &str) -> Option<i64> {
     //    We should do some approximation instead. Maybe find a subsequence greedily, then do one forward and one backward pass greedily coalescing the pieces.
     //  * If the query string is not a subsequence of the string, it's not included in the results at all.
 
-    // Rust standard library doesn't provide a good substring search implementation for [u8], only for str (because the implementation takes some extra steps to ensure the results are aligned with utf8 codepoints).
-    // We recklessly convert strings from DWARF (file paths, function names, variable names) to str without checking if it's valid utf8 (in practice it always is). If this turns out to be a problem, we should implement our own substring search instead.
-    let haystack_str = unsafe {std::str::from_utf8_unchecked(haystack)};
-    if let Some(pos) = haystack_str.rfind(needle) {
-        let score = if haystack.len() == needle.len() { 3 } else if pos + needle.len() == haystack.len() { 2 } else { 1 };
-        return Some(score);
+    let needle = query.s.get();
+
+    if needle.len() > haystack.len() {
+        return None;
+    }
+    // Check the suffix separately (because we don't have backwards search).
+    if memmem_maybe_case_sensitive(&haystack[haystack.len() - needle.len()..], &query.s, query.case_sensitive).is_some() {
+        return Some(if haystack.len() == needle.len() {3} else {2});
+    }
+    if memmem_maybe_case_sensitive(&haystack[..haystack.len() - 1], &query.s, query.case_sensitive).is_some() {
+        return Some(1);
     }
 
     let needle = needle.as_bytes();
@@ -315,6 +358,7 @@ fn fuzzy_match(haystack: &[u8], needle: &str) -> Option<i64> {
         if i == needle.len() {
             break;
         }
+        let c = if query.case_sensitive {c} else {c.to_ascii_lowercase()};
         if c == needle[i] {
             i += 1;
             if !prev_matched {
@@ -329,4 +373,150 @@ fn fuzzy_match(haystack: &[u8], needle: &str) -> Option<i64> {
         return None;
     }
     return Some(-pieces);
+}
+
+#[cfg(target_feature = "avx2")]
+pub fn memmem_maybe_case_sensitive(haystack: &[u8], needle: &PaddedString, case_sensitive: bool) -> Option<usize> {
+    unsafe {
+        let needle = needle.get();
+        if needle.is_empty() {
+            return Some(0);
+        }
+        if needle.len() > haystack.len() {
+            return None;
+        }
+
+        let needle_len = needle.len();
+
+        // Create constants for case conversion.
+        let upper_a = _mm256_set1_epi8(b'A' as i8);
+        let twenty_six = _mm256_set1_epi8(26);
+        let lowercase_mask = _mm256_set1_epi8(if case_sensitive {0} else {32});
+
+        unsafe fn compare(mut hay: __m256i, need: __m256i, upper_a: __m256i, twenty_six: __m256i, lowercase_mask: __m256i) -> u32 {
+            let offset = _mm256_sub_epi8(hay, upper_a);
+            let is_upper = _mm256_cmpgt_epi8(twenty_six, offset);
+            hay = _mm256_or_si256(hay, _mm256_and_si256(is_upper, lowercase_mask));
+            let cmp = _mm256_cmpeq_epi8(hay, need);
+            _mm256_movemask_epi8(cmp) as u32
+        }
+
+        if needle_len > 32 {
+            // Believe it or not, long needle is the more straightforward case.
+
+            let first_32 = _mm256_loadu_si256(needle.as_ptr() as *const __m256i);
+            let last_32 = _mm256_loadu_si256(needle[needle_len - 32..].as_ptr() as *const __m256i);
+
+            for i in 0..=haystack.len() - needle_len {
+                // First 32 bytes.
+                let haystack_first = _mm256_loadu_si256(haystack[i..].as_ptr() as *const __m256i);
+                if compare(haystack_first, first_32, upper_a, twenty_six, lowercase_mask) != u32::MAX {
+                    continue;
+                }
+
+                // Last 32 bytes (potentially overlapping other 32-byte ranges we're checking).
+                let haystack_last = _mm256_loadu_si256(haystack[i + needle_len - 32..].as_ptr() as *const __m256i);
+                if compare(haystack_last, last_32, upper_a, twenty_six, lowercase_mask) != u32::MAX {
+                    continue;
+                }
+
+                // Other blocks of 32 bytes.
+                let mut j = 32;
+                while j < needle_len - 32 {
+                    let haystack_chunk = _mm256_loadu_si256(haystack[i + j..].as_ptr() as *const __m256i);
+                    let needle_chunk = _mm256_loadu_si256(needle[j..].as_ptr() as *const __m256i);
+                    if compare(haystack_chunk, needle_chunk, upper_a, twenty_six, lowercase_mask) != u32::MAX {
+                        break;
+                    }
+                    j += 32;
+                }
+                if j >= needle_len - 32 {
+                    return Some(i);
+                }
+            }
+        } else {
+            // This is tricky because AVX and SSE don't seem to have unaligned masked loads that don't segfault if the 32-byte range touches an unmapped page (even in the masked-off part).
+            // We could require padding, but that seems overall more annoying than dealing with unpadded data in this function.
+            // The padded version would be simple: for each i, we read haystack[i..i+32] into a register and check if the first needle_len bytes of the register match the needle.
+            // But if i+32 > haystack.len(), and haystack is at the very end of the last mapped page, this read will segfault.
+            // To avoid it, we introduce the second way of doing the comparison: read haystack[i+needle_len-32..i+needle_len] into a register and check if the *last* needle_len bytes match the needle.
+            // The first way breaks near the end of a page, the second way breaks near the start of a page. So we switch between them as needed, such that we only ever touch aligned 32-byte blocks that touch the needle.
+
+            // Load the needle into a SIMD register.
+            let prefix_needle = _mm256_loadu_si256(needle.as_ptr() as *const __m256i);
+            let prefix_mask = !0u32 >> (32 - needle_len);
+            let suffix_needle = _mm256_loadu_si256(needle.as_ptr().add(needle_len).sub(32) as *const __m256i);
+            let suffix_mask = !0u32 << (32 - needle_len);
+
+            let switch_point = 32usize.wrapping_sub(haystack.as_ptr() as usize % 64);
+            let switch_point = if switch_point > 32 { 0 } else { switch_point };
+
+            // Using a prefix of the register.
+            for i in 0..switch_point.min(haystack.len() - needle_len + 1) {
+                let haystack_chunk = _mm256_loadu_si256(haystack[i..].as_ptr() as *const __m256i);
+                if compare(haystack_chunk, prefix_needle, upper_a, twenty_six, lowercase_mask) & prefix_mask == prefix_mask {
+                    return Some(i);
+                }
+            }
+
+            // Using a suffix of the register.
+            for i in switch_point..=haystack.len() - needle_len {
+                let haystack_chunk = _mm256_loadu_si256(haystack.as_ptr().add(i + needle_len).sub(32) as *const __m256i);
+                if compare(haystack_chunk, suffix_needle, upper_a, twenty_six, lowercase_mask) & suffix_mask == suffix_mask {
+                    return Some(i);
+                }
+            }
+        }
+
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::search::*;
+
+    #[test]
+    fn test_memmem() {
+        let mut rng = thread_rng();
+        // Short enough that we'll hit empty substring case sometimes, long enough to have a few 32-byte blocks.
+        let data: String = (0..300).map(|_| rng.sample(Alphanumeric) as char).collect();
+        let mut temp = String::new();
+        for i in 0..3000 {
+            let hay_start = random::<usize>() % (data.len() + 1);
+            let hay_len = random::<usize>() % (data.len() - hay_start + 1);
+            let needle_start = random::<usize>() % (data.len() + 1);
+            let needle_len = random::<usize>() % (data.len() - needle_start + 1).min(hay_len + 3);
+            let case_sensitive = random::<bool>();
+            let hay = &data[hay_start..hay_start + hay_len];
+            let needle = &data[needle_start..needle_start + needle_len];
+
+            temp.clear();
+            temp.push_str(needle);
+            if !case_sensitive {
+                temp.make_ascii_lowercase();
+            }
+            let mut bad_needle = false;
+            if i % 4 == 0 && needle_len != 0 {
+                let c = rng.sample(Alphanumeric) as u8;
+                bad_needle |= !case_sensitive && (c as char).is_ascii_uppercase();
+                unsafe {temp.as_bytes_mut()[random::<usize>() % needle_len] = c};
+            }
+            let needle = &temp;
+
+            let expected = if case_sensitive {
+                hay.find(needle)
+            } else if needle_len == 0 {
+                Some(0)
+            } else if bad_needle {
+                None
+            } else {
+                hay.as_bytes().windows(needle_len).position(|w| unsafe {std::str::from_utf8_unchecked(w).eq_ignore_ascii_case(needle)})
+            };
+
+            let found = memmem_maybe_case_sensitive(hay.as_bytes(), &PaddedString::new(needle), case_sensitive);
+
+            assert_eq!(expected, found, "{} {} {} {}", i, hay, needle, case_sensitive);
+        }
+    }
 }

@@ -1549,7 +1549,7 @@ impl WindowContent for DisassemblyWindow {
                 let end = ui.text.num_lines();
                 with_parent!(ui, content_root, {
                     // Horizontally scrollable error message.
-                    build_biscrollable_area_with_header(start..end, [0, 0], &mut tab.area_state, ui);
+                    build_biscrollable_area_with_header(None, start..end, [0, 0], &mut tab.area_state, ui);
                 });
                 return;
             }
@@ -1569,7 +1569,7 @@ impl WindowContent for DisassemblyWindow {
 
         let end = ui.text.num_lines();
         let (content, visible_y) = with_parent!(ui, content_root, {
-            build_biscrollable_area_with_header(start..end, [prefix_width + disas.widest_line, disas.lines.len()], &mut tab.area_state, ui)
+            build_biscrollable_area_with_header(None, start..end, [prefix_width + disas.widest_line, disas.lines.len()], &mut tab.area_state, ui)
         });
 
         // Now the cursor position is final.
@@ -1588,13 +1588,13 @@ impl WindowContent for DisassemblyWindow {
                 state.selected_addr = Some((binary.id.clone(), function_idx, binary.addr_map.static_to_dynamic(disas_line.static_addr)));
             }
 
-            for action in ui.check_keys(&[KeyAction::ToggleBreakpoint, KeyAction::PreviousMatch, KeyAction::NextMatch]) {
+            for action in ui.check_keys(&[KeyAction::ToggleBreakpoint, KeyAction::PreviousLocation, KeyAction::NextLocation]) {
                 match action {
                     KeyAction::ToggleBreakpoint if has_addr => {
                         // TODO: Instruction breakpoints. Probably store static addr + binary id, not dynamic addr. But make it work without requiring Symbols, just based on mmaps.
                     }
-                    KeyAction::PreviousMatch => tab.selected_subfunction_level = tab.selected_subfunction_level.min(disas_line.subfunction_level).saturating_sub(1),
-                    KeyAction::NextMatch => {
+                    KeyAction::PreviousLocation => tab.selected_subfunction_level = tab.selected_subfunction_level.min(disas_line.subfunction_level).saturating_sub(1),
+                    KeyAction::NextLocation => {
                         tab.selected_subfunction_level = tab.selected_subfunction_level.saturating_add(1);
                         if tab.selected_subfunction_level > disas_line.subfunction_level {
                             tab.selected_subfunction_level = u16::MAX;
@@ -1762,7 +1762,7 @@ impl WindowContent for DisassemblyWindow {
         out.extend([
             KeyHint::key(KeyAction::Open, "find function"),
             KeyHint::key(KeyAction::CloseTab, "close/pin tab"),
-            KeyHint::keys(&[KeyAction::PreviousMatch, KeyAction::NextMatch], "select level")]);
+            KeyHint::keys(&[KeyAction::PreviousLocation, KeyAction::NextLocation], "select level")]);
         // TODO: KeyAction::ToggleBreakpoint, KeyAction::DisableBreakpoint
     }
 
@@ -2731,11 +2731,76 @@ struct SourceFile {
 }
 
 #[derive(Default)]
-struct CodeSearchResults {
-    query: String,
+struct CodeSearch {
+    bar: SearchBar,
+
+    query: SearchQuery,
     tab_identity: usize,
 
-    matches: Vec<(/*line*/ usize, /*column*/ Range<usize>)>,
+    match_ranges: Vec<Range<usize>>,
+    matches: Vec<(/*line_idx*/ usize, /*column_ranges*/ Range<usize>)>,
+    match_idx: usize,
+    cursor_is_on_a_match: bool,
+}
+impl CodeSearch {
+    // Does the search if needed, moves the cursor if needed.
+    fn update(&mut self, tab: &mut CodeTab, text: &StyledText, select_match: isize) {
+        let query = SearchQuery::parse(&self.bar.text.text);
+        if (&self.query, self.tab_identity) != (&query, tab.identity) {
+            (self.query, self.tab_identity) = (query, tab.identity);
+            self.match_ranges.clear();
+            self.matches.clear();
+            if !self.query.is_empty() {
+                for line_idx in 0..text.num_lines() {
+                    let start = self.match_ranges.len();
+                    let s = text.get_line_str(line_idx).as_bytes();
+                    let mut col = 0usize;
+                    while let Some(pos) = memmem_maybe_case_sensitive(&s[col..], &self.query.s, self.query.case_sensitive) {
+                        let needle_len = self.query.s.get().len();
+                        col += pos;
+                        self.match_ranges.push(col..col+needle_len);
+                        col += needle_len;
+                    }
+                    let end = self.match_ranges.len();
+                    if end > start {
+                        self.matches.push((line_idx, start..end));
+                    }
+                }
+            }
+        }
+        (self.match_idx, self.cursor_is_on_a_match) = self.calculate_match_idx(tab.area_state.cursor);
+        if select_match != 0 && !self.matches.is_empty() {
+            let mut i = self.match_idx;
+            if !self.cursor_is_on_a_match {
+                if select_match > 0 {
+                    i = (i + self.matches.len() - 1) % self.matches.len();
+                }
+                self.cursor_is_on_a_match = true;
+            }
+            self.match_idx = (i as isize + select_match).rem_euclid(self.matches.len() as isize) as usize;
+            tab.area_state.select(self.matches[self.match_idx].0);
+        }
+        assert_eq!((self.match_idx, self.cursor_is_on_a_match), self.calculate_match_idx(tab.area_state.cursor));
+    }
+
+    fn needs_update(&mut self, tab: &CodeTab) -> bool {
+        (&self.query, self.tab_identity, (self.match_idx, self.cursor_is_on_a_match)) != (&SearchQuery::parse(&self.bar.text.text), tab.identity, self.calculate_match_idx(tab.area_state.cursor))
+    }
+
+    fn calculate_match_idx(&self, cursor: usize) -> (usize, bool) {
+        let i = self.matches.partition_point(|(line, _)| *line < cursor);
+        let on = self.matches.get(i).is_some_and(|(line, _)| *line == cursor);
+        (i, on)
+    }
+
+    fn match_ranges_on_line(&self, line_idx: usize) -> &[Range<usize>] {
+        let i = self.matches.partition_point(|(l, _)| *l < line_idx);
+        if i < self.matches.len() && self.matches[i].0 == line_idx {
+            &self.match_ranges[self.matches[i].1.clone()]
+        } else {
+            &[]
+        }
+    }
 }
 
 #[derive(Default)]
@@ -2746,9 +2811,8 @@ struct CodeWindow {
 
     search_dialog: Option<SearchDialog>,
 
-    search_bar: SearchBar,
-    search_results: CodeSearchResults,
-    go_to_line_bar: Option<SearchBar>,//asdqwe use all that
+    search: CodeSearch,
+    go_to_line_bar: SearchBar,
 
     // When this changes (usually because the user moved the cursor around the file), we scroll disassembly to the address corresponding to the selected line.
     disassembly_scrolled_to: Option<(PathBuf, FileVersionInfo, /*cursor*/ usize)>,
@@ -3161,8 +3225,9 @@ impl CodeWindow {
 impl WindowContent for CodeWindow {
     fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
         let mut open_dialog = false;
+        let mut search_select_match = 0isize;
         // TODO: Move CloseTab logic into Tabs, next to reordering logic. Also close tabs with middle click.
-        for action in ui.check_keys(&[KeyAction::Open, KeyAction::CloseTab]) {
+        for action in ui.check_keys(&[KeyAction::Open, KeyAction::CloseTab, KeyAction::GoToLine, KeyAction::Find, KeyAction::NextMatch, KeyAction::PreviousMatch]) {
             match action {
                 KeyAction::Open if self.search_dialog.is_none() => open_dialog = true,
                 KeyAction::CloseTab if self.tabs.get(self.tabs_state.selected).is_some() => {
@@ -3172,6 +3237,19 @@ impl WindowContent for CodeWindow {
                     } else {
                         self.tabs.remove(self.tabs_state.selected);
                     }
+                }
+                KeyAction::GoToLine => {
+                    self.go_to_line_bar.text.clear();
+                    self.go_to_line_bar.start_editing();
+                }
+                KeyAction::Find => self.search.bar.start_editing(),
+                KeyAction::NextMatch => {
+                    self.search.bar.visible = true;
+                    search_select_match += 1;
+                }
+                KeyAction::PreviousMatch => {
+                    self.search.bar.visible = true;
+                    search_select_match -= 1;
                 }
                 _ => (),
             }
@@ -3187,12 +3265,12 @@ impl WindowContent for CodeWindow {
         };
 
         let mut select_disassembly_address: isize = 0;
-        for action in ui.check_keys(&[KeyAction::ToggleBreakpoint, KeyAction::DisableBreakpoint, KeyAction::PreviousMatch, KeyAction::NextMatch]) {
+        for action in ui.check_keys(&[KeyAction::ToggleBreakpoint, KeyAction::DisableBreakpoint, KeyAction::PreviousLocation, KeyAction::NextLocation]) {
             match action {
                 KeyAction::ToggleBreakpoint => self.toggle_breakpoint(false, state, debugger, ui),
                 KeyAction::DisableBreakpoint => self.toggle_breakpoint(true, state, debugger, ui),
-                KeyAction::PreviousMatch => select_disassembly_address -= 1,
-                KeyAction::NextMatch => select_disassembly_address += 1,
+                KeyAction::PreviousLocation => select_disassembly_address -= 1,
+                KeyAction::NextLocation => select_disassembly_address += 1,
                 _ => (),
             }
         }
@@ -3210,9 +3288,11 @@ impl WindowContent for CodeWindow {
         close_excess_ephemeral_tabs(&mut self.tabs, &mut self.tabs_state, |t| t.ephemeral);
         self.evict_cache();
 
+        // Now the set of tabs is final.
+
         ui.cur_mut().set_vstack();
-        with_parent!(ui, ui.add(widget!().fixed_height(1)), {
-            ui.focus();
+        let tabs_widget = ui.add(widget!().fixed_height(1));
+        with_parent!(ui, tabs_widget, {
             let mut tabs = Tabs::new(mem::take(&mut self.tabs_state), ui);
             for tab in &self.tabs {
                 let full_title = tab.path_in_symbols.as_os_str().to_string_lossy().into_owned();
@@ -3220,6 +3300,68 @@ impl WindowContent for CodeWindow {
             }
             self.tabs_state = tabs.finish(ui);
         });
+
+        // Now the selected tab is final.
+
+        let tab = match self.tabs.get_mut(self.tabs_state.selected) {
+            None => return,
+            Some(t) => t };
+        let file = Self::find_or_open_file(&mut self.file_cache, &tab.path_in_symbols, &tab.version_in_symbols, debugger, &ui.palette);
+
+        let header_widget = ui.add(widget!().fixed_height(file.header.num_lines()));
+        let search_bar = ui.add(widget!());
+        let go_to_line_bar = ui.add(widget!().fixed_height(0));
+
+        // Multifocus the widgets in the correct order.
+        with_parent!(ui, go_to_line_bar, {ui.multifocus();});
+        with_parent!(ui, search_bar, {ui.multifocus();});
+        with_parent!(ui, tabs_widget, {ui.multifocus();});
+
+        with_parent!(ui, search_bar, {
+            self.search.bar.do_not_capture_enter_key = true;
+            if ui.check_key(KeyAction::Enter) {
+                search_select_match += 1;
+            }
+
+            self.search.update(tab, &file.text, search_select_match);
+
+            let l = ui_writeln!(ui, default, "find: ");
+            let r = if self.search.query.is_empty() {
+                None
+            } else if self.search.matches.is_empty() {
+                Some(ui_writeln!(ui, default_dim, "no results"))
+            } else {
+                Some(ui_writeln!(ui, default_dim, "{}/{}", self.search.match_idx.min(self.search.matches.len() - 1) + 1, self.search.matches.len()))
+            };
+            self.search.bar.build(Some(l), r, ui);
+        });
+
+        with_parent!(ui, go_to_line_bar, {
+            if self.go_to_line_bar.visible {
+                let prev_text = self.go_to_line_bar.text.text.clone();
+                let num_lines = file.text.num_lines().max(1);
+                let left = ui_writeln!(ui, default, "go to line (1-{}): ", num_lines);
+
+                self.go_to_line_bar.hide_when_not_editing = true;
+                self.go_to_line_bar.build(Some(left), None, ui);
+
+                if self.go_to_line_bar.text.text != prev_text {
+                    if let Ok(n) = self.go_to_line_bar.text.text.parse::<usize>() {
+                        tab.area_state.select(n.saturating_sub(1));
+                    }
+                }
+
+                if !self.go_to_line_bar.visible {
+                    // The focus+capture_keys system has its quirks.
+                    // This line is needed to prevent Escape key press from being eaten after closing go-to-file bar while search bar is also open.
+                    // (Exact repro: run with --period 0; do a search, press Escape, press F3 to open the search bar without enabling its text input, press g to open the go-to-line bar,
+                    //  press Escape or Enter to close the go-to-line bar, press Escape to close the search bar - and it doesn't close; press Escape again, and it closes.)
+                    // This happens because on the frame when go-to-line bar is closed, it already requested captured keys for next frame, so they get routed to it even though it doesn't care about those inputs anymore.
+                    ui.should_redraw = true;
+                }
+            }
+        });
+
         let content_root = ui.add(widget!().height(AutoSize::Remainder(1.0)));
         with_parent!(ui, content_root, {
             ui.multifocus();
@@ -3234,18 +3376,19 @@ impl WindowContent for CodeWindow {
             }
         }
 
-        let tab = match self.tabs.get_mut(self.tabs_state.selected) {
-            None => return,
-            Some(t) => t };
-        let file = Self::find_or_open_file(&mut self.file_cache, &tab.path_in_symbols, &tab.version_in_symbols, debugger, &ui.palette);
-
         let line_num_len = (file.text.num_lines().saturating_add(1) as f64).log10().ceil() as usize;
         let prefix_width = line_num_len + 2 + 2 + 1;
 
         let (content, visible_y) = with_parent!(ui, content_root, {
             let header = ui.text.import_lines(&file.header, 0..file.header.num_lines());
-            build_biscrollable_area_with_header(header, [prefix_width + file.widest_line, file.text.num_lines()], &mut tab.area_state, ui)
+            build_biscrollable_area_with_header(Some(header_widget), header, [prefix_width + file.widest_line, file.text.num_lines()], &mut tab.area_state, ui)
         });
+
+        // Now the cursor is final.
+
+        if self.search.needs_update(tab) {
+            ui.should_redraw = true;
+        }
 
         struct BreakpointLine {
             line: usize,
@@ -3287,6 +3430,7 @@ impl WindowContent for CodeWindow {
 
         with_parent!(ui, content, {
             let line_range = visible_y.start.max(0) as usize .. (visible_y.end.max(0) as usize).min(file.text.num_lines());
+            let mut adjustments: Vec<(Range<usize>, StyleAdjustment)> = Vec::new();
             for i in line_range.clone() {
                 let mut column_number = 0usize;
 
@@ -3316,33 +3460,23 @@ impl WindowContent for CodeWindow {
 
                 ui_write!(ui, default_dim, "{: >2$}{}", i + 1, if i < file.num_lines_in_local_file {" "} else {"~"}, line_num_len);
 
-                // Underline the character at the column number.
-                let s = file.text.get_line_str(i);
-                let spans = file.text.get_line(i);
-                if column_number == 0 {
-                    ui.text.import_spans(&file.text, spans);
-                } else if column_number - 1 >= s.len() {
-                    ui.text.import_spans(&file.text, spans);
-                    ui_write!(ui, default, "{:<1$}", "", column_number - 1 - s.len());
-                    let style = ui.palette.code_instruction_pointer_column.apply(ui.palette.default);
-                    styled_write!(ui.text, style, " ");
-                } else {
-                    let mut start = column_number - 1;
-                    while !s.is_char_boundary(start) {
-                        start -= 1;
+                // Highlight search results.
+                adjustments.clear();
+                if self.search.bar.visible {
+                    for r in self.search.match_ranges_on_line(i) {
+                        adjustments.push((r.clone(), ui.palette.search_result));
                     }
-                    let mut end = start + 1;
-                    while !s.is_char_boundary(end) {
-                        end += 1;
-                    }
-                    let spans = file.text.get_line(i);
-                    ui.text.import_substring(&file.text, spans.clone(), 0..start);
-                    let mid = ui.text.import_substring(&file.text, spans.clone(), start..end);
-                    ui.text.import_substring(&file.text, spans.clone(), end..s.len());
-                    ui.text.adjust_spans_style(mid, ui.palette.code_instruction_pointer_column);
                 }
 
-                let l = ui.text.close_line();
+                // Underline the character at the column number.
+                // Note that the text line should always be long enough to cover this line number because we extend lines when loading the file to cover all columns that appear in debug info.
+                let line_len = file.text.get_line_str(i).len();
+                if column_number != 0 {
+                    adjustments.push((column_number-1..column_number, ui.palette.code_instruction_pointer_column));
+                }
+
+                let l = ui.text.import_line_with_adjustments(&file.text, i, &adjustments);
+
                 let mut w = widget!().fixed_height(1).fixed_y(i as isize).text(l).fill(' ', ui.palette.default).flags(WidgetFlags::HSCROLL_INDICATOR_RIGHT).highlight_on_hover();
                 if i == tab.area_state.cursor {
                     w.style_adjustment.update(ui.palette.selected);
@@ -3356,6 +3490,7 @@ impl WindowContent for CodeWindow {
 
     fn drop_caches(&mut self) {
         self.file_cache.clear();
+        self.search.tab_identity = 0;
     }
 
     fn get_key_hints(&self, out: &mut Vec<KeyHint>) {
@@ -3363,7 +3498,7 @@ impl WindowContent for CodeWindow {
             KeyHint::key(KeyAction::Open, "open file"),
             KeyHint::key(KeyAction::CloseTab, "close/pin tab"),
             KeyHint::keys(&[KeyAction::ToggleBreakpoint, KeyAction::DisableBreakpoint], "toggle/disable breakpoint"),
-            KeyHint::keys(&[KeyAction::PreviousMatch, KeyAction::NextMatch], "cycle disasm addrs"),
+            KeyHint::keys(&[KeyAction::PreviousLocation, KeyAction::NextLocation], "cycle disasm addrs"),
         ]);
     }
 

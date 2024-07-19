@@ -1,12 +1,16 @@
-search and go-to-line in code window
 do something to prevent stopping again on the same line when continuing from a breakpoint, when there are multiple locations on the same line (e.g. function args)
 add watch on pressing enter on non-root value tree node
 sorting tables, especially threads by cpu usage
 hotkey to run to cursor
+make search auto-case-sensitive (insensitive if all lowercase, sensitive otherwise)
+make function search ignore characters like :<>, (research whether it's possible to actually match some of them without full demangling)
 reordering tabs
 rearranging windows
 maximizing windows
+test on mac, make sure copying text out of the terminal is possible
+loading key binds and colors from file
 
+investigate search cancellation not working well
 fix empty symbols loading stage name near the end
 fix picking up updated binary unnecessarily
 investigate regression in symbols loading speed (stuck on "parsing drawf" for ~10 seconds)
@@ -49,7 +53,6 @@ key to follow a jump in disas
 allow line-based steps in .plt* (maybe by just turning them into single-instruction-steps)
 in disassembly window, make 'left' key jump to the start of inlined function
 maximizing windows (hot key and button in a corner)
-make search auto-case-sensitive (insensitive if all lowercase, sensitive otherwise)
 special breakpoints: panic, exception, signal, program start (replacing -c), main function entry, dynamic library load
 make source window autoscroll horizontally in addition to vertically
 -v for build datetime

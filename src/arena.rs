@@ -29,7 +29,8 @@ pub struct StringRef {
 
 struct Chunk {
     data: *mut u8, // avoiding Box<[u8]> because I'm not sure whether it's valid with aliasing rules
-    capacity: usize,
+    allocated: usize,
+    capacity: usize, // currently always equal to `allocated`, but we can make it smaller for SIMD padding if needed
     used: usize,
 }
 unsafe impl Send for Chunk {}
@@ -151,12 +152,13 @@ impl Arena {
         let res = self.chunks.len();
 
         let capacity = CHUNK_SIZE.max(size);
-        let layout = Layout::from_size_align(capacity, 1).unwrap();
+        let allocated = capacity;
+        let layout = Layout::from_size_align(allocated, 1).unwrap();
         let p = unsafe { alloc(layout) };
         if p.is_null() {
             handle_alloc_error(layout);
         }
-        let c = Chunk {data: p, capacity, used: 0};
+        let c = Chunk {data: p, allocated, capacity, used: 0};
 
         // Between the new chunk and current_chunk, nominate one to be current and the other to be immutable.
         // Useful if there are both small and huge (> CHUNK_SIZE) allocations.
@@ -175,7 +177,7 @@ impl Arena {
 
 impl Drop for Chunk {
     fn drop(&mut self) {
-        unsafe { dealloc(self.data, Layout::from_size_align(self.capacity as usize, 1).unwrap()); }
+        unsafe { dealloc(self.data, Layout::from_size_align(self.allocated as usize, 1).unwrap()); }
     }
 }
 
@@ -300,7 +302,7 @@ mod tests {
      #[test]
     fn arena_push() {
         let mut arena = Arena::new();
-        let mut p: *const u64 = ptr::null();
+        let mut p: *const u64 = [].as_ptr();
         let mut l: usize = 0;
         arena.push_to_array_likely_at_end(&mut p, &mut l, 10);
         arena.push_to_array_likely_at_end(&mut p, &mut l, 20);
@@ -308,7 +310,7 @@ mod tests {
         arena.push_to_array_likely_at_end(&mut p, &mut l, 40);
         assert_eq!(arena.chunks.len(), 1);
         assert_eq!(arena.chunks[0].used, 8*4);
-        arena.alloc(8u8);
+        arena.add(8u8);
         assert_eq!(arena.chunks[0].used, 8*4+1);
         arena.push_to_array_likely_at_end(&mut p, &mut l, 50);
         assert_eq!(arena.chunks[0].used, 8*10);
@@ -321,7 +323,7 @@ mod tests {
         let mut t = StringTable::new();
         t.add_str("hello", 10);
         assert_eq!(t.arena.chunks.len(), 1);
-        t.add(&vec![b'-'; CHUNK_SIZE - 2], 20);
+        t.add_slice(&vec![b'-'; CHUNK_SIZE - 2], 20);
         assert_eq!(t.arena.chunks.len(), 2);
         t.add_str("world", 30);
         {
@@ -329,25 +331,28 @@ mod tests {
             w.write(&vec![b'+'; CHUNK_SIZE - 13]).unwrap();
             w.finish(40);
         }
-        assert_eq!(t.arena.chunks.len(), 2);
+        assert_eq!(t.arena.chunks.len(), 3);
         let mut w = t.write();
-        assert_eq!(w.arena.chunks.len(), 3);
+        assert_eq!(w.w.arena.chunks.len(), 3);
         w.write(&vec![b'%'; CHUNK_SIZE - 1]).unwrap();
         w.write(&[]).unwrap();
-        assert_eq!(w.arena.chunks.len(), 3);
+        assert_eq!(w.w.arena.chunks.len(), 4);
         w.write(&[b'%']).unwrap();
-        assert_eq!(w.arena.chunks.len(), 4);
+        assert_eq!(w.w.arena.chunks.len(), 4);
         w.write(&[b'%'; CHUNK_SIZE/2]).unwrap();
         w.finish(50);
         assert_eq!(t.arena.chunks.len(), 4);
 
         assert_eq!(t.strings.len(), 5);
         assert_eq!(t.strings[0], StringRef {s: b"hello".as_slice(), id: 10});
-        assert_eq!(t.strings[1], StringRef {s: b"world".as_slice(), id: 30});
-        assert_eq!(t.strings[2], StringRef {s: vec![b'+'; CHUNK_SIZE - 13].as_slice(), id: 40});
-        assert_eq!(t.strings[3], StringRef {s: vec![b'-'; CHUNK_SIZE - 2].as_slice(), id: 20});
-        assert_eq!(t.strings[4], StringRef {s: vec![b'%'; CHUNK_SIZE + CHUNK_SIZE/2].as_slice(), id: 50});
+        assert_eq!(t.strings[2], StringRef {s: b"world".as_slice(), id: 30});
+        assert_eq!(t.strings[3].s, vec![b'+'; CHUNK_SIZE - 13].as_slice());
+        assert_eq!(t.strings[3].id, 40);
+        assert_eq!(t.strings[1].s, vec![b'-'; CHUNK_SIZE - 2].as_slice());
+        assert_eq!(t.strings[1].id, 20);
+        assert_eq!(t.strings[4].s, vec![b'%'; CHUNK_SIZE + CHUNK_SIZE/2].as_slice());
+        assert_eq!(t.strings[4].id, 50);
 
-        assert_eq!(t.arena.used(), CHUNK_SIZE*3 + CHUNK_SIZE/2 - 13 - 2 + "hello".len() + "world".len() + 5);
+        assert_eq!(t.arena.used(), CHUNK_SIZE*3 + CHUNK_SIZE/2 - 13 - 2 + "hello".len() + "world".len());
     }
 }

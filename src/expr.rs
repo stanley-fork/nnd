@@ -2,6 +2,7 @@ use crate::{*, error::{*, Result, Error}, util::*, registers::*, types::*, procf
 use std::{fmt, fmt::Write, mem, collections::{HashMap, HashSet}, io::Write as ioWrite, borrow::Cow, ops::Range};
 use gimli::{Operation, EndianSlice, LittleEndian, Expression, Encoding, EvaluationResult, ValueType, DieReference, DW_AT_location, Location, DebugInfoOffset};
 use bitflags::*;
+use rand::random;
 
 type SliceType = EndianSlice<'static, LittleEndian>;
 
@@ -1233,29 +1234,26 @@ impl StructBuilder {
 mod tests {
     use crate::expr::*;
 
-    // Slow but caught bugs.
     #[test]
-    fn value_blob_nonsense_slow() {
-        let lens = [0usize, 1, 3, 5, 7, 8, 9, 13, 15, 16, 17, 23, 24, 25, 25, 28, 31, 32, 33, 34, 35, 38, 39, 40, 41, 47];
-        for &bits1 in &lens {
-            for &bits2 in &lens {
-                for pos1 in 0..bits1 {
-                    for pos2 in 0..bits2 {
-                        for off in 0..pos2+1 {
-                            let mut a = ValueBlob::with_capacity((bits1+7)/8);
-                            let mut b = ValueBlob::with_capacity((bits2+7)/8);
-                            a.as_mut_slice()[pos1/8] |= 1 << (pos1 & 7) as u32;
-                            b.as_mut_slice()[pos2/8] |= 1 << (pos2 & 7) as u32;
-                            a.append_bits(bits1, b, bits2 - off, off);
-                            let s = a.as_slice();
-                            assert!(s.len() * 8 >= bits1 + bits2 - off);
-                            for i in 0..s.len()*8 {
-                                let bit = s[i/8] & (1 << (i&7) as u32) != 0;
-                                assert_eq!(bit, i == pos1 || i == pos2 - off + bits1);
-                            }
-                        }
-                    }
-                }
+    fn value_blob_nonsense() {
+        let lens = [1, 3, 5, 7, 8, 9, 13, 15, 16, 17, 23, 24, 25, 25, 28, 31, 32, 33, 34, 35, 38, 39, 40, 41, 47];
+        for _ in 0..3000 {
+            let bits1 = lens[random::<usize>()%lens.len()];
+            let bits2 = lens[random::<usize>()%lens.len()];
+            let pos1: usize = random::<usize>()%bits1;
+            let pos2: usize = random::<usize>()%bits2;
+            let off: usize = random::<usize>()%(pos2+1);
+
+            let mut a = ValueBlob::with_capacity((bits1+7)/8);
+            let mut b = ValueBlob::with_capacity((bits2+7)/8);
+            a.as_mut_slice()[pos1/8] |= 1 << (pos1 & 7) as u32;
+            b.as_mut_slice()[pos2/8] |= 1 << (pos2 & 7) as u32;
+            a.append_bits(bits1, b, bits2 - off, off);
+            let s = a.as_slice();
+            assert!(s.len() * 8 >= bits1 + bits2 - off);
+            for i in 0..s.len()*8 {
+                let bit = s[i/8] & (1 << (i&7) as u32) != 0;
+                assert_eq!(bit, i == pos1 || i == pos2 - off + bits1);
             }
         }
     }

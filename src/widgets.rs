@@ -843,7 +843,11 @@ impl TextInput {
         self.mark = 0;
         self.scroll_to_cursor = true;
     }
-    
+    pub fn clear(&mut self) {
+        self.text.clear();
+        self.go_to_end();
+    }
+
     // Returns true if there was any input (or if scroll_to_cursor was set to true from the outside).
     // cur_parent's axes determine scrolling/resizing behavior:
     //  * If AutoSize::Fixed, the viewport size is fixed, and the text is scrollable inside it.
@@ -1351,17 +1355,15 @@ pub struct SearchBar {
     pub text: TextInput,
     pub visible: bool,
     pub editing: bool,
-    pub close_on_enter: bool,
+
+    pub hide_when_not_editing: bool,
+    pub do_not_capture_enter_key: bool,
 }
 impl SearchBar {
-    // Sets cur_parent's height to 0 or 1. Returns true if close_on_enter, and Enter was pressed.
-    pub fn build(&mut self, left_text: Option<usize>, right_text: Option<usize>, ui: &mut UI) -> bool {
-        let enter = self.editing && ui.check_key(KeyAction::Enter);
-        if enter {
+    // Sets cur_parent's height to 0 or 1.
+    pub fn build(&mut self, left_text: Option<usize>, right_text: Option<usize>, ui: &mut UI) {
+        if self.editing && !self.do_not_capture_enter_key && ui.check_key(KeyAction::Enter) {
             self.editing = false;
-            if self.close_on_enter {
-                self.visible = false;
-            }
         }
         if self.visible && ui.check_key(KeyAction::Cancel) {
             self.editing = false;
@@ -1370,13 +1372,18 @@ impl SearchBar {
         if self.editing && !ui.check_focus() {
             self.editing = false;
         }
+        if !self.editing && self.hide_when_not_editing {
+            self.visible = false;
+        }
         if !self.editing && self.text.text.is_empty() {
             self.visible = false;
         }
         if !self.visible {
             ui.cur_mut().set_fixed_height(0);
-            return enter;
+            return;
         }
+
+        // TODO: Up and down keys to navigate history.
 
         ui.cur_mut().set_fixed_height(1);
         ui.cur_mut().axes[Axis::X].flags.insert(AxisFlags::STACK);
@@ -1398,14 +1405,17 @@ impl SearchBar {
                 ui.cur_mut().draw_text = Some(l..l+1);
             }
         });
-
-        false
     }
 
     pub fn start_editing(&mut self) {
         self.visible = true;
         self.editing = true;
         self.text.select_all();
+    }
+
+    pub fn hide(&mut self) {
+        self.visible = false;
+        self.editing = false;
     }
 }
 
@@ -1444,36 +1454,44 @@ impl AreaState {
 }
 
 // Makes the tree of widgets used by code and disassembly windows (simplified):
+//  +-header_widget (hscrollable)------------+
+//  | header                                 |
+//  +----------------------------------------+
 //  +-cur_parent-----------------------------+
-//  | +-hscrollable---------+ +-vscrollbar-+ |
-//  | | header text         | |            | |
-//  | | +-vscrollable-----+ | |            | |
-//  | | | content         | | |            | |
-//  | | +-----------------+ | |            | |
+//  | +-h/v scrollable------+ +-vscrollbar-+ |
+//  | | content             | |            | |
 //  | +---------------------+ +------------+ |
 //  +----------------------------------------+
 //
 // Moves cursor by arrow keys and clicks (using CLICK rather than CLICK_SUBTREE, so the caller may intercept it).
+// Horizontal scrolling is synced between the header and the main content.
 // Returns content widget and its visible Y range. Remember to put HSCROLL_INDICATOR_RIGHT flag on each widget inside `content`.
-pub fn build_biscrollable_area_with_header(header_lines: Range<usize>, mut content_size: [usize; 2], state: &mut AreaState, ui: &mut UI) -> (WidgetIdx, Range<isize>) {
+pub fn build_biscrollable_area_with_header(header_viewport: Option<WidgetIdx>, header_lines: Range<usize>, mut content_size: [usize; 2], state: &mut AreaState, ui: &mut UI) -> (WidgetIdx, Range<isize>) {
     content_size[Axis::X] = content_size[Axis::X].max(ui.text.widest_line(header_lines.clone()));
     content_size[Axis::X] = content_size[Axis::X].max(ui.cur().get_fixed_width());
 
-    ui.cur_mut().set_hstack();
-    let hscroll_viewport = ui.add(widget!().width(AutoSize::Remainder(1.0)));
-    let scroll_bar = ui.add(widget!().fixed_width(1));
-    ui.layout_children(Axis::X);
-
-    let hscroll_content = ui.add(widget!().parent(hscroll_viewport).fixed_width(content_size[Axis::X]).vstack().flags(WidgetFlags::HSCROLL_INDICATOR_LEFT));
-    let vscroll_viewport;
-    with_parent!(ui, hscroll_content, {
-        ui.add(widget!().text_lines(header_lines).height(AutoSize::Text).flags(WidgetFlags::HSCROLL_INDICATOR_RIGHT));
-        vscroll_viewport = ui.add(widget!().height(AutoSize::Remainder(1.0)));
+    let (header_viewport, main_root) = if let Some(h) = header_viewport {
+        (h, ui.cur_parent)
+    } else {
+        ui.cur_mut().set_vstack();
+        let h = ui.add(widget!().fixed_height(header_lines.len()));
+        let r = ui.add(widget!().height(AutoSize::Remainder(1.0)));
         ui.layout_children(Axis::Y);
+        (h, r)
+    };
+    
+    let header_content = ui.add(widget!().parent(header_viewport).text_lines(header_lines).fixed_width(content_size[Axis::X]).flags(WidgetFlags::HSCROLL_INDICATOR_RIGHT));
+
+    let (main_viewport, scroll_bar);
+    with_parent!(ui, main_root, {
+        ui.cur_mut().set_hstack();
+        main_viewport = ui.add(widget!().width(AutoSize::Remainder(1.0)));
+        scroll_bar = ui.add(widget!().fixed_width(1));
+        ui.layout_children(Axis::X);
     });
 
-    let vscroll_content = ui.add(widget!().parent(vscroll_viewport).fixed_height(content_size[Axis::Y] + state.cursor_extra_height));
-    with_parent!(ui, vscroll_content, {
+    let content = ui.add(widget!().parent(main_viewport).fixed_width(content_size[Axis::X]).fixed_height(content_size[Axis::Y] + state.cursor_extra_height).flags(WidgetFlags::HSCROLL_INDICATOR_LEFT));
+    with_parent!(ui, content, {
         if ui.check_mouse(MouseActions::CLICK) {
             let y = ui.cur().mouse_pos[Axis::Y];
             if y >= 0 && (y as usize) < content_size[Axis::Y] + state.cursor_extra_height {
@@ -1489,23 +1507,24 @@ pub fn build_biscrollable_area_with_header(header_lines: Range<usize>, mut conte
     });
 
     let visible_y;
-    let root = ui.cur_parent;
-    with_parent!(ui, vscroll_viewport, {
+    with_parent!(ui, main_viewport, {
         ui.focus();
         state.scroll_to_cursor |= list_cursor_navigation(&mut state.cursor, content_size[Axis::Y], 1, ui);
         let scroll_to = if state.scroll_to_cursor {Some(state.cursor as isize .. (state.cursor + state.cursor_extra_height) as isize + 1)} else {None};
-        visible_y = scrolling_navigation(&mut state.scroll, scroll_to, root, scroll_bar, ui);
+        visible_y = scrolling_navigation(&mut state.scroll, scroll_to, main_root, scroll_bar, ui);
     });
 
     if !state.no_auto_hscroll {
         if state.scroll_to_cursor {
             scroll_to_range(&mut state.hscroll, state.hcursor as isize .. state.hcursor as isize + 1, content_size[Axis::X]);
         }
-        with_parent!(ui, hscroll_viewport, {
+        with_parent!(ui, main_viewport, {
             hscrolling_navigation(&mut state.hscroll, ui);
         });
+        let x = ui.get(content).get_fixed_x();
+        ui.get_mut(header_content).set_fixed_x(x);
         state.scroll_to_cursor = false;
     }
 
-    (vscroll_content, visible_y)
+    (content, visible_y)
 }
