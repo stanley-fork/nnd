@@ -82,8 +82,8 @@ fn main() {
             settings.stdout_file = Some(v);
         } else if let Some(v) = parse_arg(&mut args, "--stderr", "", false) {
             settings.stderr_file = Some(v);
-        } else if let Some(_) = parse_arg(&mut args, "--continue", "-c", true) {
-            settings.stop_on_initial_exec = false;
+        } else if let Some(_) = parse_arg(&mut args, "--stop", "-s", true) {
+            settings.stop_on_initial_exec = true;
         } else if let Some(m) = parse_arg(&mut args, "--mouse", "-m", false) {
             settings.mouse_mode = match &m.to_lowercase()[..] {
                 "full" => MouseMode::Full,

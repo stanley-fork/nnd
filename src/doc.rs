@@ -6,30 +6,27 @@ pub fn print_help_chapter(arg: &str, executable_name: &str) -> bool {
         "--help" => println!(r###"Hi, I'm a debugger.
 
 Please (pretty please!) report all bugs, usability issues, slowness, first impressions, improvement ideas, feature requests, etc.
-If you work at ClickHouse, report to #debugger channel in slack. Otherwise email to mk.al13n+nnd@gmail.com or comment at https://al13n.itch.io/nnd
+If you work at ClickHouse, report to #debugger channel in slack or DM Michael Kolupaev. Otherwise email to mk.al13n+nnd@gmail.com or comment at https://al13n.itch.io/nnd
 
 Usage:
-{0} command [args...]   - run a program under the debugger (just prepend {0} to the command line)
+{0} command [args...]   - run a program under the debugger (i.e. just prepend {0} to the command line)
 sudo {0} -p pid   - attach to an existing process
-
-You may need to `cd` to the directory with the source code in order for the debugger to find the source code.
-(Specifically, this is needed if (a) the debug info don't contain absolute paths, or (b) the source code is at a different absolute path than when the program was built; e.g. it was built on some CI server.)
 
 Additional arguments:
 --stdin/--stdout/--stderr path   - redirect stdin/stdout/stderr to file
 --tty path   - equivalent to --stdin path --stdout path, see --help-tty
--c   - don't pause on startup, continue the program immediately (similar to pressing 'c' right after startup)
--d path   - directory in which to look for source code; can be specified multiple times; default: current directory
--m full|no-hover|disabled   - mouse mode; no-hover to react only to clicking and dragging, disabled to disable mouse altogether; default is 'full' (if it doesn't work, check if mouse reporting is enabled in the terminal application)
+-s   - suspend the program right after starting it
+-d path   - directory in which to look for source code; if specified multiple times, multiple directories will be searched; default: current directory
+-m full|no-hover|disabled   - mouse mode; 'no-hover' to react only to clicking and dragging, 'disabled' to disable mouse altogether; default is 'full' (if it doesn't work, check if mouse reporting is enabled in the terminal application)
 --help   - show this help message; see below for more help pages
 
 Documentation chapters:
 --help-overview - general information and first steps, start here
 --help-known-problems - list of known bugs and missing features to look out for
 --help-watches - watch expression language documentation
---help-state - files in ~/.nnd/ - log file, default stdout/stderr redirects, saved state, customizing colors and key bindings, etc
+--help-files - files in ~/.nnd/ - keys config, log file, default stdout/stderr redirects, saved state
 --help-tty - how to debug interactive programs that require a terminal (e.g. using this debugger to debug itself)
---help-features - list of features (not very readable)"###,
+--help-features - raw list of features (not very readable)"###,
                              executable_name),
         "--help-overview" => println!(r###"nnd is a debugger that has a TUI and is meant to be fast and enjoyable to use, and work well on large executables.
 ('nnd' stands for 'no-nonsense debugger', but it doesn't quite live up to this name at the moment)
@@ -47,7 +44,7 @@ Properties:
  * Not based on gdb or lldb, implemented mostly from scratch.
    (Uses libraries for a few well-isolated things like disassembling, DWARF parsing, and demangling.)
    (Many tricky things are handcrafted, e.g.: stepping (and dealing with inlined functions), breakpoints (and switching between hw/sw breakpoints as needed to make things work),
-    debug info handling (data structures, parallel loading), type system (parallel loading and deduplication), watch expression interpreter, specialized UI elements.)
+    debug info handling (data structures, parallel loading), type system (parallel loading and deduplication), watch expression interpreter, all of UI.)
  * Fast.
    Operations that can be instantaneous should be instantaneous. I.e. snappy UI, no random freezes, no long waits.
    (Known exception: if the program has >~2k threads things become pretty slow, can be improved.)
@@ -58,17 +55,28 @@ Properties:
 # Getting started
 
 When running the debugger for the first time, notice:
- 1. The UI consists of windows. There's an 'active' window, indicated with bright bold outline.
-    The active window can be selected using digit keys (window numbers are shown in their titles) or using ctrl-wasd.
+ 1. The UI consists of windows. There's an 'active' window, indicated with bright outline.
+    The active window can be selected using digit keys (window numbers are shown in their titles), or using alt+arrows, or with the mouse.
  2. The 'hints' window in top left lists (almost) all available key combinations.
     Some of them are global, others depend on the active window.
-    There's currently no mouse support.
 
 This information should be enough to discover most features by trial and error, which is recommended. Additionally, reading --help-known-problems and --help-watches is recommended.
 
-Tips and caveats:
+UI tips:
+ * Not compatible with Mac OS default Terminal application. Use e.g. iTerm2 or kitty instead.
+ * There's mouse support. If it's not working, check if mouse reporting is enabled in the terminal application settings.
+ * When mouse is enabled, click+dragging usually doesn't select text (to copy it out of the terminal). But terminal applications usually have a way to override this and select text anyway.
+   Try shift+drag (in GNOME Terminal or kitty) or option+drag (in iTerm2).
+ * In 'hints' window, prefix "C-" means ctrl key, "M-" means alt/option, "S-" means shift.
+   On Mac OS you may need to change terminal settings to make the option key work, e.g. in kitty set "macos_option_as_alt both".
+   Key bindings can be changed through config file, see --help-files
+ * If you use tmux, the escape key is unreliable, consider using ctrl-g instead. Tmux adds 0.5s delay before passing the escape key through, and if you press another key during that time,
+   the two key presses get incorrectly interpreted as alt+keypress (that's how ansi escape codes work, unfortunately).
+ * Windows can be resized by dragging the boundaries with the mouse. Rearranging windows is not implemented yet.
+
+Debugging tips:
  * The highlighted characters in the source code window are locations of statements and inlined function calls, as listed in the debug info.
-   These are all the places where the control can stop, e.g. if you step repeatedly.
+   These are all the places where the control can stop, e.g. if you step repeatedly or add a breakpoint.
  * 'Step over column' ('m' key by default) runs until the control moves to a different line+column location. Similar to how 'step over line' runs until the control moves to a different line.
    Useful for stepping into a function call when its arguments are nontrivial expressions - you'd do step-over-column to skip over evaluating the arguments,
    then step-into when the current column is at the function call you're interested in.
@@ -76,59 +84,40 @@ Tips and caveats:
    Step-over steps over the calls inside the currently selected stack frame, i.e. it may involve an internal step-out.
    (This may seem like an unnecessary feature, but if you think through how stepping interacts with inlined functions, it's pretty much required, things get very confusing otherwise.)
  * While a step is in progress, breakpoints are automatically disabled for the duration of the step.
- * Step-into-instruction ('S' key by default) works no matter what, even if there's no debug info or if disassembly or stack unwinding fails. Use it when other steps fail.
  * Stepping can be interrupted with the suspend key ('C' by default). Useful e.g. if you try to step-over a function, but the function turns out to be too slow.
  * Run-to-cursor works like a step: it runs until the selected (not any) thread hits the requested like, and it disables other breakpoints for the duration of the step.
+ * Step-into-instruction ('S' key by default) works no matter what, even if there's no debug info or if disassembly or stack unwinding fails. Use it when other steps fail.
  * Breakpoints are preserved across debugger restarts, but they're put into disabled state on startup. Use Enter key in breakpoints window to reactivate.
  * The function search (in disassembly window, 'o' key by default) does fuzzy search over *mangled* function names, for now (for peformance reasons).
    Omit '::' in the search query. E.g. to search for 'std::foo::bar(int)' try typing 'stdfoobar'.
    The search results display demangled names, i.e. slightly different from what's actually searched.
+ * In watches window, on non-root tree nodes press Enter to add a corresponding watch. E.g. for local variable or struct field or array element.
  * Expect debugger's memory usage around 3x the size of the executable. E.g. ~7 GB for 2.3 GB clickhouse, release build. This is mostly debug information.
    (If you're curious, see ~/.nnd/<number>/log for a breakdown of which parts of the debug info take how much memory and take how long to load.)
  * For clickhouse server, use CLICKHOUSE_WATCHDOG_ENABLE=0. Otherwise it forks on startup, and the debugger doesn't follow forks.
- * If you use tmux, the escape key is unreliable, consider using ctrl-g instead. Tmux adds 0.5s delay before passing the escape key through, and if you press another key during that time,
-   the two key presses get incorrectly interpreted as alt+keypress (that's how ansi escape codes work, unfortunately).
 
 Please (pretty please!) report all bugs, usability issues, slowness, first impressions, improvement ideas, feature requests, etc.
-If you work at ClickHouse, report to #debugger channel in slack. Otherwise email to mk.al13n+nnd@gmail.com or comment at https://al13n.itch.io/nnd"###),
+If you work at ClickHouse, report to #debugger channel in slack or DM Michael Kolupaev. Otherwise email to mk.al13n+nnd@gmail.com or comment at https://al13n.itch.io/nnd"###),
         "--help-known-problems" =>             println!(r###"Current limitations:
- * Resizing and rearranging windows is not implemented. You need a reasonably big screen to fit all the UI without cutting off any table columns, sorry.
- * Navigation in the source code window is lacking. There's no search and no go-to-line. You pretty much have to alt-tab into a real text editor,
-   find the line you're looking for, alt-tab to the debugger, and scroll to that line using PgUp/PgDown.
-   There's also no way to set a breakpoint without navigating to the line in the source code window.
- * Thread filter ('/' in the threads window) is too limited: just a substring match in function name and file name. Need to extend it enough to be able to e.g. filter out idle threads waiting for work or epoll.
  * Stepping is not aware of exceptions. E.g. if you step-over a function call, and the function throws an exception, the step won't notice that the control left the function;
    the program will keep running (the status window will say 'stepping') until you manually suspend it (shift-c by default). Similar for step-out.
- * Almost no pretty-printers.
+ * There are pretty printers for vector/slice/string/shared_ptr-like standard types in C++ and Rust. No pretty printers for hash tables, linked lists, and std::deque yet.
  * No global variables.
+ * Thread filter ('/' in the threads window) is too limited: just a substring match in function name and file name. Need to extend it enough to be able to e.g. filter out idle threads waiting for work or epoll.
  * In watch expressions, type names (for casts or type info) have to be spelled *exactly* the same way as they appear in the debug info.
    E.g. `std::vector<int>` doesn't work, you have to write `std::__1::vector<int, std::__1::allocator<int> >` (whitespace matters).
    The plan is to add a fuzzy search dialog for type names, similar to file and function search.
    (There is no plan to actually parse the template type names into their component parts; doing it correctly would be crazy complicated like everything else in C++.)
  * Can't assign to the debugged program's variables or registers
- * Can't add breakpoints in the disassembly window.
+ * Can't add breakpoints in the disassembly window yet.
  * No data breakpoints, whole-file breakpoints, conditional breakpoints, special breakpoints (signals, exceptions/panics, main()).
  * Inside libraries that were dlopen()ed at runtime, breakpoints get disabled on program restart. Manually disable-enable the breakpoint after the dlopen() to reactivate it.
- * The disassembly window can only open 'functions' that appear in .symtab or debug info. Can't disassemble arbitrary memory, e.g. JIT-generated code or code from binaries without .symtab or debug info.
- * The 'locations' window is too cryptic and often cuts off most of the information.
- * Rust unions are not supported well: they show discriminator and all variants as fields, with no indication of which discriminator values correspond to which variants. But it's mostly usable.
+ * The disassembly window can only open functions that appear in .symtab or debug info. Can't disassemble arbitrary memory, e.g. JIT-generated code or code from binaries without .symtab or debug info.
+ * The 'locations' window is too cryptic.
  * The debugger gets noticeably slow when the program has > 1K threads, and unusably slow with 20K threads. Part of it is inevitable syscalls
    (to start/stop all n threads we have to do n*const syscalls, then wait for n notifications - that takes a while), but there's a lot of room for improvement anyway
    (reduce the const, do the syscalls in parallel, avoid the remaining O(n^2) work on our side).
  * No customization of colors. Dark theme only.
- * No customization of key bindings.
- * The UI desperately needs line wrapping and/or horizontal scrolling in more places. Useful information gets cut off a lot with no way to see the whole string. In practice:
-    - Long function or file names in the stack trace window don't fit.
-      Workaround: select the stack frame and look at the top of the disassembly - it shows the function name and file name and has horizontal scrolling.
-    - In the threads window, function name doesn't even begin to fit unless you have a big monitor. Needs horizontal scrolling.
-    - Watch expressions are usually way too long to fit on one line in the narrow table column.
-    - Error messages in the locals/watches window often don't fit.
-    - String values in the locals/watches window often don't fit. Workaround: use watches to split into shorter substrings (manually).
-    - Type names in the locals/watches window often don't fit. Workaround: use `typeof(<expression>).type.name`, then apply the long string workaround.
- * More UI improvements needed:
-    - Scroll bars.
-    - Text editing: selection, copy-paste.
-    - In Mac OS default Terminal, colors and styles are messed up. Maybe we'll investigate this when rewriting the UI. For now, the recommended workaround is to use iTerm2.
  * No remote debugging. The debugger works over ssh, but it's inconvenient for production servers: you have to scp the source code and the unstripped binary to it.
    And the debugger uses lots of RAM, which may be a problem on small servers.
    (I'm not sure what exactly to do about this. Fully separating the debugger-agent from UI+debuginfo would increase the code complexity a lot and make performance worse.
@@ -175,15 +164,16 @@ Script variables:
  * If the debugged program has a variable with the same name, it can be accessed with backticks: '`x`', while the script variable can be accessed without backticks: 'x'
 
 Pretty-printers:
-Currently there are no pretty-printers for specific types (e.g. std::vector, std::map, std::shared_ptr, etc).
-But there are a couple of general pretty-printers:
  * If a struct has exactly one nonempty field, we replace the struct with the value of that field.
-   Useful for trivial wrappers (e.g. common in Rust).
+   Useful for trivial wrappers that are ubiquitous in C++ and Rust.
    E.g. unwraps std::unique_ptr into a plain pointer, even though it actually has multiple levels of wrappers, inheritance, and empty fields.
- * Automatically downcasts abstract classes to concrete ones. Applies to any class/struct with a vtable pointer.
+ * Abstract classes are automatically downcasted to concrete ones. Applies to any class/struct with a vtable pointer.
    Not very reliable, currently it often fails when the concrete type is template or is in anonymous namespace.
    (This can be improved to some extent, but can't be made fully reliable because vtable information is poorly structured in DWARF/symtab.)
  * Fields of base classes are inlined. Otherwise the base class is a field named '#base'.
+ * There are designated pretty-printers for C++ and Rust vector/slice/string-like containers (turning them into slices), and for shared_ptr (turning it into plain pointer).
+   Hash tables, linked lists, and std::deque are not supported yet.
+ * All of the above transformations can be disabled by adding ".#r" to the expression.
 
 Value modifiers:
  * 'value.#x' to print in hexadecimal.
@@ -197,7 +187,9 @@ Value modifiers:
         "--help-state" => println!(r###"The debugger creates directory ~/.nnd/ and stores a few things there, such as log file and saved state (watches, breakpoints, open tabs).
 It doesn't create any other files or make any other changes to your system.
 
-Each nnd process uses a subdirectory of ~/.nnd/ . The only one nnd is started, it'll use ~/.nnd/0/ . If a second nnd is started while the first is still running, it'll get ~/.nnd/1/ , etc.
+Key bindings can be customized by creating ~/.nnd/keys . Read the comments in ~/.nnd/keys.default to get started.
+
+Each nnd process uses a subdirectory of ~/.nnd/ . When only one nnd is started, it'll use ~/.nnd/0/ . If a second nnd is started while the first is still running, it'll get ~/.nnd/1/ , etc.
 After an nnd process ends, the directory can be reused.
 E.g. if you start a few instances of nnd, then quit them all, then start them again in the same order, they'll use the same directories in the same order.
 
@@ -216,7 +208,7 @@ E.g. how to use nnd to debug itself?
 One way is to just attach using -p <pid>.
 
 But what if you need to set breakpoints before the program starts, e.g. to debug a crash on startup? Then you can do the following:
- 1. Open a terminal window (in xterm or tmux or whatever). Let's call this window A. This is where you'll be able interact with the debugged program.
+ 1. Open a terminal window (in terminal application or tmux or whatever). Let's call this window A. This is where you'll be able interact with the debugged program.
  2. This terminal window is attached to some 'pty' pseudo-device in /dev/pts/ . Figure out which one:
      $ ls -l /proc/$$/fd | grep /dev/pts/
     For example, suppose it output /dev/pts/2 . You can also double-check this with: `echo henlo > /dev/pts/2` - if the text appears in the correct terminal then it's the correct path.
@@ -229,7 +221,7 @@ But what if you need to set breakpoints before the program starts, e.g. to debug
 
 The latter approach is often more convenient than -p, even when both approaches are viable.
 
-(This can even be chained multiple levels deep: `nnd --tty /dev/pts/1 nnd --tty /dev/pts/2 my_program`. The longest chain I used in practice is 3 nnd-s + 1 clickhouse."###),
+(This can even be chained multiple levels deep: `nnd --tty /dev/pts/1 nnd --tty /dev/pts/2 my_program`. The longest chain I've used in practice is 3 nnd-s + 1 clickhouse."###),
         "--help-features" => println!(r###"Appendix: raw list of features (optional reading)
 
 loading debug info

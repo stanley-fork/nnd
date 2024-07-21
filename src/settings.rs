@@ -25,7 +25,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self { Settings {
         tab_width: 2,
-        stop_on_initial_exec: true,
+        stop_on_initial_exec: false,
         fps: 144.0,
         max_threads: 128,
         periodic_timer_ns: 250_000_000,

@@ -1186,6 +1186,12 @@ impl WindowContent for LocationsWindow {
             self.table_state = table.finish(ui);
         });
     }
+
+    fn get_key_hints(&self, out: &mut Vec<KeyHint>) {
+        out.extend([
+            KeyHint::key(KeyAction::Tooltip, "tooltip"),
+        ]);
+    }
 }
 
 impl LocationsWindow {
@@ -2263,6 +2269,12 @@ impl WindowContent for BinariesWindow {
 
         self.table_state = table.finish(ui);
     }
+
+    fn get_key_hints(&self, out: &mut Vec<KeyHint>) {
+        out.extend([
+            KeyHint::key(KeyAction::Tooltip, "tooltip"),
+        ]);
+    }
 }
 
 #[derive(Default)]
@@ -2570,6 +2582,7 @@ impl WindowContent for ThreadsWindow {
         out.extend([
             KeyHint::key(KeyAction::Find, "filter"),
             KeyHint::key(KeyAction::ToggleSort, "sort by cpu"),
+            KeyHint::key(KeyAction::Tooltip, "tooltip"),
         ]);
     }
 }
@@ -2785,6 +2798,12 @@ impl WindowContent for StackWindow {
 
     fn drop_caches(&mut self) {
         self.rerequest_scroll = true;
+    }
+
+    fn get_key_hints(&self, out: &mut Vec<KeyHint>) {
+        out.extend([
+            KeyHint::key(KeyAction::Tooltip, "tooltip"),
+        ]);
     }
 }
 
@@ -3669,7 +3688,11 @@ struct BreakpointsWindow {
 }
 impl WindowContent for BreakpointsWindow {
     fn get_key_hints(&self, out: &mut Vec<KeyHint>) {
-        out.extend([KeyHint::key(KeyAction::DeleteRow, "delete breakpoint"), KeyHint::key(KeyAction::ToggleBreakpoint, "enable/disable breakpoint")]);
+        out.extend([
+            KeyHint::key(KeyAction::DeleteRow, "delete breakpoint"),
+            KeyHint::key(KeyAction::Enter, "enable/disable breakpoint"),
+            KeyHint::key(KeyAction::Tooltip, "tooltip"),
+        ]);
     }
 
     fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {

@@ -1,8 +1,3 @@
-revise documentation
-  say to enable mouse reporting in terminal settings, say to hold shift (in gterm and kitty) or option (in iTerm2) to bypass and select text
-  say to set "macos_option_as_alt both" in kitty
-  keys config
-
 reordering tabs
 rearranging windows
 maximizing windows
