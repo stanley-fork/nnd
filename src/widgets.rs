@@ -955,12 +955,12 @@ impl TextInput {
             ui.cur_mut().capture_keys.extend_from_slice(&[
                 Key::Up.plain(), Key::Up.shift(), Key::Down.plain(), Key::Down.shift(), Key::Char('n').ctrl(), Key::Char('p').ctrl(),
                 Key::PageUp.plain(), Key::PageUp.shift(), Key::PageDown.plain(), Key::PageDown.shift(),
-                // The ctrl+v is a collision between page-down (emacs style) and paste (in text_input_key_to_action by default). The text_input_key_to_action takes precedence, but the user may unbind it and get the emacs-like behavior.
+                // The ctrl+v is a collision between page-down (emacs style) and paste (in KeyBinds.text_input by default). The text_input takes precedence, but the user may unbind it and get the emacs-like behavior.
                 // (Ctrl+shift+v is unrepresentable in ansi escape codes.)
                 Key::Char('v').ctrl(), Key::Char('v').alt(), Key::Char('V').alt(),
             ]);
         }
-        let req: Vec<KeyEx> = ui.key_binds.text_input_key_to_action.keys().copied().collect();
+        let req: Vec<KeyEx> = ui.key_binds.text_input.key_to_action.keys().copied().collect();
         ui.cur_mut().capture_keys.extend_from_slice(&req);
 
         let mut keys = mem::take(&mut ui.cur_mut().keys);
@@ -970,7 +970,7 @@ impl TextInput {
             let mut killed = false; // did emacs-style cut operation
             let saved_x = mem::take(&mut self.saved_x);
             let old_cursor = self.cursor;
-            match ui.key_binds.text_input_key_to_action.get(key) {
+            match ui.key_binds.text_input.key_to_action.get(key) {
                 Some(KeyAction::Undo) => {
                     if self.undo_idx > 0 {
                         self.cursor = self.undo[self.undo_idx].1;

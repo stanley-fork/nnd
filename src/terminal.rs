@@ -338,7 +338,7 @@ pub struct ModKeys: u8 {
     const ANY = 0x8;
 }}
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub enum Key {
     Char(char),
     F(u8),
@@ -444,7 +444,7 @@ impl FromStr for Key {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub struct KeyEx {
     pub key: Key,
     pub mods: ModKeys,

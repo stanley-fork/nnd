@@ -689,12 +689,12 @@ impl UI {
     // Requests input for cur_parent for next frame, returns input that was requested on previous frame.
     // Multiple such calls for different keys can coexist on the same Widget; each call will return only the actions that it requested.
     pub fn check_keys(&mut self, actions: &[KeyAction]) -> Vec<KeyAction> {
-        let req = self.key_binds.actions_to_keys(actions);
+        let req = self.key_binds.normal.actions_to_keys(actions);
         let w = &mut self.tree[self.cur_parent.0];
         w.capture_keys.extend_from_slice(&req);
         let mut res: Vec<KeyAction> = Vec::new();
         w.keys.retain(|key| {
-            match self.key_binds.key_to_action.get(key) {
+            match self.key_binds.normal.key_to_action.get(key) {
                 Some(a) if actions.iter().position(|x| x == a).is_some() => {
                     res.push(*a);
                     false
@@ -706,7 +706,7 @@ impl UI {
     }
 
     pub fn check_key(&mut self, action: KeyAction) -> bool {
-        let keys = match self.key_binds.action_to_keys.get(&action) {
+        let keys = match self.key_binds.normal.action_to_keys.get(&action) {
             Some(x) => x,
             None => return false };
         let w = &mut self.tree[self.cur_parent.0];

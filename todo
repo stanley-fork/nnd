@@ -1,10 +1,14 @@
-test on mac, make sure copying text out of the terminal is possible
+test on mac
+  investigate alt+arrow keys not parsing correctly
+  check all other keys from keys.default
+  try kitty
+  check that copying text out of the terminal is possible
 revise documentation
+  say to enable mouse reporting in terminal settings, say to hold shift (check in iTerm2 and kitty) bypass and select text
 
 reordering tabs
 rearranging windows
 maximizing windows
-loading key binds and colors from file
 
 fix empty symbols loading stage name near the end
 fix picking up updated binary unnecessarily
@@ -22,6 +26,7 @@ test with 10k threads
   if there are enough free hw breakpoints, activate new breakpoints as hw and thread-specific right away without waiting for them to be spuriously hit by other threads
   maybe avoid duplicate POKEUSER calls for debug registers if the thread already had them assigned
 
+tooltip in status window showing more log lines with line wrapping
 key to send SIGINT to the program
 instruction breakpoints
 option to load symbols from another file (unstripped executable) - will make it usable in ch cloud
@@ -52,6 +57,7 @@ special breakpoints: panic, exception, signal, program start (replacing -c), mai
 make source window autoscroll horizontally in addition to vertically
 -v for build datetime
 handle partially-optimized-out struct values (common in rust)
+read color scheme from file
 color threads based on stack hash
 
 watches, expressions

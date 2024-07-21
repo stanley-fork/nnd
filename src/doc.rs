@@ -20,7 +20,7 @@ Additional arguments:
 --tty path   - equivalent to --stdin path --stdout path, see --help-tty
 -c   - don't pause on startup, continue the program immediately (similar to pressing 'c' right after startup)
 -d path   - directory in which to look for source code; can be specified multiple times; default: current directory
--m full|no-hover|disabled   - mouse mode; no-hover to react only to clicking and dragging, disabled to disable mouse altogether
+-m full|no-hover|disabled   - mouse mode; no-hover to react only to clicking and dragging, disabled to disable mouse altogether; default is 'full' (if it doesn't work, check if mouse reporting is enabled in the terminal application)
 --help   - show this help message; see below for more help pages
 
 Documentation chapters:

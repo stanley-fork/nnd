@@ -384,7 +384,7 @@ impl Debugger {
             let command_line = mem::take(&mut self.command_line);
             let context = mem::replace(&mut self.context, Context::invalid());
             let symbols = mem::replace(&mut self.symbols, SymbolsRegistry::new(Context::invalid()));
-            let persistent = mem::replace(&mut self.persistent, PersistentState::empty());
+            let persistent = mem::take(&mut self.persistent);
             let my_resource_stats = mem::replace(&mut self.my_resource_stats, ResourceStats::default());
             let mut breakpoints = mem::replace(&mut self.breakpoints, Pool::new());
             let prof = mem::replace(&mut self.prof, Profiling::new());

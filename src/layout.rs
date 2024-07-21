@@ -310,13 +310,12 @@ impl Layout {
     pub fn build(&mut self, ui: &mut UI) {
         // Maybe change active_window.
         let mut switched_window = false;
-        for action in ui.check_keys(&[KeyAction::Window(0), KeyAction::Window(1), KeyAction::Window(2), KeyAction::Window(3), KeyAction::Window(4), KeyAction::Window(5), KeyAction::Window(6), KeyAction::Window(7), KeyAction::Window(8), KeyAction::Window(9)]) {
-            match action {
-                KeyAction::Window(n) => if let Some((id, _)) = self.windows.iter().find(|(_, win)| win.region.is_some() && win.hotkey_number == Some(n)) {
-                    self.active_window = Some(id);
-                    switched_window = true;
-                }
-                _ => panic!("huh"),
+        let window_keys = [KeyAction::Window0, KeyAction::Window1, KeyAction::Window2, KeyAction::Window3, KeyAction::Window4, KeyAction::Window5, KeyAction::Window6, KeyAction::Window7, KeyAction::Window8, KeyAction::Window9];
+        for action in ui.check_keys(&window_keys) {
+            let n = window_keys.iter().position(|k| *k == action).unwrap();
+            if let Some((id, _)) = self.windows.iter().find(|(_, win)| win.region.is_some() && win.hotkey_number == Some(n)) {
+                self.active_window = Some(id);
+                switched_window = true;
             }
         }
 

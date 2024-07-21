@@ -249,7 +249,7 @@ impl DebuggerUI {
 
         // Handle some of the global hotkeys. Windows may also handle their global hotkeys by attaching them to the content_root widget, e.g. threads window handling global hotkeys for switching threads.
         for key in &keys {
-            match self.ui.key_binds.key_to_action.get(key) {
+            match self.ui.key_binds.normal.key_to_action.get(key) {
                 Some(KeyAction::Quit) => {
                     self.should_quit = true;
                     return Ok(());
@@ -306,7 +306,7 @@ impl DebuggerUI {
         } else {
             hints.push(KeyHint::key(KeyAction::Quit, "kill and quit"));
         }
-        hints.push(KeyHint::ranges(&[[KeyAction::Window(0), KeyAction::Window(9)], [KeyAction::WindowLeft, KeyAction::WindowDown]], "switch window"));
+        hints.push(KeyHint::ranges(&[[KeyAction::Window0, KeyAction::Window9], [KeyAction::WindowLeft, KeyAction::WindowDown]], "switch window"));
         hints.push(KeyHint::keys(&[KeyAction::NextTab, KeyAction::PreviousTab], "switch tab"));
         match debugger.target_state {
             ProcessState::Running => hints.push(
@@ -343,7 +343,7 @@ impl DebuggerUI {
 
         // Stepping has to be handled after updating windows because selected_subframe is assigned by StackWindow.
         for key in &keys {
-            let (kind, by_instructions, use_line_number_with_column) = match self.ui.key_binds.key_to_action.get(key) {
+            let (kind, by_instructions, use_line_number_with_column) = match self.ui.key_binds.normal.key_to_action.get(key) {
                 Some(KeyAction::StepIntoLine) => (StepKind::Into, false, false),
                 Some(KeyAction::StepIntoInstruction) => (StepKind::Into, true, false),
                 Some(KeyAction::StepOverLine) => (StepKind::Over, false, false),
@@ -2125,10 +2125,10 @@ impl WindowContent for HintsWindow {
                 if i != 0 {
                     ui_write!(ui, default_dim, "/");
                 }
-                styled_write!(ui.text, ui.palette.hotkey.apply(ui.palette.default_dim), "{}", ui.key_binds.action_to_key_name(range[0]));
+                styled_write!(ui.text, ui.palette.hotkey.apply(ui.palette.default_dim), "{}", ui.key_binds.normal.action_to_key_name(range[0]));
                 if range[0] != range[1] {
                     ui_write!(ui, default_dim, "…");
-                    styled_write!(ui.text, ui.palette.hotkey.apply(ui.palette.default_dim), "{}", ui.key_binds.action_to_key_name(range[1]));
+                    styled_write!(ui.text, ui.palette.hotkey.apply(ui.palette.default_dim), "{}", ui.key_binds.normal.action_to_key_name(range[1]));
                 }
             }
             ui_writeln!(ui, default_dim, " - {}", hint.hint);

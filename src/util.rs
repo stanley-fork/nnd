@@ -1,6 +1,6 @@
 use crate::{*, error::*, log::*};
 use libc::{pid_t, c_char, c_void};
-use std::{io, io::{Read, BufReader, BufRead, Write}, str::FromStr, ptr, mem, mem::ManuallyDrop, fmt, os::fd::RawFd, ffi::{CStr, OsString}, os::unix::ffi::{OsStringExt, OsStrExt}, arch::asm, cell::UnsafeCell, sync::atomic::{AtomicBool, Ordering}, ops::{Deref, DerefMut, FnOnce}, fs::File, collections::{BinaryHeap, hash_map::DefaultHasher}, hash::{Hash, Hasher}, cmp::Ord, cmp, path::{Path, PathBuf}};
+use std::{io, io::{Read, BufReader, BufRead, Write}, str::FromStr, ptr, mem, mem::ManuallyDrop, fmt, os::fd::RawFd, ffi::{CStr, OsString, CString}, os::unix::ffi::{OsStringExt, OsStrExt}, arch::asm, cell::UnsafeCell, sync::atomic::{AtomicBool, Ordering}, ops::{Deref, DerefMut, FnOnce}, fs::File, collections::{BinaryHeap, hash_map::DefaultHasher}, hash::{Hash, Hasher}, cmp::Ord, cmp, path::{Path, PathBuf}};
 
 pub fn tgkill(pid: pid_t, tid: pid_t, sig: i32) -> Result<i32> {
     eprintln!("trace: tgkill({}, {}, {})", pid, tid, sig);
@@ -107,7 +107,6 @@ impl Drop for Epoll {
 pub struct TimerFD {
     pub fd: i32,
 }
-
 impl TimerFD {
     pub fn new() -> Self {
         let fd = unsafe {libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC | libc::TFD_NONBLOCK)};
@@ -141,7 +140,6 @@ impl TimerFD {
         }
     }
 }
-
 impl Drop for TimerFD {
     fn drop(&mut self) {
         unsafe {
@@ -154,7 +152,6 @@ impl Drop for TimerFD {
 pub struct EventFD {
     pub fd: i32,
 }
-
 impl EventFD {
     pub fn new() -> Self {
         let fd = unsafe {libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK)};
@@ -185,12 +182,83 @@ impl EventFD {
         }
     }
 }
-
 impl Drop for EventFD {
     fn drop(&mut self) {
         unsafe {
             let r = libc::close(self.fd);
             if r != 0 { eprintln!("warning: close() failed on event fd: {:?}", io::Error::last_os_error()); }
+        }
+    }
+}
+
+pub struct INotifyFD {
+    pub fd: i32,
+}
+impl INotifyFD {
+    pub fn new() -> Result<Self> {
+        let fd = unsafe {libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC)};
+        if fd < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        Ok(Self {fd})
+    }
+
+    pub fn add_watch(&self, path: &Path, mask: u32) -> Result<i32> {
+        let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let r = unsafe {libc::inotify_add_watch(self.fd, c_path.as_ptr() as *const i8, mask)};
+        if r < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        Ok(r)
+    }
+
+    pub fn read(&self) -> Vec<(libc::inotify_event, /*name*/ Vec<u8>)> {
+        let mut res: Vec<(libc::inotify_event, Vec<u8>)> = Vec::new();
+        loop {
+            let mut buf: [mem::MaybeUninit<u8>; 8192] = unsafe {mem::MaybeUninit::uninit().assume_init()};
+            let r = unsafe {libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())};
+            if r < 0 {
+                let e = io::Error::last_os_error();
+                match e.kind() {
+                    io::ErrorKind::Interrupted => continue,
+                    io::ErrorKind::WouldBlock => break,
+                    _ => panic!("read() from inotify fd returned {}: {:?}", r, e),
+                }
+            }
+            if r == 0 {
+                break;
+            }
+            let mut slice = unsafe {std::slice::from_raw_parts(buf.as_ptr() as *const u8, r as usize)};
+            while !slice.is_empty() {
+                let sizeof = mem::size_of::<libc::inotify_event>();
+                // man inotify: "Each successful read(2) returns a buffer containing one or more of the following structures".
+                if slice.len() < sizeof {
+                    panic!("read() from inotify fd returned only {} bytes", slice.len());
+                }
+                let mut ev: libc::inotify_event;
+                unsafe {
+                    ev = mem::zeroed();
+                    std::ptr::copy_nonoverlapping(slice.as_ptr() as *const u8, &mut ev as *mut libc::inotify_event as *mut u8, sizeof);
+                }
+                slice = &slice[sizeof..];
+                let name_len = ev.len as usize;
+                if name_len > slice.len() {
+                    panic!("inotify_event has len = {}, but only {} more bytes were returned by read()", name_len, slice.len());
+                }
+                let n = slice[..name_len].iter().position(|c| *c == 0u8).unwrap_or(name_len);
+                let name = slice[..n].to_owned();
+                res.push((ev, name));
+                slice = &slice[name_len..];
+            }
+        }
+        res
+    }
+}
+impl Drop for INotifyFD {
+    fn drop(&mut self) {
+        unsafe {
+            let r = libc::close(self.fd);
+            if r != 0 { eprintln!("warning: close() failed on inotify fd: {:?}", io::Error::last_os_error()); }
         }
     }
 }

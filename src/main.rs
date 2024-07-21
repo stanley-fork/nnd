@@ -276,19 +276,17 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, command_line: Option<Vec<S
 
     let mut ui = DebuggerUI::new();
 
-    match PersistentState::load_state(&mut debugger, &mut ui) {
-        Ok(()) => (),
-        Err(e) => {
-            eprintln!("warning: restore failed: {}", e);
-            log!(debugger.log, "restore failed: {}", e);
-        }
-    }
+    let config_change_fd = PersistentState::load_state_and_configs(&mut debugger, &mut ui);
 
     let symbols_event_fd = debugger.symbols.event_fd();
     epoll.add(symbols_event_fd.fd, libc::EPOLLIN, symbols_event_fd.fd as u64)?;
 
     let misc_wakeup_fd = debugger.context.wake_main_thread.clone();
     epoll.add(misc_wakeup_fd.fd, libc::EPOLLIN, misc_wakeup_fd.fd as u64)?;
+
+    if let &Some(fd) = &config_change_fd {
+        epoll.add(fd, libc::EPOLLIN, fd as u64)?;
+    }
 
     // Throttle rendering to <= fps. Render only when something changes.
     let mut pending_render = true;
@@ -350,6 +348,8 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, command_line: Option<Vec<S
                 PersistentState::try_to_save_state_if_changed(&mut debugger, &mut ui);
                 debugger.prof.bucket.other_tsc += prof.finish(&debugger.prof.bucket);
                 debugger.prof.advance_bucket();
+            } else if &Some(fd) == &config_change_fd {
+                PersistentState::process_events(&mut debugger, &mut ui);
             } else {
                 return err!(Internal, "epoll returned unexpected data: {}", fd);
             }
