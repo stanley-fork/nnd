@@ -1,10 +1,7 @@
-test on mac
-  investigate alt+arrow keys not parsing correctly
-  check all other keys from keys.default
-  try kitty
-  check that copying text out of the terminal is possible
 revise documentation
-  say to enable mouse reporting in terminal settings, say to hold shift (check in iTerm2 and kitty) bypass and select text
+  say to enable mouse reporting in terminal settings, say to hold shift (in gterm and kitty) or option (in iTerm2) to bypass and select text
+  say to set "macos_option_as_alt both" in kitty
+  keys config
 
 reordering tabs
 rearranging windows

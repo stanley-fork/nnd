@@ -331,7 +331,7 @@ pub struct ModKeys: u8 {
     // The values match the encoding in the ANSI escape codes, do not change.
     // SHIFT doesn't always appear as modifier: for Key::Char, it's built into the `char`, e.g. 'E' is shift+e.
     const SHIFT = 0x1;
-    const ALT = 0x2;
+    const ALT = 0x2; // or Meta
     const CTRL = 0x4;
 
     // Special value that can only be used in capture_keys. Means accept any combination of modifier keys.
@@ -545,9 +545,10 @@ pub struct InputReader {
     start: usize,
     end: usize,
     buf: [u8; 128],
+    saw_extra_escape: bool,
 }
 impl InputReader {
-    pub fn new() -> Self { Self {start: 0, end: 0, buf: [0; 128]} }
+    pub fn new() -> Self { Self {start: 0, end: 0, buf: [0; 128], saw_extra_escape: false} }
 
     // Reads readily available input from stdin, doesn't block.
     pub fn read(&mut self, out: &mut Vec<Event>, prof: &mut ProfileBucket) -> Result<usize> {
@@ -568,7 +569,25 @@ impl InputReader {
 
             loop {
                 let start = self.start;
-                match self.parse_event() {
+                let mut e = self.parse_event();
+
+                // Fix up weird escape sequences like <esc><esc>[5~ , where the extra <esc> means ALT key.
+                // Apply this only to few keys where I was this behavior (in iTerm2).
+                if self.saw_extra_escape {
+                    if let Ok(e) = &mut e {
+                        if let Event::Key(k) = e {
+                            if k.mods.is_empty() && [Key::Left, Key::Right, Key::Up, Key::Down, Key::PageUp, Key::PageDown].contains(&k.key) {
+                                k.mods.insert(ModKeys::ALT);
+                                self.saw_extra_escape = false;
+                            }
+                        }
+                    }
+                }
+                if mem::take(&mut self.saw_extra_escape) {
+                    out.push(Event::Key(Key::Escape.plain()));
+                }
+
+                match e {
                     Ok(e) => out.push(e),
                     Err(false) => (), // quietly skip unrecognized escape sequence
                     Err(true) => {
@@ -630,11 +649,17 @@ impl InputReader {
         Ok(c)
     }
 
-    fn ansi_modifier(n: usize) -> result::Result<ModKeys, bool> {
+    fn ansi_modifier(mut n: usize) -> result::Result<ModKeys, bool> {
         if n < 1 || n > 16 {
             Err(false)
         } else {
-            Ok(ModKeys::from_bits(n as u8 - 1).unwrap())
+            n -= 1;
+            if n & 8 == 8 {
+                // Convert Meta to Alt.
+                n |= 2;
+                n ^= 8;
+            }
+            Ok(ModKeys::from_bits(n as u8).unwrap())
         }
     }
 
@@ -675,6 +700,7 @@ impl InputReader {
             b'\n' | b'\r' => Key::Char('\n').plain(),
             b'\x7f' => Key::Backspace.plain(),
             b'\x08' => Key::Backspace.ctrl(), // ctrl+backspace is indistinguishable from ctrl+h
+            b'\x00' => Key::Char(' ').ctrl(),
             b'\x01'..=b'\x1A' => Key::Char((c - 0x1 + b'a') as char).ctrl(), // ctrl+[a..z]; shift is ignored in this case
             b'\x1c'..=b'\x1f' => Key::Char((c - 0x1c + b'4') as char).ctrl(), // crtl+[4..7]; other digits don't work
             0..=127 => Key::Char(c.into()).plain(), // fast path for ASCII
@@ -735,91 +761,107 @@ impl InputReader {
             // <esc> '[' -> alt-[
             // <esc> '[' (<modifier>) <char>   -> keypress, <modifier> is a decimal number and defaults to 1 (xterm)
             // <esc> '[' (<keycode>) (';'<modifier>) '~'   -> keypress, <keycode> and <modifier> are decimal numbers and default to 1 (vt)
+            // <esc> <esc> '[' <char>   -> alt-keypress
+            // <esc> <esc> '[' <keycode> '~'   -> alt-keypress
             // <esc> '[' '<' ...  -> mouse event
 
             // Escape key.
             b'\x1B' if self.start == self.end && self.end < self.buf.len() => Event::Key(Key::Escape.plain()),
             // Escape sequences.
-            b'\x1B' => match self.eat()? {
-                // Mashing the escape key.
-                b'\x1B' => {
-                    self.start -= 1;
-                    Event::Key(Key::Escape.plain())
+            b'\x1B' => {
+                let mut c = self.eat()?;
+                if c == b'\x1B' {
+                    if self.start == self.end && self.end < self.buf.len() {
+                        // Escape key twice.
+                        self.start -= 1;
+                        return Ok(Event::Key(Key::Escape.plain()));
+                    }
+                    // Maybe a weird "<esc><esc>[<key>" escape sequence, maybe escape key followed by escape sequence. The caller will decide.
+                    self.saw_extra_escape = true;
+                    c = self.eat()?;
                 }
-                // Alt+O
-                b'O' if self.start == self.end && self.end < self.buf.len() => Event::Key(Key::Char('O').alt()),
-                // F1-F4
-                b'O' => match self.eat()? {
-                    c @ b'P'..=b'S' => Event::Key(Key::F(1 + c - b'P').plain()),
-                    _ => return Err(false),
-                }
-                // Alt+[
-                b'[' if self.start == self.end && self.end < self.buf.len() => Event::Key(Key::Char('[').alt()),
-                // Mouse events.
-                b'[' if self.peek()? == b'<' => {
-                    self.start += 1;
-                    let n = self.parse_ansi_number()?;
-                    if self.eat()? != b';' {
-                        return Err(false);
+                match c {
+                    // Mashing the escape key.
+                    b'\x1B' => {
+                        self.start -= 1;
+                        Event::Key(Key::Escape.plain())
                     }
-                    let x = self.parse_ansi_number()?;
-                    if self.eat()? != b';' {
-                        return Err(false);
+                    // Alt+O
+                    b'O' if self.start == self.end && self.end < self.buf.len() => Event::Key(Key::Char('O').alt()),
+                    // F1-F4
+                    b'O' => match self.eat()? {
+                        c @ b'P'..=b'S' => Event::Key(Key::F(1 + c - b'P').plain()),
+                        _ => return Err(false),
                     }
-                    let y = self.parse_ansi_number()?;
-                    let c = self.eat()?;
+                    // Alt+[
+                    b'[' if self.start == self.end && self.end < self.buf.len() => Event::Key(Key::Char('[').alt()),
+                    // Mouse events.
+                    b'[' if self.peek()? == b'<' => {
+                        self.start += 1;
+                        let n = self.parse_ansi_number()?;
+                        if self.eat()? != b';' {
+                            return Err(false);
+                        }
+                        let x = self.parse_ansi_number()?;
+                        if self.eat()? != b';' {
+                            return Err(false);
+                        }
+                        let y = self.parse_ansi_number()?;
+                        let c = self.eat()?;
 
-                    let mut button = match n&3 {
-                        0 => MouseButton::Left,
-                        1 => MouseButton::Middle,
-                        2 => MouseButton::Right,
-                        3 => MouseButton::None,
-                        _ => panic!("huh"),
-                    };
-                    let mods = ModKeys::from_bits(((n>>2)&7) as u8).unwrap();
-                    let mut event = if c == b'm' {MouseEvent::Release} else {MouseEvent::Press};
-
-                    if n&32 != 0 {
-                        event = MouseEvent::Move;
-                    }
-                    if n&64 != 0 {
-                        event = match n&3 {
-                            0 => MouseEvent::ScrollUp,
-                            1 => MouseEvent::ScrollDown,
-                            // Maybe 2 and 3 are horizontal scrolling? Idk, my mouse doesn't have horizontal scrolling.
-                            _ => return Err(false),
+                        let mut button = match n&3 {
+                            0 => MouseButton::Left,
+                            1 => MouseButton::Middle,
+                            2 => MouseButton::Right,
+                            3 => MouseButton::None,
+                            _ => panic!("huh"),
                         };
-                        button = MouseButton::None;
-                    }
+                        let mods = ModKeys::from_bits(((n>>2)&7) as u8).unwrap();
+                        let mut event = if c == b'm' {MouseEvent::Release} else {MouseEvent::Press};
 
-                    Event::Mouse(MouseEventEx {pos: [x as isize - 1, y as isize - 1], button, event, mods})
-                }
-                b'[' if self.peek()? == b'I' => { self.start += 1; Event::FocusIn }
-                b'[' if self.peek()? == b'O' => { self.start += 1; Event::FocusOut }
-                // xterm and vt escape sequences.
-                b'[' => {
-                    // [number] [;[number]] char
-                    let n = self.parse_ansi_number()?;
-                    let mut c = self.eat()?;
-                    let mut mods = ModKeys::empty();
-                    if c == b';' {
-                        mods = Self::ansi_modifier(self.parse_ansi_number()?)?;
-                        c = self.eat()?;
-                    }
+                        if n&32 != 0 {
+                            event = MouseEvent::Move;
+                        }
+                        if n&64 != 0 {
+                            event = match n&3 {
+                                0 => MouseEvent::ScrollUp,
+                                1 => MouseEvent::ScrollDown,
+                                // 2 => MouseEvent::ScrollLeft,
+                                // 3 => MouseEvent::ScrollRight,
+                                _ => return Err(false),
+                            };
+                            button = MouseButton::None;
+                        }
 
-                    if c == b'~' {
-                        // vt
-                        Event::Key(Self::ansi_key_vt(n)?.mods(mods))
-                    } else {
-                        // xterm
-                        Event::Key(Self::ansi_key_xterm(c)?.mods(mods))
+                        Event::Mouse(MouseEventEx {pos: [x as isize - 1, y as isize - 1], button, event, mods})
                     }
-                }
-                // Alt+char
-                c => {
-                    let mut k = self.ansi_key_char(c)?;
-                    k.mods.insert(ModKeys::ALT);
-                    Event::Key(k)
+                    b'[' if self.peek()? == b'I' => { self.start += 1; Event::FocusIn }
+                    b'[' if self.peek()? == b'O' => { self.start += 1; Event::FocusOut }
+                    // xterm and vt escape sequences.
+                    b'[' => {
+                        // [number] [;[number]] char
+                        let n = self.parse_ansi_number()?;
+                        let mut c = self.eat()?;
+                        let mut mods = ModKeys::empty();
+                        if c == b';' {
+                            mods = Self::ansi_modifier(self.parse_ansi_number()?)?;
+                            c = self.eat()?;
+                        }
+
+                        if c == b'~' {
+                            // vt
+                            Event::Key(Self::ansi_key_vt(n)?.mods(mods))
+                        } else {
+                            // xterm
+                            Event::Key(Self::ansi_key_xterm(c)?.mods(mods))
+                        }
+                    }
+                    // Alt+char
+                    c => {
+                        let mut k = self.ansi_key_char(c)?;
+                        k.mods.insert(ModKeys::ALT);
+                        Event::Key(k)
+                    }
                 }
             }
             // Char (includes some special keys, some codes for ctrl+key, shift+key if uppercase, some ctrl+shift+key).

@@ -86,6 +86,8 @@ Tips and caveats:
  * Expect debugger's memory usage around 3x the size of the executable. E.g. ~7 GB for 2.3 GB clickhouse, release build. This is mostly debug information.
    (If you're curious, see ~/.nnd/<number>/log for a breakdown of which parts of the debug info take how much memory and take how long to load.)
  * For clickhouse server, use CLICKHOUSE_WATCHDOG_ENABLE=0. Otherwise it forks on startup, and the debugger doesn't follow forks.
+ * If you use tmux, the escape key is unreliable, consider using ctrl-g instead. Tmux adds 0.5s delay before passing the escape key through, and if you press another key during that time,
+   the two key presses get incorrectly interpreted as alt+keypress (that's how ansi escape codes work, unfortunately).
 
 Please (pretty please!) report all bugs, usability issues, slowness, first impressions, improvement ideas, feature requests, etc.
 If you work at ClickHouse, report to #debugger channel in slack. Otherwise email to mk.al13n+nnd@gmail.com or comment at https://al13n.itch.io/nnd"###),
@@ -323,7 +325,7 @@ pub fn run_input_echo_tool() -> Result<()> {
         // Render.
         commands.clear();
         write!(commands, "{}\x1B[{};{}H{}", CURSOR_HIDE, 1, 1, "input echo tool; showing key presses, as can be used in keys config file").unwrap();
-        write!(commands, "\x1B[{};{}H{}", 2, 1, "some keys combinations are indistinguishable due to ANSI escape codes, e.g. ctrl-j and enter").unwrap();
+        write!(commands, "\x1B[{};{}H{}", 2, 1, "some key combinations are indistinguishable due to ANSI escape codes, e.g. ctrl-j and enter").unwrap();
         write!(commands, "\x1B[{};{}H{}", 3, 1, "press 'q' to exit").unwrap();
         for (y, key) in keys.iter().rev().enumerate() {
             write!(commands, "\x1B[{};{}H\x1B[K{}", y + 4 + 1, 1, key).unwrap();

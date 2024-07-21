@@ -604,6 +604,8 @@ impl Default for KeyBinds {
             (Key::Char('{').plain(), KeyAction::PreviousThread),
             (Key::Char('.').plain(), KeyAction::NextLocation),
             (Key::Char(',').plain(), KeyAction::PreviousLocation),
+            (Key::Char('g').alt(), KeyAction::NextMatch),
+            (Key::Char('G').alt(), KeyAction::PreviousMatch),
             (Key::F(3).plain(), KeyAction::NextMatch),
             (Key::F(3).shift(), KeyAction::PreviousMatch),
             (Key::Char('+').plain(), KeyAction::ToggleSort),

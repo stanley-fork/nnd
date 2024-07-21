@@ -967,7 +967,19 @@ impl WindowContent for WatchesWindow {
                         self.text_input = Some((node.identity, height_estimate, TextInput::new_multiline(text)));
                     }
                 }
-                KeyAction::Enter => {
+                KeyAction::DuplicateRow if expr_idx.is_some_and(|i| self.expressions[i].special.is_none()) => {
+                    let i = expr_idx.unwrap();
+                    let text = self.expressions[i].text.clone();
+                    let mut i = self.expressions.len();
+                    if self.expressions.last().is_some_and(|e| &e.special == &Some(SpecialWatch::AddWatch)) {
+                        i -= 1;
+                    }
+                    let identity: usize = random();
+                    self.expressions.insert(i, WatchExpression {identity, text, special: None});
+                    self.cursor_path = vec![identity];
+                    refresh_data = true;
+                }
+                KeyAction::Enter | KeyAction::DuplicateRow => {
                     if let Some(s) = self.make_expression_for_tree_node(node_idx) {
                         let mut i = self.expressions.len();
                         if self.expressions.last().is_some_and(|e| &e.special == &Some(SpecialWatch::AddWatch)) {
@@ -986,14 +998,6 @@ impl WindowContent for WatchesWindow {
                     if !self.expressions.is_empty() {
                         self.cursor_path = vec![self.expressions[i.min(self.expressions.len()-1)].identity];
                     }
-                }
-                KeyAction::DuplicateRow if expr_idx.is_some_and(|i| !self.expressions[i].special.is_none()) => {
-                    let i = expr_idx.unwrap();
-                    let text = self.expressions[i].text.clone();
-                    let identity: usize = random();
-                    self.expressions.push(WatchExpression {identity, text, special: None});
-                    self.cursor_path = vec![identity];
-                    refresh_data = true;
                 }
                 _ => (),
             }
