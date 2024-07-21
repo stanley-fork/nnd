@@ -57,7 +57,7 @@ Properties:
 When running the debugger for the first time, notice:
  1. The UI consists of windows. There's an 'active' window, indicated with bright outline.
     The active window can be selected using digit keys (window numbers are shown in their titles), or using alt+arrows, or with the mouse.
- 2. The 'hints' window in top left lists (almost) all available key combinations.
+ 2. The 'controls' window in top left lists (almost) all available key combinations.
     Some of them are global, others depend on the active window.
 
 This information should be enough to discover most features by trial and error, which is recommended. Additionally, reading --help-known-problems and --help-watches is recommended.
@@ -67,7 +67,7 @@ UI tips:
  * There's mouse support. If it's not working, check if mouse reporting is enabled in the terminal application settings.
  * When mouse is enabled, click+dragging usually doesn't select text (to copy it out of the terminal). But terminal applications usually have a way to override this and select text anyway.
    Try shift+drag (in GNOME Terminal or kitty) or option+drag (in iTerm2).
- * In 'hints' window, prefix "C-" means ctrl key, "M-" means alt/option, "S-" means shift.
+ * In 'controls' window, prefix "C-" means ctrl key, "M-" means alt/option, "S-" means shift.
    On Mac OS you may need to change terminal settings to make the option key work, e.g. in kitty set "macos_option_as_alt both".
    Key bindings can be changed through config file, see --help-files
  * If you use tmux, the escape key is unreliable, consider using ctrl-g instead. Tmux adds 0.5s delay before passing the escape key through, and if you press another key during that time,
