@@ -2455,20 +2455,19 @@ impl WindowContent for ThreadsWindow {
                 cursor = threads.len() - 1;
             }
         }
+        // When the program is running, keep the cursor on the selected tid, but don't auto-scroll to cursor if that tid moves around (e.g. if the table is sorted by cpu%).
+        table.state.cursor = cursor;
 
         // Global hotkeys.
         with_parent!(ui, ui.content_root, {
             for key in ui.check_keys(&[KeyAction::PreviousThread, KeyAction::NextThread]) {
                 match key {
-                    KeyAction::PreviousThread => cursor = cursor.saturating_sub(1),
-                    KeyAction::NextThread => cursor += 1,
+                    KeyAction::PreviousThread => table.state.select(table.state.cursor.saturating_sub(1)),
+                    KeyAction::NextThread => table.state.select(table.state.cursor + 1),
                     _ => panic!("huh"),
                 }
             }
         });
-
-        // When the program is running, keep the cursor on the selected tid, but don't auto-scroll to cursor if that tid moves around (e.g. if the table is sorted by cpu%).
-        table.state.cursor = cursor;
 
         let range = table.lazy(threads.len(), 1, ui);
 
