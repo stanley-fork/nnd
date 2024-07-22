@@ -379,6 +379,7 @@ impl KeyBinds {
 # You may `cp {1} {0}` and edit {0}
 #
 # If the debugger fails to parse the config file, a file with error message will be created at: {2}
+# The config is reloaded on the fly, no restart needed, just save the file.
 #
 # The basic syntax is: "action: key", e.g. "Find: C-f"
 # All action names can be found in this config.

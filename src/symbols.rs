@@ -1542,7 +1542,7 @@ impl SymbolsLoader {
 
             eprintln!("info: loaded symbols for {} in {:.3}s (cpu: {:.3}s) in {} threads, process peak memory usage: {}, stats: {} units, {} files \
                        ({:.2}x dedup, {:.2}x unused, {} of paths, {} of remap), \
-                       {} functions ({:.2}x dedup, {}, {} of names), {} bytes in misc arena \
+                       {} functions ({:.2}x dedup, {}, {} of names), {} in misc arena \
                        {} subfunctions ({:.2}x ranges, {} sf, {} ranges, {} levels), \
                        {} lines ({}), {} local variables ({}), {} global variables, \
                        {} types ({:.2}x dedup, {:.2}x offsets, {} names ({}), \
