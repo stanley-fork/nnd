@@ -1,7 +1,7 @@
 use crate::{*, elf::*, error::*, util::*, log::*, symbols::*, process_info::*, symbols_registry::*, unwind::*, procfs::*, registers::*, disassembly::*, pool::*, settings::*, context::*, disassembly::*, expr::*, persistent::*};
 use libc::{pid_t, c_char, c_void};
 use iced_x86::FlowControl;
-use std::{io, ptr, rc::Rc, collections::{HashMap, VecDeque, HashSet}, mem, path::{Path, PathBuf}, sync::Arc, ffi::CStr, ops::Range, os::fd::AsRawFd, fs};
+use std::{io, ptr, rc::Rc, collections::{HashMap, VecDeque, HashSet}, mem, path::{Path, PathBuf}, sync::Arc, ffi::CStr, ops::Range, os::fd::AsRawFd, fs, time::{Instant, Duration}};
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum RunMode {
@@ -375,7 +375,7 @@ impl Debugger {
     pub fn start_child(&mut self) -> Result<()> {
         if self.mode != RunMode::Run { return err!(Usage, "can't start new process in attach mode"); }
         if self.target_state != ProcessState::NoProcess { return err!(Usage, "already debugging, can't start"); }
-        eprintln!("trace: starting child");
+        eprintln!("info: starting child");
 
         {
             // Clear all fields but a few. I guess this suggests that these fields should be grouped into a struct (or a few). Would probably
@@ -515,15 +515,26 @@ impl Debugger {
         Ok(())
     }
 
-    pub fn process_events(&mut self) -> Result</*drop_caches*/ bool> {
+    pub fn process_events(&mut self) -> Result<(/*have_more_events_to_process*/ bool, /*drop_caches*/ bool)> {
         // If all we did was skip conditional breakpoints, don't waste time refreshing process info. Otherwise conditional breakpoints would be very slow.
         // (Also useful for other spurious traps, e.g. when doing step-over in a recursive function.)
         let mut refresh_info = false;
         let mut is_initial_exec = false;
         let mut stack_digests_to_select: Vec<(pid_t, (Vec<usize>, bool, u16))> = Vec::new();
 
-        loop {
+        // If events arrive faster than we can process them, periodically yield to avoid blocking the main thread indefinitely.
+        let start_time = Instant::now();
+        let time_limit = if self.context.settings.periodic_timer_ns == 0 {250000000} else {self.context.settings.periodic_timer_ns};
+        let time_limit = Duration::from_nanos(time_limit as u64);
+        let mut stopped_early = false;
+
+        for iteration in 0usize.. {
             if self.target_state == ProcessState::NoProcess {
+                break;
+            }
+
+            if (iteration + 1) & 1023 == 1023 && Instant::now() - start_time > time_limit {
+                stopped_early = true;
                 break;
             }
 
@@ -551,7 +562,7 @@ impl Debugger {
                     if let Some(t) = self.threads.get_mut(&tid) {
                         thread = Some(t);
                     } else {
-                        eprintln!("trace: deferring event {:x} for tid {} that doesn't exist yet", wstatus, tid);
+                        eprintln!("info: deferring event {:x} for tid {} that doesn't exist yet", wstatus, tid);
                         self.pending_wait_events.push_back((tid, wstatus));
                         continue;
                     }
@@ -570,13 +581,13 @@ impl Debugger {
                     let stepping_this_thread = self.stepping.as_ref().is_some_and(|s| s.tid == tid);
                     if libc::WIFEXITED(wstatus) {
                         let exit_code = libc::WEXITSTATUS(wstatus);
-                        eprintln!("trace: thread {} exited with status {}", tid, exit_code);
+                        eprintln!("info: thread {} exited with status {}", tid, exit_code);
                         if tid == self.pid || exit_code != 0 || stepping_this_thread {
                             log!(self.log, "{} {} exited with status {}", if tid == self.pid {"process"} else {"thread"}, tid, exit_code);
                         }
                     } else {
                         let signal = libc::WTERMSIG(wstatus);
-                        eprintln!("trace: thread {} was terminated by signal {} {}", tid, signal, signal_name(signal));
+                        eprintln!("info: thread {} was terminated by signal {} {}", tid, signal, signal_name(signal));
                         let core_dumped = libc::WCOREDUMP(wstatus);
                         log!(self.log, "{} {} was terminated by signal {} {}{}", if tid == self.pid {"process"} else {"thread"}, tid, signal, signal_name(signal), if core_dumped {" (core dumped)"} else {""});
                     }
@@ -599,7 +610,7 @@ impl Debugger {
                     if signal == libc::SIGSTOP && self.waiting_for_initial_sigstop {
                         // Ignore the initial SIGSTOP, it has served its purpose.
                         // The `wstatus>>16` value in this case is inconsistent: sometimes it's 0, sometimes PTRACE_EVENT_STOP.
-                        eprintln!("trace: got initial SIGSTOP");
+                        eprintln!("info: got initial SIGSTOP");
                         force_resume = true;
                         self.waiting_for_initial_sigstop = false;
                         assert!(thread.waiting_for_initial_stop);
@@ -610,7 +621,7 @@ impl Debugger {
                     } else if wstatus>>16 == libc::PTRACE_EVENT_STOP { // group-stop, PTRACE_INTERRUPT, or newly created thread
                         if thread.waiting_for_initial_stop {
                             // The `signal` value in this case for newly created thread is inconsistent: sometimes SIGSTOP, sometimes SIGTRAP.
-                            eprintln!("trace: thread {} got initial stop {} {}", tid, signal, signal_name(signal));
+                            if self.context.settings.trace_logging { eprintln!("trace: thread {} got initial stop {} {}", tid, signal, signal_name(signal)); }
                             thread.waiting_for_initial_stop = false;
                             thread_initial_stop = true;
                             self.set_debug_registers_for_thread(tid)?;
@@ -620,7 +631,7 @@ impl Debugger {
                     } else if signal == libc::SIGTRAP && wstatus>>16 != 0 { // various ptrace stops
                         match wstatus>>16 {
                             libc::PTRACE_EVENT_EXEC => {
-                                eprintln!("trace: exec tid {}", tid);
+                                eprintln!("info: exec tid {}", tid);
                                 assert!(!self.waiting_for_initial_sigstop);
 
                                 if self.target_state == ProcessState::Starting {
@@ -646,21 +657,21 @@ impl Debugger {
                                         log!(self.log, "error: duplicate tid: {}", new_tid);
                                     }
                                 } else {
-                                    eprintln!("trace: new thread: {}", new_tid);
+                                    if self.context.settings.trace_logging { eprintln!("info: new thread: {}", new_tid); }
                                     let thread = Thread::new(self.next_thread_idx, new_tid, ThreadState::Running);
                                     self.next_thread_idx += 1;
                                     self.threads.insert(new_tid, thread);
                                 }
                             }
                             libc::PTRACE_EVENT_EXIT => {
-                                eprintln!("trace: thread {} exiting", tid);
+                                eprintln!("info: thread {} exiting", tid);
                                 if thread.exiting {
                                     eprintln!("warning: got multiple PTRACE_EVENT_EXIT for tid {}", tid);
                                 }
                                 thread.exiting = true;
                                 force_resume = true;
                                 if self.threads.iter().all(|(_, t)| t.exiting) {
-                                    eprintln!("trace: process exiting");
+                                    eprintln!("info: process exiting");
                                     // Make sure we don't try to read things like /proc/<pid>/maps when the pid may not exist anymore.
                                     self.target_state = ProcessState::Exiting;
                                     self.stepping = None;
@@ -669,7 +680,7 @@ impl Debugger {
                             _ => return err!(Internal, "unexpected ptrace event: {}", wstatus >> 16),
                         }
                     } else if signal == libc::SIGTRAP { // hit a breakpoint
-                        eprintln!("trace: thread {} got SIGTRAP", tid);
+                        if self.context.settings.trace_logging { eprintln!("trace: thread {} got SIGTRAP", tid); }
 
                         let thread_single_stepping = mem::take(&mut thread.single_stepping);
                         let thread_ignore_next_hw_breakpoint_hit_at_addr = mem::take(&mut thread.ignore_next_hw_breakpoint_hit_at_addr);
@@ -695,7 +706,7 @@ impl Debugger {
                             skip_refresh = true;
                         }
                     } else { // other signals, with no special meaning for the debugger
-                        eprintln!("trace: thread {} stopped by signal {} {}", tid, signal, signal_name(signal));
+                        if self.context.settings.trace_logging { eprintln!("trace: thread {} stopped by signal {} {}", tid, signal, signal_name(signal)); }
                         thread.pending_signal = Some(signal);
 
                         if [libc::SIGSEGV, libc::SIGABRT, libc::SIGILL, libc::SIGFPE].contains(&signal) {
@@ -793,7 +804,7 @@ impl Debugger {
             self.threads.get_mut(&tid).unwrap().subframe_to_select = Self::determine_subframe_to_select(&stack, &digest, step_into, subfunction_level);
         }
 
-        Ok(drop_caches)
+        Ok((stopped_early, drop_caches))
     }
 
     pub fn refresh_all_resource_stats(&mut self) {
@@ -820,7 +831,7 @@ impl Debugger {
     // The caller is responsible for assigning target_state and suspending/resuming threads as needed.
     fn cancel_stepping(&mut self) {
         if self.stepping.is_some() {
-            eprintln!("trace: cancel stepping");
+            eprintln!("info: cancel stepping");
             self.remove_step_breakpoints();
             self.stepping = None;
         }
@@ -833,7 +844,7 @@ impl Debugger {
     }
 
     pub fn drop_caches(&mut self) -> Result<()> {
-        eprintln!("trace: drop caches");
+        eprintln!("info: drop caches");
         refresh_maps_and_binaries_info(self);
         for t in self.threads.values_mut() {
             t.info.invalidate();
@@ -853,7 +864,7 @@ impl Debugger {
             ProcessState::Suspended => (),
             ProcessState::Stepping => self.cancel_stepping(),
             _ => return err!(Usage, "not suspended, can't resume") }
-        eprintln!("trace: resume");
+        eprintln!("info: resume");
         
         self.target_state = ProcessState::Running;
         let tids: Vec<pid_t> = self.threads.keys().copied().collect();
@@ -870,7 +881,7 @@ impl Debugger {
         match self.target_state {
             ProcessState::Running | ProcessState::Stepping => (),
             _ => return err!(Usage, "not running, can't suspend") }
-        eprintln!("trace: suspend");
+        eprintln!("info: suspend");
         self.cancel_stepping();
 
         self.target_state = ProcessState::Suspended;
@@ -895,7 +906,7 @@ impl Debugger {
     pub fn murder(&mut self) -> Result<()> {
         if self.mode == RunMode::Attach { return err!(Usage, "not killing attached process"); }
         if self.target_state == ProcessState::NoProcess || self.target_state == ProcessState::Exiting { return err!(Usage, "no process"); }
-        eprintln!("trace: kill");
+        eprintln!("info: kill");
         unsafe {
             let r = libc::kill(self.pid, libc::SIGKILL);
             if r != 0 {
@@ -949,7 +960,7 @@ impl Debugger {
         if thread.state != ThreadState::Suspended {
             return err!(Usage, "thread not suspended");
         }
-        eprintln!("trace: step {} subframe {} {:?} instr {} col {}", tid, subframe_idx, kind, by_instructions, use_line_number_with_column);
+        eprintln!("info: step {} subframe {} {:?} instr {} col {}", tid, subframe_idx, kind, by_instructions, use_line_number_with_column);
 
         // Special no-op case: step-into from non-top subframe.
         // Just switch to the child subframe. This seems like the least confusing behavior for the user, but I'm not very sure.
@@ -1241,7 +1252,7 @@ impl Debugger {
 
         // 3. Actually initiate the step and add breakpoints.
 
-        eprintln!("trace: proceeding with step from addr 0x{:x} {:?}", frame.addr, step);
+        eprintln!("info: proceeding with step from addr 0x{:x} {:?}", frame.addr, step);
         
         self.stepping = Some(step);
         self.target_state = ProcessState::Stepping;
@@ -1312,7 +1323,7 @@ impl Debugger {
         Self::determine_locations_for_breakpoint(&self.info, &mut breakpoint);
         let addrs = breakpoint.addrs?;
 
-        eprintln!("trace: step to cursor thread {} cursor {:?}", tid, breakpoint.on);
+        eprintln!("info: step to cursor thread {} cursor {:?}", tid, breakpoint.on);
 
         self.cancel_stepping();
         assert!(self.stepping.is_none());
@@ -1405,6 +1416,7 @@ impl Debugger {
 
         let mut regs = thread.info.regs.clone();
         let mut scratch = UnwindScratchBuffer::default();
+        let mut pseudo_addr = regs.get_int(RegisterIdx::Rip).unwrap().0 as usize;
 
         loop {
             let idx = stack.frames.len();
@@ -1414,41 +1426,43 @@ impl Debugger {
             }
 
             let addr = regs.get_int(RegisterIdx::Rip).unwrap().0 as usize;
-            if addr == 0 {
-                // (I've seen this in MUSL's clone.s, which has bad unwind info.)
-                return err!(Dwarf, "zero return address");
-            }
-            let pseudo_addr = if idx == 0 {addr} else {addr - 1};
             stack.subframes.push(StackSubframe {frame_idx: stack.frames.len(), function_idx: err!(MissingSymbols, "unwind failed"), ..Default::default()});
             stack.frames.push(StackFrame {addr, pseudo_addr, regs: regs.clone(), subframes: stack.subframes.len()-1..stack.subframes.len(), .. Default::default()});
             let frame = &mut stack.frames.last_mut().unwrap();
 
             // Would be nice to fall back to unwinding using some default ABI (rbp and callee cleanup, or something).
             // But for now we just stop if we can't find the binary (may be a problem for JIT-generated code) or .eh_frame section in it.
-            let (_, static_addr, binary, _) = self.addr_to_binary(pseudo_addr)?;
+            let (_, static_pseudo_addr, binary, _) = self.addr_to_binary(pseudo_addr)?;
             frame.binary_id = Some(binary.id.clone());
-            frame.addr_static_to_dynamic = binary.addr_map.static_to_dynamic(static_addr).wrapping_sub(static_addr);
+            frame.addr_static_to_dynamic = binary.addr_map.static_to_dynamic(static_pseudo_addr).wrapping_sub(static_pseudo_addr);
 
             // This populates CFA "register", so needs to happen before symbolizing the frame (because frame_base expression might use CFA).
             let unwind = binary.unwind.as_ref_clone_error()?;
-            let next_regs_result = unwind.step(&self.memory, &binary.addr_map, &mut scratch, pseudo_addr, &mut frame.regs);
+            let step_result = unwind.step(&self.memory, &binary.addr_map, &mut scratch, pseudo_addr, &mut frame.regs);
 
-            self.symbolize_stack_frame(static_addr, binary, frame, &mut stack.subframes);
+            self.symbolize_stack_frame(static_pseudo_addr, binary, frame, &mut stack.subframes);
 
             if partial {
                 return Ok(());
             }
 
-            let next_regs = next_regs_result?;
+            let (next_regs, is_signal_trampoline) = step_result?;
             if !next_regs.has(RegisterIdx::Rip) {
+                // This is how stacks usually end.
                 return Ok(());
             }
-            if next_regs.get_int(RegisterIdx::Rip).unwrap().0 as usize == addr && next_regs.has(RegisterIdx::Rsp) && regs.has(RegisterIdx::Rsp) && next_regs.get_int(RegisterIdx::Rsp).unwrap().0 == regs.get_int(RegisterIdx::Rsp).unwrap().0 {
-                // RIP and RSP didn't change, we'd almost certainly be stuck in a loop if we continue. I've seen this in MUSL's clone.s, which has bad unwind info.
+            let next_addr = next_regs.get_int(RegisterIdx::Rip).unwrap().0 as usize;
+            if next_addr == 0 {
+                // I've seen this in MUSL's clone.s, which has bad unwind info.
+                return err!(Dwarf, "zero return address");
+            }
+            if next_addr == addr && next_regs.has(RegisterIdx::Rsp) && regs.has(RegisterIdx::Rsp) && next_regs.get_int(RegisterIdx::Rsp).unwrap().0 == regs.get_int(RegisterIdx::Rsp).unwrap().0 {
+                // RIP and RSP didn't change. We'd almost certainly be stuck in a loop if we continue. I've seen this in MUSL's clone.s, which has bad unwind info.
                 return err!(Dwarf, "cycle");
             }
 
             regs = next_regs;
+            pseudo_addr = if is_signal_trampoline {next_addr} else {next_addr - 1};
         }
     }
 
@@ -1915,7 +1929,7 @@ impl Debugger {
         let in_ranges = i < step.addr_ranges.len() && step.addr_ranges[i].start <= addr;
         if step.internal_kind == StepKind::Into && step.by_instructions {
             if step.addr_ranges.is_empty() && spurious_stop {
-                eprintln!("trace: ignoring spurious stop on hw breakpoint {:x} (stepping)", addr);
+                if self.context.settings.trace_logging { eprintln!("trace: ignoring spurious stop on hw breakpoint {:x} (stepping)", addr); }
                 return false;
             }
             return !in_ranges;
@@ -2068,7 +2082,7 @@ impl Debugger {
                     BreakpointRef::Id {id, subfunction_level} => {
                         if spurious_stop {
                             // Spurious stop after converting breakpoint from software to hardware, or initial hit after adding a breakpoint on current line.
-                            eprintln!("trace: ignoring spurious stop on hw breakpoint {:x}", addr);
+                            if self.context.settings.trace_logging { eprintln!("trace: ignoring spurious stop on hw breakpoint {:x}", addr); }
                             continue;
                         }
                         if let Some(step) = &self.stepping {
@@ -2142,7 +2156,7 @@ impl Drop for Debugger {
             return;
         }
         self.target_state = ProcessState::NoProcess;
-        eprintln!("trace: detaching");
+        eprintln!("info: detaching");
 
         let memory = self.memory.clone();
         let mut memory_bytes_to_restore: Vec<(usize, u8)> = Vec::new();
@@ -2206,7 +2220,7 @@ impl Drop for Debugger {
                 (tid, wstatus)
             };
             if !running_threads.contains(&tid) {
-                eprintln!("trace: got event {} for unknown thread {} during detach", wstatus, tid);
+                eprintln!("info: got event {} for unknown thread {} during detach", wstatus, tid);
                 continue;
             }
 

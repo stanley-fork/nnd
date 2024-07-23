@@ -113,6 +113,8 @@ fn main() {
                 }
             };
             settings.periodic_timer_ns = (seconds * 1e9) as usize;
+        } else if let Some(_) = parse_arg(&mut args, "--verbose", "", true) {
+            settings.trace_logging = true;
         } else if print_help_chapter(&args[0], &all_args[0]) {
             process::exit(0);
         } else {
@@ -292,6 +294,8 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, command_line: Option<Vec<S
     let mut pending_render = true;
     render_timer.set(1, 0);
 
+    let mut have_debugger_events = false;
+
     if context.settings.fixed_fps {
         render_timer.set(1, frame_ns);
     }
@@ -304,17 +308,11 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, command_line: Option<Vec<S
         let mut schedule_render = false;
         for event in &events[..n] {
             let fd = event.u64 as i32;
-            let mut prof = TscScopeExcludingSyscalls::new(&debugger.prof.bucket);
+            let prof = TscScopeExcludingSyscalls::new(&debugger.prof.bucket);
             schedule_render = true;
             if fd == signal_pipes_read[libc::SIGCHLD as usize] {
                 drain_signal_pipe(fd);
-                let drop_caches = debugger.process_events()?;
-                debugger.prof.bucket.debugger_tsc += prof.restart(&debugger.prof.bucket);
-                if drop_caches {
-                    debugger.drop_caches()?;
-                    ui.drop_caches();
-                    debugger.prof.bucket.other_tsc += prof.finish(&debugger.prof.bucket);
-                }
+                have_debugger_events = true;
             } else if fd == signal_pipes_read[libc::SIGWINCH as usize] {
                 drain_signal_pipe(fd);
             } else if fd == misc_wakeup_fd.fd {
@@ -355,6 +353,23 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, command_line: Option<Vec<S
             }
         }
 
+        if have_debugger_events {
+            let mut prof = TscScopeExcludingSyscalls::new(&debugger.prof.bucket);
+            let drop_caches;
+            (have_debugger_events, drop_caches) = debugger.process_events()?;
+            debugger.prof.bucket.debugger_tsc += prof.restart(&debugger.prof.bucket);
+            if drop_caches {
+                debugger.drop_caches()?;
+                ui.drop_caches();
+                debugger.prof.bucket.other_tsc += prof.finish(&debugger.prof.bucket);
+            }
+
+            if have_debugger_events {
+                // process_events() yielded to give us a chance to render a frame; need to call it again right after that.
+                debugger.context.wake_main_thread.write(1);
+            }
+        }
+        
         if render_now {
             assert!(!pending_render);
             schedule_render = false;

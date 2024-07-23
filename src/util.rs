@@ -3,7 +3,7 @@ use libc::{pid_t, c_char, c_void};
 use std::{io, io::{Read, BufReader, BufRead, Write}, str::FromStr, ptr, mem, mem::ManuallyDrop, fmt, os::fd::RawFd, ffi::{CStr, OsString, CString}, os::unix::ffi::{OsStringExt, OsStrExt}, arch::asm, cell::UnsafeCell, sync::atomic::{AtomicBool, Ordering}, ops::{Deref, DerefMut, FnOnce}, fs::File, collections::{BinaryHeap, hash_map::DefaultHasher}, hash::{Hash, Hasher}, cmp::Ord, cmp, path::{Path, PathBuf}};
 
 pub fn tgkill(pid: pid_t, tid: pid_t, sig: i32) -> Result<i32> {
-    eprintln!("trace: tgkill({}, {}, {})", pid, tid, sig);
+    //eprintln!("trace: tgkill({}, {}, {})", pid, tid, sig);
     let ret: i32;
     unsafe {
         asm!(

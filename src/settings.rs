@@ -20,6 +20,7 @@ pub struct Settings {
     pub stderr_file: Option<String>,
 
     pub fixed_fps: bool, // render `fps` times per second even if nothing changes
+    pub trace_logging: bool, // verbose logging, e.g. log every signal passed-through to the process
 }
 
 impl Default for Settings {
@@ -37,6 +38,7 @@ impl Default for Settings {
         stderr_file: None,
 
         fixed_fps: false,
+        trace_logging: false,
     } }
 }
 

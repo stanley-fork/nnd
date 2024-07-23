@@ -1,12 +1,14 @@
+improve threads filter: search by thread name, have some way to choose what to search by
 reordering tabs
 rearranging windows
 maximizing windows
 
+fix not auto-scrolling threads window when thread is switched by breakpoint or signal
+fix step incorrectly switching to a thread that previously hit a breakpoint (presumably because its stop_reasons isn't cleared - probably clear all stop_reasons on every step)
 fix empty symbols loading stage name near the end
 fix picking up updated binary unnecessarily
 investigate regression in symbols loading speed (stuck on "parsing drawf" for ~10 seconds)
 investigate why many types are not deduped, e.g. there's DB::Block#441
-unwinding stack out of signal handler, e.g. clickhouse's sampling profiler
 make stack unwinding work when control is in .plt or .plt.got, see "Recognise PLT entries such as" in libunwind code
 
 optimize simple things found by profiler (samply is nice)

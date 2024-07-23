@@ -1576,7 +1576,7 @@ fn open_debuglink(elf: &ElfFile) -> Result<Option<ElfFile>> {
             if build_id.desc.len() < 1 { return err!(Dwarf, ".note.gnu.build-id descr is too short: {}", build_id.desc.len()); }
 
             let path: String = format!("/usr/lib/debug/.build-id/{:02x}/{}", build_id.desc[0], filename);
-            eprintln!("trace: opening debuglink file for {} at {}", elf.name, path);
+            eprintln!("info: opening debuglink file for {} at {}", elf.name, path);
             let file = match File::open(&path) {
                 Ok(f) => f,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => return err!(MissingSymbols, "debuglink file not found: {}", path),

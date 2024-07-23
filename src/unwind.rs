@@ -212,7 +212,7 @@ impl UnwindInfo {
     }
 
     // Assigns cfa and return address in current frame and returns registers for next frame.
-    pub fn step(&self, memory: &MemReader, addr_map: &AddrMap, scratch: &mut UnwindScratchBuffer, pseudo_addr: usize, regs: &mut Registers) -> Result<Registers> {
+    pub fn step(&self, memory: &MemReader, addr_map: &AddrMap, scratch: &mut UnwindScratchBuffer, pseudo_addr: usize, regs: &mut Registers) -> Result<(Registers, /*is_signal_trampoline*/ bool)> {
         let (fde, row, cfa, cfa_dubious) = self.find_row_and_eval_cfa(memory, addr_map, scratch, pseudo_addr, regs)?;
         regs.set_int(RegisterIdx::Cfa, cfa as u64, cfa_dubious);
 
@@ -287,7 +287,7 @@ impl UnwindInfo {
             }
         }
 
-        Ok(new_regs)
+        Ok((new_regs, fde.is_signal_trampoline()))
     }
 }
 
