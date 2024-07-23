@@ -4,7 +4,7 @@ rearranging windows
 maximizing windows
 
 fix not auto-scrolling threads window when thread is switched by breakpoint or signal
-fix step incorrectly switching to a thread that previously hit a breakpoint (presumably because its stop_reasons isn't cleared - probably clear all stop_reasons on every step)
+fix step incorrectly switching to a thread that previously hit a breakpoint (idk why, maybe something broken with seen_stop_count, stop_count, and stop_reasons)
 fix empty symbols loading stage name near the end
 fix picking up updated binary unnecessarily
 investigate regression in symbols loading speed (stuck on "parsing drawf" for ~10 seconds)

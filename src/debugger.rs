@@ -1612,14 +1612,11 @@ impl Debugger {
         if b.enabled == enabled {
             return Ok(true);
         }
-        if enabled {
-            b.enabled = true;
-            if self.target_state.breakpoints_should_be_active() {
-                self.activate_breakpoints(vec![id])?;
-            }
-        } else {
-            b.enabled = false;
+        b.enabled = enabled;
+        if !enabled {
             self.deactivate_breakpoint(id);
+        } else if self.target_state.breakpoints_should_be_active() {
+            self.activate_breakpoints(vec![id])?;
         }
         Ok(true)
     }
@@ -2063,6 +2060,12 @@ impl Debugger {
             if stopped_on_sw_breakpoint && location.hardware {
                 eprintln!("warning: got unexpected SIGTRAP in thread {} at {:x} (just after a hw breakpoint)", tid, addr + 1);
             }
+
+            if location.breakpoints.is_empty() {
+                // Lazily deactivate obsolete breakpoint location if we hit it. This is just for performance, to avoid repeatedly hitting+ignoring a deleted hot breakpoint.
+                self.deactivate_breakpoint_location(idx, tid)?;
+            }
+            let location = &mut self.breakpoint_locations[idx];
 
             for b in &location.breakpoints {
                 match b {
