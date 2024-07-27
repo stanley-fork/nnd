@@ -2293,8 +2293,9 @@ impl ThreadsFilter {
             self.cache_key = query.clone();
             self.cached_results.clear();
         }
-        let name_only = if query.starts_with('"') && query.ends_with('"') && query.len() > 1 {
-            query = query[1..query.len()-1].to_string();
+        let name_only = if query.starts_with('"') {
+            let end = if query.len() > 1 && query.ends_with('"') { query.len()-1 } else {query.len()};
+            query = query[1..end].to_string();
             true
         } else {
             false
@@ -2392,7 +2393,7 @@ impl WindowContent for ThreadsWindow {
         }
         with_parent!(ui, ui.add(widget!().identity(&'s')), {
             ui.focus();
-            let l = ui_writeln!(ui, default_dim, "filter: ");
+            let l = ui_writeln!(ui, default_dim, "filter (name+stack): ");
             self.filter.bar.build(Some(l), None, ui);
         });
         let table_widget = ui.add(widget!().identity(&'t').height(AutoSize::Remainder(1.0)));

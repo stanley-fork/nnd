@@ -103,7 +103,7 @@ If you work at ClickHouse, report to #debugger channel in slack or DM Michael Ko
    the program will keep running (the status window will say 'stepping') until you manually suspend it (shift-c by default). Similar for step-out.
  * There are pretty printers for vector/slice/string/shared_ptr-like standard types in C++ and Rust. No pretty printers for hash tables, linked lists, and std::deque yet.
  * No global variables.
- * Thread filter ('/' in the threads window) is too limited: just a substring match in function name and file name. Need to extend it enough to be able to e.g. filter out idle threads waiting for work or epoll.
+ * Thread filter ('/' in the threads window) is too limited: just a substring match in function name, file name, and thread name. Need to extend it enough to be able to e.g. filter out idle threads waiting for work or epoll.
  * In watch expressions, type names (for casts or type info) have to be spelled *exactly* the same way as they appear in the debug info.
    E.g. `std::vector<int>` doesn't work, you have to write `std::__1::vector<int, std::__1::allocator<int> >` (whitespace matters).
    The plan is to add a fuzzy search dialog for type names, similar to file and function search.
