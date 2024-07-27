@@ -2090,10 +2090,22 @@ impl Debugger {
                         }
                         if let Some(step) = &self.stepping {
                             if step.disable_breakpoints {
-                                // Ignore regular breakpoints when stepping. (Maybe it would be better for performance to also deactivate them as we go, then reactivate after the step completes.)
-                                // We can add a setting to disable this behavior.
+                                // Ignore regular breakpoints when stepping.
+                                // (It would be better for performance to also deactivate them as we go, then reactivate after the step completes.)
                                 continue;
                             }
+                        }
+                        if self.target_state == ProcessState::Suspended {
+                            // Solves this race condition:
+                            //  1. A step completes. It's added to thread's stop_reasons. Other threads are requested to suspend.
+                            //  2. The UI sees the stepped thread's stop_reasons.
+                            //  3. Just before suspending, some other thread hits a breakpoint. It's added to stop_reasons (because self.stepping is already unset).
+                            //  4. The UI sees the breakpoint hit in stop_reasons and switches to that thread.
+                            //     Very confusing because breakpoints are supposed to be disabled when stepping.
+                            //
+                            // As a side effect, this check also prevents reporting simultaneous breakpoint hits by multiple threads.
+                            // If this turns out to be a problem, replace this with a different mechanism (maybe a flag in Thread saying "ignore breakpoints in this thread until it's suspended").
+                            continue;
                         }
 
                         let bp = self.breakpoints.get_mut(*id);

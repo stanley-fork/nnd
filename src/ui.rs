@@ -2288,11 +2288,17 @@ impl ThreadsFilter {
     fn get_filtered_tids(&mut self, debugger: &mut Debugger) -> Vec<pid_t> {
         let mut tids: Vec<(usize, usize, pid_t)> = debugger.threads.values().map(|t| (t.idx, t.stop_count, t.tid)).collect();
         tids.sort_unstable_by_key(|t| t.0);
-        let query = if self.bar.visible {self.bar.text.text.clone()} else {String::new()};
+        let mut query = if self.bar.visible {self.bar.text.text.clone()} else {String::new()};
         if query != self.cache_key {
             self.cache_key = query.clone();
             self.cached_results.clear();
         }
+        let name_only = if query.starts_with('"') && query.ends_with('"') && query.len() > 1 {
+            query = query[1..query.len()-1].to_string();
+            true
+        } else {
+            false
+        };
         let (mut i, mut j) = (0, 0);
         let mut new_cached: Vec<(usize, usize, bool)> = Vec::new();
         let mut res: Vec<pid_t> = Vec::new();
@@ -2300,7 +2306,7 @@ impl ThreadsFilter {
             if i < tids.len() && (j == self.cached_results.len() || tids[i].0 < self.cached_results[j].0 || (tids[i].0 == self.cached_results[j].0 && tids[i].1 != self.cached_results[j].1)) {
                 // Cache miss.
                 let (thread_idx, stop_count, tid) = tids[i].clone();
-                let pass = Self::thread_passes(tid, &query, debugger);
+                let pass = Self::thread_passes(tid, &query, name_only, debugger);
                 new_cached.push((thread_idx, stop_count, pass));
                 if pass {
                     res.push(tid);
@@ -2327,10 +2333,18 @@ impl ThreadsFilter {
         res
     }
 
-    fn thread_passes(tid: pid_t, query: &str, debugger: &mut Debugger) -> bool {
+    fn thread_passes(tid: pid_t, query: &str, name_only: bool, debugger: &mut Debugger) -> bool {
         if query.is_empty() {
             return true;
         }
+        let name = debugger.threads.get(&tid).unwrap().info.resource_stats.latest.comm();
+        if name.find(query).is_some() {
+            return true;
+        }
+        if name_only {
+            return false;
+        }
+
         // This is very primitive right now, but I'm not sure in which direction to take it to be most useful.
         let stack = debugger.get_stack_trace(tid, false);
         for subframe in &stack.subframes {
@@ -2423,7 +2437,9 @@ impl WindowContent for ThreadsWindow {
         }
 
         // If some thread hit a breakpoint or fatal signal, switch to it.
+        // If multiple threads stopped for different reasons, pick the highest-priority reason.
         self.seen_stop_counts.retain(|tid, _| debugger.threads.contains_key(tid));
+        let mut switch_to: (/*priority*/ isize, pid_t) = (-1, 0);
         for (tid, thread) in &debugger.threads {
             if thread.stop_reasons.is_empty() {
                 continue;
@@ -2440,23 +2456,35 @@ impl WindowContent for ThreadsWindow {
             if seen {
                 continue;
             }
-            state.selected_thread = *tid;
-        }
-
-        let mut selected_thread_filtered_out = false;
-        let mut cursor = table.state.cursor;
-        if let Some(thread) = debugger.threads.get(&state.selected_thread) {
-            if let Some(i) = threads.iter().position(|t| t.tid == state.selected_thread) {
-                cursor = i;
-            } else {
-                // If selected thread doesn't pass the filter, awkwardly add it to the list anyway, greyed out.
-                selected_thread_filtered_out = true;
-                threads.push(thread);
-                cursor = threads.len() - 1;
+            for reason in &thread.stop_reasons {
+                let priority: isize = match reason {
+                    StopReason::Breakpoint(_) => 0,
+                    StopReason::Step => 1,
+                    StopReason::Signal(_) => 2,
+                };
+                if priority > switch_to.0 {
+                    switch_to = (priority, *tid);
+                }
             }
         }
-        // When the program is running, keep the cursor on the selected tid, but don't auto-scroll to cursor if that tid moves around (e.g. if the table is sorted by cpu%).
-        table.state.cursor = cursor;
+        if switch_to.0 >= 0 {
+            state.selected_thread = switch_to.1;
+            table.state.scroll_to_cursor = true;
+        }
+
+        table.state.cursor_elsewhere = false;
+        if let Some(thread) = debugger.threads.get(&state.selected_thread) {
+            if let Some(i) = threads.iter().position(|t| t.tid == state.selected_thread) {
+                // Keep the cursor on the selected tid, but don't auto-scroll to cursor if that tid moves around (e.g. if the table is sorted by cpu% or if threads are added or removed).
+                table.state.cursor = i;
+            } else {
+                // Selected thread doesn't pass the filter. Hide cursor.
+                table.state.cursor_elsewhere = true;
+            }
+        } else {
+            // Thread disappeared, switch to whatever thread took its position in the list.
+            table.state.scroll_to_cursor = true;
+        }
 
         // Global hotkeys.
         with_parent!(ui, ui.content_root, {
@@ -2471,9 +2499,8 @@ impl WindowContent for ThreadsWindow {
 
         let range = table.lazy(threads.len(), 1, ui);
 
-        state.selected_thread = threads.get(table.state.cursor).map_or(0, |t| t.tid);
-        if selected_thread_filtered_out && state.selected_thread != threads.last().unwrap().tid {
-            ui.should_redraw = true;
+        if !table.state.cursor_elsewhere {
+            state.selected_thread = threads.get(table.state.cursor).map_or(0, |t| t.tid);
         }
 
         let visible_tids: Vec<pid_t> = threads[range.clone()].iter().map(|t| t.tid).collect();
@@ -2489,12 +2516,11 @@ impl WindowContent for ThreadsWindow {
             ui_writeln!(ui, default_dim, "{}", t.tid);
             table.text_cell(ui);
 
-            let is_filtered_out = selected_thread_filtered_out && tid == state.selected_thread;
             if let Some(e) = &t.info.resource_stats.error {
                 ui_writeln!(ui, error, "{}", e);
             } else {
                 let name = t.info.resource_stats.latest.comm();
-                styled_writeln!(ui.text, if is_filtered_out {ui.palette.default_dim} else {ui.palette.default}, "{}", name);
+                ui_writeln!(ui, default, "{}", name);
             }
             table.text_cell(ui);
 

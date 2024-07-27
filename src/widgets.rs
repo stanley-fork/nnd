@@ -240,11 +240,15 @@ pub struct TableState {
     pub did_scroll_to_cursor: bool, // whether the latest finish() had a reason to auto-scroll (because of keyboard input or mouse click or because scroll_to_cursor was set from outside).
     pub sort_column: usize,
     pub sort_descending: bool,
+
+    // Hide cursor. If any cursor movement key is pressed, unhide it and inset this flag. Used e.g. in filtered threads list if the selected thread doesn't pass the filter.
+    pub cursor_elsewhere: bool,
 }
 impl TableState {
     pub fn select(&mut self, cursor: usize) {
         self.cursor = cursor;
         self.scroll_to_cursor = true;
+        self.cursor_elsewhere = false;
     }
     pub fn select_if_changed(&mut self, cursor: usize) {
         self.scroll_to_cursor |= cursor != self.cursor;
@@ -351,7 +355,13 @@ impl Table {
             }
         });
         with_parent!(ui, self.viewport, {
-            self.state.scroll_to_cursor |= list_cursor_navigation(&mut self.state.cursor, num_rows, row_height, ui)
+            if self.state.cursor_elsewhere {
+                self.state.cursor = num_rows;
+            }
+            if list_cursor_navigation(&mut self.state.cursor, num_rows, row_height, ui) {
+                self.state.cursor_elsewhere = false;
+                self.state.scroll_to_cursor = true;
+            }
         });
         let scroll_to = if self.state.scroll_to_cursor && num_rows > 0 {
             Some((self.state.cursor*row_height) as isize..((self.state.cursor+1)*row_height) as isize)
@@ -533,7 +543,13 @@ impl Table {
         if !self.lazy {
             let num_rows = ui.get(self.rows_container).children.len();
             with_parent!(ui, self.viewport, {
-                self.state.scroll_to_cursor |= list_cursor_navigation_with_variable_row_height(&mut self.state.cursor, num_rows, |i, ui| ui.get(ui.get(self.rows_container).children[i]).axes[Axis::Y].size, ui)
+                if self.state.cursor_elsewhere {
+                    self.state.cursor = num_rows;
+                }
+                if list_cursor_navigation_with_variable_row_height(&mut self.state.cursor, num_rows, |i, ui| ui.get(ui.get(self.rows_container).children[i]).axes[Axis::Y].size, ui) {
+                    self.state.cursor_elsewhere = false;
+                    self.state.scroll_to_cursor = true;
+                }
             });
             let scroll_to = if self.state.scroll_to_cursor && num_rows > 0 {
                 let ax = &ui.get(ui.get(self.rows_container).children[self.state.cursor]).axes[Axis::Y];
@@ -547,7 +563,7 @@ impl Table {
         }
 
         let hide_cursor = with_parent!(ui, self.viewport, {
-            self.hide_cursor_if_unfocused && !ui.check_focus()
+            (self.hide_cursor_if_unfocused && !ui.check_focus()) || self.state.cursor_elsewhere
         });
         if self.row_idxs.contains(&self.state.cursor) && !hide_cursor {
             with_parent!(ui, ui.get(self.rows_container).children[self.state.cursor - self.row_idxs.start], {
