@@ -68,7 +68,7 @@ fn main() -> Result<()> {
 
         let mut entries_iter = eh.entries(&base_addresses);
         let mut unwind_context = UnwindContext::new();
-        dbg!(mem::size_of::<UnwindContext<EndianSlice<LittleEndian>>>()); // documentation says to put it in a Box because it's big, but idk what they mean, it's only 64 bytes; maybe they changed UnwindContext to store stuff on the heap internally but didn't update the documentation?
+        dbg!(mem::size_of::<UnwindContext<usize>>()); // documentation says to put it in a Box because it's big, but idk what they mean, it's only 64 bytes; maybe they changed UnwindContext to store stuff on the heap internally but didn't update the documentation?
         while let Some(entry) = entries_iter.next()? {
             match entry {
                 CieOrFde::Cie(_) => (),
@@ -1030,7 +1030,7 @@ fn main() -> Result<()> {
                                 eprintln!("example program @{} producing sequence starting at 0 (sequence number {}, {} rows)", program_offset.0, sequences_in_program, rows_in_sequence);
                                 let mut instr_iter = header.instructions();
                                 while let Some(instr) = instr_iter.next_instruction(header)? {
-                                    eprintln!("  {}", instr);
+                                    eprintln!("  {:?}", instr);
                                 }
                             }
                         } else if end < start {

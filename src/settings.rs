@@ -210,7 +210,7 @@ impl Default for Palette {
 
             value: Style {fg: white, ..D!()},
             value_misc: Style {fg: white.darker(), ..D!()},
-            value_dubious: StyleAdjustment {add_fg: (-80, -80, -80), ..D!()},
+            value_dubious: StyleAdjustment {add_fg: (-60, -60, -60), ..D!()},
 
             code_statement: Style {fg: white, bg: dark_gray, ..D!()},
             code_inlined_site: Style {fg: white, bg: light_blue, ..D!()},

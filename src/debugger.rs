@@ -1999,7 +1999,7 @@ impl Debugger {
                 eprintln!("warning: no frame for addr 0x{:x} (when determining cfa for step): {}", addr, e);
                 return None;
             }
-            Ok((_, _, cfa, _)) => Some(cfa),
+            Ok((_, _, cfa, _, _)) => Some(cfa),
         }
     }
     

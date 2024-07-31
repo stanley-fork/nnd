@@ -3,7 +3,7 @@ use gimli::*;
 use std::{sync::Arc, rc::Rc, mem, path::PathBuf, ops::Range};
 
 type SliceType = EndianSlice<'static, LittleEndian>;
-pub type UnwindScratchBuffer = UnwindContext<SliceType>;
+pub type UnwindScratchBuffer = UnwindContext<usize>;
 
 pub struct UnwindInfo {
     elf: Arc<ElfFile>,
@@ -120,7 +120,7 @@ impl<S: UnwindSection<SliceType>> UnwindSectionIndex<S> {
         Ok(Self {section, static_base_addresses, cies, static_addr_to_fde: RangeIndex::new(fde_ranges, "unwind")})
     }
 
-    fn find_fde_and_row<'a>(&self, pseudo_addr: usize, addr_map: &AddrMap, scratch: &'a mut UnwindScratchBuffer) -> Result<Option<(FrameDescriptionEntry<SliceType>, &'a UnwindTableRow<SliceType>)>> {
+    fn find_fde_and_row<'a>(&self, pseudo_addr: usize, addr_map: &AddrMap, scratch: &'a mut UnwindScratchBuffer) -> Result<Option<(FrameDescriptionEntry<SliceType>, &'a UnwindTableRow<usize>, /*section*/ SliceType)>> {
         let static_pseudo_addr = addr_map.dynamic_to_static(pseudo_addr);
         let fde_offset = match self.static_addr_to_fde.find(static_pseudo_addr) {
             None => return Ok(None),
@@ -132,7 +132,7 @@ impl<S: UnwindSection<SliceType>> UnwindSectionIndex<S> {
             Err(e) if e == gimli::read::Error::NoUnwindInfoForAddress => return Ok(None),
             Err(e) => return Err(e.into()),
         };
-        Ok(Some((fde, row)))
+        Ok(Some((fde, row, self.section.section().clone())))
     }
 }
 
@@ -189,7 +189,7 @@ impl UnwindInfo {
         Ok(res)
     }
 
-    pub fn find_row_and_eval_cfa<'a>(&self, memory: &MemReader, addr_map: &AddrMap, scratch: &'a mut UnwindScratchBuffer, pseudo_addr: usize, regs: &Registers) -> Result<(FrameDescriptionEntry<SliceType>, &'a UnwindTableRow<SliceType>, /*cfa*/ usize, /*cfa_dubious*/ bool)> {
+    pub fn find_row_and_eval_cfa<'a>(&self, memory: &MemReader, addr_map: &AddrMap, scratch: &'a mut UnwindScratchBuffer, pseudo_addr: usize, regs: &Registers) -> Result<(FrameDescriptionEntry<SliceType>, &'a UnwindTableRow<usize>, /*cfa*/ usize, /*cfa_dubious*/ bool, /*section*/ SliceType)> {
         let found = match &self.debug_frame {
             Some(section) => section.find_fde_and_row(pseudo_addr, addr_map, scratch)?,
             None => None,
@@ -201,19 +201,19 @@ impl UnwindInfo {
                 None => None,
             }
         };
-        let (fde, row) = match found {
+        let (fde, row, section) = match found {
             Some(x) => x,
             None => return err!(Dwarf, "no unwind info for address"),
         };
-        let (cfa, cfa_dubious) = eval_cfa_rule(row.cfa(), fde.cie().encoding(), &regs, memory, addr_map)?;
+        let (cfa, cfa_dubious) = eval_cfa_rule(row.cfa(), fde.cie().encoding(), section, &regs, memory, addr_map)?;
 
-        let row: &'static UnwindTableRow<SliceType> = unsafe {mem::transmute(row)}; // work around borrow checker weirdness by transmuting to 'static and back
-        Ok((fde, row, cfa as usize, cfa_dubious))
+        let row: &'static UnwindTableRow<usize> = unsafe {mem::transmute(row)}; // work around borrow checker weirdness by transmuting to 'static and back
+        Ok((fde, row, cfa as usize, cfa_dubious, section))
     }
 
     // Assigns cfa and return address in current frame and returns registers for next frame.
     pub fn step(&self, memory: &MemReader, addr_map: &AddrMap, scratch: &mut UnwindScratchBuffer, pseudo_addr: usize, regs: &mut Registers) -> Result<(Registers, /*is_signal_trampoline*/ bool)> {
-        let (fde, row, cfa, cfa_dubious) = self.find_row_and_eval_cfa(memory, addr_map, scratch, pseudo_addr, regs)?;
+        let (fde, row, cfa, cfa_dubious, section) = self.find_row_and_eval_cfa(memory, addr_map, scratch, pseudo_addr, regs)?;
         regs.set_int(RegisterIdx::Cfa, cfa as u64, cfa_dubious);
 
         let mut new_regs = Registers::default();
@@ -225,7 +225,7 @@ impl UnwindInfo {
                 seen_regs |= 1usize << r as u32;
             }
 
-            let val = eval_register_rule(reg.clone(), rule, fde.cie().encoding(), &regs, memory, addr_map)?;
+            let val = eval_register_rule(reg.clone(), rule, fde.cie().encoding(), section, &regs, memory, addr_map)?;
             if let Some((v, dubious)) = val {
                 if let Some(r) = reg {
                     new_regs.set_int(r, v, dubious);
@@ -308,9 +308,12 @@ fn eval_dwarf_expression_as_u64(expression: Expression<SliceType>, encoding: Enc
     Ok((val, dubious))
 }
 
-fn eval_cfa_rule(rule: &CfaRule<SliceType>, encoding: Encoding, registers: &Registers, memory: &MemReader, addr_map: &AddrMap) -> Result<(u64, bool)> {
+fn eval_cfa_rule(rule: &CfaRule<usize>, encoding: Encoding, section: SliceType, registers: &Registers, memory: &MemReader, addr_map: &AddrMap) -> Result<(u64, bool)> {
     Ok(match rule {
-        CfaRule::Expression(e) => eval_dwarf_expression_as_u64(e.clone(), encoding, registers, memory, addr_map, /*skip_final_dereference*/ true)?,
+        CfaRule::Expression(e) => {
+            let e = Expression(EndianSlice::new(&section.slice()[e.offset..e.offset+e.length], LittleEndian));
+            eval_dwarf_expression_as_u64(e, encoding, registers, memory, addr_map, /*skip_final_dereference*/ true)?
+        }
         CfaRule::RegisterAndOffset {register: reg, offset} => {
             let reg = match RegisterIdx::from_dwarf(*reg) {
                 None => return err!(Dwarf, "unsupported register in cfa: {:?}", reg),
@@ -325,7 +328,7 @@ fn eval_cfa_rule(rule: &CfaRule<SliceType>, encoding: Encoding, registers: &Regi
     })
 }
 
-fn eval_register_rule(reg: Option<RegisterIdx>, rule: &RegisterRule<SliceType>, encoding: Encoding, registers: &Registers, memory: &MemReader, addr_map: &AddrMap) -> Result<Option<(u64, bool)>> {
+fn eval_register_rule(reg: Option<RegisterIdx>, rule: &RegisterRule<usize>, encoding: Encoding, section: SliceType, registers: &Registers, memory: &MemReader, addr_map: &AddrMap) -> Result<Option<(u64, bool)>> {
     let (cfa, cfa_dubious) = registers.get_int(RegisterIdx::Cfa).unwrap();
     let val = match rule {
         RegisterRule::Undefined => return Ok(None),
@@ -348,11 +351,15 @@ fn eval_register_rule(reg: Option<RegisterIdx>, rule: &RegisterRule<SliceType>, 
         }
         RegisterRule::Offset(offset) => (memory.read_u64(cfa.wrapping_add(*offset as u64) as usize)?, cfa_dubious),
         RegisterRule::ValOffset(offset) => (cfa.wrapping_add(*offset as u64), cfa_dubious),
-        RegisterRule::Expression(ex) => {
-            let (addr, dubious) = eval_dwarf_expression_as_u64(ex.clone(), encoding, registers, memory, addr_map, /*skip_final_dereference*/ true)?;
+        RegisterRule::Expression(e) => {
+            let e = Expression(EndianSlice::new(&section.slice()[e.offset..e.offset+e.length], LittleEndian));
+            let (addr, dubious) = eval_dwarf_expression_as_u64(e, encoding, registers, memory, addr_map, /*skip_final_dereference*/ true)?;
             (memory.read_u64(addr as usize)?, dubious)
         }
-        RegisterRule::ValExpression(ex) => eval_dwarf_expression_as_u64(ex.clone(), encoding, registers, memory, addr_map, /*skip_final_dereference*/ false)?,
+        RegisterRule::ValExpression(e) => {
+            let e = Expression(EndianSlice::new(&section.slice()[e.offset..e.offset+e.length], LittleEndian));
+            eval_dwarf_expression_as_u64(e, encoding, registers, memory, addr_map, /*skip_final_dereference*/ false)?
+        }
         RegisterRule::Architectural => return err!(Dwarf, "architectural register rule"),
 
         RegisterRule::Constant(c) => (*c, false),
