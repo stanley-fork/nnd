@@ -1029,7 +1029,17 @@ pub struct DwarfEvalContext<'a> {
     pub local_variables: &'a [LocalVariable],
 }
 
-pub fn eval_dwarf_expression(expression: Expression<SliceType>, context: &DwarfEvalContext) -> Result<(AddrOrValueBlob, /*dubious*/ bool)> {
+pub fn eval_dwarf_expression(mut expression: Expression<SliceType>, context: &DwarfEvalContext) -> Result<(AddrOrValueBlob, /*dubious*/ bool)> {
+    // Ignore [DW_OP_deref, DW_OP_stack_value] at the end of expression.
+    // This is a workaround for what may be a quirk in LLVM: sometimes [DW_OP_deref, DW_OP_stack_value] is used for
+    // variables whose type is a struct bigger than 8 bytes. Taken literally, these instructions say to read 8 bytes
+    // at the address and report the result as the value of the variable, which makes no sense. Usually such address
+    // points to the whole struct, not just its first 8 bytes, so we can report the address without dereferencing it.
+    // (Maybe this will end up in gimli instead: https://github.com/gimli-rs/gimli/pull/738 )
+    if expression.0.slice().len() >= 2 && expression.0.slice().ends_with(&[gimli::constants::DW_OP_deref.0, gimli::constants::DW_OP_stack_value.0]) {
+        expression = Expression(EndianSlice::new(&expression.0.slice()[..expression.0.slice().len() - 2], LittleEndian));
+    }
+
     let mut eval = expression.evaluation(context.encoding);
     let mut result = eval.evaluate()?;
     let mut dubious = false;
