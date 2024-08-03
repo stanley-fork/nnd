@@ -27,6 +27,7 @@ crc32fast = "^1.3.2" # a few things in ELF and DWARF use crc32
 flate2 = "^1.0.26" # for decompressing ELF sections
 md5 = "^0.7" # for checking source file hashes against debug symbols
 cpp_demangle = "^0.4.3" # for demangling function names (unavoidable in .symtab, convenient in .debug_info)
+#cpp_demangle = {path = "/home/al13n/Dropbox/coding/cpp_demangle"}
 rand = "^0.8.5"
 unicode-segmentation = "^1.10"
 unicode-width = "^0.1"

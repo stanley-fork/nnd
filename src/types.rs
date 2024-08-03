@@ -403,6 +403,7 @@ pub struct BuiltinTypes {
     pub i64_: *const TypeInfo,
     pub f32_: *const TypeInfo,
     pub f64_: *const TypeInfo,
+    pub f128_: *const TypeInfo, // not actually supported currently
     pub char8: *const TypeInfo,
     pub char32: *const TypeInfo,
     pub bool_: *const TypeInfo,
@@ -410,10 +411,10 @@ pub struct BuiltinTypes {
     pub meta_field: *const TypeInfo,
 }
 impl BuiltinTypes {
-    pub fn invalid() -> Self { Self {void: ptr::null(), void_pointer: ptr::null(), unknown: ptr::null(), u8_: ptr::null(), u16_: ptr::null(), u32_: ptr::null(), u64_: ptr::null(), i8_: ptr::null(), i16_: ptr::null(), i32_: ptr::null(), i64_: ptr::null(), f32_: ptr::null(), f64_: ptr::null(), char8: ptr::null(), char32: ptr::null(), bool_: ptr::null(), meta_type: ptr::null(), meta_field: ptr::null()} }
+    pub fn invalid() -> Self { Self {void: ptr::null(), void_pointer: ptr::null(), unknown: ptr::null(), u8_: ptr::null(), u16_: ptr::null(), u32_: ptr::null(), u64_: ptr::null(), i8_: ptr::null(), i16_: ptr::null(), i32_: ptr::null(), i64_: ptr::null(), f32_: ptr::null(), f64_: ptr::null(), f128_: ptr::null(), char8: ptr::null(), char32: ptr::null(), bool_: ptr::null(), meta_type: ptr::null(), meta_field: ptr::null()} }
 
     fn map<F: FnMut(*const TypeInfo) -> *const TypeInfo>(&self, mut f: F) -> Self {
-        Self {void: f(self.void), void_pointer: f(self.void_pointer), unknown: f(self.unknown), u8_: f(self.u8_), u16_: f(self.u16_), u32_: f(self.u32_), u64_: f(self.u64_), i8_: f(self.i8_), i16_: f(self.i16_), i32_: f(self.i32_), i64_: f(self.i64_), f32_: f(self.f32_), f64_: f(self.f64_), char8: f(self.char8), char32: f(self.char32), bool_: f(self.bool_), meta_type: f(self.meta_type), meta_field: f(self.meta_field)}
+        Self {void: f(self.void), void_pointer: f(self.void_pointer), unknown: f(self.unknown), u8_: f(self.u8_), u16_: f(self.u16_), u32_: f(self.u32_), u64_: f(self.u64_), i8_: f(self.i8_), i16_: f(self.i16_), i32_: f(self.i32_), i64_: f(self.i64_), f32_: f(self.f32_), f64_: f(self.f64_), f128_: f(self.f128_), char8: f(self.char8), char32: f(self.char32), bool_: f(self.bool_), meta_type: f(self.meta_type), meta_field: f(self.meta_field)}
     }
 
     fn create<F: FnMut(TypeInfo) -> *const TypeInfo>(mut f: F) -> Self {
@@ -433,6 +434,7 @@ impl BuiltinTypes {
             i64_: f(primitive("i64", 8, PrimitiveFlags::SIGNED)),
             f32_: f(primitive("f32", 4, PrimitiveFlags::FLOAT)),
             f64_: f(primitive("f64", 8, PrimitiveFlags::FLOAT)),
+            f128_: f(TypeInfo {name: "<f128 not supported>", size: 16, flags: TypeFlags::SIZE_KNOWN | TypeFlags::BUILTIN, ..Default::default()}),
             char8: f(primitive("char8", 1, PrimitiveFlags::CHAR)),
             char32: f(primitive("char32", 4, PrimitiveFlags::CHAR)),
             bool_: f(primitive("bool", 1, PrimitiveFlags::BOOL)),

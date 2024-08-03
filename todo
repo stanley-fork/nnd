@@ -9,6 +9,7 @@ investigate why many types are not deduped, e.g. there's DB::Block#441
 make stack unwinding work when control is in .plt or .plt.got, see "Recognise PLT entries such as" in libunwind code
 log a message if the process forked away
 when duplicating a watch, add it after current one rather than at the end
+make cpp_demangle support things like "DB8_" ("C23 signed _BitInt(N)"), as in "_ZTVN2DB20AggregateFunctionAvgIDB8_EE"; I guess search for "C23" and "C++23" on https://itanium-cxx-abi.github.io/cxx-abi/abi.html#mangle.decltype and send a PR to cpp_demangle
 
 optimize simple things found by profiler (samply is nice)
 look at profiler on ch server (1500 threads)
@@ -28,7 +29,6 @@ make return key do something in each window: go from threads to stack -> code ->
 "unexpectedly big memory read" (16 bytes) for f64 local variables on the stack in rust
 floating point and simd registers
 allow to put breakpoint on a whole file
-"warning: DW_AT_encoding = DW_ATE_complex_float on DW_TAG_base_type is not supported" (/usr/lib/x86_64-linux-gnu/libm.so.6)
 find function by address (like addr2line)
 show number of function inlined sites in disassembly window, allow setting breakpoint on it, allow opening inline-only functions
 add decl location to TypeInfo and MetaType

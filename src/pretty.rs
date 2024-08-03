@@ -80,7 +80,7 @@ pub fn prettify_value(val: &mut Cow<Value>, warning: &mut Option<Error>, state: 
         new_struct.set_fields(new_fields);
 
         let mut w = state.types.unsorted_type_names.write();
-        write!(w, "{}#pretty", type_.name).unwrap();
+        write!(w, "{}", type_.name).unwrap();
         new_type.name = w.finish_str(0);
 
         let new_type = state.types.types_arena.add(new_type);
@@ -790,7 +790,7 @@ fn recognize_rust_vec(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, 
         let mut builder = StructBuilder::default();
         builder.add_slice_field("part1", ptr + head*inner_size, len.min(cap - head), inner_type, SliceFlags::empty(), &mut state.types);
         builder.add_slice_field("part2", ptr, len.saturating_sub(cap - head), inner_type, SliceFlags::empty(), &mut state.types);
-        let new_val = builder.finish("VecDeque#pretty", val.flags, &mut state.types);
+        let new_val = builder.finish("VecDeque", val.flags, &mut state.types);
         *val = Cow::Owned(new_val);
     } else {
         let is_string = inner_size == 1 && container_name_looks_like_string(val.type_, additional_names);

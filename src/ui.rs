@@ -613,7 +613,12 @@ impl WatchesWindow {
             }
             (&None, Err(e)) if e.is_value_tree_placeholder() => (),
             (&None, Err(e)) => {
-                let l = styled_writeln!(self.tree.text, palette.error, "<{}>", e);
+                let style = if e.is_too_long() {
+                    palette.warning
+                } else {
+                    palette.error
+                };
+                let l = styled_writeln!(self.tree.text, style, "<{}>", e);
                 node.formatted_value[0] = Some(l..l+1);
                 node.formatted_value[1] = Some(l..l+1);
             }

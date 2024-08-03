@@ -2202,6 +2202,7 @@ impl<'a> DwarfLoader<'a> {
                         _ => panic!("huh?") };
                     let mut info = TypeInfo {die: offset, t, language: self.unit_language, ..Default::default()};
                     let mut saw_type = false;
+                    let mut is_complex_float = false;
                     for &attr in abbrev.attributes() {
                         match attr.name() {
                             DW_AT_name => {
@@ -2251,7 +2252,8 @@ impl<'a> DwarfLoader<'a> {
                                                 DW_ATE_unsigned => (),
                                                 DW_ATE_unsigned_char => p.insert(PrimitiveFlags::CHAR),
                                                 DW_ATE_UTF | DW_ATE_UCS | DW_ATE_ASCII => p.insert(PrimitiveFlags::CHAR | if self.unit_language.presumably_cpp() {PrimitiveFlags::AMBIGUOUS_CHAR} else {PrimitiveFlags::empty()}),
-                                                //DW_ATE_complex_float | DW_ATE_packed_decimal | DW_ATE_numeric_string | DW_ATE_edited | DW_ATE_signed_fixed | DW_ATE_unsigned_fixed | DW_ATE_decimal_float
+                                                DW_ATE_complex_float => is_complex_float = true,
+                                                //DW_ATE_packed_decimal | DW_ATE_numeric_string | DW_ATE_edited | DW_ATE_signed_fixed | DW_ATE_unsigned_fixed | DW_ATE_decimal_float
                                                 _ => {
                                                     if self.shard.warn.check(line!()) { eprintln!("warning: {} = {} on {} is not supported", attr.name(), e, abbrev.tag()); }
                                                     info.flags.insert(TypeFlags::UNSUPPORTED);
@@ -2287,6 +2289,32 @@ impl<'a> DwarfLoader<'a> {
                         self.append_namespace_to_scope_name("_", false);
                     }
 
+                    if is_complex_float {
+                        // Treat complex float as a struct rather than primitive type.
+                        let inner_size = if !info.flags.contains(TypeFlags::SIZE_KNOWN) {
+                            if self.shard.warn.check(line!()) { eprintln!("warning: DW_ATE_complex_float without size @0x{:x}", offset.0); }
+                            8
+                        } else if info.size != 8 && info.size != 16 && info.size != 32 {
+                            if self.shard.warn.check(line!()) { eprintln!("warning: DW_ATE_complex_float with unexpected size: {} @0x{:x}", info.size, offset.0); }
+                            8
+                        } else {
+                            info.size / 2
+                        };
+                        let inner_type = match inner_size {
+                            4 => self.loader.types.builtin_types.f32_,
+                            8 => self.loader.types.builtin_types.f64_,
+                            16 => self.loader.types.builtin_types.f128_,
+                            _ => panic!("huh"),
+                        };
+                        let fields = [
+                            StructField {name: "real", flags: FieldFlags::empty(), bit_offset: 0, bit_size: 0, type_: inner_type, discr_value: 0},
+                            StructField {name: "imag", flags: FieldFlags::empty(), bit_offset: inner_size * 8, bit_size: 0, type_: inner_type, discr_value: 0}];
+                        let fields = self.shard.types.temp_types.fields_arena.add_slice(&fields);
+                        let mut struct_type = StructType::default();
+                        struct_type.set_fields(fields);
+                        info.t = Type::Struct(struct_type);
+                    }
+
                     if !saw_type {
                         // Pointer without DW_AT_type is a void*
                         match &mut info.t {
@@ -2305,19 +2333,22 @@ impl<'a> DwarfLoader<'a> {
                     }
 
                     if abbrev.tag() == DW_TAG_base_type {
-                        let flags = info.t.as_primitive().unwrap();
-                        let type_enum = match info.size {
-                            8 if flags.contains(PrimitiveFlags::FLOAT) => ValueType::F64,
-                            8 if flags.contains(PrimitiveFlags::SIGNED) => ValueType::I64,
-                            8 => ValueType::U64,
-                            4 if flags.contains(PrimitiveFlags::FLOAT) => ValueType::F32,
-                            4 if flags.contains(PrimitiveFlags::SIGNED) => ValueType::I32,
-                            4 => ValueType::U32,
-                            2 if flags.contains(PrimitiveFlags::SIGNED) => ValueType::I16,
-                            2 => ValueType::U16,
-                            1 if flags.contains(PrimitiveFlags::SIGNED) => ValueType::I8,
-                            1 => ValueType::U8,
-                            _ => ValueType::Generic, // unexpected
+                        let type_enum = if let &Type::Primitive(flags) = &info.t {
+                            match info.size {
+                                8 if flags.contains(PrimitiveFlags::FLOAT) => ValueType::F64,
+                                8 if flags.contains(PrimitiveFlags::SIGNED) => ValueType::I64,
+                                8 => ValueType::U64,
+                                4 if flags.contains(PrimitiveFlags::FLOAT) => ValueType::F32,
+                                4 if flags.contains(PrimitiveFlags::SIGNED) => ValueType::I32,
+                                4 => ValueType::U32,
+                                2 if flags.contains(PrimitiveFlags::SIGNED) => ValueType::I16,
+                                2 => ValueType::U16,
+                                1 if flags.contains(PrimitiveFlags::SIGNED) => ValueType::I8,
+                                1 => ValueType::U8,
+                                _ => ValueType::Generic, // unexpected
+                            }
+                        } else {
+                            ValueType::Generic // probably a 16-byte complex float, not really supported by gimli; use 8-byte Generic instead
                         };
                         debug_assert!(mem::size_of::<ValueType>() == 1);
                         self.shard.base_types.push((offset.0 as u64) << 8 | type_enum as u64);
@@ -2458,8 +2489,8 @@ impl<'a> DwarfLoader<'a> {
                         array = unsafe {(*self.stack[self.depth - 1].exact_type).t.as_array_mut().unwrap()};
                     }
 
-                    let mut lower_bound: i64 = 0;
-                    let mut upper_bound: Option<i64> = None;
+                    let mut lower_bound: u64 = 0;
+                    let mut upper_bound: Option<u64> = None;
                     for &attr in abbrev.attributes() {
                         match attr.name() {
                             DW_AT_byte_stride | DW_AT_bit_stride => if let Some(s) = parse_attr_stride(cursor.read_attribute(attr)?, offset, &mut self.shard.warn) {
@@ -2472,7 +2503,7 @@ impl<'a> DwarfLoader<'a> {
                                     array.flags.insert(ArrayFlags::LEN_KNOWN);
                                 }
                             }
-                            DW_AT_lower_bound => match cursor.read_attribute(attr)?.value().sdata_value() {
+                            DW_AT_lower_bound => match cursor.read_attribute(attr)?.value().udata_value() {
                                 None => (), // likely VLA
                                 Some(s) => {
                                     if s != 0 && self.shard.warn.check(line!()) { eprintln!("warning: arrays with nonzero lower bound are not supported (have one @0x{:x})", offset.0); }
@@ -2480,7 +2511,7 @@ impl<'a> DwarfLoader<'a> {
                                     lower_bound = s;
                                 }
                             }
-                            DW_AT_upper_bound => match cursor.read_attribute(attr)?.value().sdata_value() {
+                            DW_AT_upper_bound => match cursor.read_attribute(attr)?.value().udata_value() {
                                 None => (), // likely VLA
                                 Some(s) => upper_bound = Some(s),
                             }

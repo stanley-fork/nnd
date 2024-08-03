@@ -114,5 +114,36 @@ int main() {
 
     t.join();
 
+
+    // Make everything big.
+    std::vector<std::vector<std::complex<double>>> mat;
+    for (int i = 0; i < 1000000; ++i) {
+        vec.push_back(i * 10);
+        long_str.push_back((char)('a'+__builtin_popcount(i)));
+        deq.push_back(i * 11);
+        stk.push(i * 12);
+        lst.push_back(i * 13);
+        flst.push_front(i * 14);
+        set.insert(i * 15);
+        mset.insert(i / 10);
+        map.emplace(i * 16, std::to_string(i * 160));
+        mmap.emplace(i / 5, std::to_string(i / 5 * 10));
+        uset.insert(i * 17);
+        umset.insert(i / 6);
+        umap.emplace(i * 18, std::to_string(i * 180));
+        ummap.emplace(i / 4, std::to_string(i / 4 * 10));
+
+        int row = i / 1000;
+        mat.resize(row + 1);
+        mat[row].emplace_back((double)i, (double)(i/10));
+    }
+    auto big_array = std::make_unique<std::array<int, 1000000>>();
+
+    volatile int dummy2 = vec[0] + arr[0] + *uptr + *sptr + short_str[0] + long_str[0] + pair.first + std::get<0>(tuple) + 
+        *opt + (int)std::get<double>(var) + std::any_cast<int>(any_val) + func(1) + 
+        bits.count() + c.real() + va[0] + sp[0] + *range.begin() + strview[0] + 
+        wstr[0] + u16str[0] + u32str[0] + (*pv)[0] + mat.size() + mat[10].size();
+    (void)dummy2;
+
     return 0;
 }
