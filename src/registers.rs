@@ -33,21 +33,20 @@ pub enum RegisterIdx {
     R14 = 14,
     R15 = 15,
     Rip = 16,
-    Es = 17,
-    Cs = 18,
-    Ss = 19,
-    Ds = 20,
-    Fs = 21,
-    Gs = 22,
-    FsBase = 23,
-    GsBase = 24,
+    Cs = 17,
+    Ss = 18,
+    Fs = 19,
+    Gs = 20,
+    FsBase = 21,
+    GsBase = 22,
+
     // Other things in user_regs_struct. Not actually registers.
-    Eflags = 25,
-    OrigRax = 26, // as in user_regs_struct
+    Flags = 23,
+    OrigRax = 24, // as in user_regs_struct
 
     // Other things for unwinding. Not actually registers.
-    Cfa = 27, // Canonical Frame Address from .eh_frame
-    Ret = 28, // return address according to .eh_frame
+    Cfa = 25, // Canonical Frame Address from .eh_frame
+    Ret = 26, // return address according to .eh_frame
 }
 
 impl RegisterIdx {
@@ -57,9 +56,13 @@ impl RegisterIdx {
     pub fn from_dwarf(r: gimli::Register) -> Option<RegisterIdx> {
         match r.0 {
             0..=16 => Some(unsafe {mem::transmute(r.0 as u8)}),
-            50..=55 => Some(unsafe {mem::transmute((r.0 - 50 + RegisterIdx::Es as u16) as u8)}),
-            58..=59 => Some(unsafe {mem::transmute((r.0 - 58 + RegisterIdx::FsBase as u16) as u8)}),
-            49 => Some(RegisterIdx::Eflags),
+            49 => Some(RegisterIdx::Flags),
+            51 => Some(RegisterIdx::Cs),
+            52 => Some(RegisterIdx::Ss),
+            54 => Some(RegisterIdx::Fs),
+            55 => Some(RegisterIdx::Gs),
+            58 => Some(RegisterIdx::FsBase),
+            59 => Some(RegisterIdx::GsBase),
             _ => None,
         }
     }
@@ -77,14 +80,24 @@ impl RegisterIdx {
     }
 }
 
-pub const REGISTER_IDXS: [RegisterIdx; RegisterIdx::TOTAL_COUNT] =  [RegisterIdx::Rax, RegisterIdx::Rdx, RegisterIdx::Rcx, RegisterIdx::Rbx, RegisterIdx::Rsi, RegisterIdx::Rdi, RegisterIdx::Rbp, RegisterIdx::Rsp, RegisterIdx::R8, RegisterIdx::R9, RegisterIdx::R10, RegisterIdx::R11, RegisterIdx::R12, RegisterIdx::R13, RegisterIdx::R14, RegisterIdx::R15, RegisterIdx::Rip, RegisterIdx::Es, RegisterIdx::Cs, RegisterIdx::Ss, RegisterIdx::Ds, RegisterIdx::Fs, RegisterIdx::Gs, RegisterIdx::FsBase, RegisterIdx::GsBase, RegisterIdx::Eflags, RegisterIdx::OrigRax, RegisterIdx::Cfa, RegisterIdx::Ret];
-pub const REGISTER_NAMES: [&'static str; RegisterIdx::TOTAL_COUNT] = ["rax", "rdx", "rcx", "rbx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip", "es", "cs", "ss", "ds", "fs", "gs", "fs_base", "gs_base", "eflags", "orig_rax", "cfa", "ret"];
+pub const REGISTER_IDXS: [RegisterIdx; RegisterIdx::TOTAL_COUNT] =  [RegisterIdx::Rax, RegisterIdx::Rdx, RegisterIdx::Rcx, RegisterIdx::Rbx, RegisterIdx::Rsi, RegisterIdx::Rdi, RegisterIdx::Rbp, RegisterIdx::Rsp, RegisterIdx::R8, RegisterIdx::R9, RegisterIdx::R10, RegisterIdx::R11, RegisterIdx::R12, RegisterIdx::R13, RegisterIdx::R14, RegisterIdx::R15, RegisterIdx::Rip, RegisterIdx::Cs, RegisterIdx::Ss, RegisterIdx::Fs, RegisterIdx::Gs, RegisterIdx::FsBase, RegisterIdx::GsBase, RegisterIdx::Flags, RegisterIdx::OrigRax, RegisterIdx::Cfa, RegisterIdx::Ret];
+pub const REGISTER_NAMES: [&'static str; RegisterIdx::TOTAL_COUNT] = ["rax", "rdx", "rcx", "rbx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip", "cs", "ss", "fs", "gs", "fs_base", "gs_base", "flags", "orig_rax", "cfa", "ret"];
 
 impl Registers {
     pub fn from_ptrace(s: &libc::user_regs_struct) -> Self {
         Registers {
-            ints: [s.rax, s.rdx, s.rcx, s.rbx, s.rsi, s.rdi, s.rbp, s.rsp, s.r8, s.r9, s.r10, s.r11, s.r12, s.r13, s.r14, s.r15, s.rip, s.es, s.cs, s.ss, s.ds, s.fs, s.gs, s.fs_base, s.gs_base, s.eflags, s.orig_rax, 0, 0],
+            ints: [s.rax, s.rdx, s.rcx, s.rbx, s.rsi, s.rdi, s.rbp, s.rsp, s.r8, s.r9, s.r10, s.r11, s.r12, s.r13, s.r14, s.r15, s.rip, s.cs, s.ss, s.fs, s.gs, s.fs_base, s.gs_base, s.eflags, s.orig_rax, 0, 0],
             mask: (1u64 << (RegisterIdx::OrigRax as u32 + 1)) - 1,
+            dubious_mask: 0,
+        }
+    }
+
+    // From sigcontext_64, aka libc::mcontext_t.gregs
+    pub fn from_context(r: &[u64; 23]) -> Self {
+        // TODO: Take FsBase and GsBase from fpstate, it's used for TLS.
+        Registers {
+            ints: [r[13], r[12], r[14], r[11], r[9], r[8], r[10], r[15], r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[16], r[18] & 0xffff, r[18] >> 48, (r[18] >> 32) & 0xffff, (r[18] >> 16) & 0xffff, 0, 0, r[17], 0, 0, 0],
+            mask: ((1u64 << (RegisterIdx::Flags as u32 + 1)) - 1) & !(1 << RegisterIdx::FsBase as u32) & !(1 << RegisterIdx::GsBase as u32),
             dubious_mask: 0,
         }
     }

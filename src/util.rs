@@ -671,3 +671,47 @@ impl<T: Ord+Copy> SetMinMax for T {
         *self = std::cmp::max(*self, other);
     }
 }
+
+// copy_from_slice() is very slow for short slices of variable length because it does a function call, so here's a hack to make it a little faster.
+// (Maybe we should enforce padding of strings everywhere and then it'll be just a 4-byte load+store.)
+#[inline]
+pub fn small_memcpy(from: &[u8], to: &mut [u8; 4]) {
+    match from.len() {
+        1 => to[0] = from[0],
+        2 => to[..2].copy_from_slice(from),
+        3 => to[..3].copy_from_slice(from),
+        4 => to.copy_from_slice(from),
+        _ => panic!("unexpected small_memcpy length"),
+    }
+}
+
+// String's fmt::Write::write_char implementation is slow because it copies the character using variable-length copy_from_slice(), which does non-inlined memcpy call.
+// This wrapper works around it.
+pub struct FmtString<'a> {
+    pub s: &'a mut String,
+}
+impl<'a> FmtString<'a> {
+    pub fn new(s: &'a mut String) -> Self { Self {s} }
+}
+impl fmt::Write for FmtString<'_> {
+    #[inline]
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.s.push_str(s);
+        Ok(())
+    }
+
+    #[inline]
+    fn write_char(&mut self, c: char) -> fmt::Result {
+        unsafe {
+            let v = self.s.as_mut_vec();
+            let mut buf = [0u8; 4];
+            let bp = buf.as_ptr();
+            let s = c.encode_utf8(&mut buf);
+            assert_eq!(s.as_ptr(), bp);
+            v.reserve(4);
+            ptr::copy_nonoverlapping(bp, v.spare_capacity_mut().as_ptr() as *mut u8, 4);
+            v.set_len(v.len() + s.len());
+        }
+        Ok(())
+    }
+}

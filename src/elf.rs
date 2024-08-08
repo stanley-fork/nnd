@@ -51,6 +51,7 @@ pub struct ElfFile {
 
     pub section_by_offset: Vec<(usize, usize, usize)>, // (offset, offset + size, index in `sections`), sorted, only mapped sections with nonzero size in file are included
     pub section_by_name: HashMap<String, usize>,
+    pub text_section: Option<usize>,
 
     mmapped: Option<Mmap>,
     owned: Vec<u8>,
@@ -86,16 +87,6 @@ impl ElfFile {
         // We don't check for unterminated strings or invalid utf8, for speed.
         // This is fine, we're not trying to be secure to adversarial attacks here, and files in practice are not going to be malformed in this way.
         std::str::from_utf8_unchecked(self.bytes_from_strtab(section_offset, offset))
-    }
-
-    pub fn offset_to_addr(&self, offset: usize) -> Option<usize> {
-        let idx = self.section_by_offset.partition_point(|t| t.1 <= offset);
-        if idx < self.section_by_offset.len() && self.section_by_offset[idx].0 <= offset {
-            let section = &self.sections[self.section_by_offset[idx].2];
-            Some(offset - section.offset + section.address)
-        } else {
-            None
-        }
     }
 
     pub fn addr_to_offset(&self, addr: usize) -> Option<usize> {
@@ -270,7 +261,7 @@ fn open_elf(name: String, mmapped: Option<Mmap>, owned: Vec<u8>) -> Result<ElfFi
     }
 
     let data: &'static [u8] = unsafe {mem::transmute(data)};
-    let mut elf = ElfFile {name, mmapped, owned, data, segments, sections, entry_point, section_by_offset: Vec::new(), section_by_name: HashMap::new()};
+    let mut elf = ElfFile {name, mmapped, owned, data, segments, sections, entry_point, section_by_offset: Vec::new(), section_by_name: HashMap::new(), text_section: None};
 
     for idx in 0..elf.sections.len() {
         let name = unsafe{elf.str_from_strtab(elf.sections[section_names_section_idx].offset, elf.sections[idx].name_offset_in_strtab as usize)}.to_string();
@@ -331,6 +322,8 @@ fn open_elf(name: String, mmapped: Option<Mmap>, owned: Vec<u8>) -> Result<ElfFi
             eprintln!("warning: ELF has overlapping sections: {} is [{}, {}), {} is [{}, {})", elf.sections[prev.2].name, prev.0, prev.1, elf.sections[cur.2].name, cur.0, cur.1);
         }
     }
+
+    elf.text_section = elf.section_by_name.get(".text").copied();
 
     Ok(elf)
 }

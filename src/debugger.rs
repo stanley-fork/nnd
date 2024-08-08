@@ -1432,13 +1432,19 @@ impl Debugger {
 
             // Would be nice to fall back to unwinding using some default ABI (rbp and callee cleanup, or something).
             // But for now we just stop if we can't find the binary (may be a problem for JIT-generated code) or .eh_frame section in it.
-            let (_, static_pseudo_addr, binary, _) = self.addr_to_binary(pseudo_addr)?;
+            let (_, mut static_pseudo_addr, binary, _) = self.addr_to_binary(pseudo_addr)?;
             frame.binary_id = Some(binary.id.clone());
             frame.addr_static_to_dynamic = binary.addr_map.static_to_dynamic(static_pseudo_addr).wrapping_sub(static_pseudo_addr);
 
             // This populates CFA "register", so needs to happen before symbolizing the frame (because frame_base expression might use CFA).
             let unwind = binary.unwind.as_ref_clone_error()?;
-            let step_result = unwind.step(&self.memory, &binary.addr_map, &mut scratch, pseudo_addr, &mut frame.regs);
+            let step_result = unwind.step(&self.memory, &binary.addr_map, &mut scratch, pseudo_addr, &mut frame.regs, &**binary.elf.as_ref().unwrap());
+
+            if step_result.as_ref().is_ok_and(|(_, is_signal_trampoline)| *is_signal_trampoline) {
+                // Un-decrement the instruction pointer, there's no `call` in signal trampoline.
+                frame.pseudo_addr = frame.regs.get_int(RegisterIdx::Rip).unwrap().0 as usize;
+                static_pseudo_addr = binary.addr_map.dynamic_to_static(frame.pseudo_addr);
+            }
 
             self.symbolize_stack_frame(static_pseudo_addr, binary, frame, &mut stack.subframes);
 

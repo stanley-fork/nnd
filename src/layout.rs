@@ -20,7 +20,8 @@ pub struct Layout {
     // to draw where. Screen coordinates -> bitset describing styles for the 4 cardinal directions (left, right, up, down):
     //  * bits 0-3 - which lines to draw,
     //  * bits 4-7 - which lines are bold.
-    wall_masks: Vec<([isize; 2], usize)>,
+    wall_masks: Vec<u8>,
+    wall_area: Rect, // area covered by wall_masks
 }
 
 pub type WindowId = Id;
@@ -95,7 +96,7 @@ impl Layout {
         let root = regions.add(Region {parent: None, area: Rect::default(), content: RegionContent::Leaf(RegionLeaf::default()), relative_size: 1000000, outer_walls: [[WidgetIdx::invalid(); 2]; 2]}).0;
         let outer_walls = [[true, true], [true, true]]; // all walls along the edge of the screen
         // let outer_walls = [[false, false], [true, false]]; // only the top wall
-        Layout {windows: Pool::new(), active_window: None, regions, root, outer_walls, root_widget: WidgetIdx::invalid(), wall_masks: Vec::new(), wall_widgets: Vec::new(), active_leaf: RegionId::default()}
+        Layout {windows: Pool::new(), active_window: None, regions, root, outer_walls, root_widget: WidgetIdx::invalid(), wall_area: Rect::default(), wall_masks: Vec::new(), wall_widgets: Vec::new(), active_leaf: RegionId::default()}
     }
 
     pub fn split(&mut self, region_id: RegionId, axis: usize, walls: Vec<f64>) -> Vec<RegionId> {
@@ -282,28 +283,36 @@ impl Layout {
         wall_widgets.push(idx);
         idx                                                                                                                                                                               
     }
-    fn trace_wall(axis: usize, area: Rect, pos: isize, bold: bool, wall_masks: &mut Vec<([isize; 2], usize)>) {
+    #[inline]
+    fn wall_masks_idx(x: isize, y: isize, wall_area: &Rect) -> usize {
+        (x - wall_area.x()) as usize + (y - wall_area.y()) as usize * wall_area.width()
+    }
+    fn trace_wall(axis: usize, area: Rect, pos: isize, bold: bool, wall_masks: &mut Vec<u8>, wall_area: &Rect) {
         let len = area.size[1-axis];
         let mut p = area.pos;
         p[axis] += pos;
 
+        let write_wall_mask = |p: [isize; 2], val: u8, masks: &mut Vec<u8>, area: &Rect| {
+            masks[(p[0]-area.pos[0]) as usize + (p[1]-area.pos[1]) as usize * area.width()] |= val;
+        };
+
         let base = if bold {4} else {0};
         let mask = match axis {
             Axis::Y => {
-                wall_masks.push(([p[0] - 1, p[1]], 2 << base));
-                wall_masks.push(([p[0] + len as isize, p[1]], 1 << base));
+                wall_masks[Self::wall_masks_idx(p[0] - 1, p[1], wall_area)] |= 2 << base;
+                wall_masks[Self::wall_masks_idx(p[0] + len as isize, p[1], wall_area)] |= 1 << base;
                 3 << base
             }
             _ => {
-                wall_masks.push(([p[0], p[1] - 1], 8 << base));
-                wall_masks.push(([p[0], p[1] + len as isize], 4 << base));
+                wall_masks[Self::wall_masks_idx(p[0], p[1] - 1, wall_area)] |= 8 << base;
+                wall_masks[Self::wall_masks_idx(p[0], p[1] + len as isize, wall_area)] |= 4 << base;
                 12 << base
             }
         };
         for i in 0..len {
             let mut pp = p;
             pp[1-axis] += i as isize;
-            wall_masks.push((pp, mask));
+            wall_masks[Self::wall_masks_idx(pp[0], pp[1], wall_area)] |= mask;
         }
     }
 
@@ -357,7 +366,6 @@ impl Layout {
 
         self.root_widget = ui.cur_parent;
         self.wall_widgets.clear();
-        self.wall_masks.clear();
         for (_, win) in self.windows.iter_mut() {
             win.clear_layout();
         }
@@ -382,13 +390,16 @@ impl Layout {
                 }
             }
         }
+        self.wall_area = Rect {pos: [area.pos[0]-1, area.pos[1]-1], size: [area.size[0]+2, area.size[1]+2]}; // add space for outer wall
+        self.wall_masks.clear();
+        self.wall_masks.resize(self.wall_area.width() * self.wall_area.height(), 0u8);
         let root = self.regions.get_mut(self.root);
         root.area = area;
         for axis in 0..2 {
             for side in 0..2 {
                 let pos = if side == 0 {-1} else {area.size[axis] as isize};
                 let w = Self::build_wall(axis, area, pos, hash(&('o', axis, side)), &mut self.wall_widgets, ui);
-                Self::trace_wall(axis, area, pos, false, &mut self.wall_masks);
+                Self::trace_wall(axis, area, pos, false, &mut self.wall_masks, &self.wall_area);
                 root.outer_walls[axis][side] = w;
                 // Cover the corners.
                 if axis == 0 {
@@ -456,28 +467,19 @@ impl Layout {
         for axis in 0..2 {
             for side in 0..2 {
                 let pos = if side == 0 {-1} else {area.size[axis] as isize};
-                let w = Self::trace_wall(axis, area, pos, true, &mut self.wall_masks);
+                let w = Self::trace_wall(axis, area, pos, true, &mut self.wall_masks, &self.wall_area);
             }
         }
 
         // Draw walls: aggregate the information in wall_masks and put chars into wall widgets.
-        self.wall_masks.sort_unstable();
         for &idx in &self.wall_widgets {
             let w = ui.get(idx);
             let x_range = w.axes[Axis::X].get_fixed_range();
             let start_line = ui.text.num_lines();
             for y in w.axes[Axis::Y].get_fixed_range() {
                 for x in x_range.clone() {
-                    // OR the bit masks for this cell.
-                    let pos = [x, y];
-                    let mut i = self.wall_masks.partition_point(|(p, _)| p < &pos);
-                    let mut mask = 0usize;
-                    while i < self.wall_masks.len() && self.wall_masks[i].0 == pos {
-                        mask |= self.wall_masks[i].1;
-                        i += 1;
-                    }
-
-                    let c = BOX_DRAWING_LUT[mask];
+                    let mask = self.wall_masks[Self::wall_masks_idx(x, y, &self.wall_area)];
+                    let c = BOX_DRAWING_LUT[mask as usize];
                     let style = if mask >= 16 {ui.palette.window_border_active} else {ui.palette.window_border};
                     styled_write!(ui.text, style, "{}", c);
                 }
@@ -649,7 +651,7 @@ impl Layout {
             let pos = calculate_wall_pos(i, &cumsum).0;
             walls[i].1 = pos;
             ui.get_mut(walls[i].0).axes[axis].rel_pos = region.area.pos[axis] + pos;
-            Self::trace_wall(axis, region.area, pos, false, &mut self.wall_masks);
+            Self::trace_wall(axis, region.area, pos, false, &mut self.wall_masks, &self.wall_area);
         }
 
         // Propagate information to children.

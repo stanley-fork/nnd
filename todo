@@ -1,9 +1,6 @@
-reordering tabs
-rearranging windows
-maximizing windows
-
+investigate `clickhouse local` progress spinner appearing in debugger window despite -t
+recognize musl __restore_rt
 fix empty symbols loading stage name near the end
-fix picking up updated binary unnecessarily
 investigate regression in symbols loading speed (stuck on "parsing drawf" for ~10 seconds)
 investigate why many types are not deduped, e.g. there's DB::Block#441
 make stack unwinding work when control is in .plt or .plt.got, see "Recognise PLT entries such as" in libunwind code
@@ -21,9 +18,13 @@ test with 10k threads
   maybe avoid duplicate POKEUSER calls for debug registers if the thread already had them assigned
 test with watches window filled with long arrays (I saw 50ms frames when there are ~5 of them; maybe just decrease length limit)
 
+instruction breakpoints
+reordering tabs
+rearranging windows
+maximizing windows
+ability to save value in watches window
 tooltip in status window showing more log lines with line wrapping
 key to send SIGINT to the program
-instruction breakpoints
 option to load symbols from another file (unstripped executable) - will make it usable in ch cloud
 make return key do something in each window: go from threads to stack -> code -> disassembly -> code; from locals create a watch; from watch sub-value create another watch for that field/element; from breakpoints to code/disassembly/watch (depending on breakpoint type)
 "unexpectedly big memory read" (16 bytes) for f64 local variables on the stack in rust

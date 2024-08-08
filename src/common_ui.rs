@@ -1,4 +1,4 @@
-use crate::{imgui::Axis};
+use crate::{imgui::Axis, util::FmtString};
 use std::{ops::Range, fmt::Write as fmtWrite};
 use bitflags::*;
 use unicode_segmentation::UnicodeSegmentation;
@@ -163,7 +163,7 @@ pub struct StyledText {
 macro_rules! styled_write {
     ($out:expr, $style:expr, $($arg:tt)*) => {{
         use std::fmt::Write as f;
-        let _ = write!(($out).chars, $($arg)*);
+        let _ = write!(FmtString {s: &mut ($out).chars}, $($arg)*);
         ($out).close_span($style);
     }};
 }
@@ -172,7 +172,7 @@ macro_rules! styled_write {
 macro_rules! styled_writeln {
     ($out:expr, $style:expr, $($arg:tt)*) => {{
         use std::fmt::Write as f;
-        let _ = write!(($out).chars, $($arg)*);
+        let _ = write!(FmtString {s: &mut ($out).chars}, $($arg)*);
         ($out).close_span($style);
         ($out).close_line()
     }};

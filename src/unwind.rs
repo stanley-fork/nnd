@@ -212,7 +212,11 @@ impl UnwindInfo {
     }
 
     // Assigns cfa and return address in current frame and returns registers for next frame.
-    pub fn step(&self, memory: &MemReader, addr_map: &AddrMap, scratch: &mut UnwindScratchBuffer, pseudo_addr: usize, regs: &mut Registers) -> Result<(Registers, /*is_signal_trampoline*/ bool)> {
+    pub fn step(&self, memory: &MemReader, addr_map: &AddrMap, scratch: &mut UnwindScratchBuffer, pseudo_addr: usize, regs: &mut Registers, elf: &ElfFile) -> Result<(Registers, /*is_signal_trampoline*/ bool)> {
+        if let Some(r) = self.step_through_sig_return(memory, addr_map, regs, elf)? {
+            return Ok((r, true));
+        }
+
         let (fde, row, cfa, cfa_dubious, section) = self.find_row_and_eval_cfa(memory, addr_map, scratch, pseudo_addr, regs)?;
         regs.set_int(RegisterIdx::Cfa, cfa as u64, cfa_dubious);
 
@@ -288,6 +292,50 @@ impl UnwindInfo {
         }
 
         Ok((new_regs, fde.is_signal_trampoline()))
+    }
+
+    fn step_through_sig_return(&self, memory: &MemReader, addr_map: &AddrMap, regs: &mut Registers, elf: &ElfFile) -> Result<Option<Registers>> {
+        // Recognize signal trampoline machine code, like GDB does. Because some libc implementations (musl) don't have correct DWARF unwind information for this function.
+        const CODE: [u8; 9] = [
+            0x48u8, 0xc7, 0xc0, 0x0f, 0x00, 0x00, 0x00, // mov rax, 15
+            0x0f, 0x05                                  // syscall
+        ];
+        const MID: usize = 7usize; // size of the first instruction
+
+        let pc = regs.get_int(RegisterIdx::Rip).unwrap().0 as usize;
+        let pc = addr_map.dynamic_to_static(pc);
+        // Read the machine code from file rather than memory to avoid our breakpoint instructions. And it's probably faster because we have it mmapped.
+        let section_idx = match &elf.text_section {
+            None => return Ok(None),
+            &Some(x) => x };
+        let section = &elf.sections[section_idx];
+        if pc < section.address || pc >= section.address + section.size {
+            return Ok(None);
+        }
+        let pos = pc - section.address;
+        let data = elf.section_data(section_idx);
+
+        let matches = match data[pos] {
+            x if x == CODE[0] => pos + CODE.len() <= data.len() && &CODE == &data[pos..pos+CODE.len()],
+            x if x == CODE[MID] => pos >= MID && pos-MID+CODE.len() <= data.len() && &CODE == &data[pos-MID..pos-MID+CODE.len()],
+            _ => false,
+        };
+        if !matches {
+            return Ok(None);
+        }
+        if !regs.has(RegisterIdx::Rsp) {
+            return Ok(None);
+        }
+
+        let offset = regs.get_int(RegisterIdx::Rsp).unwrap().0 as usize + offsetof!(libc::ucontext_t, uc_mcontext.gregs);
+        let mut gregs = [0u64; 23];
+        unsafe {
+            let size = gregs.len() * 8;
+            let slice = std::slice::from_raw_parts_mut(gregs.as_mut_ptr() as *mut u8, size);
+            memory.read(offset, slice)?;
+        }
+
+        Ok(Some(Registers::from_context(&gregs)))
     }
 }
 

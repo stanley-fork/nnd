@@ -1,4 +1,4 @@
-use crate::{*, common_ui::*, error::*, log::*};
+use crate::{*, common_ui::*, error::*, log::*, util::*};
 use std::{result, io, mem, sync::atomic::{AtomicBool, Ordering}, cell::UnsafeCell, io::Write, str, str::FromStr, fmt, fmt::{Display, Formatter}};
 use bitflags::*;
 use unicode_segmentation::UnicodeSegmentation;
@@ -53,7 +53,8 @@ impl ScreenBuffer {
 
         let mut data = [0u8; 4];
         if s.len() <= 4 {
-            data[..s.len()].copy_from_slice(s.as_bytes());
+            //data[..s.len()].copy_from_slice(s.as_bytes());
+            small_memcpy(s.as_bytes(), &mut data);
         } else {
             assert!(self.long_graphemes.len() + s.len() < u32::MAX as usize);
             data = (self.long_graphemes.len() as u32).to_le_bytes();

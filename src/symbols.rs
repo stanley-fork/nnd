@@ -134,8 +134,8 @@ pub struct Symbols {
     pub units: Vec<CompilationUnit>,
 
     // Indexes to map addresses (in debuggee's virtual address space) to stuff.
-    // Keep in mind that these assume section addresses as defined in ELF file, which are different from addresses at runtime.
-    // Use MemMapsInfo addr_to_map() and ElfFile offset_to_addr() to convert.
+    // Keep in mind that these assume segment addresses as defined in ELF file, which are different from addresses at runtime.
+    // We call these "static" and "dynamic" addresses.
 
     // Deduplicated source code files. Expect tens of thousands of these.
     pub files: Vec<FileInfo>,
