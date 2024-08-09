@@ -109,7 +109,6 @@ impl DebuggerUI {
         let state = UIState::default();
         //state.profiler_enabled = true;
         let layout = Self::default_layout(&state);
-        // TODO: Load keys and colors from config file(s), do hot-reloading (for experimenting with colors quickly).
 
         Self {terminal: Terminal::new(), input: InputReader::new(), layout, ui, state, should_drop_caches: false, should_quit: false}
     }
@@ -1254,17 +1253,6 @@ impl LocationsWindow {
     }
 }
 
-// Identifying information about a function, suitable for writing to the save file.
-// We want both more specific and less specific information here.
-// Less specific (e.g. name) to be likely to find the function if the binary changed a little.
-// Specific (e.g. address) to be able to find the exactly correct function if the binary hasn't changed.
-struct DisassemblyFunctionLocator {
-    binary_id: BinaryId,
-    mangled_name: Vec<u8>,
-    demangled_name: String,
-    addr: FunctionAddr,
-}
-
 #[derive(Default)]
 struct DisassemblyTab {
     title: String,
@@ -1277,7 +1265,7 @@ struct DisassemblyTab {
     //  * locator is Some, error is None, cached_function_idx is None - didn't try finding the function yet (loaded from save file) or the Symbols was deloaded,
     //  * locator is Some, error is None, cached_function_idx is Some - found the function is Symbols.
     // The symbols_identity needs to be re-checked before using the function_idx, in case Symbols gets reloaded for the same BinaryId (which invalidates function_idx due to nondeterminism).
-    locator: Option<DisassemblyFunctionLocator>,
+    locator: Option<FunctionLocator>,
     error: Option<Error>,
     cached_function_idx: Option<(/*symbols_identity*/ usize, /*function_idx*/ usize)>,
 
@@ -1318,13 +1306,13 @@ impl DisassemblyWindow {
             }
         }
 
-        let binary = Self::find_binary(&target.binary_id, debugger)?;
+        let binary = Debugger::find_binary_fuzzy(&debugger.info, Some(&debugger.symbols), &target.binary_id)?;
         let symbols = binary.symbols.as_ref_clone_error()?;
         let function = &symbols.functions[target.function_idx];
         let demangled_name = function.demangle_name();
         let title = Self::make_title(&demangled_name);
         self.tabs.push(DisassemblyTab {
-            identity: random(), locator: Some(DisassemblyFunctionLocator {binary_id: binary.id.clone(), mangled_name: function.mangled_name().to_owned(), addr: function.addr, demangled_name}),
+            identity: random(), locator: Some(FunctionLocator {binary_id: binary.id.clone(), mangled_name: function.mangled_name().to_owned(), addr: function.addr, demangled_name}),
             cached_function_idx: Some((symbols.identity, target.function_idx)), title, ephemeral: true, selected_subfunction_level: u16::MAX, ..Default::default()});
         self.tabs_state.select(self.tabs.len() - 1);
 
@@ -1364,20 +1352,6 @@ impl DisassemblyWindow {
         r
     }
 
-    fn find_binary<'a>(binary_id: &BinaryId, debugger: &'a Debugger) -> Result<&'a BinaryInfo> {
-        Ok(if let Some(binary) = debugger.info.binaries.get(binary_id) {
-            binary
-        } else if let Some(binary) = debugger.symbols.get_if_present(binary_id) {
-            binary
-        } else if let Some((_, binary)) = debugger.info.binaries.iter().find(|(id, _)| id.matches_incomplete(binary_id)) {
-            binary
-        } else if let Some((_, binary)) = debugger.info.binaries.iter().find(|(id, _)| id.matches_incomplete(binary_id)) {
-            binary
-        } else {
-            return err!(NoFunction, "binary not mapped: {}", binary_id.path);
-        })
-    }
-    
     fn resolve_function_for_tab<'a>(&mut self, tab_idx: usize, debugger: &'a Debugger) -> Option<(&'a BinaryInfo, /*function_idx*/ usize)> {
         let tab = &mut self.tabs[tab_idx];
         if tab.error.is_some() {
@@ -1388,7 +1362,7 @@ impl DisassemblyWindow {
             Some(x) => x };
 
         // If binary is mapped, get BinaryInfo from debugger.info, where it has AddrMap. Otherwise take it from SymbolsLoader, and disassembly will show static addresses.
-        let binary = match Self::find_binary(&locator.binary_id, debugger) {
+        let binary = match Debugger::find_binary_fuzzy(&debugger.info, Some(&debugger.symbols), &locator.binary_id) {
             Err(e) => {
                 tab.error = Some(e);
                 return None;
@@ -1528,6 +1502,42 @@ impl DisassemblyWindow {
             }
         }
     }
+
+    fn toggle_breakpoint(new_breakpoint: AddressBreakpoint, disable: bool, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
+        ui.should_redraw = true;
+
+        let mut existing_id = None;
+        for (id, breakpoint) in debugger.breakpoints.iter() {
+            if let BreakpointOn::Address(bp) = &breakpoint.on {
+                if bp.addr == new_breakpoint.addr {
+                    existing_id = Some(id);
+                }
+            } else if let Ok(addrs) = &breakpoint.addrs {
+                if existing_id.is_none() && addrs.iter().position(|(a, _)| *a == new_breakpoint.addr).is_some() {
+                    existing_id = Some(id);
+                }
+            }
+        }
+        if let Some(id) = existing_id {
+            if disable {
+                let r = debugger.set_breakpoint_enabled(id, false);
+                report_result(state, &r);
+            } else if !debugger.breakpoints.get(id).enabled {
+                let r = debugger.set_breakpoint_enabled(id, true);
+                report_result(state, &r);
+            } else {
+                debugger.remove_breakpoint(id);
+            }
+            return;
+        }
+
+        if disable {
+            state.last_error = "no breakpoint".to_string();
+        } else {
+            let r = debugger.add_breakpoint(BreakpointOn::Address(new_breakpoint));
+            report_result(state, &r);
+        }
+    }
 }
 
 impl WindowContent for DisassemblyWindow {
@@ -1654,6 +1664,7 @@ impl WindowContent for DisassemblyWindow {
 
         // Now the cursor position is final.
 
+        let binary = binary.clone();
         let symbols = binary.symbols.as_ref().unwrap();
         let function = &symbols.functions[function_idx];
         assert_eq!(disas.symbols_shard, Some(function.shard_idx()));
@@ -1668,10 +1679,20 @@ impl WindowContent for DisassemblyWindow {
                 state.selected_addr = Some((binary.id.clone(), function_idx, binary.addr_map.static_to_dynamic(disas_line.static_addr)));
             }
 
-            for action in ui.check_keys(&[KeyAction::ToggleBreakpoint, KeyAction::PreviousLocation, KeyAction::NextLocation]) {
+            for action in ui.check_keys(&[KeyAction::ToggleBreakpoint, KeyAction::DisableBreakpoint, KeyAction::StepToCursor, KeyAction::PreviousLocation, KeyAction::NextLocation]) {
                 match action {
-                    KeyAction::ToggleBreakpoint if has_addr => {
-                        // TODO: Instruction breakpoints. Probably store static addr + binary id, not dynamic addr. But make it work without requiring Symbols, just based on mmaps.
+                    KeyAction::ToggleBreakpoint | KeyAction::DisableBreakpoint if has_addr => {
+                        let offset = disas_line.static_addr - function.addr.0;
+                        let addr = binary.addr_map.static_to_dynamic(disas_line.static_addr);
+                        let new_breakpoint = AddressBreakpoint {function: Some((tab.locator.clone().unwrap(), offset)), addr, subfunction_level: tab.selected_subfunction_level};
+                        Self::toggle_breakpoint(new_breakpoint, action == KeyAction::DisableBreakpoint, state, debugger, ui);
+                    }
+                    KeyAction::StepToCursor if has_addr => {
+                        ui.should_redraw = true;
+                        let addr = binary.addr_map.static_to_dynamic(disas_line.static_addr);
+                        let temp_breakpoint = AddressBreakpoint {function: None, addr, subfunction_level: tab.selected_subfunction_level};
+                        let r = debugger.step_to_cursor(state.selected_thread, BreakpointOn::Address(temp_breakpoint));
+                        report_result(state, &r);
                     }
                     KeyAction::PreviousLocation => tab.selected_subfunction_level = tab.selected_subfunction_level.min(disas_line.subfunction_level).saturating_sub(1),
                     KeyAction::NextLocation => {
@@ -1728,6 +1749,24 @@ impl WindowContent for DisassemblyWindow {
         }
         ip_lines.sort_unstable_by_key(|k| (k.0, !k.1));
 
+        let mut address_breakpoints: Vec<(usize, /*enabled*/ bool, /*location_active*/ bool)> = Vec::new();
+        for (_, breakpoint) in debugger.breakpoints.iter() {
+            match &breakpoint.on {
+                BreakpointOn::Address(bp) => {
+                    let mut location_active = false;
+                    if breakpoint.active {
+                        let i = debugger.breakpoint_locations.partition_point(|l| l.addr < bp.addr);
+                        if i < debugger.breakpoint_locations.len() && debugger.breakpoint_locations[i].addr == bp.addr {
+                            location_active = debugger.breakpoint_locations[i].active;
+                        }
+                    }
+                    address_breakpoints.push((bp.addr, breakpoint.enabled, location_active));
+                }
+                _ => (),
+            }
+        }
+        address_breakpoints.sort_unstable();
+
         with_parent!(ui, content, {
             let line_range = visible_y.start.max(0) as usize .. (visible_y.end.max(0) as usize).min(disas.lines.len());
             for i in line_range.clone() {
@@ -1746,15 +1785,31 @@ impl WindowContent for DisassemblyWindow {
                         ui_write!(ui, additional_instruction_pointer, "⮕ ");
                     }
 
-                    let loc_idx = debugger.breakpoint_locations.partition_point(|loc| loc.addr < addr);
                     let mut marker = "  ";
-                    if line.kind == DisassemblyLineKind::Instruction && loc_idx < debugger.breakpoint_locations.len() {
-                        let loc = &debugger.breakpoint_locations[loc_idx];
-                        if loc.addr == addr && loc.breakpoints.iter().any(|b| match b { BreakpointRef::Id {..} => true, BreakpointRef::Step(_) => false }) {
-                            marker = if loc.active { "● " } else { "○ " }
+                    let mut style = ui.palette.secondary_breakpoint;
+                    if line.kind == DisassemblyLineKind::Instruction {
+                        let loc_idx = debugger.breakpoint_locations.partition_point(|loc| loc.addr < addr);
+                        if loc_idx < debugger.breakpoint_locations.len() {
+                            let loc = &debugger.breakpoint_locations[loc_idx];
+                            if loc.addr == addr && loc.breakpoints.iter().any(|b| match b { BreakpointRef::Id {..} => true, BreakpointRef::Step(_) => false }) {
+                                marker = if loc.active { "● " } else { "○ " }
+                            }
+                        }
+
+                        let bp_idx = address_breakpoints.partition_point(|(a, _, _)| *a < addr);
+                        if bp_idx < address_breakpoints.len() {
+                            let &(a, enabled, location_active) = &address_breakpoints[bp_idx];
+                            if a == addr {
+                                if !enabled {
+                                    marker = "○ ";
+                                } else {
+                                    style = ui.palette.breakpoint;
+                                    marker = if location_active {"● "} else {"○ "};
+                                }
+                            }
                         }
                     }
-                    ui_write!(ui, secondary_breakpoint, "{}", marker);
+                    styled_write!(ui.text, style, "{}", marker);
 
                     ui_write!(ui, default_dim, "{:012x} ", addr);
                     ui_write!(ui, disas_relative_address, "<{: >+1$x}> ", line.relative_addr, rel_addr_digits + 1);
@@ -1842,8 +1897,9 @@ impl WindowContent for DisassemblyWindow {
         out.extend([
             KeyHint::key(KeyAction::Open, "find function"),
             KeyHint::key(KeyAction::CloseTab, "close/pin tab"),
+            KeyHint::keys(&[KeyAction::ToggleBreakpoint, KeyAction::DisableBreakpoint], "toggle/disable breakpoint"),
+            KeyHint::key(KeyAction::StepToCursor, "run to cursor"),
             KeyHint::keys(&[KeyAction::PreviousLocation, KeyAction::NextLocation], "select level")]);
-        // TODO: KeyAction::ToggleBreakpoint, KeyAction::DisableBreakpoint
     }
 
     fn has_persistent_state(&self) -> bool {
@@ -1858,10 +1914,7 @@ impl WindowContent for DisassemblyWindow {
                 None => continue,
                 Some(x) => x };
             out.write_u8(if idx == self.tabs_state.selected {2} else {1})?;
-            locator.binary_id.save_state_incomplete(out)?;
-            out.write_slice(&locator.mangled_name)?;
-            out.write_str(&locator.demangled_name)?; // can't just demangle on load because we don't know the language (alernatively we could save the language here)
-            out.write_usize(locator.addr.0)?;
+            locator.save_state(out)?;
             tab.area_state.save_state(out)?;
             out.write_u16(tab.selected_subfunction_level)?;
         }
@@ -1875,7 +1928,7 @@ impl WindowContent for DisassemblyWindow {
                 2 => true,
                 _ => false,
             };
-            let locator = DisassemblyFunctionLocator {binary_id: BinaryId::load_state_incomplete(inp)?, mangled_name: inp.read_slice()?, demangled_name: inp.read_str()?, addr: FunctionAddr(inp.read_usize()?)};
+            let locator = FunctionLocator::load_state(inp)?;
             let title = Self::make_title(&locator.demangled_name);
             self.tabs.push(DisassemblyTab {identity: random(), title, locator: Some(locator), error: None, area_state: AreaState::load_state(inp)?, selected_subfunction_level: inp.read_u16()?, ephemeral: false, cached_function_idx: None});
             if select_this_tab {
@@ -3227,7 +3280,7 @@ impl CodeWindow {
         }
     }
 
-    fn run_to_cursor(tab: &CodeTab, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
+    fn step_to_cursor(tab: &CodeTab, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
         if tab.path_in_symbols.as_os_str().is_empty() {
             return;
         }
@@ -3476,7 +3529,7 @@ impl WindowContent for CodeWindow {
                 KeyAction::NextLocation => select_disassembly_address += 1,
                 KeyAction::ToggleBreakpoint => Self::toggle_breakpoint(tab, false, state, debugger, ui),
                 KeyAction::DisableBreakpoint => Self::toggle_breakpoint(tab, true, state, debugger, ui),
-                KeyAction::StepToCursor => Self::run_to_cursor(tab, state, debugger, ui),
+                KeyAction::StepToCursor => Self::step_to_cursor(tab, state, debugger, ui),
                 _ => (),
             }
         }
@@ -3671,11 +3724,11 @@ impl WindowContent for CodeWindow {
             KeyHint::key(KeyAction::Open, "open file"),
             KeyHint::key(KeyAction::CloseTab, "close/pin tab"),
             KeyHint::keys(&[KeyAction::ToggleBreakpoint, KeyAction::DisableBreakpoint], "toggle/disable breakpoint"),
+            KeyHint::key(KeyAction::StepToCursor, "run to cursor"),
             KeyHint::keys(&[KeyAction::PreviousLocation, KeyAction::NextLocation], "cycle disasm addrs"),
             KeyHint::key(KeyAction::GoToLine, "go to line"),
             KeyHint::key(KeyAction::Find, "find"),
             KeyHint::keys(&[KeyAction::NextMatch, KeyAction::PreviousMatch], "find next/previous"),
-            KeyHint::key(KeyAction::StepToCursor, "run to cursor"),
         ]);
     }
 
@@ -3825,6 +3878,14 @@ impl WindowContent for BreakpointsWindow {
                         ui_write!(ui, line_number, "{}", adj);
                     }
                 }
+                BreakpointOn::Address(on) => {
+                    if let Some((locator, offset)) = &on.function {
+                        ui_write!(ui, function_name, "{}", locator.demangled_name);
+                        ui_write!(ui, default, " + 0x{:x}", offset);
+                    } else {
+                        ui_write!(ui, default, "{:x}", on.addr);
+                    }
+                }
             }
             let l = ui.text.close_line();
             with_parent!(ui, table.start_cell(ui), {
@@ -3855,6 +3916,19 @@ impl WindowContent for BreakpointsWindow {
                 match &debugger.breakpoints.get(id).on {
                     BreakpointOn::Line(on) => {
                         state.should_scroll_source = Some((Some(SourceScrollTarget {path: on.path.clone(), version: on.file_version.clone(), line: on.line}), false));
+                    }
+                    BreakpointOn::Address(on) => {
+                        if let Some((locator, offset)) = &on.function {
+                            if let Ok(binary) = Debugger::find_binary_fuzzy(&debugger.info, None, &locator.binary_id) {
+                                if let Ok(symbols) = &binary.symbols {
+                                    if let Some(function_idx) = symbols.find_nearest_function(&locator.mangled_name, locator.addr) {
+                                        let function = &symbols.functions[function_idx];
+                                        state.should_scroll_disassembly = Some((Ok(DisassemblyScrollTarget {
+                                            binary_id: locator.binary_id.clone(), symbols_identity: symbols.identity, function_idx, static_pseudo_addr: function.addr.0 + offset, subfunction_level: on.subfunction_level}), false));
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }

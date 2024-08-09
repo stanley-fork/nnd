@@ -242,10 +242,19 @@ pub struct LineBreakpoint {
     pub adjusted_line: Option<usize>,
 }
 
+#[derive(Debug, Clone)]
+pub struct AddressBreakpoint {
+    // We remember the address relative to its function to make the breakpoint survive changes to the executable.
+    pub function: Option<(FunctionLocator, /*offset*/ usize)>,
+    pub addr: usize, // in case `function` is None or not found
+    pub subfunction_level: u16,
+}
+
 #[derive(Debug)]
 pub enum BreakpointOn {
     Line(LineBreakpoint),
-    // Could add address breakpoints, data breakpoints, function entry, syscall, signal, etc.
+    Address(AddressBreakpoint),
+    // Could add data breakpoints, function entry, syscall, signal, etc.
 }
 
 pub struct Breakpoint {
@@ -259,7 +268,7 @@ pub struct Breakpoint {
     pub addrs: Result<Vec<(usize, /*subfunction_level*/ u16)>>,
     // Directly controlled by the user, may be true even if we failed to activate the breakpoint.
     pub enabled: bool,
-    // True if this breakpoint's addresses are added to breakpoint_locations.
+    // True if this breakpoint's addresses are added to breakpoint_locations (even if these locations failed to activate).
     pub active: bool,
 }
 impl Breakpoint {
@@ -271,15 +280,37 @@ impl Breakpoint {
                 b.file_version.save_state(out)?;
                 out.write_usize(b.line)?;
             }
+            BreakpointOn::Address(b) => {
+                out.write_u8(1)?;
+                match &b.function {
+                    None => out.write_u8(0)?,
+                    Some((f, off)) => {
+                        out.write_u8(1)?;
+                        f.save_state(out)?;
+                        out.write_usize(*off)?;
+                    }
+                }
+                out.write_usize(b.addr)?;
+                out.write_u16(b.subfunction_level)?;
+            }
         }
         Ok(())
     }
 
     fn load_state(inp: &mut &[u8]) -> Result<Breakpoint> {
-        match inp.read_u8()? {
-            0 => Ok(Breakpoint {on: BreakpointOn::Line(LineBreakpoint {path: inp.read_path()?, file_version: FileVersionInfo::load_state(inp)?, line: inp.read_usize()?, adjusted_line: None}), hits: 0, addrs: err!(NotCalculated, ""), enabled: false, active: false}),
+        let on = match inp.read_u8()? {
+            0 => BreakpointOn::Line(LineBreakpoint {path: inp.read_path()?, file_version: FileVersionInfo::load_state(inp)?, line: inp.read_usize()?, adjusted_line: None}),
+            1 => {
+                let function = match inp.read_u8()? {
+                    0 => None,
+                    1 => Some((FunctionLocator::load_state(inp)?, inp.read_usize()?)),
+                    x => return err!(Environment, "unexpected AddressBreakpoint function flag: {}", x),
+                };
+                BreakpointOn::Address(AddressBreakpoint {function, addr: inp.read_usize()?, subfunction_level: inp.read_u16()?})
+            }
             x => return err!(Environment, "unexpected breakpoint type in save file: {}", x),
-        }
+        };
+        Ok(Breakpoint {on, hits: 0, addrs: err!(NotCalculated, ""), enabled: false, active: false})
     }
 }
 
@@ -1485,6 +1516,20 @@ impl Debugger {
         Ok((addr - map.start + map.offset, binary.addr_map.dynamic_to_static(addr), binary, map))
     }
 
+    pub fn find_binary_fuzzy<'a>(info: &'a ProcessInfo, symbols: Option<&'a SymbolsRegistry>, binary_id: &BinaryId) -> Result<&'a BinaryInfo> {
+        Ok(if let Some(binary) = info.binaries.get(binary_id) {
+            binary
+        } else if let Some(Some(binary)) = symbols.map(|s| s.get_if_present(binary_id)) {
+            binary
+        } else if let Some((_, binary)) = info.binaries.iter().find(|(id, _)| id.matches_incomplete(binary_id)) {
+            binary
+        } else if let Some((_, binary)) = info.binaries.iter().find(|(id, _)| id.matches_incomplete(binary_id)) {
+            binary
+        } else {
+            return err!(NoFunction, "binary not mapped: {}", binary_id.path);
+        })
+    }
+
     fn calculate_frame_base(&self, frame: &mut StackFrame, static_addr: usize, binary: &BinaryInfo, symbols: &Symbols, function: &FunctionInfo, root_subfunction: &Subfunction) -> Result<()> {
         let debug_info_offset = match function.debug_info_offset() {
             Some(o) => o,
@@ -1589,7 +1634,7 @@ impl Debugger {
     }
 
     pub fn add_breakpoint(&mut self, on: BreakpointOn) -> Result<BreakpointId> {
-        let mut breakpoint = Breakpoint {on: on, hits: 0, addrs: err!(NotCalculated, ""), enabled: true, active: false};
+        let mut breakpoint = Breakpoint {on, hits: 0, addrs: err!(NotCalculated, ""), enabled: true, active: false};
         if self.target_state.breakpoints_should_be_active() {
             Self::determine_locations_for_breakpoint(&self.info, &mut breakpoint);
             if let Err(e) = breakpoint.addrs {
@@ -1743,7 +1788,30 @@ impl Debugger {
                     breakpoint.addrs = Ok(res.1);
                 }
             }
+            BreakpointOn::Address(bp) => {
+                if let Some((locator, offset)) = &mut bp.function {
+                    if let Ok(a) = Self::resolve_function_breakpoint_location(info, locator, *offset) {
+                        bp.addr = a;
+                    }
+                }
+                breakpoint.addrs = Ok(vec![(bp.addr, bp.subfunction_level)]);
+            }
         }
+    }
+
+    fn resolve_function_breakpoint_location(info: &ProcessInfo, locator: &mut FunctionLocator, offset: usize) -> Result<usize> {
+        let binary = Self::find_binary_fuzzy(info, None, &locator.binary_id)?;
+        locator.binary_id = binary.id.clone();
+        let symbols = binary.symbols.as_ref_clone_error()?;
+        let function_idx = match symbols.find_nearest_function(&locator.mangled_name, locator.addr) {
+            Some(x) => x,
+            None => return err!(NoFunction, "function not found: {}", locator.demangled_name),
+        };
+        let function = &symbols.functions[function_idx];
+        locator.mangled_name = function.mangled_name().to_vec();
+        locator.demangled_name = function.demangle_name();
+        locator.addr = function.addr;
+        Ok(binary.addr_map.static_to_dynamic(function.addr.0 + offset))
     }
 
     fn add_breakpoint_location(&mut self, breakpoint: BreakpointRef, addr: usize) {
@@ -1888,10 +1956,11 @@ impl Debugger {
                 Ok(()) => self.breakpoint_locations[idx].error = None,
                 Err(e) => {
                     self.breakpoint_locations[idx].error = Some(e.clone());
+                    eprintln!("breakpoint error: {}", e);
                     if e.is_out_of_hardware_breakpoints() {
                         log!(self.log, "out of hw breakpoints! some breakpoints deactivated");
                     } else {
-                        return Err(e);
+                        log!(self.log, "breakpoint error: {}", e);
                     }
                 }
             }

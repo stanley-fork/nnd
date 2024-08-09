@@ -303,6 +303,30 @@ impl FunctionInfo {
     }
 }
 
+// Identifying information about a function, suitable for writing to the save file.
+// We want both more specific and less specific information here.
+// Specific (e.g. address) to be able to find the exactly correct function if the binary hasn't changed.
+// Less specific (e.g. name) to be likely to find the correct function if the binary changed a little.
+#[derive(Debug, Clone)]
+pub struct FunctionLocator {
+    pub binary_id: BinaryId,
+    pub mangled_name: Vec<u8>,
+    pub demangled_name: String,
+    pub addr: FunctionAddr,
+}
+impl FunctionLocator {
+    pub fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {
+        self.binary_id.save_state_incomplete(out)?;
+        out.write_slice(&self.mangled_name)?;
+        out.write_str(&self.demangled_name)?; // can't just demangle on load because we don't know the language (alernatively we could save the language here)
+        out.write_usize(self.addr.0)?;
+        Ok(())
+    }
+    pub fn load_state(inp: &mut &[u8]) -> Result<Self> {
+        Ok(Self {binary_id: BinaryId::load_state_incomplete(inp)?, mangled_name: inp.read_slice()?, demangled_name: inp.read_str()?, addr: FunctionAddr(inp.read_usize()?)})
+    }
+}
+
 
 bitflags! { pub struct LocalVariableFlags: u8 {
     // It's an argument of the containing function.

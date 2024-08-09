@@ -1,5 +1,4 @@
 investigate `clickhouse local` progress spinner appearing in debugger window despite -t
-recognize musl __restore_rt
 fix empty symbols loading stage name near the end
 investigate regression in symbols loading speed (stuck on "parsing drawf" for ~10 seconds)
 investigate why many types are not deduped, e.g. there's DB::Block#441
@@ -18,7 +17,6 @@ test with 10k threads
   maybe avoid duplicate POKEUSER calls for debug registers if the thread already had them assigned
 test with watches window filled with long arrays (I saw 50ms frames when there are ~5 of them; maybe just decrease length limit)
 
-instruction breakpoints
 reordering tabs
 rearranging windows
 maximizing windows
