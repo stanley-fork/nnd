@@ -285,7 +285,11 @@ impl Layout {
     }
     #[inline]
     fn wall_masks_idx(x: isize, y: isize, wall_area: &Rect) -> usize {
-        (x - wall_area.x()) as usize + (y - wall_area.y()) as usize * wall_area.width()
+        if wall_area.contains([x, y]) {
+            (x - wall_area.x()) as usize + (y - wall_area.y()) as usize * wall_area.width()
+        } else {
+            wall_area.width() * wall_area.height()
+        }
     }
     fn trace_wall(axis: usize, area: Rect, pos: isize, bold: bool, wall_masks: &mut Vec<u8>, wall_area: &Rect) {
         let len = area.size[1-axis];
@@ -392,7 +396,7 @@ impl Layout {
         }
         self.wall_area = Rect {pos: [area.pos[0]-1, area.pos[1]-1], size: [area.size[0]+2, area.size[1]+2]}; // add space for outer wall
         self.wall_masks.clear();
-        self.wall_masks.resize(self.wall_area.width() * self.wall_area.height(), 0u8);
+        self.wall_masks.resize(self.wall_area.width() * self.wall_area.height() + 1, 0u8);
         let root = self.regions.get_mut(self.root);
         root.area = area;
         for axis in 0..2 {
