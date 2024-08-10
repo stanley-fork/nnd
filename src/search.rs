@@ -34,21 +34,11 @@ impl SearchResults {
 }
 
 // Small and fast struct for a search match. We retrieve the slow full information (SearchResultInfo) only for the items on screen.
-#[derive(Debug, Clone, PartialEq, Eq, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd)]
 pub struct SearchResult {
-    score: i64,
+    score: usize,
     symbols_idx: usize, // index in SymbolSearcher's `symbols`
     id: usize,
-}
-
-impl PartialOrd for SearchResult {
-    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
-        if self.score != other.score {
-            Some(self.score.cmp(&other.score).reverse())
-        } else {
-            Some((self.symbols_idx, self.id).cmp(&(other.symbols_idx, other.id)))
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -56,10 +46,18 @@ pub struct SearchResultInfo {
     pub id: usize,
     pub binary: BinaryId,
     pub symbols: Arc<Symbols>,
-    
+
     pub name: String,
+    pub mangled_name: String,
     pub file: PathBuf,
     pub line: LineInfo,
+
+    pub name_match_ranges: Vec<Range<usize>>,
+    pub file_match_ranges: Vec<Range<usize>>,
+    pub mangled_name_match_ranges: Vec<Range<usize>>,
+}
+impl SearchResultInfo {
+    fn new(binary: BinaryId, symbols: Arc<Symbols>, id: usize) -> Self { Self {binary, symbols, id, name: String::new(), mangled_name: String::new(), file: PathBuf::new(), line: LineInfo::invalid(), name_match_ranges: Vec::new(), file_match_ranges: Vec::new(), mangled_name_match_ranges: Vec::new()} }
 }
 
 // String with at least 32 bytes of readable memory before and after it, unless empty.
@@ -144,7 +142,7 @@ fn search_task(state: Arc<SearchState>, query: SearchQuery, symbols: Arc<Symbols
 }
 
 fn sort_and_truncate_results(v: &mut Vec<SearchResult>) {
-    v.sort_unstable_by_key(|r| -r.score);
+    v.sort_unstable_by_key(|r| r.score);
     v.truncate(MAX_RESULTS);
 }
 
@@ -156,7 +154,7 @@ impl SymbolSearcher {
     }
 
     // Returns true if a new search started; the caller should scroll to top in this case.
-    pub fn update(&mut self, registry: &SymbolsRegistry, binaries: Option<Vec<BinaryId>>, query: &str) -> bool {
+    pub fn update(&mut self, registry: &SymbolsRegistry, binaries: Option<Vec<BinaryId>>, query: &SearchQuery) -> bool {
         let seen_binary_ids: HashSet<BinaryId> = self.symbols.iter().map(|t| t.0.clone()).collect();
         self.waiting_for_symbols = false;
         let binaries = match binaries {
@@ -175,15 +173,14 @@ impl SymbolSearcher {
             }
         }
 
-        let parsed_query = SearchQuery::parse(query);
-        if (&self.searched_query, self.searched_num_symbols) == (&parsed_query, self.symbols.len()) {
+        if (&self.searched_query, self.searched_num_symbols) == (query, self.symbols.len()) {
             return false;
         }
 
         self.state.cancel.store(true, Ordering::SeqCst);
         self.state = Arc::new(SearchState::new());
 
-        self.searched_query = parsed_query;
+        self.searched_query = query.clone();
         self.searched_num_symbols = self.symbols.len();
 
         let mut tasks: Vec<(/*symbols_idx*/ usize, /*shard_idx*/ usize)> = Vec::new();
@@ -239,6 +236,7 @@ pub type SearchCallback<'a> = dyn FnMut(Vec<SearchResult>, /*delta_items_done*/ 
 pub struct SearcherProperties {
     pub have_names: bool,
     pub have_files: bool,
+    pub have_mangled_names: bool,
     // If true, we schedule one task per SymbolsShard, otherwise one task per Symbols.
     pub parallel: bool,
 }
@@ -257,12 +255,14 @@ impl Searcher for FileSearcher {
         callback(Vec::new(), 0, items_total, 0);
         let mut res: Vec<SearchResult> = Vec::new();
         let mut bytes_done = 0usize;
+        let mut _match_ranges: Vec<Range<usize>> = Vec::new();
         for (path, &id) in &symbols.path_to_used_file {
             if cancel.load(Ordering::Relaxed) {
                 return;
             }
             let slice = path.as_os_str().as_bytes();
-            if let Some(score) = fuzzy_match(slice, query) {
+            _match_ranges.clear();
+            if let Some(score) = fuzzy_match(slice, query, &mut _match_ranges) {
                 res.push(SearchResult {score, id, symbols_idx});
             }
             bytes_done += slice.len();
@@ -272,24 +272,28 @@ impl Searcher for FileSearcher {
 
     fn format_result(&self, binary: BinaryId, symbols: &Arc<Symbols>, query: &SearchQuery, res: &SearchResult) -> SearchResultInfo {
         let file = &symbols.files[res.id];
-        SearchResultInfo {id: res.id, binary, symbols: symbols.clone(), name: String::new(), file: file.path.to_owned(), line: LineInfo::invalid()}
+        let mut res = SearchResultInfo::new(binary, symbols.clone(), res.id);
+        res.file = file.path.to_owned();
+        let slice = file.path.as_os_str().as_bytes();
+        fuzzy_match(slice, query, &mut res.file_match_ranges);
+        res
     }
 
-    fn properties(&self) -> SearcherProperties { SearcherProperties {have_names: false, have_files: true, parallel: false} }
+    fn properties(&self) -> SearcherProperties { SearcherProperties {have_names: false, have_files: true, have_mangled_names: false, parallel: false} }
 }
 
 pub struct FunctionSearcher;
 
 impl Searcher for FunctionSearcher {
     fn search(&self, symbols: &Symbols, symbols_idx: usize, shard_idx: usize, query: &SearchQuery, cancel: &AtomicBool, callback: &mut SearchCallback) {
-        let modified_query_str: String = query.s.get().chars().filter(|&c| c.is_ascii_alphanumeric() || c == '_').collect();
-        let query = SearchQuery::parse(&modified_query_str);
+        let query = modify_query_for_mangled_search(query);
 
         let range = (symbols.functions.len()*shard_idx/symbols.shards.len())..(symbols.functions.len()*(shard_idx+1)/symbols.shards.len());
         callback(Vec::new(), 0, range.len(), 0);
         let mut items_done = 0usize;
         let mut bytes_done = 0usize;
         let mut res: Vec<SearchResult> = Vec::new();
+        let mut match_ranges: Vec<Range<usize>> = Vec::new();
         for idx in range {
             if idx & 127 == 0 && cancel.load(Ordering::Relaxed) {
                 return;
@@ -299,7 +303,8 @@ impl Searcher for FunctionSearcher {
                 continue;
             }
             let slice = function.mangled_name();
-            if let Some(score) = fuzzy_match(slice, &query) {
+            match_ranges.clear();
+            if let Some(score) = fuzzy_match(slice, &query, &mut match_ranges) {
                 res.push(SearchResult {score, id: idx, symbols_idx});
             }
             items_done += 1;
@@ -315,67 +320,89 @@ impl Searcher for FunctionSearcher {
 
     fn format_result(&self, binary: BinaryId, symbols: &Arc<Symbols>, query: &SearchQuery, res: &SearchResult) -> SearchResultInfo {
         let function = &symbols.functions[res.id];
-        let mut res = SearchResultInfo {id: res.id, binary, symbols: symbols.clone(), name: function.demangle_name(), file: PathBuf::new(), line: LineInfo::invalid()};
+        let mut res = SearchResultInfo::new(binary, symbols.clone(), res.id);
+        res.name = function.demangle_name();
+        res.mangled_name = String::from_utf8_lossy(function.mangled_name()).into_owned();
         if let Some((sf, _)) = symbols.root_subfunction(function) {
             if let Some(file_idx) = sf.call_line.file_idx() {
                 res.file = symbols.files[file_idx].path.to_owned();
                 res.line = sf.call_line.clone();
             }
         }
+        let query = modify_query_for_mangled_search(query);
+        fuzzy_match(res.mangled_name.as_bytes(), &query, &mut res.mangled_name_match_ranges);
+        if fuzzy_match(res.name.as_bytes(), &query, &mut res.name_match_ranges).is_none() {
+            res.name_match_ranges.clear();
+        }
         res
     }
 
-    fn properties(&self) -> SearcherProperties { SearcherProperties {have_names: true, have_files: true, parallel: true} }
+    fn properties(&self) -> SearcherProperties { SearcherProperties {have_names: true, have_files: true, have_mangled_names: true, parallel: true} }
 }
 
-// The caller must ensure that `haystack` has at least 31 bytes of readable memory after it.
-fn fuzzy_match(haystack: &[u8], query: &SearchQuery) -> Option<i64> {
-    // Scoring:
-    //  * Score 3 if the string is exactly equal to the query string.
-    //  * Score 2 if the query string is a suffix of the string.
-    //  * Score 1 if the query string is a substring.
-    //  * Score -k if the query string appears as a subsequence in the string, with k contiguous pieces.
+fn modify_query_for_mangled_search(query: &SearchQuery) -> SearchQuery {
+    let s: String = query.s.get().chars().filter(|&c| c.is_ascii_alphanumeric() || c == '_').collect();
+    SearchQuery::parse(&s)
+}
+
+fn fuzzy_match(haystack: &[u8], query: &SearchQuery, match_ranges: &mut Vec<Range<usize>>) -> Option<usize> {
+    // Scoring (smaller tuple - higher in results list):
+    //  * 0 if the string is exactly equal to the query string.
+    //  * (1, !is_suffix, alphanum_before, alphanum_after, haystack.len()) if the query string is a substring.
+    //  * (2, k, haystack.len()) if the query string appears as a subsequence, with k contiguous pieces.
     //    Checking if it's a subsequence at all is trivial, but minimizing k takes O(n*m) time.
     //    We should do some approximation instead. Maybe find a subsequence greedily, then do one forward and one backward pass greedily coalescing the pieces.
-    //  * If the query string is not a subsequence of the string, it's not included in the results at all.
+    //  * MAX if not a match at all.
 
     let needle = query.s.get();
+    assert_eq!(match_ranges.len(), 0);
 
     if needle.len() > haystack.len() {
         return None;
     }
-    // Check the suffix separately (because we don't have backwards search).
-    if memmem_maybe_case_sensitive(&haystack[haystack.len() - needle.len()..], &query.s, query.case_sensitive).is_some() {
-        return Some(if haystack.len() == needle.len() {3} else {2});
-    }
-    if memmem_maybe_case_sensitive(&haystack[..haystack.len() - 1], &query.s, query.case_sensitive).is_some() {
-        return Some(1);
-    }
-
-    let needle = needle.as_bytes();
-    let mut i = 0usize;
-    // TODO: Do greedy coalescing of pieces.
-    let mut pieces = 0i64;
-    let mut prev_matched = false;
-    for &c in haystack {
-        if i == needle.len() {
-            break;
+    // Check the suffix separately (in case there are multiple occurrences; because we don't have backwards search).
+    let (case, extra) = if memmem_maybe_case_sensitive(&haystack[haystack.len() - needle.len()..], &query.s, query.case_sensitive).is_some() {
+        if haystack.len() == needle.len() {
+            return Some(0);
         }
-        let c = if query.case_sensitive {c} else {c.to_ascii_lowercase()};
-        if c == needle[i] {
-            i += 1;
-            if !prev_matched {
-                prev_matched = true;
-                pieces += 1;
+        match_ranges.push(haystack.len() - needle.len() .. haystack.len());
+        let alphanum_before = haystack[haystack.len() - needle.len() - 1].is_ascii_alphanumeric();
+        (1, 4usize | ((alphanum_before as usize) << 1))
+    } else if let Some(i) = memmem_maybe_case_sensitive(&haystack[..haystack.len() - 1], &query.s, query.case_sensitive) {
+        match_ranges.push(i..i+needle.len());
+        let alphanum_before = i > 0 && haystack[i - 1].is_ascii_alphanumeric();
+        let alphanum_after = i + needle.len() < haystack.len() && haystack[i + needle.len()].is_ascii_alphanumeric();
+        (1, ((alphanum_before as usize) << 1) | alphanum_after as usize)
+    } else {
+        // Check if subsequence.
+        let needle = needle.as_bytes();
+        let mut match_start: Option<usize> = None;
+        let (mut hay_i, mut needle_i) = (0usize, 0usize);
+        while hay_i < haystack.len() && needle_i < needle.len() {
+            let c = haystack[hay_i];
+            let c = if query.case_sensitive {c} else {c.to_ascii_lowercase()};
+            if c == needle[needle_i] {
+                needle_i += 1;
+                if match_start.is_none() {
+                    match_start = Some(hay_i);
+                }
+            } else if let Some(s) = match_start {
+                match_ranges.push(s..hay_i);
+                match_start = None;
             }
-        } else {
-            prev_matched = false;
+            hay_i += 1;
         }
-    }
-    if i < needle.len() {
-        return None;
-    }
-    return Some(-pieces);
+        if needle_i < needle.len() {
+            return None;
+        }
+        if let Some(s) = match_start {
+            match_ranges.push(s..hay_i);
+        }
+        // TODO: Do greedy coalescing of ranges.
+        (2, match_ranges.len())
+    };
+    // Pack tuple into one number.
+    Some((case << 61) | (extra << 32) | haystack.len())
 }
 
 #[cfg(target_feature = "avx2")]

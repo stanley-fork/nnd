@@ -88,9 +88,8 @@ Debugging tips:
  * Run-to-cursor works like a step: it runs until the selected (not any) thread hits the requested like, and it disables other breakpoints for the duration of the step.
  * Step-into-instruction ('S' key by default) works no matter what, even if there's no debug info or if disassembly or stack unwinding fails. Use it when other steps fail.
  * Breakpoints are preserved across debugger restarts, but they're put into disabled state on startup. Use Enter key in breakpoints window to reactivate.
- * The function search (in disassembly window, 'o' key by default) does fuzzy search over *mangled* function names, for now (for peformance reasons).
-   Omit '::' in the search query. E.g. to search for 'std::foo::bar(int)' try typing 'stdfoobar'.
-   The search results display demangled names, i.e. slightly different from what's actually searched.
+ * The function search (in disassembly window, 'o' key by default) currently does fuzzy search over *mangled* function names (for peformance reasons).
+   The search results display demangled names, i.e. slightly different from what's actually searched. Press tab to see mangled name.
  * In watches window, on non-root tree nodes press Enter to add a corresponding watch. E.g. for local variable or struct field or array element.
  * Expect debugger's memory usage around 3x the size of the executable. E.g. ~7 GB for 2.3 GB clickhouse, release build. This is mostly debug information.
    (If you're curious, see ~/.nnd/<number>/log for a breakdown of which parts of the debug info take how much memory and take how long to load.)

@@ -4,7 +4,6 @@ investigate regression in symbols loading speed (stuck on "parsing drawf" for ~1
 investigate why many types are not deduped, e.g. there's DB::Block#441
 make stack unwinding work when control is in .plt or .plt.got, see "Recognise PLT entries such as" in libunwind code
 log a message if the process forked away
-when duplicating a watch, add it after current one rather than at the end
 make cpp_demangle support things like "DB8_" ("C23 signed _BitInt(N)"), as in "_ZTVN2DB20AggregateFunctionAvgIDB8_EE"; I guess search for "C23" and "C++23" on https://itanium-cxx-abi.github.io/cxx-abi/abi.html#mangle.decltype and send a PR to cpp_demangle
 
 optimize simple things found by profiler (samply is nice)
@@ -17,6 +16,7 @@ test with 10k threads
   maybe avoid duplicate POKEUSER calls for debug registers if the thread already had them assigned
 test with watches window filled with long arrays (I saw 50ms frames when there are ~5 of them; maybe just decrease length limit)
 
+more built-in pretty printers: PODArray, hash tables (std, sparsehash, absl, Rust), rb trees, deque, linked lists
 reordering tabs
 rearranging windows
 maximizing windows
@@ -32,7 +32,6 @@ find function by address (like addr2line)
 show number of function inlined sites in disassembly window, allow setting breakpoint on it, allow opening inline-only functions
 add decl location to TypeInfo and MetaType
 jump to type decl location in source window when selecting it in watches window
-more built-in pretty printers: hash tables (std, sparsehash, absl, Rust), rb trees, deque, linked lists
 type search in watches window (when found, add a watch "type(`<name>`)"
 global variables, search dialog for them in watches window; research .debug_pubtypes and .debug_pubnames
 show stop reason in status window, next to "suspended"
@@ -68,16 +67,6 @@ watches, expressions
   format options for simd registers to show as vectors of given type and length (expandable)
   make basic types like u16 available without big search, with consistent names
   also consider subset of the language for injecting conditional breakpoint code
-table widget
-  line wrapping (togglable)
-  variable number of lines per row (use for progress bar and error messages)
-  auto column widths
-  cut off long strings with "…"
-  horizontal scrolling, indicator when scrolled
-  merging columns
-  configurable left/right alignment
-  scroll bar (make it a widget and reuse in search dialog)
-  make sure line wrapping enables dense display of arrays/srings/hexdumps in watches window; for hexdumps, consider more rounded grouping with starting index on each line
 
 opening core dumps
 show disassembly even if symbols are missing

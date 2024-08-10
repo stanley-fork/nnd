@@ -1326,7 +1326,8 @@ impl SearchDialog {
         });
         ui.add(widget!().fixed_height(1));
 
-        if self.search.update(registry, binaries, &self.input.text) {
+        let query = SearchQuery::parse(&self.input.text);
+        if self.search.update(registry, binaries, &query) {
             self.table_state.select(0);
         }
 
@@ -1356,26 +1357,42 @@ impl SearchDialog {
         ui.layout_children(Axis::Y);
         with_parent!(ui, table_widget, {
             ui.multifocus();
-            let mut table = Table::new(mem::take(&mut self.table_state), ui, vec![Column::new("", AutoSize::Remainder(1.0), false)]);
+            let mut columns = vec![Column::new("", AutoSize::Remainder(1.0), false)];
+            if properties.have_mangled_names {
+                // Hidden column only visible in tooltip.
+                columns.push(Column::new("mangled name", AutoSize::Fixed(0), false));
+            }
+            let mut table = Table::new(mem::take(&mut self.table_state), ui, columns);
             let range = table.lazy(res.results.len(), lines_per_result, ui);
             for (i, r) in self.search.format_results(&res.results[range]).iter().enumerate() {
                 table.start_row(i, ui);
                 let start = ui.text.num_lines();
                 if properties.have_names {
-                    ui_writeln!(ui, function_name, "{}", r.name);
+                    let l = styled_writeln!(ui.scratch_text, ui.palette.function_name, "{}", r.name);
+                    let adj: Vec<(Range<usize>, StyleAdjustment)> = r.name_match_ranges.iter().map(|r| (r.clone(), ui.palette.search_result)).collect();
+                    ui.text.import_line_with_adjustments(&ui.scratch_text, l, &adj);
                 }
                 if properties.have_files {
-                    ui_write!(ui, filename, "{}", r.file.as_os_str().to_string_lossy());
+                    styled_write!(ui.scratch_text, ui.palette.filename, "{}", r.file.as_os_str().to_string_lossy());
                     if r.line.file_idx().is_some() && r.line.line() != 0 {
-                        ui_write!(ui, line_number, ":{}", r.line.line());
+                        styled_write!(ui.scratch_text, ui.palette.line_number, ":{}", r.line.line());
                         if r.line.column() != 0 {
-                            ui_write!(ui, column_number, ":{}", r.line.column());
+                            styled_write!(ui.scratch_text, ui.palette.column_number, ":{}", r.line.column());
                         }
                     }
-                    ui.text.close_line();
+                    let l = ui.scratch_text.close_line();
+                    let adj: Vec<(Range<usize>, StyleAdjustment)> = r.file_match_ranges.iter().map(|r| (r.clone(), ui.palette.search_result)).collect();
+                    ui.text.import_line_with_adjustments(&ui.scratch_text, l, &adj);
                 }
                 let end = ui.text.num_lines();
                 table.text_cell_lines(start..end, ui);
+
+                if properties.have_mangled_names {
+                    let l = styled_writeln!(ui.scratch_text, ui.palette.default, "{}", r.mangled_name);
+                    let adj: Vec<(Range<usize>, StyleAdjustment)> = r.mangled_name_match_ranges.iter().map(|r| (r.clone(), ui.palette.search_result)).collect();
+                    ui.text.import_line_with_adjustments(&ui.scratch_text, l, &adj);
+                    table.text_cell(ui);
+                }
             }
             self.table_state = table.finish(ui);
         });

@@ -342,6 +342,7 @@ pub struct UI {
 
     pub tree: Vec<Widget>,
     pub text: StyledText,
+    pub scratch_text: StyledText,
 
     pub root: WidgetIdx,
     pub cur_parent: WidgetIdx,

@@ -26,16 +26,18 @@ pub fn prettify_value(val: &mut Cow<Value>, warning: &mut Option<Error>, state: 
     let mut allow_full_unwrap = true;
 
     if let Some(off) = find_vtable_ptr_field_offset(type_, struct_) {
-        match downcast_to_concrete_type(val, off, context) {
-            Ok(()) => {
-                allow_full_unwrap = false;
-                type_ = unsafe {&*val.type_};
-                struct_ = match &type_.t {
-                    Type::Struct(s) => s,
-                    _ => return Ok(()),
-                };
+        if val.val.addr().is_some() {
+            match downcast_to_concrete_type(val, off, context) {
+                Ok(()) => {
+                    allow_full_unwrap = false;
+                    type_ = unsafe {&*val.type_};
+                    struct_ = match &type_.t {
+                        Type::Struct(s) => s,
+                        _ => return Ok(()),
+                    };
+                }
+                Err(e) => *warning = Some(e),
             }
-            Err(e) => *warning = Some(e),
         }
     }
 
