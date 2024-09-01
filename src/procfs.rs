@@ -89,13 +89,6 @@ pub struct AddrMap {
     // Not to be confused with the difference between address and file offset - this difference may be different for different sections, we make no assumptions about that.
     consistent: bool,
 }
-
-// Thing for reading debuggee's memory.
-#[derive(Clone)]
-pub struct MemReader {
-    pid: pid_t,
-}
-
 impl AddrMap {
     pub fn new() -> Self {
         Self {diff: 0, known: false, consistent: true}
@@ -262,6 +255,11 @@ impl MemMapsInfo {
     pub fn clear(&mut self) { self.maps.clear(); }
 }
 
+// Thing for reading debuggee's memory.
+#[derive(Clone)]
+pub struct MemReader {
+    pid: pid_t,
+}
 impl MemReader {
     pub fn new(pid: pid_t) -> Self {
         MemReader {pid: pid}
@@ -325,6 +323,97 @@ impl MemReader {
     
     pub fn write_u64(&self, offset: usize, v: u64) -> Result<()> {
         self.write(offset, &v.to_le_bytes())
+    }
+}
+
+const PAGE_SIZE: usize = 4096;
+
+// Reads debuggee's memory, caches last read page. Good for sequential small reads.
+pub struct CachedMemReader {
+    mem: MemReader,
+    addr: usize,
+    page: [u8; PAGE_SIZE],
+}
+impl CachedMemReader {
+    pub fn new(mem: MemReader) -> Self { Self {mem, addr: 0, page: [0; PAGE_SIZE]} }
+
+    pub fn read(&mut self, mut offset: usize, mut buf: &mut [u8]) -> Result<()> {
+        let last_page = (offset + buf.len() - 1) & !(PAGE_SIZE - 1);
+        // Read non-last pages without populating cache.
+        while offset & !(PAGE_SIZE - 1) < last_page {
+            let start = offset & (PAGE_SIZE - 1);
+            let len = PAGE_SIZE - start;
+            if self.addr != 0 && offset & !(PAGE_SIZE - 1) == self.addr {
+                buf[..len].copy_from_slice(&self.page[start..start+len]);
+            } else {
+                self.mem.read(offset, &mut buf[..len])?;
+            }
+            buf = &mut buf[len..];
+            offset += len;
+        }
+        // Read last page through cache.
+        if self.addr == 0 || last_page != self.addr {
+            self.addr = 0;
+            self.mem.read(last_page, &mut self.page)?;
+            self.addr = last_page;
+        }
+        let start = offset & (PAGE_SIZE - 1);
+        buf.copy_from_slice(&self.page[start..start + buf.len()]);
+        return Ok(());
+    }
+
+    pub fn read_u8(&mut self, offset: usize) -> Result<u8> {
+        if self.addr != 0 && offset & !(PAGE_SIZE - 1) == self.addr {
+            // Fast path.
+            return Ok(self.page[offset & (PAGE_SIZE - 1)]);
+        }
+        let mut buf = [0u8; 1];
+        self.read(offset, &mut buf)?;
+        Ok(buf[0])
+    }
+    pub fn read_u16(&mut self, offset: usize) -> Result<u16> {
+        let mut buf = [0u8; 2];
+        self.read(offset, &mut buf)?;
+        Ok(u16::from_le_bytes(buf))
+    }
+    pub fn read_u32(&mut self, offset: usize) -> Result<u32> {
+        let mut buf = [0u8; 4];
+        self.read(offset, &mut buf)?;
+        Ok(u32::from_le_bytes(buf))
+    }
+    pub fn read_usize(&mut self, offset: usize) -> Result<usize> {
+        let mut buf = [0u8; 8];
+        self.read(offset, &mut buf)?;
+        Ok(usize::from_le_bytes(buf))
+    }
+
+    pub fn eat_uleb128(&mut self, offset: &mut usize) -> Result<usize> {
+        Ok(self.leb128_impl(offset)?.0)
+    }
+    pub fn eat_sleb128(&mut self, offset: &mut usize) -> Result<isize> {
+        let (mut res, byte, shift) = self.leb128_impl(offset)?;
+        if byte & 0x40 != 0 && shift < 64 {
+            res |= !0 << shift;
+        }
+        Ok(res as isize)
+    }
+    fn leb128_impl(&mut self, offset: &mut usize) -> Result<(usize, u8, u32)> {
+        let mut res = 0usize;
+        let mut byte: u8;
+        let mut shift = 0u32;
+        loop {
+            byte = self.read_u8(*offset)?;
+            *offset += 1;
+            res |= (byte as usize & 0x7f) << shift;
+            shift += 7;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            if shift >= 64 {
+                return err!(Sanity, "uleb128 too long");
+            }
+        }
+        Ok((res, byte, shift))
     }
 }
 

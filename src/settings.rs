@@ -14,6 +14,7 @@ pub struct Settings {
     pub periodic_timer_ns: usize,
     pub mouse_mode: MouseMode,
     pub code_dirs: Vec<PathBuf>,
+    pub exception_aware_steps: bool,
 
     pub stdin_file: Option<String>,
     pub stdout_file: Option<String>,
@@ -32,6 +33,7 @@ impl Default for Settings {
         periodic_timer_ns: 250_000_000,
         mouse_mode: MouseMode::Full,
         code_dirs: Vec::new(),
+        exception_aware_steps: true,
 
         stdin_file: None,
         stdout_file: None,

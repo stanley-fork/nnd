@@ -34,6 +34,9 @@ pub struct StackFrame {
     pub regs: Registers,
     pub frame_base: Result<(usize, /*dubious*/ bool)>, // result of the DW_AT_frame_base expression
 
+    pub fde_initial_address: usize,
+    pub lsda: Option<gimli::Pointer>,
+
     // If we found a mapped binary corresponding to this address, these two are set.
     pub binary_id: Option<BinaryId>,
     pub addr_static_to_dynamic: usize,
@@ -43,7 +46,7 @@ pub struct StackFrame {
     // Indices in StackTrace.subframes, from innermost to outermost inlined functions. Last one represents the frame. Not empty.
     pub subframes: Range<usize>,
 }
-impl Default for StackFrame { fn default() -> Self { Self {addr: 0, pseudo_addr: 0, regs: Registers::default(), frame_base: err!(Dwarf, "no frame base"), binary_id: None, addr_static_to_dynamic: 0, symbols_identity: 0, subframes: 0..0} } }
+impl Default for StackFrame { fn default() -> Self { Self {addr: 0, pseudo_addr: 0, regs: Registers::default(), frame_base: err!(Dwarf, "no frame base"), binary_id: None, addr_static_to_dynamic: 0, symbols_identity: 0, subframes: 0..0, fde_initial_address: 0, lsda: None} } }
 
 #[derive(Clone)]
 pub struct StackSubframe {
@@ -212,13 +215,15 @@ impl UnwindInfo {
     }
 
     // Assigns cfa and return address in current frame and returns registers for next frame.
-    pub fn step(&self, memory: &MemReader, addr_map: &AddrMap, scratch: &mut UnwindScratchBuffer, pseudo_addr: usize, regs: &mut Registers, elf: &ElfFile) -> Result<(Registers, /*is_signal_trampoline*/ bool)> {
-        if let Some(r) = self.step_through_sig_return(memory, addr_map, regs, elf)? {
+    pub fn step(&self, memory: &MemReader, addr_map: &AddrMap, scratch: &mut UnwindScratchBuffer, pseudo_addr: usize, frame: &mut StackFrame, elf: &ElfFile) -> Result<(Registers, /*is_signal_trampoline*/ bool)> {
+        if let Some(r) = self.step_through_sig_return(memory, addr_map, &mut frame.regs, elf)? {
             return Ok((r, true));
         }
 
-        let (fde, row, cfa, cfa_dubious, section) = self.find_row_and_eval_cfa(memory, addr_map, scratch, pseudo_addr, regs)?;
-        regs.set_int(RegisterIdx::Cfa, cfa as u64, cfa_dubious);
+        let (fde, row, cfa, cfa_dubious, section) = self.find_row_and_eval_cfa(memory, addr_map, scratch, pseudo_addr, &frame.regs)?;
+        frame.regs.set_int(RegisterIdx::Cfa, cfa as u64, cfa_dubious);
+        frame.fde_initial_address = fde.initial_address() as usize;
+        frame.lsda = fde.lsda().clone();
 
         let mut new_regs = Registers::default();
         let mut seen_regs = 0usize; // to distinguish registers that were explicitly set to RegisterRule::Undefined from ones that weren't specified
@@ -229,13 +234,13 @@ impl UnwindInfo {
                 seen_regs |= 1usize << r as u32;
             }
 
-            let val = eval_register_rule(reg.clone(), rule, fde.cie().encoding(), section, &regs, memory, addr_map)?;
+            let val = eval_register_rule(reg.clone(), rule, fde.cie().encoding(), section, &frame.regs, memory, addr_map)?;
             if let Some((v, dubious)) = val {
                 if let Some(r) = reg {
                     new_regs.set_int(r, v, dubious);
                 }
                 if *reg_num == fde.cie().return_address_register() {
-                    regs.set_int(RegisterIdx::Ret, v, dubious);
+                    frame.regs.set_int(RegisterIdx::Ret, v, dubious);
                     found_return_address = true;
                 }
             }
@@ -270,9 +275,9 @@ impl UnwindInfo {
         //  before the 'push rbp' happens, where clealy RegisterRule::SameValue behavior is expected. So I guess this is
         //  the general convention at least for this register.)
         for reg in [RegisterIdx::Rbp, RegisterIdx::Rbx, RegisterIdx::R12, RegisterIdx::R13, RegisterIdx::R14, RegisterIdx::R15] {
-            if seen_regs & 1usize << reg as u32 == 0 && regs.has(reg) {
+            if seen_regs & 1usize << reg as u32 == 0 && frame.regs.has(reg) {
                 let dubious = reg != RegisterIdx::Rbp;
-                new_regs.set_int(reg, regs.get_int(reg).unwrap().0, dubious);
+                new_regs.set_int(reg, frame.regs.get_int(reg).unwrap().0, dubious);
             }
         }
         if seen_regs & 1usize << RegisterIdx::Rsp as u32 == 0 {
@@ -415,4 +420,104 @@ fn eval_register_rule(reg: Option<RegisterIdx>, rule: &RegisterRule<usize>, enco
         _ => return err!(Dwarf, "unsupported type of register rule: {:?}", rule),
     };
     Ok(Some(val))
+}
+
+// Find addresses (of first instruction) for all C++ 'catch' blocks (as if try-catch) covering the given instruction pointer.
+//asdqwe pass whole addr_ranges instead
+pub fn find_catch_blocks(frame: &StackFrame, memory: &mut CachedMemReader) -> Result<Vec<usize>> {
+    let mut lsda = match frame.lsda.clone() {
+        None => return Ok(Vec::new()),
+        Some(Pointer::Direct(x)) => frame.addr_static_to_dynamic.wrapping_add(x as usize),
+        Some(Pointer::Indirect(x)) => memory.read_usize(frame.addr_static_to_dynamic.wrapping_add(x as usize))?,
+    };
+    let func_start = frame.addr_static_to_dynamic.wrapping_add(frame.fde_initial_address);
+    let ip_offset = frame.pseudo_addr - func_start;
+
+    // Parse Itanium ABI LSDA. Based on scan_eh_tab() in llvm-project/libcxxabi/src/cxa_personality.cpp
+    // (What does LSDA stand for? Idk about the 'A', but the rest must be what the authors of the exception handling mechanism were on, judging by the amount of unnecessary complexity.)
+
+    let start_encoding = memory.read_u8(lsda)?;
+    lsda += 1;
+    let lp_start = lsda_read_encoded_pointer(&mut lsda, memory, start_encoding)?;
+    let lp_start = if lp_start == 0 { func_start } else { lp_start };
+    let ttype_encoding = memory.read_u8(lsda)?;
+    lsda += 1;
+    if ttype_encoding != DW_EH_PE_omit.0 {
+        memory.eat_uleb128(&mut lsda)?; // we don't need class info
+    }
+    let call_site_encoding = memory.read_u8(lsda)?;
+    lsda += 1;
+    let call_site_table_length = memory.eat_uleb128(&mut lsda)?;
+    let mut call_site_ptr = lsda;
+    let call_site_table_end = call_site_ptr + call_site_table_length;
+    let action_table_start = call_site_table_end;
+    let mut res: Vec<usize> = Vec::new();
+    let mut steps = 0usize;
+    while call_site_ptr < call_site_table_end {
+        steps += 1;
+        if steps > 10000 {
+            return err!(Sanity, "lsda call site list longer than {}", steps-1);
+        }
+        let start = lsda_read_encoded_pointer(&mut call_site_ptr, memory, call_site_encoding)?;
+        let length = lsda_read_encoded_pointer(&mut call_site_ptr, memory, call_site_encoding)?;
+        let landing_pad = lsda_read_encoded_pointer(&mut call_site_ptr, memory, call_site_encoding)?;
+        let action_entry = memory.eat_uleb128(&mut call_site_ptr)?;
+        if ip_offset < start {
+            continue;
+        }
+        if ip_offset >= start + length {
+            break;
+        }
+        if landing_pad == 0 || action_entry == 0 {
+            break;
+        }
+        let landing_pad = landing_pad + lp_start;
+        let mut action_ptr = action_table_start + (action_entry - 1);
+        steps = 0;
+        loop {
+            steps += 1;
+            if steps > 10000 {
+                return err!(Sanity, "lsda action list longer than {}", steps-1);
+            }
+            let ttype_index = memory.eat_sleb128(&mut action_ptr)?;
+            if ttype_index > 0 {
+                // catch
+                res.push(landing_pad);
+            }
+            let mut temp = action_ptr;
+            let action_offset = memory.eat_sleb128(&mut temp)?;
+            if action_offset == 0 {
+                break;
+            }
+            action_ptr = (action_ptr as isize + action_offset) as usize;
+        }
+        break;
+    }
+    Ok(res)
+}
+
+fn lsda_read_encoded_pointer(ptr: &mut usize, memory: &mut CachedMemReader, encoding: u8) -> Result<usize> {
+    if encoding == DW_EH_PE_omit.0 {
+        return Ok(0);
+    }
+    let initial_ptr = *ptr;
+    let mut res: usize;
+    match DwEhPe(encoding & 0x0f) {
+        DW_EH_PE_absptr | DW_EH_PE_udata8 | DW_EH_PE_sdata8 => {res = memory.read_usize(*ptr)?; *ptr += 8;}
+        DW_EH_PE_uleb128 => res = memory.eat_uleb128(ptr)?,
+        DW_EH_PE_sleb128 => res = memory.eat_sleb128(ptr)? as usize,
+        DW_EH_PE_udata2 | DW_EH_PE_sdata2 => {res = memory.read_u16(*ptr)? as usize; *ptr += 2;}
+        DW_EH_PE_udata4 | DW_EH_PE_sdata4 => {res = memory.read_u32(*ptr)? as usize; *ptr += 4;}
+        _ => return err!(Dwarf, "unexpected pointer encoding (low bits) in lsda: {}", encoding),
+    }
+    match DwEhPe(encoding & 0x70) {
+        DW_EH_PE_absptr => (),
+        DW_EH_PE_pcrel => if res != 0 { res += initial_ptr; }
+        // llvm-project/libcxxabi/src/cxa_personality.cpp doesn't support textrel and funcrel. I guess only pcrel is ever used.
+        _ => return err!(Dwarf, "unexpected pointer encoding (high bits) in lsda: {}", encoding),
+    }
+    if res != 0 && encoding & DW_EH_PE_indirect.0 != 0 {
+        res = memory.read_usize(res)?;
+    }
+    Ok(res)
 }

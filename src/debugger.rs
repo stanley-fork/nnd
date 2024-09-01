@@ -198,6 +198,7 @@ pub enum StepBreakpointType {
     JumpOut,
     AfterRet,
     AfterRange,
+    Catch,
     Cursor(/*subfunction_level*/ u16),
 }
 
@@ -1246,6 +1247,24 @@ impl Debugger {
             }
         }
 
+        if self.context.settings.exception_aware_steps && (step.internal_kind == StepKind::Over || step.internal_kind == StepKind::Out) {
+            // If we're stepping over/out-of a function and the function throws an exception, control jumps to the 'catch' block, bypassing our AfterRet breakpoints.
+            // Put breakpoints on all catch blocks in the call stack.
+            let mut cached_memory = CachedMemReader::new(self.memory.clone());
+            let mut start_frame = subframe.frame_idx;
+            if step.internal_kind == StepKind::Out {
+                start_frame += 1;
+            }
+            for frame in &stack.frames[start_frame..] {
+                match find_catch_blocks(frame, &mut cached_memory) {
+                    Err(e) => eprintln!("warning: lsda error: {}", e),
+                    Ok(b) => for addr in b {
+                        breakpoints_to_add.push((StepBreakpointType::Catch, addr));
+                    }
+                }
+            }
+        }
+
         // Annoyingly, if a syscall is in progress, the instruction pointer may point to the *next* instruction after `syscall`.
         // So we have to heuristically check if the previous instruction is syscall (2 bytes: 0f05). This may produce false positives
         // because a longer instruction may end with bytes 0f05 (e.g. if it's an immediate operand); that's ok, this is just an optimization.
@@ -1469,7 +1488,7 @@ impl Debugger {
 
             // This populates CFA "register", so needs to happen before symbolizing the frame (because frame_base expression might use CFA).
             let unwind = binary.unwind.as_ref_clone_error()?;
-            let step_result = unwind.step(&self.memory, &binary.addr_map, &mut scratch, pseudo_addr, &mut frame.regs, &**binary.elf.as_ref().unwrap());
+            let step_result = unwind.step(&self.memory, &binary.addr_map, &mut scratch, pseudo_addr, frame, &**binary.elf.as_ref().unwrap());
 
             if step_result.as_ref().is_ok_and(|(_, is_signal_trampoline)| *is_signal_trampoline) {
                 // Un-decrement the instruction pointer, there's no `call` in signal trampoline.
@@ -1986,7 +2005,7 @@ impl Debugger {
     fn handle_step_breakpoint_hit(step: &StepState, type_: StepBreakpointType, request_single_step: &mut bool) {
         match type_ {
             StepBreakpointType::Call | StepBreakpointType::JumpOut => *request_single_step = true,
-            StepBreakpointType::AfterRange | StepBreakpointType::AfterRet | StepBreakpointType::Cursor(_) => (),
+            StepBreakpointType::AfterRange | StepBreakpointType::AfterRet | StepBreakpointType::Catch | StepBreakpointType::Cursor(_) => (),
         }
     }
 

@@ -10,5 +10,11 @@ void __attribute__((noinline)) g(int a, int b) {
 }
 
 int main() {
-    g(2,3);
+    try {
+        g(4, 5);
+    } catch (std::string & e) {
+        std::cout << e << std::endl;
+    }
+
+    g(2, 3);
 }

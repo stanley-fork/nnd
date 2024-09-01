@@ -1299,7 +1299,7 @@ impl DisassemblyWindow {
         };
         for i in 0..self.tabs.len() {
             if let Some((binary, function_idx)) = self.resolve_function_for_tab(i, debugger) {
-                if binary.id == target.binary_id && function_idx == target.function_idx && binary.symbols.as_ref().unwrap().identity == target.symbols_identity {
+                if binary.id.matches_incomplete(&target.binary_id) && function_idx == target.function_idx && binary.symbols.as_ref().unwrap().identity == target.symbols_identity {
                     self.tabs_state.select(i);
                     return Ok(());
                 }
@@ -1503,13 +1503,26 @@ impl DisassemblyWindow {
         }
     }
 
-    fn toggle_breakpoint(new_breakpoint: AddressBreakpoint, disable: bool, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
+    // Breakpoint addresses in Debugger may be outdated if the process is not running or if breakpoints weren't activated. This is a crutch to correct for that.
+    fn fixup_breakpoint_address(bp: &AddressBreakpoint, tab: &DisassemblyTab, addr_map: &AddrMap) -> usize {
+        if let Some((bp_locator, offset)) = &bp.function {
+            if let Some(tab_locator) = &tab.locator {
+                if tab_locator.matches_incomplete(bp_locator) {
+                    return addr_map.static_to_dynamic(tab_locator.addr.0 + offset);
+                }
+            }
+        }
+        bp.addr
+    }
+
+    fn toggle_breakpoint(new_breakpoint: AddressBreakpoint, disable: bool, tab: &DisassemblyTab, addr_map: &AddrMap, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
         ui.should_redraw = true;
 
         let mut existing_id = None;
         for (id, breakpoint) in debugger.breakpoints.iter() {
             if let BreakpointOn::Address(bp) = &breakpoint.on {
-                if bp.addr == new_breakpoint.addr {
+                let addr = Self::fixup_breakpoint_address(bp, tab, addr_map);
+                if addr == new_breakpoint.addr {
                     existing_id = Some(id);
                 }
             } else if let Ok(addrs) = &breakpoint.addrs {
@@ -1685,7 +1698,7 @@ impl WindowContent for DisassemblyWindow {
                         let offset = disas_line.static_addr - function.addr.0;
                         let addr = binary.addr_map.static_to_dynamic(disas_line.static_addr);
                         let new_breakpoint = AddressBreakpoint {function: Some((tab.locator.clone().unwrap(), offset)), addr, subfunction_level: tab.selected_subfunction_level};
-                        Self::toggle_breakpoint(new_breakpoint, action == KeyAction::DisableBreakpoint, state, debugger, ui);
+                        Self::toggle_breakpoint(new_breakpoint, action == KeyAction::DisableBreakpoint, tab, &binary.addr_map, state, debugger, ui);
                     }
                     KeyAction::StepToCursor if has_addr => {
                         ui.should_redraw = true;
@@ -1760,7 +1773,8 @@ impl WindowContent for DisassemblyWindow {
                             location_active = debugger.breakpoint_locations[i].active;
                         }
                     }
-                    address_breakpoints.push((bp.addr, breakpoint.enabled, location_active));
+                    let addr = Self::fixup_breakpoint_address(bp, tab, &binary.addr_map);
+                    address_breakpoints.push((addr, breakpoint.enabled, location_active));
                 }
                 _ => (),
             }

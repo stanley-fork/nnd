@@ -325,6 +325,10 @@ impl FunctionLocator {
     pub fn load_state(inp: &mut &[u8]) -> Result<Self> {
         Ok(Self {binary_id: BinaryId::load_state_incomplete(inp)?, mangled_name: inp.read_slice()?, demangled_name: inp.read_str()?, addr: FunctionAddr(inp.read_usize()?)})
     }
+
+    pub fn matches_incomplete(&self, other: &Self) -> bool {
+        self.binary_id.matches_incomplete(&other.binary_id) && self.mangled_name == other.mangled_name && (!self.mangled_name.is_empty() || self.addr == other.addr)
+    }
 }
 
 

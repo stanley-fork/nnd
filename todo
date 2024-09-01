@@ -1,10 +1,11 @@
 investigate `clickhouse local` progress spinner appearing in debugger window despite -t
+use /proc/<pid>/exe for main executable file (match by inode number, stat() /exe for it), especially if it was deleted (/maps shows "<path> (deleted)" and we fail to find the file)
 fix empty symbols loading stage name near the end
 investigate regression in symbols loading speed (stuck on "parsing drawf" for ~10 seconds)
 investigate why many types are not deduped, e.g. there's DB::Block#441
 make stack unwinding work when control is in .plt or .plt.got, see "Recognise PLT entries such as" in libunwind code
 log a message if the process forked away
-make cpp_demangle support things like "DB8_" ("C23 signed _BitInt(N)"), as in "_ZTVN2DB20AggregateFunctionAvgIDB8_EE"; I guess search for "C23" and "C++23" on https://itanium-cxx-abi.github.io/cxx-abi/abi.html#mangle.decltype and send a PR to cpp_demangle
+function search not working when no process
 
 optimize simple things found by profiler (samply is nice)
 look at profiler on ch server (1500 threads)
@@ -16,11 +17,14 @@ test with 10k threads
   maybe avoid duplicate POKEUSER calls for debug registers if the thread already had them assigned
 test with watches window filled with long arrays (I saw 50ms frames when there are ~5 of them; maybe just decrease length limit)
 
+make symtab/dynsym work when debug info (or debuglink file) is missing
+edit watch on click
+allow hitting 'b' on disassembly header (put breakpoint on first instruction)
 more built-in pretty printers: PODArray, hash tables (std, sparsehash, absl, Rust), rb trees, deque, linked lists
 reordering tabs
 rearranging windows
 maximizing windows
-ability to save value in watches window
+key to freeze value in watches window; can also be used for controlling when to run the expression if it has side effects
 tooltip in status window showing more log lines with line wrapping
 key to send SIGINT to the program
 option to load symbols from another file (unstripped executable) - will make it usable in ch cloud
@@ -45,7 +49,7 @@ key to follow a jump in disas
 allow line-based steps in .plt* (maybe by just turning them into single-instruction-steps)
 in disassembly window, make 'left' key jump to the start of inlined function
 maximizing windows (hot key and button in a corner)
-special breakpoints: panic, exception, signal, program start (replacing -c), main function entry, dynamic library load
+special breakpoints: panic (rust_panic, but also investigate how to catch things like overflow checks, they don't seem to go through rust_panic; maybe disable find_catch_blocks() for rust at least when panic bp is enabled), exception (__cxa_throw), signals, program start (replacing -c), main function entry, dynamic library load
 make source window autoscroll horizontally in addition to vertically
 -v for build datetime
 handle partially-optimized-out struct values (common in rust)
