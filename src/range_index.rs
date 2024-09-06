@@ -1,4 +1,5 @@
-
+use crate::{util::*};
+use std::ops::Range;
 
 pub struct RangeIndexEntry<T> {
     pub start: usize,
@@ -62,5 +63,28 @@ impl<T: Ord + Clone> RangeIndex<T> {
             }
         }
         return None;
+    }
+
+    pub fn find_ranges(&self, sorted_addr_ranges: &Vec<Range<usize>>) -> Vec<&RangeIndexEntry<T>> {
+        assert!(sorted_addr_ranges.windows(2).all(|a| a[0].end < a[1].start));
+        let mut res: Vec<&RangeIndexEntry<T>> = Vec::new();
+        let mut idx = 0usize;
+        let mut steps = 0usize;
+        for range in sorted_addr_ranges {
+            idx.set_max(self.ranges.partition_point(|r| r.max_end <= range.start));
+            while idx < self.ranges.len() && self.ranges[idx].start < range.end {
+                steps += 1;
+                if steps > 100000 {
+                    eprintln!("warning: lookup ranges overlap over {} index ranges", steps-1);
+                    return res;
+                }
+                
+                if self.ranges[idx].end > range.start {
+                    res.push(&self.ranges[idx]);
+                }
+                idx += 1;
+            }
+        }
+        res
     }
 }

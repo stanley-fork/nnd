@@ -154,13 +154,10 @@ impl SymbolSearcher {
     }
 
     // Returns true if a new search started; the caller should scroll to top in this case.
-    pub fn update(&mut self, registry: &SymbolsRegistry, binaries: Option<Vec<BinaryId>>, query: &SearchQuery) -> bool {
+    pub fn update(&mut self, registry: &SymbolsRegistry, query: &SearchQuery) -> bool {
         let seen_binary_ids: HashSet<BinaryId> = self.symbols.iter().map(|t| t.0.clone()).collect();
         self.waiting_for_symbols = false;
-        let binaries = match binaries {
-            Some(x) => x,
-            None => registry.list(),
-        };
+        let binaries = registry.list();
         for id in binaries {
             if seen_binary_ids.contains(&id) {
                 continue;

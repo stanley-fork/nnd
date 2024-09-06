@@ -123,8 +123,7 @@ impl<S: UnwindSection<SliceType>> UnwindSectionIndex<S> {
         Ok(Self {section, static_base_addresses, cies, static_addr_to_fde: RangeIndex::new(fde_ranges, "unwind")})
     }
 
-    fn find_fde_and_row<'a>(&self, pseudo_addr: usize, addr_map: &AddrMap, scratch: &'a mut UnwindScratchBuffer) -> Result<Option<(FrameDescriptionEntry<SliceType>, &'a UnwindTableRow<usize>, /*section*/ SliceType)>> {
-        let static_pseudo_addr = addr_map.dynamic_to_static(pseudo_addr);
+    fn find_fde_and_row<'a>(&self, static_pseudo_addr: usize, scratch: &'a mut UnwindScratchBuffer) -> Result<Option<(FrameDescriptionEntry<SliceType>, &'a UnwindTableRow<usize>, /*section*/ SliceType)>> {
         let fde_offset = match self.static_addr_to_fde.find(static_pseudo_addr) {
             None => return Ok(None),
             Some(o) => o.value,
@@ -193,14 +192,15 @@ impl UnwindInfo {
     }
 
     pub fn find_row_and_eval_cfa<'a>(&self, memory: &MemReader, addr_map: &AddrMap, scratch: &'a mut UnwindScratchBuffer, pseudo_addr: usize, regs: &Registers) -> Result<(FrameDescriptionEntry<SliceType>, &'a UnwindTableRow<usize>, /*cfa*/ usize, /*cfa_dubious*/ bool, /*section*/ SliceType)> {
+        let static_pseudo_addr = addr_map.dynamic_to_static(pseudo_addr);
         let found = match &self.debug_frame {
-            Some(section) => section.find_fde_and_row(pseudo_addr, addr_map, scratch)?,
+            Some(section) => section.find_fde_and_row(static_pseudo_addr, scratch)?,
             None => None,
         };
         let found = match found {
             Some(x) => Some(x),
             None => match &self.eh_frame {
-                Some(section) => section.find_fde_and_row(pseudo_addr, addr_map, scratch)?,
+                Some(section) => section.find_fde_and_row(static_pseudo_addr, scratch)?,
                 None => None,
             }
         };
@@ -212,6 +212,22 @@ impl UnwindInfo {
 
         let row: &'static UnwindTableRow<usize> = unsafe {mem::transmute(row)}; // work around borrow checker weirdness by transmuting to 'static and back
         Ok((fde, row, cfa as usize, cfa_dubious, section))
+    }
+
+    fn list_lsdas(&self, sorted_addr_ranges: &Vec<Range<usize>>, addr_map: &AddrMap) -> Result<Vec<(/*fde_initial_address*/ usize, /*lsda*/ gimli::Pointer)>> {
+        let mut res: Vec<(usize, gimli::Pointer)> = Vec::new();
+        let eh_frame = match &self.eh_frame {
+            None => return Ok(res),
+            Some(x) => x };
+        let static_addr_ranges: Vec<Range<usize>> = sorted_addr_ranges.iter().map(|r| addr_map.dynamic_to_static(r.start)..addr_map.dynamic_to_static(r.end)).collect();
+        // (Look up all ranges at once because this allows better deduplication than if we iterated over sorted_addr_ranges here. The idx.set_max() thing in RangeIndex.)
+        for index_entry in eh_frame.static_addr_to_fde.find_ranges(&static_addr_ranges) {
+            let fde = eh_frame.section.fde_from_offset(&eh_frame.static_base_addresses, index_entry.value.into(), |_, _, offset| find_cie_in(UnwindOffset::into(offset) as u64, &eh_frame.cies))?;
+            if let Some(lsda) = fde.lsda() {
+                res.push((fde.initial_address() as usize, lsda));
+            }
+        }
+        Ok(res)
     }
 
     // Assigns cfa and return address in current frame and returns registers for next frame.
@@ -423,19 +439,32 @@ fn eval_register_rule(reg: Option<RegisterIdx>, rule: &RegisterRule<usize>, enco
 }
 
 // Find addresses (of first instruction) for all C++ 'catch' blocks (as if try-catch) covering the given instruction pointer.
-//asdqwe pass whole addr_ranges instead
-pub fn find_catch_blocks(frame: &StackFrame, memory: &mut CachedMemReader) -> Result<Vec<usize>> {
-    let mut lsda = match frame.lsda.clone() {
-        None => return Ok(Vec::new()),
+pub fn find_catch_blocks_for_frame(frame: &StackFrame, memory: &mut CachedMemReader, out: &mut Vec<usize>) -> Result<()> {
+    let lsda = match frame.lsda.clone() {
+        None => return Ok(()),
         Some(Pointer::Direct(x)) => frame.addr_static_to_dynamic.wrapping_add(x as usize),
         Some(Pointer::Indirect(x)) => memory.read_usize(frame.addr_static_to_dynamic.wrapping_add(x as usize))?,
     };
     let func_start = frame.addr_static_to_dynamic.wrapping_add(frame.fde_initial_address);
-    let ip_offset = frame.pseudo_addr - func_start;
+    parse_itanium_lsda(lsda, &vec![frame.pseudo_addr..frame.pseudo_addr+1], func_start, memory, out)?;
+    Ok(())
+}
 
-    // Parse Itanium ABI LSDA. Based on scan_eh_tab() in llvm-project/libcxxabi/src/cxa_personality.cpp
-    // (What does LSDA stand for? Idk about the 'A', but the rest must be what the authors of the exception handling mechanism were on, judging by the amount of unnecessary complexity.)
+pub fn find_catch_blocks_for_ranges(sorted_addr_ranges: &Vec<Range<usize>>, unwind: &UnwindInfo, addr_map: &AddrMap, memory: &mut CachedMemReader, out: &mut Vec<usize>) -> Result<()> {
+    for (fde_initial_address, lsda) in unwind.list_lsdas(sorted_addr_ranges, addr_map)? {
+        let lsda = match lsda {
+            Pointer::Direct(x) => addr_map.static_to_dynamic(x as usize),
+            Pointer::Indirect(x) => memory.read_usize(addr_map.static_to_dynamic(x as usize))?,
+        };
+        let func_start = addr_map.static_to_dynamic(fde_initial_address);
+        parse_itanium_lsda(lsda, sorted_addr_ranges, func_start, memory, out)?;
+    }
+    Ok(())
+}
 
+// Find addresses of catch blocks. Based on scan_eh_tab() in llvm-project/libcxxabi/src/cxa_personality.cpp
+// (What does LSDA stand for? Idk about the 'A', but the rest must be what the authors of the exception handling mechanism were on, judging by the amount of unnecessary complexity.)
+fn parse_itanium_lsda(mut lsda: usize, sorted_addr_ranges: &Vec<Range<usize>>, func_start: usize, memory: &mut CachedMemReader, out: &mut Vec<usize>) -> Result<()> {
     let start_encoding = memory.read_u8(lsda)?;
     lsda += 1;
     let lp_start = lsda_read_encoded_pointer(&mut lsda, memory, start_encoding)?;
@@ -453,6 +482,7 @@ pub fn find_catch_blocks(frame: &StackFrame, memory: &mut CachedMemReader) -> Re
     let action_table_start = call_site_table_end;
     let mut res: Vec<usize> = Vec::new();
     let mut steps = 0usize;
+    let mut addr_ranges_idx = sorted_addr_ranges.partition_point(|r| r.end <= func_start);
     while call_site_ptr < call_site_table_end {
         steps += 1;
         if steps > 10000 {
@@ -462,14 +492,21 @@ pub fn find_catch_blocks(frame: &StackFrame, memory: &mut CachedMemReader) -> Re
         let length = lsda_read_encoded_pointer(&mut call_site_ptr, memory, call_site_encoding)?;
         let landing_pad = lsda_read_encoded_pointer(&mut call_site_ptr, memory, call_site_encoding)?;
         let action_entry = memory.eat_uleb128(&mut call_site_ptr)?;
-        if ip_offset < start {
+
+        // Check if this table entry overlaps any of the requested address ranges.
+        let start_addr = start + func_start;
+        while addr_ranges_idx < sorted_addr_ranges.len() && sorted_addr_ranges[addr_ranges_idx].end <= start_addr {
+            addr_ranges_idx += 1;
+        }
+        if addr_ranges_idx == sorted_addr_ranges.len() {
+            break;
+        }
+        if sorted_addr_ranges[addr_ranges_idx].start >= start_addr + length {
             continue;
         }
-        if ip_offset >= start + length {
-            break;
-        }
+
         if landing_pad == 0 || action_entry == 0 {
-            break;
+            continue;
         }
         let landing_pad = landing_pad + lp_start;
         let mut action_ptr = action_table_start + (action_entry - 1);
@@ -493,7 +530,7 @@ pub fn find_catch_blocks(frame: &StackFrame, memory: &mut CachedMemReader) -> Re
         }
         break;
     }
-    Ok(res)
+    Ok(())
 }
 
 fn lsda_read_encoded_pointer(ptr: &mut usize, memory: &mut CachedMemReader, encoding: u8) -> Result<usize> {

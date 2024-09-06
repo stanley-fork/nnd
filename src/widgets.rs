@@ -1314,7 +1314,7 @@ pub struct SearchDialog {
 impl SearchDialog {
     pub fn new(searcher: Arc<dyn Searcher>, context: Arc<Context>) -> Self { Self {input: TextInput::default(), search: SymbolSearcher::new(searcher, context), table_state: TableState::default(), should_open_document: None, should_close_dialog: false, loading: false} }
 
-    pub fn build(&mut self, registry: &SymbolsRegistry, binaries: Option<Vec<BinaryId>>, ui: &mut UI) {
+    pub fn build(&mut self, registry: &SymbolsRegistry, ui: &mut UI) {
         self.should_open_document = None;
         self.should_close_dialog = false;
         self.loading = false;
@@ -1327,7 +1327,7 @@ impl SearchDialog {
         ui.add(widget!().fixed_height(1));
 
         let query = SearchQuery::parse(&self.input.text);
-        if self.search.update(registry, binaries, &query) {
+        if self.search.update(registry, &query) {
             self.table_state.select(0);
         }
 

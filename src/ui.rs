@@ -711,11 +711,13 @@ impl WatchesWindow {
     }
 
     fn build_widgets(&mut self, visible_y: Range<isize>, context: &Result<EvalContext>, ui: &mut UI) {
+        self.text_input_built = false;
         let mut stack: Vec<ValueTreeNodeIdx> = self.tree.roots.iter().copied().rev().collect();
+        let mut should_start_editing: Option<usize> = None;
         while let Some(node_idx) = stack.pop() {
             let node = &self.tree.nodes[node_idx.0];
             assert_eq!(node.layout_frame_idx, ui.frame_idx);
-            if node.start_y >= visible_y.end || node.subtree_end_y <= visible_y.start {
+            if !node.is_text_input && (node.start_y >= visible_y.end || node.subtree_end_y <= visible_y.start) {
                 continue;
             }
 
@@ -756,7 +758,7 @@ impl WatchesWindow {
                 if ui.check_mouse(MouseActions::CLICK) {
                     if node.expanded {
                         self.expanded_nodes.remove(&node.identity);
-                    } else {
+                    } else if &node.special != &Some(SpecialWatch::AddWatch) {
                         self.expanded_nodes.insert(node.identity);
                     }
                     self.scroll_to_cursor = true;
@@ -790,16 +792,14 @@ impl WatchesWindow {
 
             if node.node_end_y > visible_y.start {
                 let row_x = indent + 2;
-                with_parent!(ui, ui.add(widget!().identity(&node.identity).fixed_x(row_x as isize).fixed_width((self.name_width + self.value_width + 1).saturating_sub(row_x)).fixed_height((node.node_end_y - node.start_y) as usize).fixed_y(node.start_y).fill(' ', ui.palette.default).highlight_on_hover()), {
+                let row_widget = ui.add(widget!().identity(&node.identity).fixed_x(row_x as isize).fixed_width((self.name_width + self.value_width + 1).saturating_sub(row_x)).fixed_height((node.node_end_y - node.start_y) as usize).fixed_y(node.start_y).fill(' ', ui.palette.default).highlight_on_hover());
+                with_parent!(ui, row_widget, {
                     if self.cursor_path.last() == Some(&node.identity) {
                         let a = ui.palette.selected;
                         ui.cur_mut().style_adjustment.update(a);
+                        ui.focus();
                     }
 
-                    if ui.check_mouse(MouseActions::CLICK) {
-                        self.set_cursor_path_from_node(node_idx);
-                        ui.should_redraw = true;
-                    }
                     let node = &self.tree.nodes[node_idx.0];
 
                     let name_effective_width = self.name_width.saturating_sub(row_x);
@@ -810,12 +810,13 @@ impl WatchesWindow {
                     }
                     ui.add(w);
 
-                    if node.is_text_input {
+                    let mut clicked_name = false;
+                    if node.is_text_input && ui.check_focus() {
                         let (identity, height, input) = self.text_input.as_mut().unwrap();
                         assert_eq!(*identity, node.identity);
                         let input_widget = ui.add(widget!().identity(&'i').width(AutoSize::Children).min_width(name_effective_width).max_width(name_effective_width + self.value_width + 1).height(AutoSize::Children).max_height(self.row_height_limit));
                         with_parent!(ui, input_widget, {
-                            ui.focus();
+                            ui.relative_focus(row_widget);
                             let changed = input.build(ui);
                             self.scroll_to_cursor |= changed && (visible_y.start > node.start_y || visible_y.end < node.node_end_y);
                             self.text_input_built = true;
@@ -827,6 +828,7 @@ impl WatchesWindow {
                             ui.should_redraw = true;
                         }
                     } else {
+                        clicked_name = ui.check_mouse(MouseActions::CLICK);
                         let lines = if node.expanded {
                             assert_eq!(node.name_line_wrap_width, name_effective_width);
                             node.line_wrapped_name.clone().unwrap()
@@ -841,21 +843,53 @@ impl WatchesWindow {
                         }
                         ui.add(w);
                     }
+
+                    if ui.check_mouse(MouseActions::CLICK_SUBTREE) {
+                        let moved = Self::set_cursor_path_from_node(node_idx, &mut self.cursor_path, &self.tree);
+                        if !moved && clicked_name && node.depth == 0 {
+                            if let Some(expr_idx) = self.tree.roots.iter().position(|ix| *ix == node_idx) {
+                                if self.expressions[expr_idx].is_editable() {
+                                    // Can't assign self.text_input right here because a later iteration of this loop may incorrectly use it.
+                                    should_start_editing = Some(expr_idx);
+                                }
+                            }
+                        }
+                        ui.should_redraw = true;
+                    }
                 });
             }
         }
+
+        if let Some(expr_idx) = should_start_editing {
+            let expr = &self.expressions[expr_idx];
+            Self::start_editing_expression(&self.tree.nodes[self.tree.roots[expr_idx].0], expr, &mut self.text_input);
+            self.text_input_built = true; // prevent the caller from closing the text input immediately
+            ui.should_redraw = true;
+        }
     }
 
-    fn set_cursor_path_from_node(&mut self, mut node_idx: ValueTreeNodeIdx) {
-        self.cursor_path.clear();
+    // Returns false if the cursor was already on this node.
+    fn set_cursor_path_from_node(mut node_idx: ValueTreeNodeIdx, cursor_path: &mut Vec<usize>, tree: &ValueTree) -> bool {
+        let mut new_path: Vec<usize> = Vec::new();
         while node_idx.is_valid() {
-            let node = &self.tree.nodes[node_idx.0];
-            self.cursor_path.push(node.identity);
+            let node = &tree.nodes[node_idx.0];
+            new_path.push(node.identity);
             node_idx = node.parent;
         }
-        self.cursor_path.reverse();
+        new_path.reverse();
+        if new_path == *cursor_path {
+            return false;
+        }
+        *cursor_path = new_path;
+        true
     }
 
+    fn start_editing_expression(node: &ValueTreeNode, expr: &WatchExpression, text_input: &mut Option<(usize, usize, TextInput)>) {
+        let height_estimate = (node.node_end_y - node.start_y).max(1) as usize;
+        let text = if expr.special.is_some() {String::new()} else {expr.text.clone()};
+        *text_input = Some((node.identity, height_estimate, TextInput::new_multiline(text)));
+    }
+    
     fn make_expression_for_tree_node(&self, mut node_idx: ValueTreeNodeIdx) -> Option<String> {
         let mut components: Vec<(/*deref*/ usize, /*suffix*/ String)> = Vec::new();
         loop {
@@ -938,7 +972,7 @@ impl WindowContent for WatchesWindow {
             };
             match action {
                 // We allow expanding even nodes without children, to enable line wrapping. Currently we have no indication of that, would be nice to check whether the text fits and allow expanding only if it doesn't.
-                KeyAction::CursorRight => {self.expanded_nodes.insert(node.identity);}
+                KeyAction::CursorRight if &node.special != &Some(SpecialWatch::AddWatch) => {self.expanded_nodes.insert(node.identity);}
                 KeyAction::CursorLeft => {
                     self.expanded_nodes.remove(&node.identity);
                     if node.depth > 0 && !node.expanded {
@@ -966,9 +1000,7 @@ impl WindowContent for WatchesWindow {
                         }
                         self.text_input = None;
                     } else {
-                        let height_estimate = (node.node_end_y - node.start_y).max(1) as usize;
-                        let text = if expr.special.is_some() {String::new()} else {expr.text.clone()};
-                        self.text_input = Some((node.identity, height_estimate, TextInput::new_multiline(text)));
+                        Self::start_editing_expression(node, &self.expressions[expr_idx.unwrap()], &mut self.text_input);
                     }
                 }
                 KeyAction::DuplicateRow if expr_idx.is_some_and(|i| self.expressions[i].special.is_none()) => {
@@ -1109,7 +1141,7 @@ impl WindowContent for WatchesWindow {
 
         // Convert cursor_idx back to cursor_path.
         if !self.tree.rows.is_empty() {
-            self.set_cursor_path_from_node(self.tree.rows[self.cursor_idx]);
+            Self::set_cursor_path_from_node(self.tree.rows[self.cursor_idx], &mut self.cursor_path, &self.tree);
         }
 
         // Create widgets for visible nodes, handle mouse clicks.
@@ -1119,6 +1151,9 @@ impl WindowContent for WatchesWindow {
 
         if self.text_input.is_some() && !self.text_input_built {
             self.text_input = None;
+            ui.should_redraw = true;
+        }
+        if self.scroll_to_cursor {
             ui.should_redraw = true;
         }
     }
@@ -1488,7 +1523,7 @@ impl DisassemblyWindow {
 
         let d = self.search_dialog.get_or_insert_with(|| SearchDialog::new(Arc::new(FunctionSearcher), debugger.context.clone()));
         with_parent!(ui, dialog_widget, {
-            d.build(&debugger.symbols, Some(debugger.info.binaries.keys().cloned().collect()), ui);
+            d.build(&debugger.symbols, ui);
         });
 
         if d.should_close_dialog {
@@ -1687,23 +1722,27 @@ impl WindowContent for DisassemblyWindow {
         let mut source_line: Option<SourceScrollTarget> = None;
 
         if let Some(disas_line) = disas.lines.get(tab.area_state.cursor) {
-            let has_addr = disas_line.static_addr != 0 && disas_line.static_addr != usize::MAX;
-            if has_addr {
-                state.selected_addr = Some((binary.id.clone(), function_idx, binary.addr_map.static_to_dynamic(disas_line.static_addr)));
+            let mut cursor_static_addr = disas_line.static_addr;
+            if cursor_static_addr == 0 {
+                // If the cursor is in the header, use first instruction address.
+                cursor_static_addr = disas.lines.iter().find(|l| l.static_addr != 0).map_or(usize::MAX, |l| l.static_addr);
+            }
+            let mut cursor_addr = usize::MAX;
+            if cursor_static_addr != usize::MAX {
+                cursor_addr = binary.addr_map.static_to_dynamic(cursor_static_addr);
+                state.selected_addr = Some((binary.id.clone(), function_idx, cursor_addr));
             }
 
             for action in ui.check_keys(&[KeyAction::ToggleBreakpoint, KeyAction::DisableBreakpoint, KeyAction::StepToCursor, KeyAction::PreviousLocation, KeyAction::NextLocation]) {
                 match action {
-                    KeyAction::ToggleBreakpoint | KeyAction::DisableBreakpoint if has_addr => {
-                        let offset = disas_line.static_addr - function.addr.0;
-                        let addr = binary.addr_map.static_to_dynamic(disas_line.static_addr);
-                        let new_breakpoint = AddressBreakpoint {function: Some((tab.locator.clone().unwrap(), offset)), addr, subfunction_level: tab.selected_subfunction_level};
+                    KeyAction::ToggleBreakpoint | KeyAction::DisableBreakpoint if cursor_addr != usize::MAX => {
+                        let offset = cursor_static_addr - function.addr.0;
+                        let new_breakpoint = AddressBreakpoint {function: Some((tab.locator.clone().unwrap(), offset)), addr: cursor_addr, subfunction_level: tab.selected_subfunction_level};
                         Self::toggle_breakpoint(new_breakpoint, action == KeyAction::DisableBreakpoint, tab, &binary.addr_map, state, debugger, ui);
                     }
-                    KeyAction::StepToCursor if has_addr => {
+                    KeyAction::StepToCursor if cursor_addr != usize::MAX => {
                         ui.should_redraw = true;
-                        let addr = binary.addr_map.static_to_dynamic(disas_line.static_addr);
-                        let temp_breakpoint = AddressBreakpoint {function: None, addr, subfunction_level: tab.selected_subfunction_level};
+                        let temp_breakpoint = AddressBreakpoint {function: None, addr: cursor_addr, subfunction_level: tab.selected_subfunction_level};
                         let r = debugger.step_to_cursor(state.selected_thread, BreakpointOn::Address(temp_breakpoint));
                         report_result(state, &r);
                     }
@@ -3447,7 +3486,7 @@ impl CodeWindow {
 
         let d = self.search_dialog.get_or_insert_with(|| SearchDialog::new(Arc::new(FileSearcher), debugger.context.clone()));
         with_parent!(ui, dialog_widget, {
-            d.build(&debugger.symbols, None, ui);
+            d.build(&debugger.symbols, ui);
         });
 
         if d.should_close_dialog {

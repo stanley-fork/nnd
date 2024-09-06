@@ -1005,6 +1005,7 @@ impl Debugger {
         let mut buf: Vec<u8> = Vec::new();
         let mut step = StepState {tid, keep_other_threads_suspended: true, disable_breakpoints: true, internal_kind: kind, by_instructions, addr_ranges: Vec::new(), cfa: 0, single_steps: false, stack_digest: Vec::new()};
         let mut breakpoint_types: Vec<StepBreakpointType> = Vec::new();
+        let mut unwind: Option<(Arc<UnwindInfo>, AddrMap)> = None;
 
         // There are 2 things that can be missing:
         //  * Debug symbols (.debug_info).
@@ -1095,6 +1096,7 @@ impl Debugger {
             if symbols.identity != frame.symbols_identity {
                 return err!(Internal, "symbols were reloaded after generating backtrace");
             }
+            unwind = Some((binary.unwind.clone()?, binary.addr_map.clone()));
             let function = &symbols.functions[function_idx];
             let static_pseudo_addr = binary.addr_map.dynamic_to_static(frame.pseudo_addr);
             let mut static_addr_ranges: Vec<Range<usize>> = Vec::new();
@@ -1251,17 +1253,26 @@ impl Debugger {
             // If we're stepping over/out-of a function and the function throws an exception, control jumps to the 'catch' block, bypassing our AfterRet breakpoints.
             // Put breakpoints on all catch blocks in the call stack.
             let mut cached_memory = CachedMemReader::new(self.memory.clone());
-            let mut start_frame = subframe.frame_idx;
-            if step.internal_kind == StepKind::Out {
-                start_frame += 1;
+            let mut start_frame = subframe.frame_idx + 1;
+            let mut addrs: Vec<usize> = Vec::new();
+            if step.internal_kind == StepKind::Over {
+                if let Some((unwind, addr_map)) = unwind {
+                    // Find catch blocks in current function for the address ranges over which we're stepping.
+                    if let Err(e) = find_catch_blocks_for_ranges(&step.addr_ranges, &unwind, &addr_map, &mut cached_memory, &mut addrs) {
+                        eprintln!("warning: lsda error: {}", e);
+                    }
+                } else {
+                    // For step-over-instruction, find catch blocks covering just that instruction.
+                    start_frame -= 1;
+                }
             }
             for frame in &stack.frames[start_frame..] {
-                match find_catch_blocks(frame, &mut cached_memory) {
-                    Err(e) => eprintln!("warning: lsda error: {}", e),
-                    Ok(b) => for addr in b {
-                        breakpoints_to_add.push((StepBreakpointType::Catch, addr));
-                    }
+                if let Err(e) = find_catch_blocks_for_frame(frame, &mut cached_memory, &mut addrs) {
+                    eprintln!("warning: lsda error: {}", e);
                 }
+            }
+            for addr in addrs {
+                breakpoints_to_add.push((StepBreakpointType::Catch, addr));
             }
         }
 
