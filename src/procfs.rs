@@ -145,7 +145,7 @@ impl MemMapsInfo {
         let mut executables: HashSet<BinaryId> = HashSet::new();
         for line in reader.lines() {
             let line = line?;
-            
+
             // The last field of the line is path. It can contain spaces (including trailing).
             // So we can't just use line.split_whitespace() (SplitWhitespace.remainder() is currently nightly-only).
             // We also can't just use splitn(5) because it doesn't skip repeated spaces.
@@ -197,7 +197,12 @@ impl MemMapsInfo {
                 if p == "[vdso]" && permissions.contains(MemMapPermissions::EXECUTE) {
                     binary_id = Some(BinaryId {path: p.clone(), inode: pid as u64, special: SpecialSegmentId::Vdso(start..end)});
                 } else if !p.is_empty() && !p.starts_with('[') {
-                    binary_id = Some(BinaryId {path: p.clone(), inode, special: SpecialSegmentId::None});
+                    // If the executable file was deleted (e.g. recompiled), /proc/maps shows its filename as "/path/to/executable (deleted)". Discard this suffix.
+                    // It's also possible that the executable is named literally "/path/to/executable (deleted)" and not deleted - we'll fail to find it in this case;
+                    // in this case we'll fail to find it; AFAICT there's no reliable way to distinguish these cases
+                    // (but we may try harder if needed, e.g. check if this file exists; it'll always be vulnerable to race conditions with renaming the file).
+                    let path = p.strip_suffix(" (deleted)").unwrap_or(p).to_string();
+                    binary_id = Some(BinaryId {path, inode, special: SpecialSegmentId::None});
                 }
                 // We currently ignore executable anon (p.is_empty()) mappings, e.g. JITted code.
             }

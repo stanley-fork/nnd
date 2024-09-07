@@ -17,6 +17,7 @@ Additional arguments:
 --tty path   - equivalent to --stdin path --stdout path, see --help-tty
 -s   - suspend the program right after starting it
 -d path   - directory in which to look for source code; if specified multiple times, multiple directories will be searched; default: current directory
+--unstripped path   - path to executable from which to load debug symbols; useful if the running executable is stripped and you have an unstripped version on the side
 -m full|no-hover|disabled   - mouse mode; 'no-hover' to react only to clicking and dragging, 'disabled' to disable mouse altogether; default is 'full' (if it doesn't work, check if mouse reporting is enabled in the terminal application)
 --help   - show this help message; see below for more help pages
 
@@ -98,8 +99,6 @@ Debugging tips:
 Please (pretty please!) report all bugs, usability issues, slowness, first impressions, improvement ideas, feature requests, etc.
 If you work at ClickHouse, report to #debugger channel in slack or DM Michael Kolupaev. Otherwise email to mk.al13n+nnd@gmail.com or comment at https://al13n.itch.io/nnd"###),
         "--help-known-problems" =>             println!(r###"Current limitations:
- * Stepping is not aware of exceptions. E.g. if you step-over a function call, and the function throws an exception, the step won't notice that the control left the function;
-   the program will keep running (the status window will say 'stepping') until you manually suspend it (shift-c by default). Similar for step-out.
  * There are pretty printers for vector/slice/string/shared_ptr-like standard types in C++ and Rust. No pretty printers for hash tables, linked lists, and std::deque yet.
  * No global variables.
  * Thread filter ('/' in the threads window) is too limited: just a substring match in function name, file name, and thread name. Need to extend it enough to be able to e.g. filter out idle threads waiting for work or epoll.

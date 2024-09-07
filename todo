@@ -1,5 +1,4 @@
 investigate `clickhouse local` progress spinner appearing in debugger window despite -t
-use /proc/<pid>/exe for main executable file (match by inode number, stat() /exe for it), especially if it was deleted (/maps shows "<path> (deleted)" and we fail to find the file)
 fix empty symbols loading stage name near the end
 investigate regression in symbols loading speed (stuck on "parsing drawf" for ~10 seconds)
 investigate why many types are not deduped, e.g. there's DB::Block#441
@@ -16,15 +15,16 @@ test with 10k threads
   maybe avoid duplicate POKEUSER calls for debug registers if the thread already had them assigned
 test with watches window filled with long arrays (I saw 50ms frames when there are ~5 of them; maybe just decrease length limit)
 
+up/down arrows should close code search, or cycle history
 make symtab/dynsym work when debug info (or debuglink file) is missing
 more built-in pretty printers: PODArray, hash tables (std, sparsehash, absl, Rust), rb trees, deque, linked lists
+hotkey to switch between .h/.cpp (/.cc/.hh/.hpp/.cxx - maybe just all extensions)
 reordering tabs
 rearranging windows
 maximizing windows
 key to freeze value in watches window; can also be used for controlling when to run the expression if it has side effects
 tooltip in status window showing more log lines with line wrapping
 key to send SIGINT to the program
-option to load symbols from another file (unstripped executable) - will make it usable in ch cloud
 make return key do something in each window: go from threads to stack -> code -> disassembly -> code; from locals create a watch; from watch sub-value create another watch for that field/element; from breakpoints to code/disassembly/watch (depending on breakpoint type)
 "unexpectedly big memory read" (16 bytes) for f64 local variables on the stack in rust
 floating point and simd registers

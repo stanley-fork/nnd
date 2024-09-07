@@ -1,11 +1,12 @@
 use crate::{*, debugger::*, error::*, util::*, symbols::*, symbols_registry::*, procfs::*, unwind::*, registers::*, log::*, settings::*};
-use std::{collections::{HashMap, hash_map::Entry}, time::Instant};
+use std::{collections::{HashMap, hash_map::Entry}, time::Instant, fs, os::unix::fs::MetadataExt};
 use std::mem;
 use libc::pid_t;
 
 #[derive(Default)]
 pub struct ProcessInfo {
     pub maps: MemMapsInfo,
+    pub exe_inode: u64,
     // Pointers to symbols for all mapped binaries. Guaranteed to be present in SymbolsRegistry.
     pub binaries: HashMap<BinaryId, BinaryInfo>,
 
@@ -121,13 +122,27 @@ impl ThreadInfo {
 }
 
 pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) {
+    if debugger.info.exe_inode == 0 {
+        let path = format!("/proc/{}/exe", debugger.pid);
+        let m = match fs::metadata(&path) {
+            Err(e) => {
+                eprintln!("error: failed to read {}: {}", path, e);
+                return;
+            }
+            Ok(x) => x };
+        debugger.info.exe_inode = m.ino();
+        if debugger.info.exe_inode == 0 {
+            eprintln!("error: stat({}) returned inode number 0", path);
+            debugger.info.exe_inode = 1;
+        }
+    }
+
     let maps = match MemMapsInfo::read_proc_maps(debugger.pid) {
         Err(e) => {
-            eprintln!("error: failed to read maps: {:?}", e);
+            eprintln!("error: failed to read maps: {}", e);
             return;
         }
-        Ok(m) => m
-    };
+        Ok(m) => m };
 
     let mut binaries: HashMap<BinaryId, BinaryInfo> = HashMap::new();
 
@@ -150,7 +165,17 @@ pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) {
                 Entry::Vacant(v) => v,
             };
 
-            let latest = debugger.symbols.get_or_load(id, &debugger.memory);
+            let custom_path = if id.inode == debugger.info.exe_inode {
+                if let Some(p) = debugger.context.settings.unstripped_executable_path.clone() {
+                    Some(p)
+                } else {
+                    Some(format!("/proc/{}/exe", debugger.pid))
+                }
+            } else {
+                None
+            };
+
+            let latest = debugger.symbols.get_or_load(id, &debugger.memory, custom_path);
 
             let mut binary = match prev_binaries.remove(id) {
                 Some(mut bin) => {

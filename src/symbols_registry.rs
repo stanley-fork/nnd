@@ -23,7 +23,7 @@ pub struct SymbolsRegistry {
 impl SymbolsRegistry {
     pub fn new(context: Arc<Context>) -> Self { Self {binaries: HashMap::new(), shared: Arc::new(Shared {context, to_main_thread: Mutex::new(VecDeque::new()), wake_main_thread: Arc::new(EventFD::new())})} }
 
-    pub fn get_or_load(&mut self, id: &BinaryId, memory: &MemReader) -> BinaryInfo {
+    pub fn get_or_load(&mut self, id: &BinaryId, memory: &MemReader, custom_path: Option<String>) -> BinaryInfo {
         self.binaries.entry(id.clone()).or_insert_with(|| {
             let mut elf_contents_maybe: Result<Vec<u8>> = err!(Internal, "no contents");
             match &id.special {
@@ -41,7 +41,7 @@ impl SymbolsRegistry {
             let status = Arc::new(SymbolsLoadingStatus::new());
             *status.stage.lock().unwrap() = "opening ELF".to_string();
             let (shared_clone, id_clone, status_clone) = (self.shared.clone(), id.clone(), status.clone());
-            self.shared.context.executor.add(move || task_load_elf(shared_clone, id_clone, status_clone, elf_contents_maybe));
+            self.shared.context.executor.add(move || task_load_elf(shared_clone, id_clone, status_clone, elf_contents_maybe, custom_path));
             (BinaryInfo {id: id.clone(), elf: err!(Loading, "loading symbols"), symbols: err!(Loading, "loading symbols"), unwind: err!(Loading, "loading symbols"), addr_map: AddrMap::new()}, status)
         }).0.clone()
     }
@@ -131,11 +131,11 @@ enum Message {
     Unwind {id: BinaryId, unwind: Result<UnwindInfo>},
 }
 
-fn task_load_elf(shared: Arc<Shared>, id: BinaryId, status: Arc<SymbolsLoadingStatus>, elf_contents_maybe: Result<Vec<u8>>) {
+fn task_load_elf(shared: Arc<Shared>, id: BinaryId, status: Arc<SymbolsLoadingStatus>, elf_contents_maybe: Result<Vec<u8>>, custom_path: Option<String>) {
     let elf;
     {
         let _prof = ProfileScope::with_threshold(0.01, format!("opening elf {}", id.path));
-        elf = load_elf(&id, elf_contents_maybe);
+        elf = load_elf(&id, elf_contents_maybe, custom_path);
     }
 
     {
@@ -166,16 +166,17 @@ fn task_load_unwind(shared: Arc<Shared>, id: BinaryId, elf: Arc<ElfFile>) {
     shared.wake_main_thread.write(1);
 }
 
-fn load_elf(id: &BinaryId, contents_maybe: Result<Vec<u8>>) -> Result<Arc<ElfFile>> {
+fn load_elf(id: &BinaryId, contents_maybe: Result<Vec<u8>>, custom_path: Option<String>) -> Result<Arc<ElfFile>> {
     let elf = match &id.special {
         SpecialSegmentId::None => {
-            let file = File::open(&id.path)?;
+            let path = custom_path.as_ref().unwrap_or(&id.path);
+            let file = File::open(path)?;
             let metadata = file.metadata()?;
-            if metadata.ino() != id.inode {
+            if metadata.ino() != id.inode && custom_path.is_none() {
                 return err!(Usage, "binary changed");
             }
             let mmap = unsafe { Mmap::map(&file)? };
-            ElfFile::from_mmap(id.path.clone(), mmap)?
+            ElfFile::from_mmap(path.to_string(), mmap)?
         }
         SpecialSegmentId::Vdso(_) => {
             ElfFile::from_contents(id.path.clone(), contents_maybe?)?

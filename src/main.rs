@@ -104,6 +104,8 @@ fn main() {
             settings.fixed_fps = true;
         } else if let Some(path) = parse_arg(&mut args, "--dir", "-d", false) {
             settings.code_dirs.push(PathBuf::from(path));
+        } else if let Some(path) = parse_arg(&mut args, "--unstripped", "", false) {
+            settings.unstripped_executable_path = Some(path);
         } else if let Some(s) = parse_arg(&mut args, "--period", "", false) {
             let seconds = match s.parse::<f64>() {
                 Ok(p) if p >= 0.0 && p <= 4e9 => p,
