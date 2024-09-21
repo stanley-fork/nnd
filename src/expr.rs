@@ -213,7 +213,24 @@ pub enum AddrOrValueBlob {
 impl Default for AddrOrValueBlob { fn default() -> Self { AddrOrValueBlob::Blob(ValueBlob::new(0)) } }
 
 impl AddrOrValueBlob {
+    // asdqwe merge into into_value()
     pub fn into_value(self, bytes: usize, memory: &MemReader) -> Result<ValueBlob> {
+        Ok(match self {
+            Self::Blob(b) => {
+                if b.capacity() < bytes {
+                    return err!(Dwarf, "value too short: ~{} < {}", b.capacity(), bytes);
+                }
+                b
+            }
+            Self::Addr(a) => {
+                let mut b = ValueBlob::with_capacity(bytes);
+                memory.read(a, &mut b.as_mut_slice()[..bytes])?;
+                b
+            }
+        })
+    }
+
+    pub fn into_value_cached(self, bytes: usize, memory: &mut CachedMemReader) -> Result<ValueBlob> {
         Ok(match self {
             Self::Blob(b) => {
                 if b.capacity() < bytes {
@@ -413,7 +430,7 @@ impl EvalState {
     fn get_local_variable(&mut self, context: &mut EvalContext, name: &str, subframe_idx: usize, only_type: bool) -> Result<Value> {
         let subframe = &context.stack.subframes[subframe_idx];
         let pseudo_addr = context.stack.frames[subframe.frame_idx].pseudo_addr;
-        let (dwarf_context, _) = context.make_local_dwarf_eval_context(subframe_idx)?;
+        let (mut dwarf_context, _) = context.make_local_dwarf_eval_context(subframe_idx)?;
         let static_pseudo_addr = dwarf_context.addr_map.dynamic_to_static(pseudo_addr);
         for v in dwarf_context.local_variables {
             if !v.range().contains(&(static_pseudo_addr)) || unsafe {v.name()} != name {
@@ -422,7 +439,7 @@ impl EvalState {
             if only_type {
                 return Ok(Value {val: Default::default(), type_: v.type_, flags: ValueFlags::empty()});
             }
-            let (value, dubious) = eval_dwarf_expression(v.expr, &dwarf_context)?;
+            let (value, dubious) = eval_dwarf_expression(v.expr, &mut dwarf_context)?;
             let val = Value {val: value, type_: v.type_, flags: ValueFlags::empty()};
             self.currently_evaluated_value_dubious |= dubious;
             return Ok(val);
@@ -434,6 +451,7 @@ impl EvalState {
 
 pub struct EvalContext<'a> {
     pub memory: &'a MemReader,
+    pub cached_memory: CachedMemReader, // asdqwe merge into `memory`
     pub process_info: &'a ProcessInfo,
     // We include the whole stack to allow watch expressions to use variables from other frames.
     pub stack: &'a StackTrace,
@@ -467,7 +485,7 @@ impl EvalContext<'_> {
         let subfunction = &symbols.shards[shard_idx].subfunctions[subfunction_idx];
         let local_variables = symbols.local_variables_in_subfunction(subfunction, shard_idx);
 
-        let context = DwarfEvalContext {memory: self.memory, symbols: Some(symbols), addr_map: &binary.addr_map, encoding: unit.unit.header.encoding(), unit: Some(unit), regs: Some(&frame.regs), frame_base: &frame.frame_base, local_variables};
+        let context = DwarfEvalContext {memory: &mut self.cached_memory, symbols: Some(symbols), addr_map: &binary.addr_map, encoding: unit.unit.header.encoding(), unit: Some(unit), regs: Some(&frame.regs), frame_base: &frame.frame_base, local_variables};
         Ok((context, function))
     }
 }
@@ -1025,8 +1043,7 @@ pub fn get_struct_field(val: &AddrOrValueBlob, field: &StructField, memory: &Mem
 // Information needed for evaluating DWARF expressions.
 pub struct DwarfEvalContext<'a> {
     // Process.
-    // TODO: CachedMemReader
-    pub memory: &'a MemReader,
+    pub memory: &'a mut CachedMemReader,
 
     // Binary.
     pub symbols: Option<&'a Symbols>,
@@ -1043,7 +1060,7 @@ pub struct DwarfEvalContext<'a> {
     pub local_variables: &'a [LocalVariable],
 }
 
-pub fn eval_dwarf_expression(mut expression: Expression<SliceType>, context: &DwarfEvalContext) -> Result<(AddrOrValueBlob, /*dubious*/ bool)> {
+pub fn eval_dwarf_expression(mut expression: Expression<SliceType>, context: &mut DwarfEvalContext) -> Result<(AddrOrValueBlob, /*dubious*/ bool)> {
     // Ignore [DW_OP_deref, DW_OP_stack_value] at the end of expression.
     // This is a workaround for what may be a quirk in LLVM: sometimes [DW_OP_deref, DW_OP_stack_value] is used for
     // variables whose type is a struct bigger than 8 bytes. Taken literally, these instructions say to read 8 bytes
@@ -1207,7 +1224,7 @@ pub fn eval_dwarf_expression(mut expression: Expression<SliceType>, context: &Dw
             return Ok((val, dubious));
         }
 
-        let val = val.into_value((size_in_bits + bit_offset + 7) / 8, context.memory)?;
+        let val = val.into_value_cached((size_in_bits + bit_offset + 7) / 8, context.memory)?;
         res.append_bits(res_bits, val, size_in_bits, bit_offset);
         res_bits += size_in_bits;
     }

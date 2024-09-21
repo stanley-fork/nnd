@@ -191,7 +191,7 @@ impl UnwindInfo {
         Ok(res)
     }
 
-    pub fn find_row_and_eval_cfa<'a>(&self, memory: &MemReader, addr_map: &AddrMap, scratch: &'a mut UnwindScratchBuffer, pseudo_addr: usize, regs: &Registers) -> Result<(FrameDescriptionEntry<SliceType>, &'a UnwindTableRow<usize>, /*cfa*/ usize, /*cfa_dubious*/ bool, /*section*/ SliceType)> {
+    pub fn find_row_and_eval_cfa<'a>(&self, memory: &mut CachedMemReader, addr_map: &AddrMap, scratch: &'a mut UnwindScratchBuffer, pseudo_addr: usize, regs: &Registers) -> Result<(FrameDescriptionEntry<SliceType>, &'a UnwindTableRow<usize>, /*cfa*/ usize, /*cfa_dubious*/ bool, /*section*/ SliceType)> {
         let static_pseudo_addr = addr_map.dynamic_to_static(pseudo_addr);
         let found = match &self.debug_frame {
             Some(section) => section.find_fde_and_row(static_pseudo_addr, scratch)?,
@@ -231,7 +231,7 @@ impl UnwindInfo {
     }
 
     // Assigns cfa and return address in current frame and returns registers for next frame.
-    pub fn step(&self, memory: &MemReader, addr_map: &AddrMap, scratch: &mut UnwindScratchBuffer, pseudo_addr: usize, frame: &mut StackFrame, elf: &ElfFile) -> Result<(Registers, /*is_signal_trampoline*/ bool)> {
+    pub fn step(&self, memory: &mut CachedMemReader, addr_map: &AddrMap, scratch: &mut UnwindScratchBuffer, pseudo_addr: usize, frame: &mut StackFrame, elf: &ElfFile) -> Result<(Registers, /*is_signal_trampoline*/ bool)> {
         if let Some(r) = self.step_through_sig_return(memory, addr_map, &mut frame.regs, elf)? {
             return Ok((r, true));
         }
@@ -315,7 +315,7 @@ impl UnwindInfo {
         Ok((new_regs, fde.is_signal_trampoline()))
     }
 
-    fn step_through_sig_return(&self, memory: &MemReader, addr_map: &AddrMap, regs: &mut Registers, elf: &ElfFile) -> Result<Option<Registers>> {
+    fn step_through_sig_return(&self, memory: &mut CachedMemReader, addr_map: &AddrMap, regs: &mut Registers, elf: &ElfFile) -> Result<Option<Registers>> {
         // Recognize signal trampoline machine code, like GDB does. Because some libc implementations (musl) don't have correct DWARF unwind information for this function.
         const CODE: [u8; 9] = [
             0x48u8, 0xc7, 0xc0, 0x0f, 0x00, 0x00, 0x00, // mov rax, 15
@@ -360,8 +360,8 @@ impl UnwindInfo {
     }
 }
 
-fn eval_dwarf_expression_as_u64(expression: Expression<SliceType>, encoding: Encoding, regs: &Registers, memory: &MemReader, addr_map: &AddrMap, skip_final_dereference: bool) -> Result<(u64, /* dubious */ bool)> {
-    let (val, dubious) = eval_dwarf_expression(expression, &DwarfEvalContext {encoding, memory, symbols: None, unit: None, addr_map, regs: Some(regs), frame_base: &err!(Dwarf, "no frame base"), local_variables: &[]})?;
+fn eval_dwarf_expression_as_u64(expression: Expression<SliceType>, encoding: Encoding, regs: &Registers, memory: &mut CachedMemReader, addr_map: &AddrMap, skip_final_dereference: bool) -> Result<(u64, /* dubious */ bool)> {
+    let (val, dubious) = eval_dwarf_expression(expression, &mut DwarfEvalContext {encoding, memory, symbols: None, unit: None, addr_map, regs: Some(regs), frame_base: &err!(Dwarf, "no frame base"), local_variables: &[]})?;
     let val = if skip_final_dereference {
         // I'm probably misunderstanding something, but the meaning of gimli::read::Location::Address seems to be different between CFA/frame-base vs registers/variables.
         // In CFA and frame base, we treat Location::Address the same as Location::Value, presumably because the "value" of CFA/frame-base is an "address", so no dereference is needed.
@@ -372,12 +372,13 @@ fn eval_dwarf_expression_as_u64(expression: Expression<SliceType>, encoding: Enc
             AddrOrValueBlob::Blob(v) => v.get_usize()? as u64,
         }
     } else {
-        val.into_value(8, memory)?.get_usize()? as u64
+        val.into_value_cached(8, memory)?.get_usize()? as u64
     };
     Ok((val, dubious))
+
 }
 
-fn eval_cfa_rule(rule: &CfaRule<usize>, encoding: Encoding, section: SliceType, registers: &Registers, memory: &MemReader, addr_map: &AddrMap) -> Result<(u64, bool)> {
+fn eval_cfa_rule(rule: &CfaRule<usize>, encoding: Encoding, section: SliceType, registers: &Registers, memory: &mut CachedMemReader, addr_map: &AddrMap) -> Result<(u64, bool)> {
     Ok(match rule {
         CfaRule::Expression(e) => {
             let e = Expression(EndianSlice::new(&section.slice()[e.offset..e.offset+e.length], LittleEndian));
@@ -397,7 +398,7 @@ fn eval_cfa_rule(rule: &CfaRule<usize>, encoding: Encoding, section: SliceType, 
     })
 }
 
-fn eval_register_rule(reg: Option<RegisterIdx>, rule: &RegisterRule<usize>, encoding: Encoding, section: SliceType, registers: &Registers, memory: &MemReader, addr_map: &AddrMap) -> Result<Option<(u64, bool)>> {
+fn eval_register_rule(reg: Option<RegisterIdx>, rule: &RegisterRule<usize>, encoding: Encoding, section: SliceType, registers: &Registers, memory: &mut CachedMemReader, addr_map: &AddrMap) -> Result<Option<(u64, bool)>> {
     let (cfa, cfa_dubious) = registers.get_int(RegisterIdx::Cfa).unwrap();
     let val = match rule {
         RegisterRule::Undefined => return Ok(None),
@@ -418,12 +419,12 @@ fn eval_register_rule(reg: Option<RegisterIdx>, rule: &RegisterRule<usize>, enco
                 Ok(x) => x,
             }
         }
-        RegisterRule::Offset(offset) => (memory.read_u64(cfa.wrapping_add(*offset as u64) as usize)?, cfa_dubious),
+        RegisterRule::Offset(offset) => (memory.read_usize(cfa.wrapping_add(*offset as u64) as usize)? as u64, cfa_dubious),
         RegisterRule::ValOffset(offset) => (cfa.wrapping_add(*offset as u64), cfa_dubious),
         RegisterRule::Expression(e) => {
             let e = Expression(EndianSlice::new(&section.slice()[e.offset..e.offset+e.length], LittleEndian));
             let (addr, dubious) = eval_dwarf_expression_as_u64(e, encoding, registers, memory, addr_map, /*skip_final_dereference*/ true)?;
-            (memory.read_u64(addr as usize)?, dubious)
+            (memory.read_usize(addr as usize)? as u64, dubious)
         }
         RegisterRule::ValExpression(e) => {
             let e = Expression(EndianSlice::new(&section.slice()[e.offset..e.offset+e.length], LittleEndian));

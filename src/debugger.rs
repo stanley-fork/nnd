@@ -1478,6 +1478,7 @@ impl Debugger {
         let mut regs = thread.info.regs.clone();
         let mut scratch = UnwindScratchBuffer::default();
         let mut pseudo_addr = regs.get_int(RegisterIdx::Rip).unwrap().0 as usize;
+        let mut memory = CachedMemReader::new(self.memory.clone());
 
         loop {
             let idx = stack.frames.len();
@@ -1499,7 +1500,7 @@ impl Debugger {
 
             // This populates CFA "register", so needs to happen before symbolizing the frame (because frame_base expression might use CFA).
             let unwind = binary.unwind.as_ref_clone_error()?;
-            let step_result = unwind.step(&self.memory, &binary.addr_map, &mut scratch, pseudo_addr, frame, &**binary.elf.as_ref().unwrap());
+            let step_result = unwind.step(&mut memory, &binary.addr_map, &mut scratch, pseudo_addr, frame, &**binary.elf.as_ref().unwrap());
 
             if step_result.as_ref().is_ok_and(|(_, is_signal_trampoline)| *is_signal_trampoline) {
                 // Un-decrement the instruction pointer, there's no `call` in signal trampoline.
@@ -1507,7 +1508,7 @@ impl Debugger {
                 static_pseudo_addr = binary.addr_map.dynamic_to_static(frame.pseudo_addr);
             }
 
-            self.symbolize_stack_frame(static_pseudo_addr, binary, frame, &mut stack.subframes);
+            self.symbolize_stack_frame(static_pseudo_addr, binary, frame, &mut stack.subframes, &mut memory);
 
             if partial {
                 return Ok(());
@@ -1560,13 +1561,13 @@ impl Debugger {
         })
     }
 
-    fn calculate_frame_base(&self, frame: &mut StackFrame, static_addr: usize, binary: &BinaryInfo, symbols: &Symbols, function: &FunctionInfo, root_subfunction: &Subfunction) -> Result<()> {
+    fn calculate_frame_base(&self, frame: &mut StackFrame, static_addr: usize, binary: &BinaryInfo, symbols: &Symbols, function: &FunctionInfo, root_subfunction: &Subfunction, memory: &mut CachedMemReader) -> Result<()> {
         let debug_info_offset = match function.debug_info_offset() {
             Some(o) => o,
             None => return Ok(()) };
         let unit = symbols.find_unit(debug_info_offset)?;
         let no_frame_base = err!(Dwarf, "frame base depends on itself");
-        let context = DwarfEvalContext {memory: &self.memory, symbols: Some(symbols), addr_map: &binary.addr_map, encoding: unit.unit.header.encoding(), unit: Some(unit), regs: Some(&frame.regs), frame_base: &no_frame_base, local_variables: &[]};
+        let mut context = DwarfEvalContext {memory, symbols: Some(symbols), addr_map: &binary.addr_map, encoding: unit.unit.header.encoding(), unit: Some(unit), regs: Some(&frame.regs), frame_base: &no_frame_base, local_variables: &[]};
         for v in symbols.local_variables_in_subfunction(root_subfunction, function.shard_idx()) {
             if !v.flags().contains(LocalVariableFlags::FRAME_BASE) {
                 // Frame bases are always first in the list.
@@ -1575,7 +1576,7 @@ impl Debugger {
             if !v.range().contains(&static_addr) {
                 continue;
             }
-            let (val, dubious) = eval_dwarf_expression(v.expr, &context)?;
+            let (val, dubious) = eval_dwarf_expression(v.expr, &mut context)?;
             
             // Not sure how exactly the result of DW_AT_frame_base expression is meant to be interpreted.
             // I've seen only two different expressions ever used as DW_AT_frame_base:
@@ -1595,7 +1596,7 @@ impl Debugger {
         Ok(())
     }
     
-    fn symbolize_stack_frame(&self, static_addr: usize, binary: &BinaryInfo, frame: &mut StackFrame, subframes: &mut Vec<StackSubframe>) {
+    fn symbolize_stack_frame(&self, static_addr: usize, binary: &BinaryInfo, frame: &mut StackFrame, subframes: &mut Vec<StackSubframe>, memory: &mut CachedMemReader) {
         assert!(frame.subframes.len() == 1 && frame.subframes.start + 1 == subframes.len());
         let frame_idx = subframes.last().unwrap().frame_idx;
         let symbols = match binary.symbols.as_ref_clone_error() {
@@ -1621,7 +1622,7 @@ impl Debugger {
                 if let Some((root_subfunction, root_subfunction_idx)) = symbols.root_subfunction(function) {
                     sf.subfunction_idx = Some(root_subfunction_idx);
 
-                    match self.calculate_frame_base(frame, static_addr, binary, symbols, function, root_subfunction) {
+                    match self.calculate_frame_base(frame, static_addr, binary, symbols, function, root_subfunction, memory) {
                         Ok(()) => (),
                         Err(e) => frame.frame_base = Err(e) }
 
@@ -1660,7 +1661,7 @@ impl Debugger {
     }
 
     pub fn make_eval_context<'a>(&'a self, stack: &'a StackTrace, selected_subframe: usize) -> EvalContext<'a> {
-        EvalContext {memory: &self.memory, process_info: &self.info, stack, selected_subframe}
+        EvalContext {memory: &self.memory, cached_memory: CachedMemReader::new(self.memory.clone()), process_info: &self.info, stack, selected_subframe}
     }
 
     pub fn add_breakpoint(&mut self, on: BreakpointOn) -> Result<BreakpointId> {
@@ -2098,7 +2099,8 @@ impl Debugger {
             }
             Ok(u) => u };
         let mut scratch = UnwindScratchBuffer::default();
-        match unwind.find_row_and_eval_cfa(memory, &binary.addr_map, &mut scratch, addr, regs) {
+        let mut memory = CachedMemReader::new(memory.clone());
+        match unwind.find_row_and_eval_cfa(&mut memory, &binary.addr_map, &mut scratch, addr, regs) {
             Err(e) => {
                 log!(log, "no frame for addr 0x{:x}: {}", addr, e);
                 eprintln!("warning: no frame for addr 0x{:x} (when determining cfa for step): {}", addr, e);

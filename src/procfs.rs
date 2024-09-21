@@ -337,7 +337,7 @@ const PAGE_SIZE: usize = 4096;
 pub struct CachedMemReader {
     pub mem: MemReader,
     addr: usize,
-    page: [u8; PAGE_SIZE],
+    page: [u8; PAGE_SIZE],// TODO: MaybeUninit, to make it cheap to create unused CachedMemReader, in particular when handling spurious SIGSTOPs
 }
 impl CachedMemReader {
     pub fn new(mem: MemReader) -> Self { Self {mem, addr: 0, page: [0; PAGE_SIZE]} }

@@ -502,7 +502,7 @@ impl WatchesWindow {
         let selected_subframe = context.selected_subframe;
         let subframe = &context.stack.subframes[selected_subframe];
         let pseudo_addr = context.stack.frames[subframe.frame_idx].pseudo_addr;
-        let (dwarf_context, _) = match context.make_local_dwarf_eval_context(selected_subframe) {
+        let (mut dwarf_context, _) = match context.make_local_dwarf_eval_context(selected_subframe) {
             Ok(x) => x,
             Err(e) => {
                 self.tree.nodes[parent.0].value = Err(e);
@@ -521,7 +521,7 @@ impl WatchesWindow {
                 // Pseudo-variable internal to eh_frame unwind mechanism. We don't list it here, but it's available as `#frame_base` in watch expressions.
                 continue;
             }
-            let (value, dubious) = match eval_dwarf_expression(v.expr, &dwarf_context) {
+            let (value, dubious) = match eval_dwarf_expression(v.expr, &mut dwarf_context) {
                 Ok((val, dub)) => (Ok(val), dub),
                 Err(e) => (Err(e), false),
             };
