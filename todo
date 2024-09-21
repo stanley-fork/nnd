@@ -46,7 +46,7 @@ key to follow a jump in disas
 allow line-based steps in .plt* (maybe by just turning them into single-instruction-steps)
 in disassembly window, make 'left' key jump to the start of inlined function
 maximizing windows (hot key and button in a corner)
-special breakpoints: panic (rust_panic, but also investigate how to catch things like overflow checks, they don't seem to go through rust_panic; maybe disable find_catch_blocks() for rust at least when panic bp is enabled), exception (__cxa_throw), signals, program start (replacing -c), main function entry, dynamic library load
+special breakpoints: panic (rust_panic, core::panicking::panic_fmt, or maybe std::panicking::rust_panic_with_hook; maybe disable find_catch_blocks() for rust at least when panic bp is enabled), exception (__cxa_throw), signals, program start (replacing -c), main function entry, dynamic library load
 make source window autoscroll horizontally in addition to vertically
 -v for build datetime
 handle partially-optimized-out struct values (common in rust)

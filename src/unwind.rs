@@ -372,7 +372,7 @@ fn eval_dwarf_expression_as_u64(expression: Expression<SliceType>, encoding: Enc
             AddrOrValueBlob::Blob(v) => v.get_usize()? as u64,
         }
     } else {
-        val.into_value_cached(8, memory)?.get_usize()? as u64
+        val.into_value(8, memory)?.get_usize()? as u64
     };
     Ok((val, dubious))
 

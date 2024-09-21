@@ -336,41 +336,49 @@ const PAGE_SIZE: usize = 4096;
 // Reads debuggee's memory, caches last read page. Good for sequential small reads.
 pub struct CachedMemReader {
     pub mem: MemReader,
-    addr: usize,
-    page: [u8; PAGE_SIZE],// TODO: MaybeUninit, to make it cheap to create unused CachedMemReader, in particular when handling spurious SIGSTOPs
+    addr: Option<usize>,
+    page: [MaybeUninit<u8>; PAGE_SIZE],
 }
 impl CachedMemReader {
-    pub fn new(mem: MemReader) -> Self { Self {mem, addr: 0, page: [0; PAGE_SIZE]} }
+    pub fn new(mem: MemReader) -> Self { Self {mem, addr: None, page: unsafe {MaybeUninit::uninit().assume_init()}} }
 
-    pub fn read(&mut self, mut offset: usize, mut buf: &mut [u8]) -> Result<()> {
+    pub fn read_uninit<'a>(&mut self, mut offset: usize, mut buf: &'a mut [MaybeUninit<u8>]) -> Result<&'a mut [u8]> {
+        if buf.is_empty() {
+            return Ok(&mut []);
+        }
         let last_page = (offset + buf.len() - 1) & !(PAGE_SIZE - 1);
         // Read non-last pages without populating cache.
         while offset & !(PAGE_SIZE - 1) < last_page {
             let start = offset & (PAGE_SIZE - 1);
             let len = PAGE_SIZE - start;
-            if self.addr != 0 && offset & !(PAGE_SIZE - 1) == self.addr {
+            if &self.addr == &Some(offset & !(PAGE_SIZE - 1)) {
                 buf[..len].copy_from_slice(&self.page[start..start+len]);
             } else {
-                self.mem.read(offset, &mut buf[..len])?;
+                self.mem.read_uninit(offset, &mut buf[..len])?;
             }
             buf = &mut buf[len..];
             offset += len;
         }
         // Read last page through cache.
-        if self.addr == 0 || last_page != self.addr {
-            self.addr = 0;
-            self.mem.read(last_page, &mut self.page)?;
-            self.addr = last_page;
+        if &self.addr != &Some(last_page) {
+            self.addr = None;
+            self.mem.read_uninit(last_page, &mut self.page)?;
+            self.addr = Some(last_page);
         }
         let start = offset & (PAGE_SIZE - 1);
         buf.copy_from_slice(&self.page[start..start + buf.len()]);
-        return Ok(());
+        Ok(unsafe {std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())})
+    }
+
+    pub fn read(&mut self, offset: usize, buf: &mut [u8]) -> Result<()> {
+        unsafe {self.read_uninit(offset, std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut MaybeUninit<u8>, buf.len()))}?;
+        Ok(())
     }
 
     pub fn read_u8(&mut self, offset: usize) -> Result<u8> {
-        if self.addr != 0 && offset & !(PAGE_SIZE - 1) == self.addr {
+        if &self.addr == &Some(offset & !(PAGE_SIZE - 1)) {
             // Fast path.
-            return Ok(self.page[offset & (PAGE_SIZE - 1)]);
+            return Ok(unsafe {self.page[offset & (PAGE_SIZE - 1)].assume_init()});
         }
         let mut buf = [0u8; 1];
         self.read(offset, &mut buf)?;

@@ -116,7 +116,7 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                         None => return err!(TypeMismatch, "field {} not found", name),
                     };
                     let field = &s.fields()[field_idx];
-                    let v = get_struct_field(&val.val, field, context.memory)?;
+                    let v = get_struct_field(&val.val, field, &mut context.memory)?;
                     // Should the field inherit flags from the struct? E.g. should `foo.#r._M_begin` be printed as raw?
                     // Unclear, but this should be kept consistent between expression evaluation and value printing (format_value()).
                     // Currently we inherit.
@@ -135,7 +135,7 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                         return err!(TypeMismatch, "field index our of range: {} >= {}", field_idx, s.fields().len());
                     }
                     let field = &s.fields()[field_idx];
-                    let v = get_struct_field(&val.val, field, context.memory)?;
+                    let v = get_struct_field(&val.val, field, &mut context.memory)?;
                     Ok(Value {val: v, type_: field.type_, flags: val.flags.inherit()})
                 }
                 _ => return err!(TypeMismatch, "trying to get field of {}", type_.t.kind_name()),
@@ -167,7 +167,7 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
             match op {
                 UnaryOperator::Dereference => match &type_.t {
                     Type::Pointer(p) => {
-                        let addr = val.val.into_value(8, context.memory)?.get_usize()?;
+                        let addr = val.val.into_value(8, &mut context.memory)?.get_usize()?;
                         val.val = AddrOrValueBlob::Addr(addr);
                         val.type_ = p.type_;
                     }
@@ -178,7 +178,7 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                         Type::Primitive(f) => {
                             if f.contains(PrimitiveFlags::UNSPECIFIED) { return err!(TypeMismatch, "can't negate void"); }
                             let size = type_.calculate_size();
-                            let mut x = val.val.into_value(size, context.memory)?.get_usize()?;
+                            let mut x = val.val.into_value(size, &mut context.memory)?.get_usize()?;
                             if f.contains(PrimitiveFlags::FLOAT) {
                                 if op == UnaryOperator::Not { return err!(TypeMismatch, "can't bit-negate float"); }
                                 match size {
@@ -213,7 +213,7 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
             let mut val = eval_expression(expr, node.children[0], state, context, false)?;
             follow_references_and_prettify(&mut val, false, state, context)?;
             let type_ = eval_type(expr, node.children[1], state, context)?;
-            let b = to_basic(&val, &context.memory, "cast")?;
+            let b = to_basic(&val, &mut context.memory, "cast")?;
             val.val = from_basic(b, type_)?;
             val.type_ = type_;
             Ok(val)
@@ -243,12 +243,12 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
             follow_references_and_prettify(&mut lhs, false, state, context)?;
             match op { // short-circuiting
                 BinaryOperator::LazyAnd | BinaryOperator::LazyOr => {
-                    let mut x = to_basic(&lhs, &context.memory, "&&/||")?.cast_to_usize() != 0;
+                    let mut x = to_basic(&lhs, &mut context.memory, "&&/||")?.cast_to_usize() != 0;
                     if x == (op == BinaryOperator::LazyAnd) {
                         // Not ideal that short-circuiting also skips typechecking.
                         let rhs = eval_expression(expr, node.children[1], state, context, false)?;
                         follow_references_and_prettify(&mut lhs, false, state, context)?;
-                        x = to_basic(&rhs, &context.memory, "&&/||")?.cast_to_usize() != 0;
+                        x = to_basic(&rhs, &mut context.memory, "&&/||")?.cast_to_usize() != 0;
                     }
                     let type_ = state.builtin_types.bool_;
                     return Ok(Value {val: AddrOrValueBlob::Blob(ValueBlob::new(x as usize)), type_, flags: ValueFlags::empty()});
@@ -258,13 +258,13 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
             let mut rhs = eval_expression(expr, node.children[1], state, context, false)?;
             follow_references_and_prettify(&mut rhs, false, state, context)?;
             if op == BinaryOperator::Index || op == BinaryOperator::Slicify {
-                let b = to_basic(&rhs, &context.memory, "index with")?;
+                let b = to_basic(&rhs, &mut context.memory, "index with")?;
                 if b.is_f64() { return err!(TypeMismatch, "can't index with float"); }
                 let idx = b.cast_to_usize();
                 let t = unsafe {&*lhs.type_};
                 return Ok(match &t.t {
                     Type::Pointer(p) => {
-                        let addr = lhs.val.into_value(8, context.memory)?.get_usize()?;
+                        let addr = lhs.val.into_value(8, &mut context.memory)?.get_usize()?;
                         let stride = unsafe {(*p.type_).calculate_size()};
                         if op == BinaryOperator::Index {
                             Value {val: AddrOrValueBlob::Addr(addr + idx * stride), type_: p.type_, flags: lhs.flags.inherit()}
@@ -274,6 +274,9 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                         }
                     }
                     Type::Array(a) if op == BinaryOperator::Index => {
+                        if a.flags.contains(ArrayFlags::LEN_KNOWN) && idx >= a.len {
+                            return err!(Runtime, "array index out of range: {} >= {}", idx, a.len);
+                        }
                         let stride = if a.stride == 0 {unsafe {(*a.type_).calculate_size()}} else {a.stride};
                         let val = match lhs.val {
                             AddrOrValueBlob::Addr(addr) => AddrOrValueBlob::Addr(addr + idx * stride),
@@ -283,8 +286,12 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                     }
                     Type::Slice(s) if op == BinaryOperator::Index => {
                         let stride = unsafe {(*s.type_).calculate_size()};
-                        let blob = lhs.val.into_value(16, context.memory)?;
+                        let blob = lhs.val.into_value(16, &mut context.memory)?;
                         let addr = blob.get_usize_prefix();
+                        let len = blob.get_usize_at(8)?;
+                        if idx >= len {
+                            return err!(Runtime, "slice index out of range: {} >= {}", idx, len);
+                        }
                         Value {val: AddrOrValueBlob::Addr(addr + idx * stride), type_: s.type_, flags: lhs.flags.inherit()}
                     }
                     _ => return err!(TypeMismatch, "can't {} {}", if op == BinaryOperator::Index {"index"} else {"slicify"}, t.t.kind_name()),
@@ -304,7 +311,7 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                 if size == 0 {
                     return err!(TypeMismatch, "range of size-0 types is not allowed");
                 }
-                let (addr1, addr2) = (lhs.val.into_value(8, context.memory)?.get_usize()?, rhs.val.into_value(8, context.memory)?.get_usize()?);
+                let (addr1, addr2) = (lhs.val.into_value(8, &mut context.memory)?.get_usize()?, rhs.val.into_value(8, &mut context.memory)?.get_usize()?);
                 if addr1 > addr2 {
                     return err!(Runtime, "range has negative length: 0x{:x} > 0x{:x}", addr1, addr2);
                 }
@@ -316,8 +323,8 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                 let array_type = state.types.add_array(t1, len, ArrayFlags::empty());
                 return Ok(Value {val: AddrOrValueBlob::Addr(addr1), type_: array_type, flags: ValueFlags::empty()});
             }
-            let mut a = to_basic(&lhs, &context.memory, "arithmetic")?;
-            let mut b = to_basic(&rhs, &context.memory, "arithmetic")?;
+            let mut a = to_basic(&lhs, &mut context.memory, "arithmetic")?;
+            let mut b = to_basic(&rhs, &mut context.memory, "arithmetic")?;
             let r = match op {
                 BinaryOperator::Add | BinaryOperator::Sub => {
                     let (mut ta, mut tb) = unsafe {(&*lhs.type_, &*rhs.type_)};
@@ -505,7 +512,7 @@ fn follow_references_and_prettify(val: &mut Value, pointers_too: bool, state: &m
         let type_ = unsafe {&*val.type_};
         match &type_.t {
             Type::Pointer(p) if p.flags.contains(PointerFlags::REFERENCE) || pointers_too => {
-                let addr = val.val.clone().into_value(8, context.memory)?.get_usize()?;
+                let addr = val.val.clone().into_value(8, &mut context.memory)?.get_usize()?;
                 val.val = AddrOrValueBlob::Addr(addr);
                 val.type_ = p.type_;
             }
@@ -533,12 +540,12 @@ impl BasicValue {
     fn is_isize(&self) -> bool { match self { Self::I(_) => true, _ => false } }
 }
 
-fn to_basic(val: &Value, memory: &MemReader, what: &str) -> Result<BasicValue> {
+fn to_basic(val: &Value, memory: &mut CachedMemReader, what: &str) -> Result<BasicValue> {
     let t = unsafe {&*val.type_};
     let size = t.calculate_size();
     Ok(match &t.t {
         Type::Primitive(f) => {
-            let mut x = val.val.clone().into_value(size, &memory)?.get_usize()?;
+            let mut x = val.val.clone().into_value(size, memory)?.get_usize()?;
             if f.contains(PrimitiveFlags::FLOAT) {
                 BasicValue::F(match size {
                     4 => unsafe {mem::transmute::<u32, f32>(x as u32) as f64},
@@ -555,7 +562,7 @@ fn to_basic(val: &Value, memory: &MemReader, what: &str) -> Result<BasicValue> {
                 BasicValue::U(x)
             }
         }
-        Type::Pointer(_) | Type::Enum(_) => BasicValue::U(val.val.clone().into_value(size, &memory)?.get_usize()?),
+        Type::Pointer(_) | Type::Enum(_) => BasicValue::U(val.val.clone().into_value(size, memory)?.get_usize()?),
         _ => return err!(TypeMismatch, "can't {} {}", what, t.t.kind_name()),
     })
 }

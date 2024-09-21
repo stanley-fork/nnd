@@ -65,7 +65,7 @@ pub fn prettify_value(val: &mut Cow<Value>, warning: &mut Option<Error>, state: 
         t.t.as_pointer().is_some_and(|p| p.type_ == inner)
     };
     if allow_full_unwrap && fields.len() == 1 && !is_pointer_to(fields[0].type_, type_) {
-        let field_val = get_struct_field(&val.val, &fields[0], context.memory)?;
+        let field_val = get_struct_field(&val.val, &fields[0], &mut context.memory)?;
         let new_val = Value {val: field_val, type_: fields[0].type_, flags: val.flags};
         *val = Cow::Owned(new_val);
         return Ok(());
@@ -365,7 +365,7 @@ fn find_vtable_ptr_field_offset(t: &TypeInfo, s: &StructType) -> Option<usize> {
 
 fn downcast_to_concrete_type(val: &mut Cow<Value>, vtable_ptr_field_offset: usize, context: &mut EvalContext) -> Result<()> {
     let Some(addr) = val.val.addr() else { return err!(Runtime, "struct address not known") };
-    let vptr = context.memory.read_u64(addr + vtable_ptr_field_offset)? as usize;
+    let vptr = context.memory.read_usize(addr + vtable_ptr_field_offset)?;
     // Itanium ABI vtable layout is:
     //  * (various optional stuff)
     //  * 8 bytes: offset from vptr to start of subclass instance - that's how we downcast
@@ -377,7 +377,7 @@ fn downcast_to_concrete_type(val: &mut Cow<Value>, vtable_ptr_field_offset: usiz
     let static_vptr = binary.addr_map.dynamic_to_static(vptr);
     let vtable = symbols.find_vtable(static_vptr)?;
     let Some(type_) = vtable.type_.clone() else { return err!(Dwarf, "unknown type: {}", vtable.name) };
-    let offset = context.memory.read_u64(vptr.saturating_sub(16))? as usize;
+    let offset = context.memory.read_usize(vptr.saturating_sub(16))?;
     let addr = (addr + vtable_ptr_field_offset).wrapping_add(offset);
     let new_val = Value {val: AddrOrValueBlob::Addr(addr), type_, flags: val.flags | ValueFlags::SHOW_TYPE_NAME};
     *val = Cow::Owned(new_val);
@@ -409,8 +409,8 @@ fn resolve_discriminated_union(val: &AddrOrValueBlob, fields: &mut Cow<[StructFi
                 return Ok(false);
             }
 
-            let val = get_struct_field(&val, field, context.memory)?;
-            let mut x = val.into_value(size, context.memory)?.get_usize()?;
+            let val = get_struct_field(&val, field, &mut context.memory)?;
+            let mut x = val.into_value(size, &mut context.memory)?.get_usize()?;
 
             if signed && size < 8 && size > 0 && x & 1 << (size*8-1) as u32 != 0 {
                 // Sign-extend (because that's what we do to discr_values when parsing DWARF).
@@ -515,6 +515,18 @@ fn unravel_container_field(field: &StructField, substruct: &mut ContainerSubstru
     Ok((t, bit_offset..bit_offset+bit_size))
 }
 
+fn container_aux_struct(type_: *const TypeInfo) -> Result<ContainerSubstruct<'static>> {
+    let t = unsafe {&*type_};
+    match &t.t {
+        Type::Struct(s) => {
+            let mut fields = Cow::Borrowed(s.fields());
+            unravel_struct(&mut fields, None);
+            Ok(ContainerSubstruct {fields, bit_offset: 0, used_fields_mask: 0})
+        }
+        _ => err!(NoField, ""),
+    }
+}
+
 fn find_struct_field<'a>(names: &[&str], substruct: &mut ContainerSubstruct<'a>) -> Result<ContainerSubstruct<'a>> {
     let f = find_field(names, substruct)?;
     let t = unsafe {&*f.type_};
@@ -601,42 +613,6 @@ fn find_nested_type(name: &str, type_: *const TypeInfo) -> Result<*const TypeInf
     err!(NoField, "")
 }
 
-fn get_container_usize_field(bit_offset: Range<usize>, slice: &[u8]) -> Result<usize> {
-    assert!(bit_offset.len() <= 64);
-    if bit_offset.end > slice.len() * 64 {
-        return err!(NotContainer, "");
-    }
-    let mut a = [0u8; 8];
-    let byte_offset = bit_offset.start/8..bit_offset.end/8;
-    a[..byte_offset.len()].copy_from_slice(&slice[byte_offset.clone()]);
-    let mut r = usize::from_le_bytes(a);
-
-    if bit_offset.start%8 != 0 {
-        r >>= (bit_offset.start%8) as u32;
-    }
-    if bit_offset.end%8 != 0 {
-        let e = slice[bit_offset.end/8];
-        let e = e & ((1u8 << (bit_offset.end%8) as u32) - 1);
-        r |= (e as usize) << (bit_offset.len() - bit_offset.end%8) as u32;
-    }
-
-    Ok(r)
-}
-
-// TODO: Use CachedMemReader instead.
-fn read_container_struct<'a>(value: &'a Value, scratch: &'a mut [MaybeUninit<u8>], memory: &MemReader) -> Result<&'a [u8]> {
-    let t = unsafe {&*value.type_};
-    if t.size > scratch.len() {
-        return err!(NotContainer, "");
-    }
-    match &value.val {
-        AddrOrValueBlob::Blob(b) => Ok(b.as_slice()),
-        &AddrOrValueBlob::Addr(addr) => {
-            Ok(memory.read_uninit(addr, &mut scratch[..t.size])?)
-        }
-    }
-}
-
 fn optional_field<T>(r: Result<T>) -> Result<Option<T>> {
     match r {
         Ok(x) => Ok(Some(x)),
@@ -675,7 +651,7 @@ fn trim_field_name(mut name: &str) -> &str {
 }
 
 // Guess the common C++ and Rust containers. Turn them into slices/arrays/pointers as needed.
-// The input Value already went through do_general_transformations(), so wrappers and inheritance are mostly gone.
+// The input Value already went through unravel_struct(), so wrappers and inheritance are mostly gone.
 // Returns Ok if the whole Value was replaced and doesn't need any further transformations.
 // Returns NotContainer error if the value wasn't replaced (but `fields` may have been mutated, e.g. removing refcount field from shared_ptr).
 // Returns other errors if we should fail the whole prettification (e.g. failed to read the struct from memory).
@@ -757,20 +733,16 @@ fn recognize_slice_or_vec(substruct: &mut ContainerSubstruct, val: &mut Cow<Valu
 
     let inner_size = (unsafe {&*inner_type}).calculate_size();
 
-    // Read the struct into temp buffer (instead of reading fields one by one using multiple syscalls).
-    let mut scratch: [MaybeUninit<u8>; 40] = unsafe {MaybeUninit::uninit().assume_init()};
-    let slice = read_container_struct(val, &mut scratch, &context.memory)?;
-
     // Parse the field values.
-    let start = get_container_usize_field(begin_field, slice)?;
+    let start = val.val.bit_range(begin_field, &mut context.memory)?;
     let len = if let Some(r) = len_field {
-        get_container_usize_field(r, slice)?
+        val.val.bit_range(r, &mut context.memory)?
     } else {
         if inner_size == 0 {
             *warning = Some(error!(NotContainer, "element size is 0"));
             return err!(NotContainer, "");
         }
-        let end = get_container_usize_field(end_field.unwrap(), slice)?;
+        let end = val.val.bit_range(end_field.unwrap(), &mut context.memory)?;
         if end < start {
             *warning = Some(error!(ProcessState, "end < start"));
             return err!(NotContainer, "");
@@ -803,17 +775,14 @@ fn recognize_rust_vec(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, 
     let head_field = optional_field(find_int_field(&["head"], substruct))?;
     substruct.check_all_fields_used()?;
 
-    let mut scratch: [MaybeUninit<u8>; 40] = unsafe {MaybeUninit::uninit().assume_init()};
-    let slice = read_container_struct(val, &mut scratch, &context.memory)?;
-
-    let len = get_container_usize_field(len_field, slice)?;
-    let ptr = get_container_usize_field(ptr_field, slice)?;
-    let cap = get_container_usize_field(cap_field, slice)?;
+    let len = val.val.bit_range(len_field, &mut context.memory)?;
+    let ptr = val.val.bit_range(ptr_field, &mut context.memory)?;
+    let cap = val.val.bit_range(cap_field, &mut context.memory)?;
 
     let inner_size = (unsafe {&*inner_type}).calculate_size();
     if let Some(f) = head_field {
         // VecDeque.
-        let head = get_container_usize_field(f, slice)?;
+        let head = val.val.bit_range(f, &mut context.memory)?;
         if head > cap || len > cap {
             return err!(Runtime, "VecDeque out of bounds");
         }
@@ -882,7 +851,7 @@ fn recognize_libcpp_string(substruct: &mut ContainerSubstruct, val: &mut Cow<Val
         Err(e) => return Err(e),
     }
     let _ = optional_field(find_field(&["padding"], &mut s))?;
-    let (short_data_field, short_capacity)= find_array_field(&["data"], &mut s, &mut inner_type)?;
+    let (short_data_field, short_capacity) = find_array_field(&["data"], &mut s, &mut inner_type)?;
     s.check_all_fields_used()?;
 
     let l_is_long_field;
@@ -902,14 +871,11 @@ fn recognize_libcpp_string(substruct: &mut ContainerSubstruct, val: &mut Cow<Val
     let long_ptr_field = find_pointer_field(&["data"], &mut l, &mut inner_type)?;
     l.check_all_fields_used()?;
 
-    let mut scratch: [MaybeUninit<u8>; 256] = unsafe {MaybeUninit::uninit().assume_init()};
-    let slice = read_container_struct(val, &mut scratch, &context.memory)?;
-
-    let s_is_long = get_container_usize_field(s_is_long_field, slice)?;
+    let s_is_long = val.val.bit_range(s_is_long_field, &mut context.memory)?;
     if s_is_long > 1 {
         return err!(Runtime, "bad is_long: {}", s_is_long);
     }
-    let l_is_long = get_container_usize_field(l_is_long_field, slice)?;
+    let l_is_long = val.val.bit_range(l_is_long_field, &mut context.memory)?;
     if s_is_long != l_is_long {
         return err!(Runtime, "s.is_long != l.is_long: {} {}", s_is_long, l_is_long);
     }
@@ -918,11 +884,11 @@ fn recognize_libcpp_string(substruct: &mut ContainerSubstruct, val: &mut Cow<Val
     let is_string = inner_size == 1;
 
     if l_is_long != 0 {
-        let (ptr, len) = (get_container_usize_field(long_ptr_field, slice)?, get_container_usize_field(long_len_field, slice)?);
+        let (ptr, len) = (val.val.bit_range(long_ptr_field, &mut context.memory)?, val.val.bit_range(long_len_field, &mut context.memory)?);
         make_slice(val, ptr, len, inner_type, is_string, state);
         Ok(())
     } else {
-        let len = get_container_usize_field(short_len_field, slice)?;
+        let len = val.val.bit_range(short_len_field, &mut context.memory)?;
         if len > short_capacity {
             return err!(Runtime, "short len > capacity: {} {}", len, short_capacity);
         }
@@ -963,13 +929,10 @@ fn recognize_absl_inlined_vector(substruct: &mut ContainerSubstruct, val: &mut C
     let _ = find_int_field(&["allocated_capacity"], &mut allocated)?;
     allocated.check_all_fields_used()?;
 
-    let mut scratch: [MaybeUninit<u8>; 1024] = unsafe {MaybeUninit::uninit().assume_init()};
-    let slice = read_container_struct(val, &mut scratch, &context.memory)?;
-
-    let metadata = get_container_usize_field(metadata_field, slice)?;
+    let metadata = val.val.bit_range(metadata_field, &mut context.memory)?;
     let (is_long, len) = (metadata & 1 != 0, metadata >> 1);
     if is_long {
-        let ptr = get_container_usize_field(allocated_data_field, slice)?;
+        let ptr = val.val.bit_range(allocated_data_field, &mut context.memory)?;
         make_slice(val, ptr, len, inner_type, false, state);
         Ok(())
     } else {
@@ -983,59 +946,59 @@ fn recognize_absl_inlined_vector(substruct: &mut ContainerSubstruct, val: &mut C
 }
 
 // std::list
-// libc++: {__end_: node, __size_alloc_: usize}, node: {__prev_: *node, __next_: *node}
-// libstdc++: {_M_prev: *node, _M_next: *node, _M_size: usize}, node: {_M_prev: *node, _M_next: *node}
+// libc++ list: {__end_: node, __size_alloc_: usize}, node: {__prev_: *node, __next_: *node}
+// libstdc++ list: {_M_prev: *node, _M_next: *node, _M_size: usize}, node: {_M_prev: *node, _M_next: *node}
+// libc++ forward_list: {__next_: *node}, node: {__next_: *node}
+// libstdc++ forward_list: {_M_next: *node}, node: {_M_next: *node}
+// In all cases the value is right after the node struct (I wish it was just a field, then pretty printer wouldn't be needed).
 fn recognize_cpp_list(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
-    let size_field = find_int_field(&["__size_alloc_", "_M_size"], substruct)?;
+    let size_field = optional_field(find_int_field(&["size_alloc", "size"], substruct))?;
     let value_type = find_nested_type("value_type", val.type_)?;
     let mut node_type: *const TypeInfo = ptr::null();
-    let (last_node_field, first_node_field);
-    if let Some(mut end) = optional_field(find_struct_field(&["__end_"], substruct))? {
-        last_node_field = find_pointer_field(&["__prev_"], &mut end, &mut node_type)?;
-        first_node_field = find_pointer_field(&["__next_"], &mut end, &mut node_type)?;
+    let first_node_field;
+    if let Some(mut end) = optional_field(find_struct_field(&["end"], substruct))? {
+        first_node_field = find_pointer_field(&["next"], &mut end, &mut node_type)?;
+        optional_field(find_pointer_field(&["prev"], &mut end, &mut node_type))?;
         end.check_all_fields_used()?;
     } else {
-        last_node_field = find_pointer_field(&["_M_prev"], substruct, &mut node_type)?;
-        first_node_field = find_pointer_field(&["_M_next"], substruct, &mut node_type)?;
+        first_node_field = find_pointer_field(&["next"], substruct, &mut node_type)?;
+        optional_field(find_pointer_field(&["prev"], substruct, &mut node_type))?;
     }
     substruct.check_all_fields_used()?;
-/*
-    asdqwe analyze node struct;
 
-    let mut scratch: [MaybeUninit<u8>; 40] = unsafe {MaybeUninit::uninit().assume_init()};
-    let slice = read_container_struct(val, &mut scratch, &context.memory)?;
+    let mut node_struct = container_aux_struct(node_type)?;
+    let next_field = find_pointer_field(&["next"], &mut node_struct, &mut node_type)?;
+    optional_field(find_pointer_field(&["prev"], &mut node_struct, &mut node_type))?;
+    node_struct.check_all_fields_used()?;
 
-    let size = get_container_usize_field(size_field, slice)?;
-    let first_node = get_container_usize_field(first_node_field, slice)?;
-    let last_node = get_container_usize_field(last_node_field, slice)?;
+    let size = match size_field {
+        Some(f) => Some(val.val.bit_range(f, &mut context.memory)?),
+        None => None,
+    };
+    let first_node = val.val.bit_range(first_node_field, &mut context.memory)?;
+    let sizeof_node = unsafe {(*node_type).calculate_size()};
 
-    let mut node = first_node;
+    let mut node_addr = first_node;
     let mut data: Vec<u8> = Vec::new();
-    let n = size.min(1000);
-    for i in 0..size {
-        asdqwe;
-asdqwe cached reader;
-        node = asdqwe;
+    let mut array_flags = ArrayFlags::empty();
+    for i in 0..size.unwrap_or(usize::MAX) {
+        if node_addr == 0 && size.is_none() {
+            break;
+        }
+        if i >= 300 {
+            array_flags.insert(ArrayFlags::TRUNCATED);
+            break;
+        }
+        let elem_addr = node_addr + sizeof_node;
+        data.extend_from_slice(&elem_addr.to_le_bytes());
+        node_addr = AddrOrValueBlob::Addr(node_addr).bit_range(next_field.clone(), &mut context.memory)?;
     }
 
-    asdqwe;
-    asdqwe set truncation flag if long;
+    let value_ref_type = state.types.add_pointer(value_type, PointerFlags::REFERENCE);
+    let array_type = state.types.add_array(value_ref_type, data.len() / 8, array_flags);
 
-    let inner_size = (unsafe {&*inner_type}).calculate_size();
-    if let Some(f) = head_field {
-        // VecDeque.
-        let head = get_container_usize_field(f, slice)?;
-        if head > cap || len > cap {
-            return err!(Runtime, "VecDeque out of bounds");
-        }
-        let mut builder = StructBuilder::default();
-        builder.add_slice_field("part1", ptr + head*inner_size, len.min(cap - head), inner_type, SliceFlags::empty(), &mut state.types);
-        builder.add_slice_field("part2", ptr, len.saturating_sub(cap - head), inner_type, SliceFlags::empty(), &mut state.types);
-        let new_val = builder.finish("VecDeque", val.flags, &mut state.types);
-        *val = Cow::Owned(new_val);
-    } else {
-        let is_string = inner_size == 1 && container_name_looks_like_string(val.type_, additional_names);
-        make_slice(val, ptr, len, inner_type, is_string, state);
-    }*/
+    let v = AddrOrValueBlob::Blob(ValueBlob::from_vec(data));
+    let new_val = Value {val: v, type_: array_type, flags: val.flags};
+    *val = Cow::Owned(new_val);
     Ok(())
 }

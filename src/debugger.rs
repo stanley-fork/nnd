@@ -1252,13 +1252,13 @@ impl Debugger {
         if self.context.settings.exception_aware_steps && (step.internal_kind == StepKind::Over || step.internal_kind == StepKind::Out) {
             // If we're stepping over/out-of a function and the function throws an exception, control jumps to the 'catch' block, bypassing our AfterRet breakpoints.
             // Put breakpoints on all catch blocks in the call stack.
-            let mut cached_memory = CachedMemReader::new(self.memory.clone());
+            let mut memory = CachedMemReader::new(self.memory.clone());
             let mut start_frame = subframe.frame_idx + 1;
             let mut addrs: Vec<usize> = Vec::new();
             if step.internal_kind == StepKind::Over {
                 if let Some((unwind, addr_map)) = unwind {
                     // Find catch blocks in current function for the address ranges over which we're stepping.
-                    if let Err(e) = find_catch_blocks_for_ranges(&step.addr_ranges, &unwind, &addr_map, &mut cached_memory, &mut addrs) {
+                    if let Err(e) = find_catch_blocks_for_ranges(&step.addr_ranges, &unwind, &addr_map, &mut memory, &mut addrs) {
                         eprintln!("warning: lsda error: {}", e);
                     }
                 } else {
@@ -1267,7 +1267,7 @@ impl Debugger {
                 }
             }
             for frame in &stack.frames[start_frame..] {
-                if let Err(e) = find_catch_blocks_for_frame(frame, &mut cached_memory, &mut addrs) {
+                if let Err(e) = find_catch_blocks_for_frame(frame, &mut memory, &mut addrs) {
                     eprintln!("warning: lsda error: {}", e);
                 }
             }
@@ -1661,7 +1661,7 @@ impl Debugger {
     }
 
     pub fn make_eval_context<'a>(&'a self, stack: &'a StackTrace, selected_subframe: usize) -> EvalContext<'a> {
-        EvalContext {memory: &self.memory, cached_memory: CachedMemReader::new(self.memory.clone()), process_info: &self.info, stack, selected_subframe}
+        EvalContext {memory: CachedMemReader::new(self.memory.clone()), process_info: &self.info, stack, selected_subframe}
     }
 
     pub fn add_breakpoint(&mut self, on: BreakpointOn) -> Result<BreakpointId> {

@@ -213,24 +213,7 @@ pub enum AddrOrValueBlob {
 impl Default for AddrOrValueBlob { fn default() -> Self { AddrOrValueBlob::Blob(ValueBlob::new(0)) } }
 
 impl AddrOrValueBlob {
-    // asdqwe merge into into_value()
-    pub fn into_value(self, bytes: usize, memory: &MemReader) -> Result<ValueBlob> {
-        Ok(match self {
-            Self::Blob(b) => {
-                if b.capacity() < bytes {
-                    return err!(Dwarf, "value too short: ~{} < {}", b.capacity(), bytes);
-                }
-                b
-            }
-            Self::Addr(a) => {
-                let mut b = ValueBlob::with_capacity(bytes);
-                memory.read(a, &mut b.as_mut_slice()[..bytes])?;
-                b
-            }
-        })
-    }
-
-    pub fn into_value_cached(self, bytes: usize, memory: &mut CachedMemReader) -> Result<ValueBlob> {
+    pub fn into_value(self, bytes: usize, memory: &mut CachedMemReader) -> Result<ValueBlob> {
         Ok(match self {
             Self::Blob(b) => {
                 if b.capacity() < bytes {
@@ -248,6 +231,37 @@ impl AddrOrValueBlob {
 
     pub fn addr(&self) -> Option<usize> { match self { Self::Addr(a) => Some(*a), _ => None } }
     pub fn blob_ref(&self) -> Option<&ValueBlob> { match self { Self::Blob(b) => Some(b), _ => None } }
+
+    pub fn bit_range(&self, bit_offset: Range<usize>, memory: &mut CachedMemReader) -> Result<usize> {
+        assert!(bit_offset.len() <= 64);
+        let mut a = [0u8; 9];
+        let byte_offset = bit_offset.start/8..(bit_offset.end+7)/8;
+        match self {
+            Self::Blob(b) => {
+                if bit_offset.end > b.capacity() * 64 {
+                    return err!(Dwarf, "value too short: ~{} < {}", b.capacity(), (bit_offset.end + 63) / 64);
+                }
+                a[..byte_offset.len()].copy_from_slice(&b.as_slice()[byte_offset.clone()]);
+            }
+            Self::Addr(addr) => memory.read(*addr + byte_offset.start, &mut a[..byte_offset.len()])?,
+        }
+
+        // Why, Rust?
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&a[..8]);
+        let mut r = usize::from_le_bytes(b);
+
+        if bit_offset.start%8 != 0 {
+            r >>= (bit_offset.start%8) as u32;
+        }
+        if bit_offset.end%8 != 0 {
+            let e = a[byte_offset.len() - 1];
+            let e = e & ((1u8 << (bit_offset.end%8) as u32) - 1);
+            r |= (e as usize) << (bit_offset.len() - bit_offset.end%8) as u32;
+        }
+
+        Ok(r)
+    }
 }
 
 pub fn format_dwarf_expression<'a>(expr: Expression<EndianSlice<'a, LittleEndian>>, encoding: Encoding) -> Result<String> {
@@ -450,8 +464,7 @@ impl EvalState {
 }
 
 pub struct EvalContext<'a> {
-    pub memory: &'a MemReader,
-    pub cached_memory: CachedMemReader, // asdqwe merge into `memory`
+    pub memory: CachedMemReader,
     pub process_info: &'a ProcessInfo,
     // We include the whole stack to allow watch expressions to use variables from other frames.
     pub stack: &'a StackTrace,
@@ -485,7 +498,7 @@ impl EvalContext<'_> {
         let subfunction = &symbols.shards[shard_idx].subfunctions[subfunction_idx];
         let local_variables = symbols.local_variables_in_subfunction(subfunction, shard_idx);
 
-        let context = DwarfEvalContext {memory: &mut self.cached_memory, symbols: Some(symbols), addr_map: &binary.addr_map, encoding: unit.unit.header.encoding(), unit: Some(unit), regs: Some(&frame.regs), frame_base: &frame.frame_base, local_variables};
+        let context = DwarfEvalContext {memory: &mut self.memory, symbols: Some(symbols), addr_map: &binary.addr_map, encoding: unit.unit.header.encoding(), unit: Some(unit), regs: Some(&frame.regs), frame_base: &frame.frame_base, local_variables};
         Ok((context, function))
     }
 }
@@ -581,7 +594,7 @@ fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut Form
             } else {
                 styled_writeln!(state.names_out, state.palette.field_name, "{}", field.name)
             };
-            let value = match get_struct_field(value, field, state.context.memory) {
+            let value = match get_struct_field(value, field, &mut state.context.memory) {
                 Ok(val) => Ok(Value {val, type_: field.type_, flags: flags.inherit()}),
                 Err(e) => Err(e),
             };
@@ -611,7 +624,7 @@ fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut Form
     let preread_limit = 100000;
     let value = match &v.val {
         AddrOrValueBlob::Blob(b) => b,
-        AddrOrValueBlob::Addr(addr) => match v.val.clone().into_value(size.min(preread_limit), state.context.memory) {
+        AddrOrValueBlob::Addr(addr) => match v.val.clone().into_value(size.min(preread_limit), &mut state.context.memory) {
             Ok(v) => {
                 temp_value = AddrOrValueBlob::Blob(v);
                 &temp_value.blob_ref().unwrap()
@@ -682,7 +695,7 @@ fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut Form
                 if !state.expanded {
                     return (true, children);
                 }
-                if !try_format_as_string(Some(x), None, p.type_, None, false, v.flags, state.context.memory, "", state.out, state.palette) {
+                if !try_format_as_string(Some(x), None, p.type_, None, false, v.flags, &mut state.context.memory, "", state.out, state.palette) {
                     // If expanded, act like a reference, i.e. expand the pointee.
                     (_, children) = format_value_recurse(&Value {val: AddrOrValueBlob::Addr(x), type_: p.type_, flags: v.flags.inherit()}, true, state);
                     for c in &mut children {
@@ -702,7 +715,7 @@ fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut Form
             let len = value.get_usize_at(8).unwrap();
             let inner_type = unsafe {&*s.type_};
             let to_read = inner_type.calculate_size().saturating_mul(len).min(preread_limit);
-            let contents = match AddrOrValueBlob::Addr(addr).into_value(to_read, state.context.memory) {
+            let contents = match AddrOrValueBlob::Addr(addr).into_value(to_read, &mut state.context.memory) {
                 Ok(x) => x,
                 Err(e) => {
                     write_val_address_if_needed(&v.val, state);
@@ -862,7 +875,7 @@ fn format_array(inner_type: *const TypeInfo, len: Option<usize>, stride: usize, 
                 let name_line = styled_writeln!(state.names_out, state.palette.value_misc, "…");
                 children.push(ValueChildInfo {identity: len.unwrap(), name_line, kind: ValueChildKind::Other, deref: 0, value: err!(TooLong, "truncated")});
             }
-            styled_write!(state.out, state.palette.value_misc, "length at least ");
+            styled_write!(state.out, state.palette.value_misc, "length > ");
             styled_write!(state.out, state.palette.value, "{}", len.clone().unwrap());
         } else if let Some(len) = len {
             styled_write!(state.out, state.palette.value_misc, "length ");
@@ -870,9 +883,9 @@ fn format_array(inner_type: *const TypeInfo, len: Option<usize>, stride: usize, 
         } else {
             styled_write!(state.out, state.palette.value_misc, "length unknown");
         }
-        try_format_as_string(addr.clone(), Some(value), inner_type, len.clone(), is_string, flags, state.context.memory, ", ", state.out, state.palette);
+        try_format_as_string(addr.clone(), Some(value), inner_type, len.clone(), is_string, flags, &mut state.context.memory, ", ", state.out, state.palette);
     } else {
-        if !try_format_as_string(addr.clone(), Some(value), inner_type, len.clone(), is_string, flags, state.context.memory, "", state.out, state.palette) {
+        if !try_format_as_string(addr.clone(), Some(value), inner_type, len.clone(), is_string, flags, &mut state.context.memory, "", state.out, state.palette) {
             styled_write!(state.out, state.palette.value_misc, "[");
             for i in 0..len.unwrap_or(1) {
                 if i != 0 {
@@ -904,7 +917,7 @@ fn format_array(inner_type: *const TypeInfo, len: Option<usize>, stride: usize, 
     }
 }
 
-fn try_format_as_string(addr: Option<usize>, preread_blob: Option<&ValueBlob>, element_type: *const TypeInfo, len: Option<usize>, marked_as_string: bool, flags: ValueFlags, memory: &MemReader, prefix: &str, out: &mut StyledText, palette: &Palette) -> bool {
+fn try_format_as_string(addr: Option<usize>, preread_blob: Option<&ValueBlob>, element_type: *const TypeInfo, len: Option<usize>, marked_as_string: bool, flags: ValueFlags, memory: &mut CachedMemReader, prefix: &str, out: &mut StyledText, palette: &Palette) -> bool {
     if flags.contains(ValueFlags::RAW) {
         return false;
     }
@@ -1009,7 +1022,7 @@ fn try_format_as_string(addr: Option<usize>, preread_blob: Option<&ValueBlob>, e
     true
 }
 
-pub fn get_struct_field(val: &AddrOrValueBlob, field: &StructField, memory: &MemReader) -> Result<AddrOrValueBlob> {
+pub fn get_struct_field(val: &AddrOrValueBlob, field: &StructField, memory: &mut CachedMemReader) -> Result<AddrOrValueBlob> {
     let mut type_bytes = unsafe {(*field.type_).calculate_size()};
     let field_bits = field.calculate_bit_size();
     if field_bits == 0 {
@@ -1224,7 +1237,7 @@ pub fn eval_dwarf_expression(mut expression: Expression<SliceType>, context: &mu
             return Ok((val, dubious));
         }
 
-        let val = val.into_value_cached((size_in_bits + bit_offset + 7) / 8, context.memory)?;
+        let val = val.into_value((size_in_bits + bit_offset + 7) / 8, &mut context.memory)?;
         res.append_bits(res_bits, val, size_in_bits, bit_offset);
         res_bits += size_in_bits;
     }
