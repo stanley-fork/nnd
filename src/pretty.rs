@@ -639,7 +639,7 @@ fn trim_field_name(mut name: &str) -> &str {
     if name.starts_with("_M_") {
         name = &name[3..];
     } else if name.starts_with("c_") {
-        name = &name[3..];
+        name = &name[2..];
     }
     while name.starts_with("_") {
         name = &name[1..];
@@ -731,7 +731,15 @@ fn recognize_slice_or_vec(substruct: &mut ContainerSubstruct, val: &mut Cow<Valu
     }
     substruct.check_all_fields_used()?;
 
-    let inner_size = (unsafe {&*inner_type}).calculate_size();
+    let mut inner_size = (unsafe {&*inner_type}).calculate_size();
+
+    // If start/end are char*, and there's typedef value_type, cast the pointers to it. This covers clickhouse PODArray in particular.
+    if inner_size == 1 {
+        if let Some(t) = optional_field(find_nested_type("value_type", val.type_))? {
+            inner_type = t;
+            inner_size = (unsafe {&*inner_type}).calculate_size();
+        }
+    };
 
     // Parse the field values.
     let start = val.val.bit_range(begin_field, &mut context.memory)?;
