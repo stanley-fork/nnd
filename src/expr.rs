@@ -350,7 +350,7 @@ impl EvalState {
         self.variables.clear();
     }
 
-    pub fn update(&mut self, context: &EvalContext) {
+    pub fn update(&mut self, context: &mut EvalContext) {
         let mut seen_binaries: HashSet<BinaryId> = HashSet::new();
         for b in &self.binaries {
             seen_binaries.insert(b.id.clone());
@@ -362,38 +362,7 @@ impl EvalState {
         }
     }
 
-    // Collect information needed to retrieve values of local variables.
-    pub fn make_local_dwarf_eval_context<'a>(&'a self, context: &'a EvalContext<'a>, selected_subframe: usize) -> Result<(DwarfEvalContext<'a>, &'a FunctionInfo)> {
-        let subframe = &context.stack.subframes[selected_subframe];
-        let selected_frame = subframe.frame_idx;
-        let frame = &context.stack.frames[selected_frame];
-        let function_idx = context.stack.subframes[frame.subframes.end-1].function_idx.clone()?;
-        let binary_id = match frame.binary_id.as_ref() {
-            None => return err!(ProcessState, "no binary for address {:x}", frame.pseudo_addr),
-            Some(b) => b,
-        };
-        let subfunction_idx = match &subframe.subfunction_idx {
-            None => return err!(Dwarf, "function has no debug info"),
-            Some(x) => *x,
-        };
-        let binary = context.process_info.binaries.get(binary_id).unwrap();
-        let symbols = binary.symbols.as_ref_clone_error()?;
-        if symbols.identity != frame.symbols_identity {
-            return err!(Internal, "symbols were reloaded after generating backtrace");
-        }
-        let function = &symbols.functions[function_idx];
-        let unit = match function.debug_info_offset() {
-            None => return err!(ProcessState, "function has no debug info"),
-            Some(off) => symbols.find_unit(off)? };
-        let shard_idx = function.shard_idx();
-        let subfunction = &symbols.shards[shard_idx].subfunctions[subfunction_idx];
-        let local_variables = symbols.local_variables_in_subfunction(subfunction, shard_idx);
-
-        let context = DwarfEvalContext {memory: context.memory, symbols: Some(symbols), addr_map: &binary.addr_map, encoding: unit.unit.header.encoding(), unit: Some(unit), regs: Some(&frame.regs), frame_base: &frame.frame_base, local_variables};
-        Ok((context, function))
-    }
-
-    pub fn get_variable(&mut self, context: &EvalContext, name: &str, maybe_register: bool, from_any_frame: bool, global: bool, only_type: bool) -> Result<Value> {
+    pub fn get_variable(&mut self, context: &mut EvalContext, name: &str, maybe_register: bool, from_any_frame: bool, global: bool, only_type: bool) -> Result<Value> {
         if global {
             return err!(NotImplemented, "global variables not implemented");
         }
@@ -427,7 +396,7 @@ impl EvalState {
         err!(NoVariable, "local var {} not found in any frame", name)
     }
 
-    pub fn get_type(&mut self, context: &EvalContext, name: &str) -> Result<*const TypeInfo> {
+    pub fn get_type(&mut self, context: &mut EvalContext, name: &str) -> Result<*const TypeInfo> {
         for binary in &self.binaries {
             let symbols = match &binary.symbols {
                 Ok(x) => x,
@@ -441,10 +410,10 @@ impl EvalState {
         err!(TypeMismatch, "no type '{}'", name)
     }
 
-    fn get_local_variable(&mut self, context: &EvalContext, name: &str, subframe_idx: usize, only_type: bool) -> Result<Value> {
-        let (dwarf_context, _) = self.make_local_dwarf_eval_context(context, subframe_idx)?;
+    fn get_local_variable(&mut self, context: &mut EvalContext, name: &str, subframe_idx: usize, only_type: bool) -> Result<Value> {
         let subframe = &context.stack.subframes[subframe_idx];
         let pseudo_addr = context.stack.frames[subframe.frame_idx].pseudo_addr;
+        let (dwarf_context, _) = context.make_local_dwarf_eval_context(subframe_idx)?;
         let static_pseudo_addr = dwarf_context.addr_map.dynamic_to_static(pseudo_addr);
         for v in dwarf_context.local_variables {
             if !v.range().contains(&(static_pseudo_addr)) || unsafe {v.name()} != name {
@@ -469,6 +438,38 @@ pub struct EvalContext<'a> {
     // We include the whole stack to allow watch expressions to use variables from other frames.
     pub stack: &'a StackTrace,
     pub selected_subframe: usize,
+}
+impl EvalContext<'_> {
+    // Collect information needed to retrieve values of local variables.
+    pub fn make_local_dwarf_eval_context<'a>(&'a mut self, selected_subframe: usize) -> Result<(DwarfEvalContext<'a>, &'a FunctionInfo)> {
+        let subframe = &self.stack.subframes[selected_subframe];
+        let selected_frame = subframe.frame_idx;
+        let frame = &self.stack.frames[selected_frame];
+        let function_idx = self.stack.subframes[frame.subframes.end-1].function_idx.clone()?;
+        let binary_id = match frame.binary_id.as_ref() {
+            None => return err!(ProcessState, "no binary for address {:x}", frame.pseudo_addr),
+            Some(b) => b,
+        };
+        let subfunction_idx = match &subframe.subfunction_idx {
+            None => return err!(Dwarf, "function has no debug info"),
+            Some(x) => *x,
+        };
+        let binary = self.process_info.binaries.get(binary_id).unwrap();
+        let symbols = binary.symbols.as_ref_clone_error()?;
+        if symbols.identity != frame.symbols_identity {
+            return err!(Internal, "symbols were reloaded after generating backtrace");
+        }
+        let function = &symbols.functions[function_idx];
+        let unit = match function.debug_info_offset() {
+            None => return err!(ProcessState, "function has no debug info"),
+            Some(off) => symbols.find_unit(off)? };
+        let shard_idx = function.shard_idx();
+        let subfunction = &symbols.shards[shard_idx].subfunctions[subfunction_idx];
+        let local_variables = symbols.local_variables_in_subfunction(subfunction, shard_idx);
+
+        let context = DwarfEvalContext {memory: self.memory, symbols: Some(symbols), addr_map: &binary.addr_map, encoding: unit.unit.header.encoding(), unit: Some(unit), regs: Some(&frame.regs), frame_base: &frame.frame_base, local_variables};
+        Ok((context, function))
+    }
 }
 
 bitflags! { pub struct ValueFlags: u8 {
@@ -516,22 +517,22 @@ pub struct ValueChildInfo {
 // `has_children` is returned even if expanded = false; it tells whether the value "logically" has children, even if there are 0 of them (e.g. empty array).
 // The format can depend on `expanded`, e.g. array and struct contents are omitted (because they should be visible as children instead).
 // Doesn't close the line in `out`, the caller should do it.
-pub fn format_value(v: &Value, expanded: bool, state: &mut EvalState, context: &EvalContext, out: &mut StyledText, names_out: &mut StyledText, palette: &Palette) -> (/*has_children*/ bool, /*children*/ Vec<ValueChildInfo>) {
+pub fn format_value(v: &Value, expanded: bool, state: &mut EvalState, context: &mut EvalContext, out: &mut StyledText, names_out: &mut StyledText, palette: &Palette) -> (/*has_children*/ bool, /*children*/ Vec<ValueChildInfo>) {
     let (text_start_lines, text_start_chars) = (out.lines.len(), out.chars.len());
     format_value_recurse(v, false, &mut FormatValueState {expanded, state, context, out, names_out, palette, text_start_lines, text_start_chars})
 }
 
-struct FormatValueState<'a> {
+struct FormatValueState<'a, 'b> {
     expanded: bool,
     state: &'a mut EvalState,
-    context: &'a EvalContext<'a>,
+    context: &'a mut EvalContext<'b>,
     out: &'a mut StyledText,
     names_out: &'a mut StyledText,
     palette: &'a Palette,
     text_start_lines: usize,
     text_start_chars: usize,
 }
-impl<'a> FormatValueState<'a> {
+impl<'a, 'b> FormatValueState<'a, 'b> {
     fn over_output_limit(&self) -> bool {
         // (Currently we don't produce multiple lines, but have a line limit anyway in case we do it in future, e.g. for printing matrices.)
         self.out.chars.len() - self.text_start_chars > 10000 || self.out.lines.len() - self.text_start_lines > 100 || (self.out.lines.len() == self.text_start_lines && self.out.chars.len() - self.text_start_chars > 1000)
@@ -675,7 +676,7 @@ fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut Form
             Err(e) => styled_write!(state.out, state.palette.error, "<{}>", e),
         }
         Type::Array(a) => {
-            format_array(a.type_, if a.flags.contains(ArrayFlags::LEN_KNOWN) {Some(a.len)} else {None}, a.stride, value, v.val.addr(), a.flags.contains(ArrayFlags::UTF_STRING), v.flags, state, &mut children);
+            format_array(a.type_, if a.flags.contains(ArrayFlags::LEN_KNOWN) {Some(a.len)} else {None}, a.stride, value, v.val.addr(), a.flags.contains(ArrayFlags::UTF_STRING), a.flags.contains(ArrayFlags::TRUNCATED), v.flags, state, &mut children);
             return (true, children);
         }
         Type::Slice(s) => {
@@ -691,7 +692,7 @@ fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut Form
                     return (false, children);
                 }
             };
-            format_array(s.type_, Some(len), 0, &contents, Some(addr), s.flags.contains(SliceFlags::UTF_STRING), v.flags, state, &mut children);
+            format_array(s.type_, Some(len), 0, &contents, Some(addr), s.flags.contains(SliceFlags::UTF_STRING), /*is_truncated*/ false, v.flags, state, &mut children);
             return (true, children);
         }
         Type::Struct(s) => {
@@ -804,7 +805,7 @@ fn format_integer(x0: usize, size: usize, signed: bool, flags: ValueFlags, out: 
     }
 }
 
-fn format_array(inner_type: *const TypeInfo, len: Option<usize>, stride: usize, value: &ValueBlob, addr: Option<usize>, is_string: bool, flags: ValueFlags,
+fn format_array(inner_type: *const TypeInfo, len: Option<usize>, stride: usize, value: &ValueBlob, addr: Option<usize>, is_string: bool, is_truncated: bool, flags: ValueFlags,
                 state: &mut FormatValueState, children: &mut Vec<ValueChildInfo>) {
     // TODO: Hexdump (0x"1a74673bc67f") if element is 1-byte and HEX value flag is set.
     let inner_type = unsafe {&*inner_type};
@@ -820,10 +821,12 @@ fn format_array(inner_type: *const TypeInfo, len: Option<usize>, stride: usize, 
         Ok(Value {val: AddrOrValueBlob::Blob(elem), type_: inner_type, flags: flags.inherit()})
     };
     if state.expanded {
+        let mut indicated_truncation = false;
         for i in 0..len.unwrap_or(1) {
             if i > 1000 {
                 let name_line = styled_writeln!(state.names_out, state.palette.value_misc, "…");
                 children.push(ValueChildInfo {identity: i, name_line, kind: ValueChildKind::ArrayTail(i), deref: 0, value: err!(TooLong, "{} more elements", len.unwrap() - i)});
+                indicated_truncation = true;
                 break;
             }
             let value = get_val(i);
@@ -836,7 +839,14 @@ fn format_array(inner_type: *const TypeInfo, len: Option<usize>, stride: usize, 
                 break;
             }
         }
-        if let &Some(len) = &len {
+        if is_truncated && len.is_some() {
+            if !indicated_truncation {
+                let name_line = styled_writeln!(state.names_out, state.palette.value_misc, "…");
+                children.push(ValueChildInfo {identity: len.unwrap(), name_line, kind: ValueChildKind::Other, deref: 0, value: err!(TooLong, "truncated")});
+            }
+            styled_write!(state.out, state.palette.value_misc, "length at least ");
+            styled_write!(state.out, state.palette.value, "{}", len.clone().unwrap());
+        } else if let Some(len) = len {
             styled_write!(state.out, state.palette.value_misc, "length ");
             styled_write!(state.out, state.palette.value, "{}", len);
         } else {
@@ -867,6 +877,9 @@ fn format_array(inner_type: *const TypeInfo, len: Option<usize>, stride: usize, 
             }
             if len.is_none() {
                 styled_write!(state.out, state.palette.value_misc, ", <length unknown>");
+            } else if is_truncated {
+                styled_write!(state.out, state.palette.value_misc, ", ");
+                styled_write!(state.out, state.palette.truncation_indicator.2, "{}", state.palette.truncation_indicator.1);
             }
             styled_write!(state.out, state.palette.value_misc, "]");
         }
@@ -1012,6 +1025,7 @@ pub fn get_struct_field(val: &AddrOrValueBlob, field: &StructField, memory: &Mem
 // Information needed for evaluating DWARF expressions.
 pub struct DwarfEvalContext<'a> {
     // Process.
+    // TODO: CachedMemReader
     pub memory: &'a MemReader,
 
     // Binary.
@@ -1237,7 +1251,7 @@ impl StructBuilder {
     pub fn finish(mut self, name: &'static str, flags: ValueFlags, types: &mut Types) -> Value {
         let fields_slice = types.fields_arena.add_slice(&self.fields);
         let struct_type = StructType {flags: StructFlags::empty(), fields_ptr: fields_slice.as_ptr(), fields_len: fields_slice.len()};
-        let type_ = TypeInfo {name, size: self.value_blob.len(), die: DebugInfoOffset(0), language: LanguageFamily::Internal, flags: TypeFlags::SIZE_KNOWN, t: Type::Struct(struct_type)};
+        let type_ = TypeInfo {name, size: self.value_blob.len(), die: DebugInfoOffset(0), language: LanguageFamily::Internal, nested_names: &[], flags: TypeFlags::SIZE_KNOWN, t: Type::Struct(struct_type)};
         let type_ = types.types_arena.add(type_);
         let val = AddrOrValueBlob::Blob(ValueBlob::from_vec(mem::take(&mut self.value_blob)));
         Value {val, type_, flags}

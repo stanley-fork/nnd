@@ -1542,12 +1542,21 @@ impl SymbolsLoader {
             let type_infos_bytes = self.shards.iter().map(|s| unsafe {(*s.get()).sym.types.types_arena.used()}).sum();
             let fields_bytes = self.shards.iter().map(|s| unsafe {(*s.get()).sym.types.fields_arena.used()}).sum();
             let types_misc_bytes = self.shards.iter().map(|s| unsafe {(*s.get()).sym.types.misc_arena.used()}).sum();
-            let field_used_bytes: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.types.iter().map(|t| match &t.t {
-                Type::Struct(s) => s.fields().len() * mem::size_of::<StructField>(), Type::Enum(e) => e.enumerands.len() * mem::size_of::<Enumerand>(), _ => 0 }).sum::<usize>()}).sum();
             let subfunctions: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.subfunctions.len()}).sum();
             let subfunction_pc_ranges: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.subfunction_pc_ranges.len()}).sum();
             let subfunction_levels: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.subfunction_levels.len()}).sum();
             let unresolved_vtables: usize = self.sym.vtables.iter().map(|v| v.type_.is_none() as usize).sum();
+            let (mut field_used_bytes, mut nested_names) = (0usize, 0usize);
+            for shard in &self.shards {
+                for t in unsafe {(*shard.get()).sym.types.iter()} {
+                    nested_names += t.nested_names.len();
+                    match &t.t {
+                        Type::Struct(s) => field_used_bytes += s.fields().len() * mem::size_of::<StructField>(),
+                        Type::Enum(e) => field_used_bytes += e.enumerands.len() * mem::size_of::<Enumerand>(),
+                        _ => (),
+                    }
+                }
+            }
 
             let peak_mem_str = match peak_memory_usage_of_current_process() {
                 Ok(x) => format!("{}", PrettySize(x)),
@@ -1574,7 +1583,7 @@ impl SymbolsLoader {
                        {} subfunctions ({:.2}x ranges, {} sf, {} ranges, {} levels), \
                        {} lines ({}), {} local variables ({}), {} global variables, \
                        {} types ({:.2}x dedup, {:.2}x offsets, {} names ({}), \
-                       {} infos, {} fields ({:.2}% growth waste), {} misc, temp {} offset maps, temp {} dedup maps) \
+                       {} infos, {} fields ({:.2}% growth waste), {} nested names, {} misc, temp {} offset maps, temp {} dedup maps) \
                        ({} base types), {} vtables ({:.2}% unresolved){}",
                       self.sym.elf.name, total_wall_ns as f64 / 1e9, total_cpu_ns as f64 / 1e9, self.num_shards, peak_mem_str, PrettyCount(self.sym.units.len()), PrettyCount(self.sym.files.len()),
                       files_before_dedup as f64 / self.sym.files.len() as f64, self.sym.files.len() as f64 / self.sym.path_to_used_file.len() as f64, PrettySize(self.sym.file_paths.arena.used()), PrettySize(files_before_dedup * mem::size_of::<usize>()),
@@ -1582,7 +1591,7 @@ impl SymbolsLoader {
                       PrettyCount(subfunctions), subfunction_pc_ranges as f64 / subfunctions as f64, PrettySize(subfunctions * mem::size_of::<Subfunction>()), PrettySize(subfunction_pc_ranges * mem::size_of::<SubfunctionPcRange>()), PrettySize(subfunction_levels * mem::size_of::<usize>()),
                       PrettyCount(lines), PrettySize(lines * mem::size_of::<LineInfo>() * 2), PrettyCount(local_variables), PrettySize(local_variables * mem::size_of::<LocalVariable>()), PrettyCount(global_variables),
                       PrettyCount(final_types), self.types_before_dedup as f64 / final_types as f64, self.type_offsets as f64 / self.types_before_dedup as f64, PrettyCount(type_names), PrettySize(type_names_len),
-                      PrettySize(type_infos_bytes), PrettySize(fields_bytes), fields_bytes as f64 / field_used_bytes as f64 * 100.0 - 100.0, PrettySize(types_misc_bytes), PrettySize(self.type_offset_maps_bytes), PrettySize(self.type_dedup_maps_bytes),
+                      PrettySize(type_infos_bytes), PrettySize(fields_bytes), fields_bytes as f64 / field_used_bytes as f64 * 100.0 - 100.0, PrettyCount(nested_names), PrettySize(types_misc_bytes), PrettySize(self.type_offset_maps_bytes), PrettySize(self.type_dedup_maps_bytes),
                       PrettyCount(self.sym.base_types.len()), self.sym.vtables.len(), unresolved_vtables as f64 / self.sym.vtables.len() as f64 * 100.0, time_breakdown);
         }
     }
@@ -1685,6 +1694,7 @@ struct LoaderStackEntry {
 
     exact_type: *mut TypeInfo, // a real pointer (not DieOffset) to the type; non-null iff the *current* DIE is a type (struct/union/array/etc); not propagated to descendants, e.g. if there's a function inside the type, the type_ is unset inside the function
     variant: Option<VariantInfo>, // if we're inside a discriminated union (e.g. Rust enum)
+    nested_names: Vec<(&'static str, NestedName)>, // if exact_type is not null
 
     // Address Range(s) of this unit/function/lexical-scope/inlined-function/etc. Used as the range for local variables (unless they have loclist ranges).
     pc_ranges: Vec<gimli::Range>,
@@ -1702,7 +1712,7 @@ struct LoaderStackEntry {
     subfunction_depth: usize,
     local_variables: Vec<LocalVariable>, // for current subfunction
 }
-impl Default for LoaderStackEntry { fn default() -> Self { Self {tag: DW_TAG_null, scope_name_len: 0, scope_name_is_linkable: true, exact_type: ptr::null_mut(), variant: None, pc_ranges: Vec::new(), pc_ranges_depth: 0, function: usize::MAX, function_depth: 0, subfunction_events: Vec::new(), subfunction: usize::MAX, subfunction_depth: 0, local_variables: Vec::new()} } }
+impl Default for LoaderStackEntry { fn default() -> Self { Self {tag: DW_TAG_null, scope_name_len: 0, scope_name_is_linkable: true, exact_type: ptr::null_mut(), variant: None, nested_names: Vec::new(), pc_ranges: Vec::new(), pc_ranges_depth: 0, function: usize::MAX, function_depth: 0, subfunction_events: Vec::new(), subfunction: usize::MAX, subfunction_depth: 0, local_variables: Vec::new()} } }
 
 // The way tree traversal is currently implemented is kind of complicated and has a lot of boilerplate, in part because it's trying to be fast.
 // I wonder if there's a better way to organize this.
@@ -1730,6 +1740,7 @@ impl<'a> DwarfLoader<'a> {
 
         new.exact_type = ptr::null_mut();
         new.variant = None;
+        new.nested_names.clear();
         new.pc_ranges.clear();
         new.function = usize::MAX;
         new.subfunction_events.clear();
@@ -1949,6 +1960,7 @@ impl<'a> DwarfLoader<'a> {
                 }
                 match top.tag {
                     DW_TAG_subprogram => self.finish_function(),
+                    DW_TAG_base_type | DW_TAG_unspecified_type | DW_TAG_structure_type | DW_TAG_class_type | DW_TAG_union_type | DW_TAG_enumeration_type | DW_TAG_pointer_type | DW_TAG_reference_type | DW_TAG_rvalue_reference_type | DW_TAG_array_type | DW_TAG_const_type | DW_TAG_restrict_type | DW_TAG_volatile_type | DW_TAG_atomic_type | DW_TAG_typedef => self.finish_type(),
                     _ => (),
                 }
             }
@@ -2203,7 +2215,7 @@ impl<'a> DwarfLoader<'a> {
                     if self.shard.warn.check(line!()) { eprintln!("warning: enum-valued array indices are not supported (have one @0x{:x})", offset.0); }
                     cursor.skip_attributes(abbrev.attributes())?;
                 }
-                    
+
                 // Types.
                 DW_TAG_base_type | DW_TAG_unspecified_type | DW_TAG_structure_type | DW_TAG_class_type | DW_TAG_union_type | DW_TAG_enumeration_type | DW_TAG_pointer_type | DW_TAG_reference_type | DW_TAG_rvalue_reference_type | DW_TAG_array_type | DW_TAG_const_type | DW_TAG_restrict_type | DW_TAG_volatile_type | DW_TAG_atomic_type | DW_TAG_typedef => {
                     // Applicable attributes (DW_AT_*) (DECL means decl_file, decl_line, decl_column):
@@ -2231,11 +2243,12 @@ impl<'a> DwarfLoader<'a> {
                     let mut info = TypeInfo {die: offset, t, language: self.unit_language, ..Default::default()};
                     let mut saw_type = false;
                     let mut is_complex_float = false;
+                    let mut unqualified_name: &'static str = "";
                     for &attr in abbrev.attributes() {
                         match attr.name() {
                             DW_AT_name => {
-                                let n = parse_attr_str(&self.loader.sym.dwarf, self.unit, &Some(cursor.read_attribute(attr)?))?.to_string();
-                                self.append_namespace_to_scope_name(&n, true);
+                                unqualified_name = parse_attr_str(&self.loader.sym.dwarf, self.unit, &Some(cursor.read_attribute(attr)?))?;
+                                self.append_namespace_to_scope_name(unqualified_name, true);
                                 info.name = self.shard.types.temp_types.unsorted_type_names.add_str(&self.scope_name, 0);
                                 if self.stack[self.depth].scope_name_is_linkable {
                                     info.flags.insert(TypeFlags::LINKABLE_NAME);
@@ -2382,12 +2395,19 @@ impl<'a> DwarfLoader<'a> {
                         self.shard.base_types.push((offset.0 as u64) << 8 | type_enum as u64);
                     }
 
+                    let ti;
                     if is_alias {
-                        self.shard.types.add_alias(offset, DebugInfoOffset(info.t.as_pointer().unwrap().type_ as usize), info.name);
+                        ti = info.t.as_pointer().unwrap().type_;
+                        self.shard.types.add_alias(offset, DebugInfoOffset(ti as usize), info.name);
                     } else {
-                        let t = self.shard.types.add_type(info).0;
+                        let t;
+                        (t, ti) = self.shard.types.add_type(info);
                         assert!(t != ptr::null());
                         self.stack[self.depth].exact_type = t as *mut TypeInfo;
+                    }
+
+                    if !unqualified_name.is_empty() && self.stack[self.depth - 1].exact_type != ptr::null_mut() {
+                        self.stack[self.depth - 1].nested_names.push((unqualified_name, NestedName::Type(ti)));
                     }
                 }
 
@@ -2720,7 +2740,13 @@ impl<'a> DwarfLoader<'a> {
                 }
 
                 // Things we (hopefully) don't care about.
-                DW_TAG_label | DW_TAG_imported_declaration | DW_TAG_imported_module | DW_TAG_template_type_parameter | DW_TAG_template_value_parameter | DW_TAG_GNU_template_parameter_pack | DW_TAG_GNU_template_template_param => {
+                DW_TAG_label | DW_TAG_imported_declaration | DW_TAG_imported_module | DW_TAG_GNU_template_parameter_pack | DW_TAG_GNU_template_template_param => {
+                    skip_subtree = self.depth;
+                    cursor.skip_attributes(abbrev.attributes())?;
+                }
+
+                // TODO: Treat these as nested typedefs / constants.
+                DW_TAG_template_type_parameter | DW_TAG_template_value_parameter => {
                     skip_subtree = self.depth;
                     cursor.skip_attributes(abbrev.attributes())?;
                 }
@@ -2832,9 +2858,21 @@ impl<'a> DwarfLoader<'a> {
 
         self.shard.functions[top.function].subfunction_levels = level_idxs;
     }
+
+    fn finish_type(&mut self) {
+        let top = &mut self.stack[self.depth + 1];
+        let t = top.exact_type;
+        if t == ptr::null_mut() {
+            return;
+        }
+        let t = unsafe {&mut *t};
+        if !top.nested_names.is_empty() {
+            t.nested_names = self.shard.types.temp_types.misc_arena.add_slice(&top.nested_names);
+        }
+    }
 }
 
-fn parse_attr_str<'a>(dwarf: &'a Dwarf<SliceType>, unit: &'a Unit<SliceType>, attr: &Option<Attribute<SliceType>>) -> Result<&'a str> {
+fn parse_attr_str(dwarf: &Dwarf<SliceType>, unit: &Unit<SliceType>, attr: &Option<Attribute<SliceType>>) -> Result<&'static str> {
     let val = match attr {
         None => return err!(Dwarf, "no name"),
         Some(a) => a.value(),
@@ -2842,7 +2880,7 @@ fn parse_attr_str<'a>(dwarf: &'a Dwarf<SliceType>, unit: &'a Unit<SliceType>, at
     // TODO: perf says this takes 5% of the symbols loading time, because it iterates over the null-terminated string one byte at a time. Replace with simd implementation or something. Maybe contribute it to gimli.
     let slice = dwarf.attr_string(unit, val)?;
     let s = str::from_utf8(slice.slice())?;
-    Ok(s)
+    Ok(unsafe {s as _})
 }
 
 // Use this when the string will be presented to the user, so the error won't go unnoticed.

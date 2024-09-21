@@ -169,6 +169,8 @@ pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) {
                 if let Some(p) = debugger.context.settings.unstripped_executable_path.clone() {
                     Some(p)
                 } else {
+                    // Use this special symlink instead of the regular path because it's available even after the file is deleted.
+                    // Useful when recompiling the program without closing the debugger.
                     Some(format!("/proc/{}/exe", debugger.pid))
                 }
             } else {

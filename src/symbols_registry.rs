@@ -176,7 +176,7 @@ fn load_elf(id: &BinaryId, contents_maybe: Result<Vec<u8>>, custom_path: Option<
                 return err!(Usage, "binary changed");
             }
             let mmap = unsafe { Mmap::map(&file)? };
-            ElfFile::from_mmap(path.to_string(), mmap)?
+            ElfFile::from_mmap(id.path.clone(), mmap)?
         }
         SpecialSegmentId::Vdso(_) => {
             ElfFile::from_contents(id.path.clone(), contents_maybe?)?

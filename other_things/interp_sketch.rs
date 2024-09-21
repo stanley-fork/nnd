@@ -122,23 +122,35 @@ enum Instruction {
 
 
 
-#pretty("DB::PODArray.*")
-fn pretty_PODArray<A>(a: A) -> *[A::value_type] {
+#pretty("DB::PODArray")
+fn pretty_PODArray(a: $A) -> *[A::value_type] {
   use T = A::value_type;
   a.c_begin as *T .. a.c_end as *T
 }
 
-#pretty(".*std.*list.*")
-fn pretty_list<L>(list: *L) {
-  use T = L::value_type;
-  let end = &list.__end_;
-  let elem = end.__next_;
-  while elem != end {
-    yield (elem + 1) as *T;
-    elem = elem.__next_;
-  }
+#pretty("::*std::*list", fields=["__end_"])
+fn pretty_list_libcpp(list: $L) {
+    use T = L::value_type;
+    let end = &list.__end_; // if list is a copy, this is silently wrong!
+    let elem = end.__next_;
+    pretty_value("std::list of size {}", list.__size_alloc_);
+    while elem != end {
+        pretty_element((elem + 1) as *T);
+        elem = elem.__next_;
+    }
 }
 
+#pretty("::*std::*list", fields=["_M_next"])
+fn pretty_list_libstdcpp(list: $L) {
+    use T = L::value_type;
+    pretty_value("std::list of size {}", list._M_size);
+    let first = list._M_next;
+    let elem = first;
+    while elem->_M_next != first {
+        pretty_element((elem + 1) as *T);
+        elem = elem._M_next;
+    }
+}
 
 watch expressions as auto-template functions; template over types of all identifiers and types; and over whether addresses are known;
 variables persisting across watch expressions;
@@ -152,3 +164,6 @@ sorting?;
 yield (?); pagination?;
 pretty-printers for types introduced in the script itself;
 template structs;
+pretty-printers for synthetic types;
+ui to check which pretty-printer was applied, see template instantiation errors and runtime errors;
+printing, eprintln (shown in tooltip?)

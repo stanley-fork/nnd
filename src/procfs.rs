@@ -335,7 +335,7 @@ const PAGE_SIZE: usize = 4096;
 
 // Reads debuggee's memory, caches last read page. Good for sequential small reads.
 pub struct CachedMemReader {
-    mem: MemReader,
+    pub mem: MemReader,
     addr: usize,
     page: [u8; PAGE_SIZE],
 }

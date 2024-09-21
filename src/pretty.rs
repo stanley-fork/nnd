@@ -5,7 +5,7 @@ use bitflags::*;
 // Apply pretty-printers and other transformations to a value. Used both for printing and expression evaluaion.
 // E.g. this function may turn an std::vector<int> into a *[int; 123], making it appear as an array both when printed whole
 // and when used in expression like v[10] (will index the array) or v._M_begin (will fail even if std::vector has field _M_begin).
-pub fn prettify_value(val: &mut Cow<Value>, warning: &mut Option<Error>, state: &mut EvalState, context: &EvalContext) -> Result<()> {
+pub fn prettify_value(val: &mut Cow<Value>, warning: &mut Option<Error>, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
     if val.flags.contains(ValueFlags::NO_UNWRAPPING_INTERNAL) {
         return Ok(());
     }
@@ -105,7 +105,7 @@ macro_rules! styled_write_maybe {
 // (Not a value of this type. The type itself. E.g. when using typeof().)
 // The returned value is a struct that the user can explore using field access in watch expressions or by expanding the line in the watches window.
 // E.g. if the *TypeInfo describes a struct, we'll return something like {name: "foo", size: 24, fields: {f1: <MetaField>, f2: <MetaField>}}.
-pub fn reflect_meta_value(val: &Value, state: &mut EvalState, context: &EvalContext, mut out: Option<(&mut StyledText, &Palette)>) -> Value {
+pub fn reflect_meta_value(val: &Value, state: &mut EvalState, context: &mut EvalContext, mut out: Option<(&mut StyledText, &Palette)>) -> Value {
     let meta_t = unsafe {&*val.type_};
     let mut builder = StructBuilder::default();
     match meta_t.t {
@@ -180,6 +180,16 @@ pub fn reflect_meta_value(val: &Value, state: &mut EvalState, context: &EvalCont
             if !t.name.is_empty() {
                 styled_write_maybe!(out, default, " {}", t.name);
                 builder.add_str_field("name", t.name, &mut state.types, &state.builtin_types);
+            }
+            if !t.nested_names.is_empty() {
+                let mut typedefs = StructBuilder::default();
+                for (name, n) in t.nested_names {
+                    match n {
+                        NestedName::Type(type_) => typedefs.add_usize_field(name, *type_ as usize, state.builtin_types.meta_type),
+                    }
+                }
+                let typedefs = typedefs.finish("", val.flags, &mut state.types);
+                builder.add_field("typedefs", typedefs);
             }
             // TODO: Decl file+line.
             if t.die.0 != 0 && t.die.0 < FAKE_DWARF_OFFSET_START {
@@ -353,7 +363,7 @@ fn find_vtable_ptr_field_offset(t: &TypeInfo, s: &StructType) -> Option<usize> {
     None
 }
 
-fn downcast_to_concrete_type(val: &mut Cow<Value>, vtable_ptr_field_offset: usize, context: &EvalContext) -> Result<()> {
+fn downcast_to_concrete_type(val: &mut Cow<Value>, vtable_ptr_field_offset: usize, context: &mut EvalContext) -> Result<()> {
     let Some(addr) = val.val.addr() else { return err!(Runtime, "struct address not known") };
     let vptr = context.memory.read_u64(addr + vtable_ptr_field_offset)? as usize;
     // Itanium ABI vtable layout is:
@@ -375,7 +385,7 @@ fn downcast_to_concrete_type(val: &mut Cow<Value>, vtable_ptr_field_offset: usiz
 }
 
 // Removes fields representing inactive variants. If nothing looks broken, removes discriminant too.
-fn resolve_discriminated_union(val: &AddrOrValueBlob, fields: &mut Cow<[StructField]>, warning: &mut Option<Error>, context: &EvalContext) -> Result<bool> {
+fn resolve_discriminated_union(val: &AddrOrValueBlob, fields: &mut Cow<[StructField]>, warning: &mut Option<Error>, context: &mut EvalContext) -> Result<bool> {
     let mut discriminant: Option<usize> = None;
     for field in fields.iter() {
         if field.flags.contains(FieldFlags::DISCRIMINANT) {
@@ -579,6 +589,18 @@ fn find_array_field(names: &[&str], substruct: &mut ContainerSubstruct, inner_ty
     }
 }
 
+fn find_nested_type(name: &str, type_: *const TypeInfo) -> Result<*const TypeInfo> {
+    let t = unsafe {&*type_};
+    for (nn, n) in t.nested_names {
+        if *nn == name {
+            match n {
+                NestedName::Type(t) => return Ok(*t),
+            }
+        }
+    }
+    err!(NoField, "")
+}
+
 fn get_container_usize_field(bit_offset: Range<usize>, slice: &[u8]) -> Result<usize> {
     assert!(bit_offset.len() <= 64);
     if bit_offset.end > slice.len() * 64 {
@@ -601,6 +623,7 @@ fn get_container_usize_field(bit_offset: Range<usize>, slice: &[u8]) -> Result<u
     Ok(r)
 }
 
+// TODO: Use CachedMemReader instead.
 fn read_container_struct<'a>(value: &'a Value, scratch: &'a mut [MaybeUninit<u8>], memory: &MemReader) -> Result<&'a [u8]> {
     let t = unsafe {&*value.type_};
     if t.size > scratch.len() {
@@ -656,7 +679,7 @@ fn trim_field_name(mut name: &str) -> &str {
 // Returns Ok if the whole Value was replaced and doesn't need any further transformations.
 // Returns NotContainer error if the value wasn't replaced (but `fields` may have been mutated, e.g. removing refcount field from shared_ptr).
 // Returns other errors if we should fail the whole prettification (e.g. failed to read the struct from memory).
-fn recognize_containers(val: &mut Cow<Value>, fields: &mut Cow<[StructField]>, additional_names: &[&str], warning: &mut Option<Error>, state: &mut EvalState, context: &EvalContext) -> Result<()> {
+fn recognize_containers(val: &mut Cow<Value>, fields: &mut Cow<[StructField]>, additional_names: &[&str], warning: &mut Option<Error>, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
     let t = unsafe {&*val.type_};
     let language = match t.language {
         LanguageFamily::Internal => return err!(NotContainer, ""),
@@ -681,17 +704,22 @@ fn recognize_containers(val: &mut Cow<Value>, fields: &mut Cow<[StructField]>, a
         Err(e) if e.is_no_field() => substruct.clear_used(),
         Err(e) => return Err(e),
     }
-    match recognize_rust_vec(&mut substruct, val, additional_names, warning, state, context) {
+    match recognize_rust_vec(&mut substruct, val, additional_names, state, context) {
         Ok(()) => return Ok(()),
         Err(e) if e.is_no_field() => substruct.clear_used(),
         Err(e) => return Err(e),
     }
-    match recognize_libcpp_string(&mut substruct, val, additional_names, warning, state, context) {
+    match recognize_libcpp_string(&mut substruct, val, state, context) {
         Ok(()) => return Ok(()),
         Err(e) if e.is_no_field() => substruct.clear_used(),
         Err(e) => return Err(e),
     }
-    match recognize_absl_inlined_vector(&mut substruct, val, additional_names, warning, state, context) {
+    match recognize_absl_inlined_vector(&mut substruct, val, state, context) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.is_no_field() => substruct.clear_used(),
+        Err(e) => return Err(e),
+    }
+    match recognize_cpp_list(&mut substruct, val, state, context) {
         Ok(()) => return Ok(()),
         Err(e) if e.is_no_field() => substruct.clear_used(),
         Err(e) => return Err(e),
@@ -710,7 +738,7 @@ fn make_slice(val: &mut Cow<Value>, ptr: usize, len: usize, inner_type: *const T
 
 // Slice or vector.
 // Something like: {start: *T, len: usize} or {begin: *T, end: *T, end_of_storage: *T}, or {buf: {ptr: *T, cap: usize}, len: usize}.
-fn recognize_slice_or_vec(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, additional_names: &[&str], warning: &mut Option<Error>, state: &mut EvalState, context: &EvalContext) -> Result<()> {
+fn recognize_slice_or_vec(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, additional_names: &[&str], warning: &mut Option<Error>, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
     // Find field offsets.
     // (We first analyze the fields, then look at data. Not necessarily the simplest way to do this right now, but a sort of rehearsal of compiling to bytecode.)
     let mut inner_type: *const TypeInfo = ptr::null();
@@ -765,7 +793,7 @@ fn recognize_slice_or_vec(substruct: &mut ContainerSubstruct, val: &mut Cow<Valu
 
 // {len, buf: {ptr, cap}}
 // Or VecDeque: {head, len, buf: {ptr, cap}}
-fn recognize_rust_vec(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, additional_names: &[&str], warning: &mut Option<Error>, state: &mut EvalState, context: &EvalContext) -> Result<()> {
+fn recognize_rust_vec(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, additional_names: &[&str], state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
     let mut buf = find_struct_field(&["buf"], substruct)?;
     let mut inner_type: *const TypeInfo = ptr::null();
     let ptr_field = find_pointer_field(&["ptr"], &mut buf, &mut inner_type)?;
@@ -799,7 +827,6 @@ fn recognize_rust_vec(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, 
         make_slice(val, ptr, len, inner_type, is_string, state);
     }
     Ok(())
-
 }
 
 // shared_ptr: {ptr, refcount} - just remove refcount, so that field unwrapping turns this into plain pointer
@@ -833,7 +860,7 @@ fn recognize_shared_ptr(fields: &mut Cow<[StructField]>) -> Result<()> {
 // }
 // (actual capacity is `cap * 2`, where 2 is `__endian_factor`)
 // (ifdef _LIBCPP_ABI_ALTERNATE_STRING_LAYOUT then the fields are shuffled around a little)
-fn recognize_libcpp_string(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, additional_names: &[&str], warning: &mut Option<Error>, state: &mut EvalState, context: &EvalContext) -> Result<()> {
+fn recognize_libcpp_string(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
     let mut s = find_struct_field(&["s"], substruct)?;
     let mut l = find_struct_field(&["l"], substruct)?;
     let _ = optional_field(find_field(&["r"], substruct))?;
@@ -923,7 +950,7 @@ fn make_array_or_slice(val: &mut Cow<Value>, byte_offset: usize, len: usize, inn
 // absl::InlinedVector: {metadata_: usize, data_: union {allocated: {allocated_data: *T, allocated_capacity: usize}, inlined: {inlined_data: [i8; cap]}}}
 // metadata_ & 1 - is_allocated
 // metadata_ >> 1 - len
-fn recognize_absl_inlined_vector(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, additional_names: &[&str], warning: &mut Option<Error>, state: &mut EvalState, context: &EvalContext) -> Result<()> {
+fn recognize_absl_inlined_vector(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
     let metadata_field = find_int_field(&["metadata"], substruct)?;
     let mut data = find_struct_field(&["data"], substruct)?;
     substruct.check_all_fields_used()?;
@@ -935,7 +962,6 @@ fn recognize_absl_inlined_vector(substruct: &mut ContainerSubstruct, val: &mut C
     let allocated_data_field = find_pointer_field(&["allocated_data"], &mut allocated, &mut inner_type)?;
     let _ = find_int_field(&["allocated_capacity"], &mut allocated)?;
     allocated.check_all_fields_used()?;
-
 
     let mut scratch: [MaybeUninit<u8>; 1024] = unsafe {MaybeUninit::uninit().assume_init()};
     let slice = read_container_struct(val, &mut scratch, &context.memory)?;
@@ -954,4 +980,62 @@ fn recognize_absl_inlined_vector(substruct: &mut ContainerSubstruct, val: &mut C
         }
         return make_array_or_slice(val, inlined_field.start/8, len, inner_type, false, state);
     }
+}
+
+// std::list
+// libc++: {__end_: node, __size_alloc_: usize}, node: {__prev_: *node, __next_: *node}
+// libstdc++: {_M_prev: *node, _M_next: *node, _M_size: usize}, node: {_M_prev: *node, _M_next: *node}
+fn recognize_cpp_list(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
+    let size_field = find_int_field(&["__size_alloc_", "_M_size"], substruct)?;
+    let value_type = find_nested_type("value_type", val.type_)?;
+    let mut node_type: *const TypeInfo = ptr::null();
+    let (last_node_field, first_node_field);
+    if let Some(mut end) = optional_field(find_struct_field(&["__end_"], substruct))? {
+        last_node_field = find_pointer_field(&["__prev_"], &mut end, &mut node_type)?;
+        first_node_field = find_pointer_field(&["__next_"], &mut end, &mut node_type)?;
+        end.check_all_fields_used()?;
+    } else {
+        last_node_field = find_pointer_field(&["_M_prev"], substruct, &mut node_type)?;
+        first_node_field = find_pointer_field(&["_M_next"], substruct, &mut node_type)?;
+    }
+    substruct.check_all_fields_used()?;
+/*
+    asdqwe analyze node struct;
+
+    let mut scratch: [MaybeUninit<u8>; 40] = unsafe {MaybeUninit::uninit().assume_init()};
+    let slice = read_container_struct(val, &mut scratch, &context.memory)?;
+
+    let size = get_container_usize_field(size_field, slice)?;
+    let first_node = get_container_usize_field(first_node_field, slice)?;
+    let last_node = get_container_usize_field(last_node_field, slice)?;
+
+    let mut node = first_node;
+    let mut data: Vec<u8> = Vec::new();
+    let n = size.min(1000);
+    for i in 0..size {
+        asdqwe;
+asdqwe cached reader;
+        node = asdqwe;
+    }
+
+    asdqwe;
+    asdqwe set truncation flag if long;
+
+    let inner_size = (unsafe {&*inner_type}).calculate_size();
+    if let Some(f) = head_field {
+        // VecDeque.
+        let head = get_container_usize_field(f, slice)?;
+        if head > cap || len > cap {
+            return err!(Runtime, "VecDeque out of bounds");
+        }
+        let mut builder = StructBuilder::default();
+        builder.add_slice_field("part1", ptr + head*inner_size, len.min(cap - head), inner_type, SliceFlags::empty(), &mut state.types);
+        builder.add_slice_field("part2", ptr, len.saturating_sub(cap - head), inner_type, SliceFlags::empty(), &mut state.types);
+        let new_val = builder.finish("VecDeque", val.flags, &mut state.types);
+        *val = Cow::Owned(new_val);
+    } else {
+        let is_string = inner_size == 1 && container_name_looks_like_string(val.type_, additional_names);
+        make_slice(val, ptr, len, inner_type, is_string, state);
+    }*/
+    Ok(())
 }

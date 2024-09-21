@@ -29,6 +29,7 @@ make return key do something in each window: go from threads to stack -> code ->
 "unexpectedly big memory read" (16 bytes) for f64 local variables on the stack in rust
 floating point and simd registers
 allow to put breakpoint on a whole file
+function pointers and field pointers
 find function by address (like addr2line)
 show number of function inlined sites in disassembly window, allow setting breakpoint on it, allow opening inline-only functions
 add decl location to TypeInfo and MetaType
@@ -51,6 +52,7 @@ make source window autoscroll horizontally in addition to vertically
 handle partially-optimized-out struct values (common in rust)
 read color scheme from file
 color threads based on stack hash
+search in watches window
 
 watches, expressions
   first, implement simple expression watches

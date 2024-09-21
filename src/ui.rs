@@ -498,8 +498,11 @@ impl Default for WatchesWindow {
     }
 }
 impl WatchesWindow {
-    fn eval_locals(&mut self, context: &EvalContext, parent: ValueTreeNodeIdx, palette: &Palette) {
-        let (dwarf_context, _) = match self.eval_state.make_local_dwarf_eval_context(context, context.selected_subframe) {
+    fn eval_locals(&mut self, context: &mut EvalContext, parent: ValueTreeNodeIdx, palette: &Palette) {
+        let selected_subframe = context.selected_subframe;
+        let subframe = &context.stack.subframes[selected_subframe];
+        let pseudo_addr = context.stack.frames[subframe.frame_idx].pseudo_addr;
+        let (dwarf_context, _) = match context.make_local_dwarf_eval_context(selected_subframe) {
             Ok(x) => x,
             Err(e) => {
                 self.tree.nodes[parent.0].value = Err(e);
@@ -507,8 +510,6 @@ impl WatchesWindow {
             }
         };
         let symbols = dwarf_context.symbols.unwrap();
-        let subframe = &context.stack.subframes[context.selected_subframe];
-        let pseudo_addr = context.stack.frames[subframe.frame_idx].pseudo_addr;
         let static_pseudo_addr = dwarf_context.addr_map.dynamic_to_static(pseudo_addr);
 
         let mut idxs_per_name: HashMap<&str, usize> = HashMap::new();
@@ -531,7 +532,7 @@ impl WatchesWindow {
         }
     }
 
-    fn eval_registers(&mut self, context: &EvalContext, parent: ValueTreeNodeIdx, palette: &Palette) {
+    fn eval_registers(&mut self, context: &mut EvalContext, parent: ValueTreeNodeIdx, palette: &Palette) {
         if let Some(sf) = context.stack.subframes.get(context.selected_subframe) {
             let regs = &context.stack.frames[sf.frame_idx].regs;
             for reg in RegisterIdx::all() {
@@ -544,7 +545,7 @@ impl WatchesWindow {
         }
     }
 
-    fn eval_watches(&mut self, context: Option<&EvalContext>, palette: &Palette) {
+    fn eval_watches(&mut self, mut context: Option<&mut EvalContext>, palette: &Palette) {
         for i in 0..self.expressions.len() {
             let expr = &self.expressions[i];
             let style = if expr.special.is_some() {palette.default_dim} else {palette.default};
@@ -556,16 +557,15 @@ impl WatchesWindow {
             if expr.special.is_some() {
                 continue;
             }
-            
-            let context = match &context {
-                None => continue,
-                &Some(x) => x };
-            match eval_watch_expression(&expr.text, &mut self.eval_state, context) {
-                Ok((val, dub)) => {
-                    node.value = Ok(val);
-                    node.dubious = dub;
+
+            if let Some(context) = &mut context {
+                match eval_watch_expression(&expr.text, &mut self.eval_state, *context) {
+                    Ok((val, dub)) => {
+                        node.value = Ok(val);
+                        node.dubious = dub;
+                    }
+                    Err(e) => node.value = Err(e),
                 }
-                Err(e) => node.value = Err(e),
             }
         }
     }
@@ -574,7 +574,7 @@ impl WatchesWindow {
     // If  node.expanded: populates formatted_value[1], has_children, children.
     // If already populated, does nothing.
     // If context is none, may not populate; in this case the caller should show the error from `context` (e.g. "running") instead of formatted_value.
-    fn ensure_node_info(&mut self, node_idx: ValueTreeNodeIdx, context: Option<&EvalContext>, palette: &Palette) {
+    fn ensure_node_info(&mut self, node_idx: ValueTreeNodeIdx, mut context: Option<&mut EvalContext>, palette: &Palette) {
         let node = &mut self.tree.nodes[node_idx.0];
         let i = node.expanded as usize;
         if node.formatted_value[i].is_some() {
@@ -584,7 +584,7 @@ impl WatchesWindow {
             (&Some(SpecialWatch::AddWatch), _) => {
                 node.formatted_value = [Some(0..0), Some(0..0), Some(0..0)];
             }
-            (&Some(special), _) => if let &Some(context) = &context {
+            (&Some(special), _) => if let Some(context) = &mut context {
                 node.formatted_value[0] = Some(0..0);
                 node.has_children = true;
                 if node.expanded {
@@ -592,11 +592,11 @@ impl WatchesWindow {
                     let start = self.tree.nodes.len();
                     let what = match special {
                         SpecialWatch::Locals => {
-                            self.eval_locals(context, node_idx, palette);
+                            self.eval_locals(*context, node_idx, palette);
                             "locals"
                         }
                         SpecialWatch::Registers => {
-                            self.eval_registers(context, node_idx, palette);
+                            self.eval_registers(*context, node_idx, palette);
                             "registers"
                         }
                         SpecialWatch::AddWatch => panic!("huh"),
@@ -621,8 +621,8 @@ impl WatchesWindow {
                 node.formatted_value[0] = Some(l..l+1);
                 node.formatted_value[1] = Some(l..l+1);
             }
-            (&None, Ok(value)) => if let &Some(context) = &context {
-                let (has_children, children) = format_value(value, node.expanded, &mut self.eval_state, context, &mut self.tree.temp_text, &mut self.tree.text, palette);
+            (&None, Ok(value)) => if let Some(context) = &mut context {
+                let (has_children, children) = format_value(value, node.expanded, &mut self.eval_state, *context, &mut self.tree.temp_text, &mut self.tree.text, palette);
                 let l = self.tree.temp_text.close_line();
                 let l = self.tree.text.import_lines(&self.tree.temp_text, l..l+1);
                 node.formatted_value[i] = Some(l);
@@ -641,7 +641,7 @@ impl WatchesWindow {
         }
     }
 
-    fn do_layout(&mut self, context: Option<&EvalContext>, palette: &Palette, frame_idx: usize) -> usize {
+    fn do_layout(&mut self, mut context: Option<&mut EvalContext>, palette: &Palette, frame_idx: usize) -> usize {
         self.cursor_idx = 0;
         self.tree.rows.clear();
         let mut y = 0isize;
@@ -680,7 +680,11 @@ impl WatchesWindow {
                     height.set_max(node.line_wrapped_name.clone().unwrap().len());
                 }
 
-                self.ensure_node_info(node_idx, context, palette);
+                // This is silly, Rust. Is there a good way to do this?
+                match &mut context {
+                    Some(context) => self.ensure_node_info(node_idx, Some(*context), palette),
+                    None => self.ensure_node_info(node_idx, None, palette),
+                }
                 let node = &mut self.tree.nodes[node_idx.0];
 
                 if node.formatted_value[2].is_none() && node.formatted_value[1].is_some() {
@@ -710,7 +714,7 @@ impl WatchesWindow {
         y as usize
     }
 
-    fn build_widgets(&mut self, visible_y: Range<isize>, context: &Result<EvalContext>, ui: &mut UI) {
+    fn build_widgets(&mut self, visible_y: Range<isize>, context: &mut Result<EvalContext>, ui: &mut UI) {
         self.text_input_built = false;
         let mut stack: Vec<ValueTreeNodeIdx> = self.tree.roots.iter().copied().rev().collect();
         let mut should_start_editing: Option<usize> = None;
@@ -739,7 +743,7 @@ impl WatchesWindow {
             let formatted = if node.expanded {
                 node.formatted_value[2].clone()
             } else {
-                self.ensure_node_info(node_idx, context.as_ref().ok(), &ui.palette);
+                self.ensure_node_info(node_idx, context.as_mut().ok(), &ui.palette);
                 self.tree.nodes[node_idx.0].formatted_value[0].clone()
             };
             let node = &self.tree.nodes[node_idx.0];
@@ -1048,7 +1052,7 @@ impl WindowContent for WatchesWindow {
         }
 
         // See if we're able to evaluate expressions.
-        let eval_context: Result<EvalContext> = match debugger.threads.get(&state.selected_thread) {
+        let mut eval_context: Result<EvalContext> = match debugger.threads.get(&state.selected_thread) {
             None => err!(ProcessState, "no process"),
             Some(thread) if thread.state != ThreadState::Suspended || state.stack.frames.is_empty() => err!(ProcessState, "running"),
             Some(thread) => {
@@ -1067,10 +1071,10 @@ impl WindowContent for WatchesWindow {
             self.eval_state.clear();
             self.scroll_to_cursor = true;
 
-            if let Ok(context) = &eval_context {
+            if let Ok(context) = &mut eval_context {
                 self.eval_state.update(context);
             }
-            self.eval_watches(eval_context.as_ref().ok(), &ui.palette);
+            self.eval_watches(eval_context.as_mut().ok(), &ui.palette);
         }
 
         // Create container widgets.
@@ -1115,7 +1119,7 @@ impl WindowContent for WatchesWindow {
 
         // Determine positions and sizes of all nodes, do line wrapping (unless cached). Also assign cursor_idx.
         // We currently do this on each frame because determining if anything changed would be error-prone.
-        let content_height = self.do_layout(eval_context.as_ref().ok(), &ui.palette, ui.frame_idx);
+        let content_height = self.do_layout(eval_context.as_mut().ok(), &ui.palette, ui.frame_idx);
 
         // Do cursor movement and scrolling.
         let visible_y: Range<isize>;
@@ -1146,7 +1150,7 @@ impl WindowContent for WatchesWindow {
 
         // Create widgets for visible nodes, handle mouse clicks.
         with_parent!(ui, content_widget, {
-            self.build_widgets(visible_y, &eval_context, ui);
+            self.build_widgets(visible_y, &mut eval_context, ui);
         });
 
         if self.text_input.is_some() && !self.text_input_built {

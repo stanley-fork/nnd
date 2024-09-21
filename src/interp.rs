@@ -19,7 +19,7 @@ pub fn parse_watch_expression(s: &str) -> Result<Expression> {
     Ok(expr)
 }
 
-pub fn eval_watch_expression(expr_str: &str, state: &mut EvalState, context: &EvalContext) -> Result<(Value, /*dubious*/ bool)> {
+pub fn eval_watch_expression(expr_str: &str, state: &mut EvalState, context: &mut EvalContext) -> Result<(Value, /*dubious*/ bool)> {
     let expr = parse_watch_expression(expr_str)?;
     state.currently_evaluated_value_dubious = false;
     Ok((eval_expression(&expr, expr.root, state, context, false)?, state.currently_evaluated_value_dubious))
@@ -72,7 +72,7 @@ pub fn make_expression_for_local_variable(name: &str) -> String {
 // Maybe the AddrOrValueBlob discriminator and the ValueFlags would become part of TypeInfo instead of being a weird external extension of the type system.
 // `only_type` is for typeof(), to allow getting type of variables that aren't available; for many operations it falls back to calculating values and
 // may fail unnecessarily, but that seems ok as long as the important case of getting types of unavailable variable is supported.
-fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, context: &EvalContext, only_type: bool) -> Result<Value> {
+fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, context: &mut EvalContext, only_type: bool) -> Result<Value> {
     let node = &expr.ast[node_idx.0];
     match &node.a {
         AST::Literal(v) => {
@@ -476,7 +476,7 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
     }
 }
 
-fn eval_type(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, context: &EvalContext) -> Result<*const TypeInfo> {
+fn eval_type(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, context: &mut EvalContext) -> Result<*const TypeInfo> {
     let node = &expr.ast[node_idx.0];
     match &node.a {
         AST::Type {name, quoted} => state.get_type(context, name),
@@ -488,7 +488,7 @@ fn eval_type(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, context
     }
 }
 
-fn follow_references_and_prettify(val: &mut Value, pointers_too: bool, state: &mut EvalState, context: &EvalContext) -> Result<()> {
+fn follow_references_and_prettify(val: &mut Value, pointers_too: bool, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
     for step in 0..100 {
         if unsafe {(*val.type_).t.is_meta_type_or_field()} {
             *val = reflect_meta_value(val, state, context, None);
