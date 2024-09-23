@@ -35,9 +35,12 @@ fn main() {
     let bm: BTreeMap<i32, &str> = BTreeMap::from([(1, "one"), (2, "two")]); // no
     let bs: BTreeSet<i32> = BTreeSet::from_iter(vec![1, 2, 3]);             // no
 
-    let mut hm: HashMap<i32, &str> = HashMap::new();                        // no
-    hm.insert(1, "one");
-    let hs: HashSet<i32> = HashSet::from_iter(vec![1, 2, 3]);               // no
+    let mut hm: HashMap<i32, String> = HashMap::new();                        // yes
+    for i in 1..200 {
+        let x = i*1310%10000;
+        hm.insert(x, format!("v{}", x));
+    }
+    let hs: HashSet<i32> = HashSet::from_iter(vec![1, 2, 3]);               // yes
 
     let rc: Rc<i32> = Rc::new(42);                                          // no
     let arc: Arc<i32> = Arc::new(42);                                       // no

@@ -458,6 +458,7 @@ fn resolve_discriminated_union(val: &AddrOrValueBlob, fields: &mut Cow<[StructFi
 // Throughout these functions, error NoField means "this container wasn't recognized, but we should try others", while NotContainer means "stop all container recognition".
 
 struct ContainerSubstruct<'a> {
+    type_: *const TypeInfo,
     fields: Cow<'a, [StructField]>,
     bit_offset: usize,
     used_fields_mask: usize,
@@ -521,7 +522,7 @@ fn container_aux_struct(type_: *const TypeInfo) -> Result<ContainerSubstruct<'st
         Type::Struct(s) => {
             let mut fields = Cow::Borrowed(s.fields());
             unravel_struct(&mut fields, None);
-            Ok(ContainerSubstruct {fields, bit_offset: 0, used_fields_mask: 0})
+            Ok(ContainerSubstruct {type_, fields, bit_offset: 0, used_fields_mask: 0})
         }
         _ => err!(NoField, ""),
     }
@@ -537,7 +538,7 @@ fn find_struct_field<'a>(names: &[&str], substruct: &mut ContainerSubstruct<'a>)
             }
             let mut fields = Cow::Borrowed(s.fields());
             unravel_struct(&mut fields, None);
-            Ok(ContainerSubstruct {fields, bit_offset: substruct.bit_offset + f.bit_offset, used_fields_mask: 0})
+            Ok(ContainerSubstruct {type_: f.type_, fields, bit_offset: substruct.bit_offset + f.bit_offset, used_fields_mask: 0})
         }
         _ => err!(NoField, ""),
     }
@@ -673,7 +674,7 @@ fn recognize_containers(val: &mut Cow<Value>, fields: &mut Cow<[StructField]>, a
         Err(e) => return Err(e),
     }
 
-    let mut substruct = ContainerSubstruct {fields: fields.clone(), bit_offset: 0, used_fields_mask: 0};
+    let mut substruct = ContainerSubstruct {type_: val.type_, fields: fields.clone(), bit_offset: 0, used_fields_mask: 0};
 
     match recognize_slice_or_vec(&mut substruct, val, additional_names, warning, state, context) {
         Ok(()) => return Ok(()),
@@ -700,6 +701,11 @@ fn recognize_containers(val: &mut Cow<Value>, fields: &mut Cow<[StructField]>, a
         Err(e) if e.is_no_field() => substruct.clear_used(),
         Err(e) => return Err(e),
     }
+    match recognize_rust_hash_table(&mut substruct, val, state, context) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.is_no_field() => substruct.clear_used(),
+        Err(e) => return Err(e),
+    }
 
     err!(NotContainer, "")
 }
@@ -709,6 +715,15 @@ fn make_slice(val: &mut Cow<Value>, ptr: usize, len: usize, inner_type: *const T
     let slice_type = state.types.add_slice(inner_type, flags);
     let v = AddrOrValueBlob::Blob(ValueBlob::from_two_usizes([ptr, len]));
     let new_val = Value {val: v, type_: slice_type, flags: val.flags};
+    *val = Cow::Owned(new_val);
+}
+
+fn make_array_of_references(val: &mut Cow<Value>, data: Vec<u8>, inner_type: *const TypeInfo, is_truncated: bool, state: &mut EvalState) {
+    let flags = if is_truncated {ArrayFlags::TRUNCATED} else {ArrayFlags::empty()};
+    let value_ref_type = state.types.add_pointer(inner_type, PointerFlags::REFERENCE);
+    let array_type = state.types.add_array(value_ref_type, data.len() / 8, flags);
+    let v = AddrOrValueBlob::Blob(ValueBlob::from_vec(data));
+    let new_val = Value {val: v, type_: array_type, flags: val.flags};
     *val = Cow::Owned(new_val);
 }
 
@@ -1005,26 +1020,62 @@ fn recognize_cpp_list(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, 
 
     let mut node_addr = first_node;
     let mut data: Vec<u8> = Vec::new();
-    let mut array_flags = ArrayFlags::empty();
+    let mut is_truncated = false;
     for i in 0..size.unwrap_or(usize::MAX) {
         if node_addr == 0 && size.is_none() {
             break;
         }
         if i >= 300 {
-            array_flags.insert(ArrayFlags::TRUNCATED);
+            is_truncated = true;
             break;
         }
         let elem_addr = node_addr + sizeof_node + value_offset;
         data.extend_from_slice(&elem_addr.to_le_bytes());
         node_addr = AddrOrValueBlob::Addr(node_addr).bit_range(next_field.clone(), &mut context.memory)?;
     }
+    make_array_of_references(val, data, value_type, is_truncated, state);
+    Ok(())
+}
 
-    let len = data.len() / 8;
-    let value_ref_type = state.types.add_pointer(value_type, PointerFlags::REFERENCE);
-    let array_type = state.types.add_array(value_ref_type, len, array_flags);
+fn recognize_rust_hash_table(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
+    let mut table = find_struct_field(&["table"], substruct)?;
+    let bucket_type = find_nested_type("T", table.type_)?;
+    let bucket_mask_field = find_int_field(&["bucket_mask"], &mut table)?;
+    let mut ctrl_type: *const TypeInfo = ptr::null();
+    let ctrl_field = find_pointer_field(&["ctrl"], &mut table, &mut ctrl_type)?;
+    if unsafe {(*ctrl_type).calculate_size()} != 1 {
+        return err!(NoField, "");
+    }
 
-    let v = AddrOrValueBlob::Blob(ValueBlob::from_vec(data));
-    let new_val = Value {val: v, type_: array_type, flags: val.flags};
-    *val = Cow::Owned(new_val);
+    // Hashbrown hash table works like this:
+    //  * x.table.bucket_mask + 1 is the number of buckets
+    //  * x.table::T is the bucket type
+    //  * x.table.ctrl[i] is the control byte for bucket i; if it's not EMPTY or DELETED, this bucket contains a value
+    //  * *(x.table.ctrl as *T - 1 - i) is the bucket value
+
+    let bucket_size = unsafe {(*bucket_type).calculate_size()};
+    let bucket_mask = val.val.bit_range(bucket_mask_field, &mut context.memory)?;
+    let ctrl = val.val.bit_range(ctrl_field, &mut context.memory)?;
+    let limit = 300usize;
+    let mut is_truncated = false;
+    let n = if bucket_mask + 1 <= limit {
+        bucket_mask + 1
+    } else {
+        is_truncated = true;
+        limit
+    };
+    let mut control_bytes = vec![0u8; n];
+    context.memory.read(ctrl, &mut control_bytes)?;
+    let mut data: Vec<u8> = Vec::new();
+    for i in 0..n {
+        let b = control_bytes[i];
+        const EMPTY: u8 = 0b1111_1111;
+        const DELETED: u8 = 0b1000_0000;
+        if b == EMPTY || b == DELETED {
+            continue;
+        }
+        data.extend_from_slice(&(ctrl - bucket_size * (i + 1)).to_le_bytes());
+    }
+    make_array_of_references(val, data, bucket_type, is_truncated, state);
     Ok(())
 }

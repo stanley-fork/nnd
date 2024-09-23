@@ -876,7 +876,7 @@ fn format_array(inner_type: *const TypeInfo, len: Option<usize>, stride: usize, 
                 let name_line = styled_writeln!(state.names_out, state.palette.value_misc, "…");
                 children.push(ValueChildInfo {identity: len.unwrap(), name_line, kind: ValueChildKind::Other, deref: 0, value: err!(TooLong, "truncated")});
             }
-            styled_write!(state.out, state.palette.value_misc, "length > ");
+            styled_write!(state.out, state.palette.value_misc, "length >= ");
             styled_write!(state.out, state.palette.value, "{}", len.clone().unwrap());
         } else if let Some(len) = len {
             styled_write!(state.out, state.palette.value_misc, "length ");

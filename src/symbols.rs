@@ -2745,8 +2745,30 @@ impl<'a> DwarfLoader<'a> {
                     cursor.skip_attributes(abbrev.attributes())?;
                 }
 
-                // TODO: Treat these as nested typedefs / constants.
-                DW_TAG_template_type_parameter | DW_TAG_template_value_parameter => {
+                // Function template arguments.
+                DW_TAG_template_type_parameter if self.stack[self.depth - 1].exact_type == ptr::null_mut() => {
+                    skip_subtree = self.depth;
+                    cursor.skip_attributes(abbrev.attributes())?;
+                }
+
+                // Treat struct template arguments as typedefs, as if e.g. vector<int> had a 'using T = int' inside it.
+                DW_TAG_template_type_parameter => {
+                    let mut name: &'static str = "";
+                    let mut type_: *const TypeInfo = ptr::null();
+                    for &attr in abbrev.attributes() {
+                        match attr.name() {
+                            DW_AT_name => name = unsafe {mem::transmute(parse_attr_str(&self.loader.sym.dwarf, self.unit, &Some(cursor.read_attribute(attr)?))?)},
+                            DW_AT_type => type_ = self.parse_type_ref(&attr, abbrev.tag(), &mut cursor)?,
+                            _ => cursor.skip_attributes(&[attr])?,
+                        }
+                    }
+                    if !name.is_empty() && type_ != ptr::null() {
+                        self.stack[self.depth - 1].nested_names.push((name, NestedName::Type(type_)));
+                    }
+                }
+
+                // TODO: Nested constants.
+                DW_TAG_template_value_parameter => {
                     skip_subtree = self.depth;
                     cursor.skip_attributes(abbrev.attributes())?;
                 }
