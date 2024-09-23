@@ -17,7 +17,7 @@ test with watches window filled with long arrays (I saw 50ms frames when there a
 
 up/down arrows should close code search, or cycle history
 make symtab/dynsym work when debug info (or debuglink file) is missing
-more built-in pretty printers: hash tables (std, sparsehash, absl, Rust), rb trees, deque
+more built-in pretty printers: hash tables (sparsehash, absl, Rust), rb trees, deque
 hotkey to switch between .h/.cpp (/.cc/.hh/.hpp/.cxx - maybe just all extensions)
 reordering tabs
 rearranging windows

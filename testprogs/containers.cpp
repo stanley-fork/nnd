@@ -52,7 +52,7 @@ int main() {
     std::u32string u32str = U"hello";      // [good enough, good enough]
 
     auto pv = std::make_shared<std::vector<int>>(std::vector<int>({10, 20, 30}));
-    
+
     // Deque.
     std::deque<int> deq = {1, 2, 3};     // [no, no]
     std::stack<int> stk;                 // [no, no]
@@ -61,8 +61,8 @@ int main() {
     que.push(1);
 
     // Linked lists.
-    std::list<int> lst = {1, 2, 3};           // [no, no]
-    std::forward_list<int> flst = {1, 2, 3};  // [no, no]
+    std::list<int> lst = {1, 2, 3};           // [yes, yes]
+    std::forward_list<int> flst = {1, 2, 3};  // [yes, yes]
 
     // Trees.
     std::set<int> set = {1, 2, 3};                                                // [no, no]
@@ -71,10 +71,10 @@ int main() {
     std::multimap<int, std::string> mmap = {{1, "one"}, {1, "uno"}, {2, "two"}};  // [no, no]
 
     // Hash tables.
-    std::unordered_set<int> uset = {1, 2, 3};                                                // [no, no]
-    std::unordered_multiset<int> umset = {1, 1, 2, 3};                                       // [no, no]
-    std::unordered_map<int, std::string> umap = {{1, "one"}, {2, "two"}};                    // [no, no]
-    std::unordered_multimap<int, std::string> ummap = {{1, "one"}, {1, "uno"}, {2, "two"}};  // [no, no]
+    std::unordered_set<int> uset = {1, 2, 3};                                                // [yes, yes]
+    std::unordered_multiset<int> umset = {1, 1, 2, 3};                                       // [yes, yes]
+    std::unordered_map<int, std::string> umap = {{1, "one"}, {2, "two"}};                    // [yes, yes]
+    std::unordered_multimap<int, std::string> ummap = {{1, "one"}, {1, "uno"}, {2, "two"}};  // [yes, yes]
 
     // Discriminated unions.
     std::optional<int> opt = 42;           // [no, no]

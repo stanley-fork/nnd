@@ -961,16 +961,24 @@ fn recognize_absl_inlined_vector(substruct: &mut ContainerSubstruct, val: &mut C
 // In all cases the value is right after the node struct (I wish it was just a field, then pretty printer wouldn't be needed).
 // Doesn't cover libc++ forward_list: it has values as field of node struct, so it's ok without pretty printer.
 fn recognize_cpp_list(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
-    let size_field = optional_field(find_int_field(&["size_alloc", "size", "element_count"], substruct))?;
+    let size_field = optional_field(find_int_field(&["size_alloc", "size", "element_count", "p2"], substruct))?;
     let value_type = find_nested_type("value_type", val.type_)?;
     let mut node_type: *const TypeInfo = ptr::null();
     let first_node_field;
     let mut allow_extra_fields = false;
+    let mut value_offset = 0;
     if let Some(mut before_begin) = optional_field(find_struct_field(&["before_begin"], substruct))? {
-        // unordered_map
+        // libstdc++ unordered_map
         allow_extra_fields = true;
         first_node_field = find_pointer_field(&["nxt"], &mut before_begin, &mut node_type)?;
         before_begin.check_all_fields_used()?;
+    } else if let Some(p) = optional_field(find_pointer_field(&["p1"], substruct, &mut node_type))? {
+        // libc++ unordered_map
+        first_node_field = p;
+        allow_extra_fields = true;
+        find_field(&["bucket_list"], substruct)?;
+        // libc++ stores hash before the value
+        value_offset = 8;
     } else if let Some(mut end) = optional_field(find_struct_field(&["end"], substruct))? {
         first_node_field = find_pointer_field(&["next"], &mut end, &mut node_type)?;
         optional_field(find_pointer_field(&["prev"], &mut end, &mut node_type))?;
@@ -1006,7 +1014,7 @@ fn recognize_cpp_list(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, 
             array_flags.insert(ArrayFlags::TRUNCATED);
             break;
         }
-        let elem_addr = node_addr + sizeof_node;
+        let elem_addr = node_addr + sizeof_node + value_offset;
         data.extend_from_slice(&elem_addr.to_le_bytes());
         node_addr = AddrOrValueBlob::Addr(node_addr).bit_range(next_field.clone(), &mut context.memory)?;
     }

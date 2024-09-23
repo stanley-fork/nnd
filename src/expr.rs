@@ -257,6 +257,7 @@ impl AddrOrValueBlob {
         if bit_offset.end%8 != 0 {
             let e = a[byte_offset.len() - 1];
             let e = e & ((1u8 << (bit_offset.end%8) as u32) - 1);
+            r &= !(0xffusize << (bit_offset.len() - bit_offset.end%8) as u32);
             r |= (e as usize) << (bit_offset.len() - bit_offset.end%8) as u32;
         }
 
@@ -684,7 +685,7 @@ fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut Form
         }
         Type::Pointer(p) => match value.get_usize() {
             Ok(x) => if p.flags.contains(PointerFlags::REFERENCE) {
-                write_address(x, state);
+                //write_address(x, state);
                 return format_value_recurse(&Value {val: AddrOrValueBlob::Addr(x), type_: p.type_, flags: v.flags.inherit()}, true, state);
             } else {
                 styled_write!(state.out, if state.expanded {state.palette.value_misc} else {state.palette.value}, "*0x{:x} ", x);
