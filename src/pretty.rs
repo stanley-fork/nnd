@@ -953,18 +953,25 @@ fn recognize_absl_inlined_vector(substruct: &mut ContainerSubstruct, val: &mut C
     }
 }
 
-// std::list
+// std::list, std::forward_list, std::unordered_{set,map,multiset,multimap}
 // libc++ list: {__end_: node, __size_alloc_: usize}, node: {__prev_: *node, __next_: *node}
 // libstdc++ list: {_M_prev: *node, _M_next: *node, _M_size: usize}, node: {_M_prev: *node, _M_next: *node}
-// libc++ forward_list: {__next_: *node}, node: {__next_: *node}
 // libstdc++ forward_list: {_M_next: *node}, node: {_M_next: *node}
+// libstdc++ unordered_map: {..., _M_before_begin: node}, node: {_M_nxt: *node}
 // In all cases the value is right after the node struct (I wish it was just a field, then pretty printer wouldn't be needed).
+// Doesn't cover libc++ forward_list: it has values as field of node struct, so it's ok without pretty printer.
 fn recognize_cpp_list(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
-    let size_field = optional_field(find_int_field(&["size_alloc", "size"], substruct))?;
+    let size_field = optional_field(find_int_field(&["size_alloc", "size", "element_count"], substruct))?;
     let value_type = find_nested_type("value_type", val.type_)?;
     let mut node_type: *const TypeInfo = ptr::null();
     let first_node_field;
-    if let Some(mut end) = optional_field(find_struct_field(&["end"], substruct))? {
+    let mut allow_extra_fields = false;
+    if let Some(mut before_begin) = optional_field(find_struct_field(&["before_begin"], substruct))? {
+        // unordered_map
+        allow_extra_fields = true;
+        first_node_field = find_pointer_field(&["nxt"], &mut before_begin, &mut node_type)?;
+        before_begin.check_all_fields_used()?;
+    } else if let Some(mut end) = optional_field(find_struct_field(&["end"], substruct))? {
         first_node_field = find_pointer_field(&["next"], &mut end, &mut node_type)?;
         optional_field(find_pointer_field(&["prev"], &mut end, &mut node_type))?;
         end.check_all_fields_used()?;
@@ -972,10 +979,12 @@ fn recognize_cpp_list(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, 
         first_node_field = find_pointer_field(&["next"], substruct, &mut node_type)?;
         optional_field(find_pointer_field(&["prev"], substruct, &mut node_type))?;
     }
-    substruct.check_all_fields_used()?;
+    if !allow_extra_fields {
+        substruct.check_all_fields_used()?;
+    }
 
     let mut node_struct = container_aux_struct(node_type)?;
-    let next_field = find_pointer_field(&["next"], &mut node_struct, &mut node_type)?;
+    let next_field = find_pointer_field(&["next", "nxt"], &mut node_struct, &mut node_type)?;
     optional_field(find_pointer_field(&["prev"], &mut node_struct, &mut node_type))?;
     node_struct.check_all_fields_used()?;
 
@@ -1002,8 +1011,9 @@ fn recognize_cpp_list(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, 
         node_addr = AddrOrValueBlob::Addr(node_addr).bit_range(next_field.clone(), &mut context.memory)?;
     }
 
+    let len = data.len() / 8;
     let value_ref_type = state.types.add_pointer(value_type, PointerFlags::REFERENCE);
-    let array_type = state.types.add_array(value_ref_type, data.len() / 8, array_flags);
+    let array_type = state.types.add_array(value_ref_type, len, array_flags);
 
     let v = AddrOrValueBlob::Blob(ValueBlob::from_vec(data));
     let new_val = Value {val: v, type_: array_type, flags: val.flags};
