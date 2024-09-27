@@ -1,5 +1,5 @@
 use crate::{util::*, arena::*, log::*, *, settings::*, common_ui::*};
-use std::{hint, collections::{HashMap, hash_map::{DefaultHasher, Entry}}, hash::{Hash, Hasher}, sync::{Mutex, atomic::{AtomicUsize, Ordering}}, ptr, mem, result, io::Write, slice, ops::Range, fmt, fmt::Write as fmtWrite};
+use std::{hint, collections::{HashMap, hash_map::{DefaultHasher, Entry}}, hash::{Hash, Hasher}, sync::{Mutex, atomic::{AtomicUsize, Ordering}}, ptr, mem, mem::MaybeUninit, result, io::Write, slice, ops::Range, fmt, fmt::Write as fmtWrite};
 use bitflags::*;
 use gimli::DebugInfoOffset;
 
@@ -262,6 +262,7 @@ pub struct TypeInfo {
     pub language: LanguageFamily,
     // Typedefs and static fields/constants. In particular useful for things like std::list<T>::value_type.
     // Doesn't include enum enumerands (to save memory).
+    // &'static is either static or in misc_arena.
     pub nested_names: &'static [(&'static str, NestedName)],
     // TODO: Add LineInfo for declaration/definition.
     pub t: Type,
@@ -358,9 +359,8 @@ impl Types {
     }
 
     pub fn find_by_name(&self, name: &str) -> Option<*const TypeInfo> {
-        let i = self.sorted_type_names.strings.partition_point(|s| s.s < name.as_bytes());
-        if self.sorted_type_names.strings.get(i).is_some_and(|s| s.s == name.as_bytes()) {
-            return Some(self.sorted_type_names.strings[i].id as *const TypeInfo);
+        if let Some(id) = self.sorted_type_names.binary_search(name.as_bytes()) {
+            return Some(id as *const TypeInfo);
         }
         for s in &self.unsorted_type_names.strings {
             if s.s == name.as_bytes() {
@@ -372,16 +372,40 @@ impl Types {
 
     // Copies parts of TypeInfo into self's arenas and updates the corresponding pointers inside TypeInfo.
     // Doesn't copy the TypeInfo itself and its type name. Copies things like fields/enumerands and their names.
-    fn partially_import(&mut self, info: *mut TypeInfo) {
+    // Adjusts field names to make them unique, if they're not.
+    fn partially_import_and_adjust_field_names(&mut self, info: *mut TypeInfo, scratch_arena: &mut Arena) {
         unsafe {
             match &mut (*info).t {
                 Type::Struct(s) => {
                     let fs = self.fields_arena.add_slice_mut(&s.fields());
-                    for f in fs.iter_mut() {
-                        if f.flags.contains(FieldFlags::NAME_IN_ARENA) {
+
+                    // Make field names unique by appending "#2" etc when needed.
+                    // And import names into the correct arena when needed.
+                    let field_names: &mut [MaybeUninit<(&str, usize)>] = scratch_arena.alloc_slice(fs.len());
+                    for i in 0..fs.len() {
+                        field_names[i].write((fs[i].name, i));
+                    }
+                    let field_names: *mut MaybeUninit<(&str, usize)> = field_names.as_mut_ptr();
+                    let field_names: &mut [(&str, usize)] = unsafe {std::slice::from_raw_parts_mut(field_names as _, fs.len())};
+                    field_names.sort_unstable();
+                    let mut repeats = 0usize;
+                    for i in 0..fs.len() {
+                        if i > 0 && field_names[i-1].0 == field_names[i].0 {
+                            repeats += 1;
+                        } else {
+                            repeats = 0;
+                        }
+                        let f = &mut fs[field_names[i].1];
+                        if repeats > 0 && !f.name.is_empty() {
+                            let mut out = self.misc_arena.write();
+                            write!(out, "{}#{}", f.name, repeats + 1).unwrap();
+                            f.name = out.finish_str();
+                            f.flags.insert(FieldFlags::NAME_IN_ARENA);
+                        } else if f.flags.contains(FieldFlags::NAME_IN_ARENA) {
                             f.name = self.misc_arena.add_str(f.name);
                         }
                     }
+
                     s.fields_ptr = fs.as_ptr();
                     s.fields_len = fs.len();
                 }
@@ -1204,7 +1228,7 @@ impl TypesLoader {
         let t: &mut TypeInfo = unsafe {&mut *(p as *mut _)};
         assert!(t.flags.contains(TypeFlags::POINTERS_NOT_RESOLVED));
         t.flags.remove(TypeFlags::POINTERS_NOT_RESOLVED);
-        final_types.partially_import(t);
+        final_types.partially_import_and_adjust_field_names(t, unsafe {&mut *self.shards[original_shard_idx].temp_fields_arena.get()});
 
         if flags & FLAG_FINALIZED != 0 {
             let prev = state.flags.swap(FLAG_FINALIZED, Ordering::Relaxed);
@@ -1259,28 +1283,16 @@ impl TypesLoader {
                 }
                 end += 1;
             }
-            // The suffix like "#024" should have fixed length to ensure the resulting sorted_type_names table is sorted.
-            // It's also important that '#' is less than any character we expect to see in type names (there are 3 printable characters less than '#': '"', '!', and ' ').
-            let mut suffix_digits = 0;
-            if end - start > 1 {
-                suffix_digits = ((end - start).saturating_add(1) as f64).log10().ceil() as usize;
-            }
-
+            let suffix_helper = DisambiguatingSuffixes::new(end - start);
             let mut suffix_idx = 0;
             for i in start..end {
                 if i > start && names[i].type_ == names[i-1].type_ {
                     continue;
                 }
-                suffix_idx += 1;
                 let n = &mut names[i];
-                let final_name = if i > start {
-                    n.adjusted_to_avoid_name_collision = true;
-                    let mut out = final_types.sorted_type_names.write();
-                    write!(out, "{}#{:0>2$}", n.name, suffix_idx, suffix_digits).unwrap();
-                    out.finish_str(n.type_ as usize)
-                } else {
-                    final_types.sorted_type_names.add_str(n.name, n.type_ as usize)
-                };
+                let final_name;
+                (final_name, n.adjusted_to_avoid_name_collision) = suffix_helper.disambiguate(n.name, suffix_idx, n.type_ as usize, &mut final_types.sorted_type_names);
+                suffix_idx += 1;
 
                 if unsafe {(*n.type_).can_have_own_name()} {
                     n.name_hash = 0;

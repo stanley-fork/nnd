@@ -111,13 +111,17 @@ pub struct SymbolsShard {
     // (Used only for restoring tabs in disassembly window after restart. They're matched by name in case the executabe was recompiled, and addresses and DIE offsets changed.
     //  Unfortunate that we have to spend time and memory on building this whole map just for that minor feature, but I don't have better ideas. This adds ~3s/num_cores to load time.)
     pub mangled_name_to_function: Vec<(&'static [u8], FunctionAddr, /*idx in Symbols.functions*/ usize)>,
-    
+
     pub misc_arena: Arena,
 
     // "Local" variables, by which we mean variables that should show up in the local variables window when the instruction pointer is in the correct range.
     // Includes static variables inside functions, but with address range clamped to the function's address range - we want
     // the variable to automatically show up in the UI only if we're in that function, not all the time.
-    pub local_variables: Vec<LocalVariable>,
+    pub local_variables: Vec<Variable>,
+
+    pub global_variables: Vec<Variable>,
+    // Id is VariableIdx. May point to different shards.
+    pub sorted_global_variable_names: StringTable,
 }
 
 pub struct Symbols {
@@ -161,9 +165,6 @@ pub struct Symbols {
 
     // C++ vtables addresses, sorted. Comes from .symtab. Used for automatically downcasting to concrete types.
     pub vtables: Vec<VTableInfo>,
-
-    // Other things to add:
-    //  * "Global" variables, i.e. variables that are available at ~any ip, including static variables in functions. Expect tens of millions of them. Can be inspected using watches. Name may be mangled. May come from symtab.
 }
 
 pub struct CompilationUnit {
@@ -332,40 +333,92 @@ impl FunctionLocator {
 }
 
 
-bitflags! { pub struct LocalVariableFlags: u8 {
+pub enum VariableLocation<'a> {
+    Const(&'a [u8]),
+    Expr(Expression<SliceType>),
+    Unknown,
+}
+#[derive(Clone, Copy)]
+pub enum PackedVariableLocation {
+    ShortConst([u8; 12]),
+    LongConst {ptr: *const u8, len: u32}, // in the binary mmap, not necessarily longer than ShortConst limit
+    Expr {ptr: *const u8, len: u32},
+    Unknown,
+}
+impl Default for PackedVariableLocation { fn default() -> Self { Self::Unknown } }
+impl PackedVariableLocation {
+    pub fn expr(e: Expression<SliceType>) -> Self { Self::Expr {ptr: e.0.as_ptr(), len: e.0.len().min(u32::MAX as usize) as u32} }
+    pub fn const_slice(x: &'static [u8]) -> Self { Self::LongConst {ptr: x.as_ptr(), len: x.len().min(u32::MAX as usize) as u32} }
+    pub fn const_usize(x: usize) -> Self { let mut a = [0u8; 12]; a[..8].copy_from_slice(&x.to_le_bytes()); Self::ShortConst(a) }
+
+    pub fn unpack(&self) -> VariableLocation {
+        match self {
+            Self::ShortConst(a) => VariableLocation::Const(a),
+            &Self::LongConst {ptr, len} => VariableLocation::Const(unsafe {slice::from_raw_parts(ptr, len as usize)}),
+            &Self::Expr {ptr, len} => VariableLocation::Expr(Expression(EndianSlice::new(unsafe {slice::from_raw_parts(ptr, len as usize)}, LittleEndian::default()))),
+            Self::Unknown => VariableLocation::Unknown,
+        }
+    }
+}
+
+bitflags! { pub struct VariableFlags: u8 {
     // It's an argument of the containing function.
     const PARAMETER = 0x1;
-    // It's pseudovariable holding the expression from DW_AT_frame_base.
+    // It's a pseudovariable holding the expression from DW_AT_frame_base.
     const FRAME_BASE = 0x2;
 }}
 
-// There are tens of millions of these, so this struct needs to be compact.
-#[derive(Clone, Debug)]
-pub struct LocalVariable {
+#[derive(Clone)]
+pub struct Variable {
+    // If local variable: unqualified name, in binary's mmap.
+    // If global variable: fully qualified name (possibly with artificial suffix to make it unique), in sorted_global_variable_names (likely of a different shard).
+    // (During symbols loading if global variable: non-disambiguated fully qualified name in temp_global_var_arena.)
     pub name_ptr: *const u8,
     pub name_len: u32,
     pub type_: *const TypeInfo,
-    pub expr: Expression<SliceType>,
+    pub location: PackedVariableLocation,
+    // Pc range in which this variable exists.
     pub start: usize,
     pub len: u32,
-    offset_and_flags: u64, // DieOffset and LocalVariableFlags
+    offset_and_flags: u64, // DieOffset and VariableFlags
 }
-unsafe impl Send for LocalVariable {}
-unsafe impl Sync for LocalVariable {}
-impl LocalVariable {
-    pub unsafe fn name(&self) -> &'static str { if self.name_len == 0 { "" } else { str::from_utf8_unchecked(std::slice::from_raw_parts(self.name_ptr, self.name_len as usize)) } }
-    pub fn range(&self) -> core::ops::Range<usize> { self.start..self.start + self.len as usize }
-    pub fn pack_offset_and_flags(off: DieOffset, flags: LocalVariableFlags) -> u64 { (off.0 as u64) << 8 | flags.bits() as u64 }
-    pub fn offset(&self) -> DieOffset { DebugInfoOffset((self.offset_and_flags as usize) >> 8) }
-    pub fn flags(&self) -> LocalVariableFlags { unsafe{mem::transmute((self.offset_and_flags & 0xff) as u8)} }
+unsafe impl Send for Variable {}
+unsafe impl Sync for Variable {}
+impl Variable {
+    fn new(name: &'static str, type_: *const TypeInfo, offset: DieOffset, flags: VariableFlags) -> Self {
+        Self {name_ptr: name.as_ptr(), name_len: name.len().min(u32::MAX as usize) as u32, type_, offset_and_flags: Variable::pack_offset_and_flags(offset, flags),
+              location: PackedVariableLocation::Unknown, start: 0, len: 0}
+    }
     
-    fn with_range(&self, expr: Expression<SliceType>, range: gimli::Range) -> Self {
+    pub unsafe fn name(&self) -> &'static str { if self.name_len == 0 { "" } else { str::from_utf8_unchecked(std::slice::from_raw_parts(self.name_ptr, self.name_len as usize)) } }
+    pub fn set_name(&mut self, n: &'static str) { self.name_ptr = n.as_ptr(); self.name_len = n.len().min(u32::MAX as usize) as u32; }
+    pub fn range(&self) -> core::ops::Range<usize> { self.start..self.start + self.len as usize }
+    pub fn pack_offset_and_flags(off: DieOffset, flags: VariableFlags) -> u64 { (off.0 as u64) << 8 | flags.bits() as u64 }
+    pub fn debug_info_offset(&self) -> Option<DieOffset> {
+        let off = (self.offset_and_flags as usize) >> 8;
+        if off == usize::MAX >> 8 {
+            None
+        } else {
+            Some(DebugInfoOffset(off))
+        }
+    }
+    pub fn flags(&self) -> VariableFlags { unsafe{mem::transmute((self.offset_and_flags & 0xff) as u8)} }
+
+    fn with_range(&self, range: gimli::Range) -> Self {
         let mut r = self.clone();
-        r.expr = expr;
         r.start = range.begin as usize;
         r.len = (range.end - range.begin).min(u32::MAX as u64) as u32;
         r
     }
+}
+
+// Packed shard idx and index in global_variables.
+#[derive(Clone, Copy, Debug, Ord, PartialOrd, Eq, PartialEq)]
+pub struct VariableIdx(pub usize);
+impl VariableIdx {
+    pub fn pack(shard_idx: usize, idx: usize) -> Self { Self(shard_idx << 48u32 | idx) }
+    pub fn shard_idx(self) -> usize { self.0 >> 48 }
+    pub fn idx(self) -> usize { self.0 & (usize::MAX >> 16) }
 }
 
 // Source code file. Can be referenced from line number information, functions (to say where the function was defined), etc.
@@ -618,7 +671,7 @@ impl Symbols {
         }
     }
 
-    pub fn local_variables_in_subfunction<'a>(&'a self, subfunction: &Subfunction, shard_idx: usize) -> &'a [LocalVariable] {
+    pub fn local_variables_in_subfunction<'a>(&'a self, subfunction: &Subfunction, shard_idx: usize) -> &'a [Variable] {
         &self.shards[shard_idx].local_variables[subfunction.local_variables_range()]
     }
 
@@ -638,6 +691,16 @@ impl Symbols {
             res = Some(ranges[i].subfunction_idx);
         }
         res
+    }
+
+    pub fn find_global_variable_by_name<'a>(&'a self, name: &str) -> Option<&'a Variable> {
+        for s in &self.shards {
+            if let Some(id) = s.sorted_global_variable_names.binary_search(name.as_bytes()) {
+                let id = VariableIdx(id);
+                return Some(&self.shards[id.shard_idx()].global_variables[id.idx()]);
+            }
+        }
+        None
     }
 
     // Iterator that merges and deduplicates sorted addr_to_line arrays from all shards on the fly.
@@ -757,11 +820,17 @@ impl<K: Ord, F: FnMut(&LineInfo) -> K> Iterator for AddrToLineIter<'_, K, F> {
 
 pub struct SymbolsLoader {
     pub num_shards: usize,
-    
+
     sym: Symbols,
     shards: Vec<SyncUnsafeCell<CachePadded<SymbolsLoaderShard>>>,
     die_to_function_shards: Vec<SyncUnsafeCell<CachePadded<Vec<(DieOffset, usize)>>>>,
     types: TypesLoader,
+
+    // Shuffling global variable names across threads for deduplication.
+    // [sender][receiver] -> messages
+    send_global_variable_names: Vec<CachePadded<SyncUnsafeCell<Vec<CachePadded<SyncUnsafeCell<Vec<(&'static str, VariableIdx)>>>>>>>,
+    // Same as sym.shards[i].global_variables, but with a hundred wrappers to be able to update names in parallel without UB.
+    global_variables: Vec<CachePadded<SyncUnsafeCell<Vec<SyncUnsafeCell<Variable>>>>>,
 
     // [.strtab, .symtab], [.dynsym, .dynstr]
     strtab_symtab: Vec<[&'static [u8]; 2]>,
@@ -815,9 +884,10 @@ struct SymbolsLoaderShard {
 
     vtables: Vec<VTableInfo>,
 
+    temp_global_var_arena: Arena,
+
     // Stats, just for information.
     functions_before_dedup: usize,
-    num_global_variables: usize,
 
     warn: Limiter,
 }
@@ -934,9 +1004,9 @@ impl SymbolsLoader {
 
         let (types_loader, types_shards) = TypesLoader::create(num_shards);
         let mut shards: Vec<SymbolsLoaderShard> = types_shards.into_iter().map(|types| SymbolsLoaderShard {
-            sym: SymbolsShard {addr_to_line: Vec::new(), line_to_addr: Vec::new(), types: Types::new(), misc_arena: Arena::new(), local_variables: Vec::new(), subfunctions: Vec::new(), subfunction_pc_ranges: Vec::new(), subfunction_levels: Vec::new(), mangled_name_to_function: Vec::new()},
+            sym: SymbolsShard {addr_to_line: Vec::new(), line_to_addr: Vec::new(), types: Types::new(), misc_arena: Arena::new(), local_variables: Vec::new(), global_variables: Vec::new(), sorted_global_variable_names: StringTable::new(), subfunctions: Vec::new(), subfunction_pc_ranges: Vec::new(), subfunction_levels: Vec::new(), mangled_name_to_function: Vec::new()},
             units: Vec::new(), symtab_ranges: Vec::new(), file_dedup: Vec::new(), file_used_lines: Vec::new(), types, base_types: Vec::new(), functions: Vec::new(), vtables: Vec::new(),
-            max_function_end: 0, functions_before_dedup: 0, num_global_variables: 0, warn: Limiter::new()}).collect();
+            temp_global_var_arena: Arena::new(), max_function_end: 0, functions_before_dedup: 0, warn: Limiter::new()}).collect();
 
         let mut round_robin_shard = 0usize;
         let mut round_robin_offset = 0usize;
@@ -990,10 +1060,15 @@ impl SymbolsLoader {
             }
         }
 
+        // I am a good programmer.
+        let send_global_variable_names: Vec<CachePadded<SyncUnsafeCell<Vec<CachePadded<SyncUnsafeCell<Vec<(&'static str, VariableIdx)>>>>>>> =
+            (0..shards.len()).map(|_| CachePadded::new(SyncUnsafeCell::new((0..shards.len()).map(|_| CachePadded::new(SyncUnsafeCell::new(Vec::new()))).collect()))).collect();
+        let global_variables: Vec<CachePadded<SyncUnsafeCell<Vec<SyncUnsafeCell<Variable>>>>> = (0..shards.len()).map(|_| CachePadded::new(SyncUnsafeCell::new(Vec::new()))).collect();
+
         prepare_time_per_stage_ns[0] = start_time.elapsed().as_nanos() as usize;
         Ok(SymbolsLoader {
             num_shards: shards.len(), sym: Symbols {elf, debuglink_elf, identity: random(), dwarf, units, files: Vec::new(), file_paths: StringTable::new(), path_to_used_file: HashMap::new(), functions: Vec::new(), shards: Vec::new(), builtin_types: BuiltinTypes::invalid(), base_types: Vec::new(), vtables: Vec::new(), code_addr_range},
-            shards: shards.into_iter().map(|s| SyncUnsafeCell::new(CachePadded::new(s))).collect(), die_to_function_shards: (0..num_shards).map(|_| SyncUnsafeCell::new(CachePadded::new(Vec::new()))).collect(), types: types_loader, strtab_symtab, status, progress_per_stage,
+            shards: shards.into_iter().map(|s| SyncUnsafeCell::new(CachePadded::new(s))).collect(), die_to_function_shards: (0..num_shards).map(|_| SyncUnsafeCell::new(CachePadded::new(Vec::new()))).collect(), types: types_loader, send_global_variable_names, global_variables, strtab_symtab, status, progress_per_stage,
             prepare_time_per_stage_ns, run_time_per_stage_ns, shard_progress_ppm: (0..num_shards).map(|_| CachePadded::new(AtomicUsize::new(0))).collect(), stage: 0, types_before_dedup: 0, type_offsets: 0, type_offset_maps_bytes: 0, type_dedup_maps_bytes: 0})
     }
 
@@ -1060,7 +1135,9 @@ impl SymbolsLoader {
                 self.sort_line_to_addr(shard);
             }
             3 => {
-                self.build_name_to_function_map(shard_idx, unsafe {&mut *self.shards[shard_idx].get()});
+                let shard = unsafe {&mut *self.shards[shard_idx].get()};
+                self.sort_global_variable_names(shard_idx, shard);
+                self.build_name_to_function_map(shard_idx, shard);
                 self.sort_die_to_function(unsafe {&mut *self.die_to_function_shards[shard_idx].get()});
                 self.types.run(0, shard_idx, &progress_callback);
             }
@@ -1069,6 +1146,7 @@ impl SymbolsLoader {
             6 => self.types.run(3, shard_idx, &progress_callback),
             7 => {
                 let shard = unsafe {&mut *self.shards[shard_idx].get()};
+                self.finish_global_variables(shard_idx, shard);
                 self.fixup_type_refs(shard_idx, shard);
                 self.fixup_function_refs(shard);
             }
@@ -1277,6 +1355,30 @@ impl SymbolsLoader {
         shard.functions.sort_unstable_by_key(Self::function_sorting_key);
         shard.functions.dedup_by_key(|f| f.addr);
     }
+
+    fn sort_global_variable_names(&self, shard_idx: usize, shard: &mut SymbolsLoaderShard) {
+        let mut names: Vec<(&'static str, VariableIdx)> = Vec::new();
+        for other_shard in &self.send_global_variable_names {
+            unsafe {names.append(&mut *(*other_shard.get())[shard_idx].get())};
+        }
+        names.sort_unstable();
+
+        let mut start = 0usize;
+        while start < names.len() {
+            let mut end = start + 1;
+            while end < names.len() && names[end].0 == names[start].0 {
+                end += 1;
+            }
+            let suffix_helper = DisambiguatingSuffixes::new(end - start);
+            for i in start..end {
+                let (name, var_idx) = names[i].clone();
+                let (final_name, _) = suffix_helper.disambiguate(name, i - start, var_idx.0, &mut shard.sym.sorted_global_variable_names);
+                unsafe {(*(*self.global_variables[var_idx.shard_idx()].get())[var_idx.idx()].get()).set_name(final_name)};
+            }
+            start = end;
+        }
+    }
+
     fn sort_addr_to_line(&self, shard: &mut SymbolsLoaderShard) {
         shard.sym.addr_to_line.sort_unstable_by_key(|x| x.addr_filenone_linebad_inlined()); // if a sequence starts at the same address another sequence ends, keep the start and discard the end
         shard.sym.addr_to_line.dedup_by_key(|x| x.addr());
@@ -1408,10 +1510,21 @@ impl SymbolsLoader {
         }
     }
 
+    fn finish_global_variables(&self, shard_idx: usize, shard: &mut SymbolsLoaderShard) {
+        let vars = unsafe {&mut *self.global_variables[shard_idx].get()};
+        shard.sym.global_variables.reserve(vars.len());
+        for var in mem::take(vars) {
+            let mut v = var.into_inner();
+            v.type_ = self.types.find_final_type(DebugInfoOffset(v.type_ as usize));
+            shard.sym.global_variables.push(v);
+        }
+    }
+    
     fn fixup_type_refs(&self, shard_idx: usize, shard: &mut SymbolsLoaderShard) {
         for v in &mut shard.sym.local_variables {
             v.type_ = self.types.find_final_type(DebugInfoOffset(v.type_ as usize));
         }
+        // global_variables are fixed up by by finish_global_variables() instead.
     }
 
     fn finish_types(&mut self) {
@@ -1524,7 +1637,8 @@ impl SymbolsLoader {
             let misc_arena_size: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.misc_arena.capacity()}).sum();
             let lines: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.addr_to_line.len()}).sum();
             let local_variables: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.local_variables.len()}).sum();
-            let global_variables: usize = self.shards.iter().map(|s| unsafe {(*s.get()).num_global_variables}).sum();
+            let global_variables: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.global_variables.len()}).sum();
+            let global_variable_name_bytes: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.sorted_global_variable_names.arena.capacity()}).sum();
             let files_before_dedup: usize = self.sym.units.iter().map(|u| u.file_idx_remap.len()).sum();
 
             let mut function_names_len = 0usize;
@@ -1581,7 +1695,7 @@ impl SymbolsLoader {
                        ({:.2}x dedup, {:.2}x unused, {} of paths, {} of remap), \
                        {} functions ({:.2}x dedup, {}, {} of names), {} in misc arena \
                        {} subfunctions ({:.2}x ranges, {} sf, {} ranges, {} levels), \
-                       {} lines ({}), {} local variables ({}), {} global variables, \
+                       {} lines ({}), {} local variables ({}), {} global variables ({} of names), \
                        {} types ({:.2}x dedup, {:.2}x offsets, {} names ({}), \
                        {} infos, {} fields ({:.2}% growth waste), {} nested names, {} misc, temp {} offset maps, temp {} dedup maps) \
                        ({} base types), {} vtables ({:.2}% unresolved){}",
@@ -1589,7 +1703,7 @@ impl SymbolsLoader {
                       files_before_dedup as f64 / self.sym.files.len() as f64, self.sym.files.len() as f64 / self.sym.path_to_used_file.len() as f64, PrettySize(self.sym.file_paths.arena.used()), PrettySize(files_before_dedup * mem::size_of::<usize>()),
                       PrettyCount(self.sym.functions.len()), funcs_before_dedup as f64 / self.sym.functions.len() as f64, PrettySize(self.sym.functions.len() * mem::size_of::<FunctionInfo>()), PrettySize(function_names_len), PrettySize(misc_arena_size),
                       PrettyCount(subfunctions), subfunction_pc_ranges as f64 / subfunctions as f64, PrettySize(subfunctions * mem::size_of::<Subfunction>()), PrettySize(subfunction_pc_ranges * mem::size_of::<SubfunctionPcRange>()), PrettySize(subfunction_levels * mem::size_of::<usize>()),
-                      PrettyCount(lines), PrettySize(lines * mem::size_of::<LineInfo>() * 2), PrettyCount(local_variables), PrettySize(local_variables * mem::size_of::<LocalVariable>()), PrettyCount(global_variables),
+                      PrettyCount(lines), PrettySize(lines * mem::size_of::<LineInfo>() * 2), PrettyCount(local_variables), PrettySize(local_variables * mem::size_of::<Variable>()), PrettyCount(global_variables), PrettySize(global_variable_name_bytes),
                       PrettyCount(final_types), self.types_before_dedup as f64 / final_types as f64, self.type_offsets as f64 / self.types_before_dedup as f64, PrettyCount(type_names), PrettySize(type_names_len),
                       PrettySize(type_infos_bytes), PrettySize(fields_bytes), fields_bytes as f64 / field_used_bytes as f64 * 100.0 - 100.0, PrettyCount(nested_names), PrettySize(types_misc_bytes), PrettySize(self.type_offset_maps_bytes), PrettySize(self.type_dedup_maps_bytes),
                       PrettyCount(self.sym.base_types.len()), self.sym.vtables.len(), unresolved_vtables as f64 / self.sym.vtables.len() as f64 * 100.0, time_breakdown);
@@ -1710,7 +1824,7 @@ struct LoaderStackEntry {
     subfunction: usize,
     // If nonzero, stack[subfunction_depth] is the innermost containing DIE that is a function or inlined function call, regardless of whether we created FunctionInfo/Subfunction for it.
     subfunction_depth: usize,
-    local_variables: Vec<LocalVariable>, // for current subfunction
+    local_variables: Vec<Variable>, // for current subfunction
 }
 impl Default for LoaderStackEntry { fn default() -> Self { Self {tag: DW_TAG_null, scope_name_len: 0, scope_name_is_linkable: true, exact_type: ptr::null_mut(), variant: None, nested_names: Vec::new(), pc_ranges: Vec::new(), pc_ranges_depth: 0, function: usize::MAX, function_depth: 0, subfunction_events: Vec::new(), subfunction: usize::MAX, subfunction_depth: 0, local_variables: Vec::new()} } }
 
@@ -1816,50 +1930,107 @@ impl<'a> DwarfLoader<'a> {
         }
     }
 
-    fn add_variable_locations(&mut self, location_attr: &Attribute<SliceType>, var: &LocalVariable, offset: DieOffset) -> Result<()> {
+    fn add_variable_locations(&mut self, location_attr: &Option<Attribute<SliceType>>, const_value_attr: &Option<Attribute<SliceType>>, linkage_name: &Option<&'static str>, mut var: Variable, offset: DieOffset) -> Result<()> {
         let top = &self.stack[self.depth];
-        let subfunction_depth = top.subfunction_depth;
         // It's possible that the containing function has no ranges and was discarded.
         // In this case we still have to interpret the variable as local rather than global.
         // We still add them to the stack entry, then no one picks them up from there.
-        if let Some(expr) = location_attr.exprloc_value() {
-            if subfunction_depth != 0 {
+        let subfunction_depth = top.subfunction_depth;
+        let parent_type = self.stack[self.depth - 1].exact_type;
+        let mut custom_ranges = false;
+        let mut is_global = false;
+
+        if let Some(attr) = location_attr {
+            let val = attr.value();
+            if let Some(expr) = val.exprloc_value() {
+                // One location.
+                var.location = PackedVariableLocation::expr(expr);
+            } else if let Some(mut locs_iter) = self.loader.sym.dwarf.attr_locations(self.unit, val)? {
+                // Different locations for different address ranges. Add multiple local variables.
+                // Or it's a static variable inside a function - then the range from location list is much longer
+                // than the containing function (e.g. whole .text section).
+                custom_ranges = true;
+                let function_depth = top.function_depth;
+                while let Some(entry) = locs_iter.next()? {
+                    var.location = PackedVariableLocation::expr(entry.data);
+                    is_global = false;
+                    if subfunction_depth != 0 {
+                        // Guess whether it's a local or a static variable.
+                        // (The `r.end + 1` is because I've seen ranges stick out like that in practice, idk why. Not sure if it was specifically variable vs function ranges, or some other kind of ranges of nested DIEs, I didn't check.)
+                        let is_local = var.flags().intersects(VariableFlags::FRAME_BASE | VariableFlags::PARAMETER)
+                            || self.stack[function_depth].pc_ranges.iter().any(|r| r.begin <= entry.range.begin && r.end + 1 >= entry.range.end);
+                        if is_local {
+                            self.stack[subfunction_depth].local_variables.push(var.with_range(entry.range));
+                        } else {
+                            // Probably a static variable inside a function. Add both local and global variable (if it's the last location list entry).
+                            self.stack[subfunction_depth].local_variables.push(var.with_range(entry.range));
+                            is_global = true;
+                        }
+                    } else {
+                        is_global = true;
+                    }
+                }
+            } else if self.shard.warn.check(line!()) { eprintln!("warning: unexpected location form @0x{:x}: {:?}", offset.0, attr); }
+        } else {
+            // Constant value.
+            let attr = const_value_attr.as_ref().unwrap();
+            var.location = parse_attr_const_value(attr, &self.loader.sym.dwarf, offset, &mut self.shard.warn);
+            is_global = true;
+        }
+
+        if !custom_ranges {
+            if subfunction_depth != 0 && parent_type == ptr::null_mut() {
+                let top = &self.stack[self.depth];
                 let ranges_depth = top.pc_ranges_depth;
                 for i in 0..self.stack[ranges_depth].pc_ranges.len() {
                     let range = self.stack[ranges_depth].pc_ranges[i];
-                    self.stack[subfunction_depth].local_variables.push(var.with_range(expr, range));
+                    self.stack[subfunction_depth].local_variables.push(var.with_range(range));
                 }
-            }else {
-                // (If ranges.is_empty(), use infinite range.)
-                self.shard.num_global_variables += 1;
+            } else {
+                is_global = true;
             }
-        } else if let Some(mut locs_iter) = self.loader.sym.dwarf.attr_locations(self.unit, location_attr.value())? {
-            let function_depth = top.function_depth;
-            while let Some(entry) = locs_iter.next()? {
-                if subfunction_depth != 0 {
-                    // Guess whether it's a local or a static variable.
-                    // (The `r.end + 1` is because I've seen ranges stick out like that in practice, idk why. Not sure if it was specifically variable vs function ranges, or some other kind of ranges of nested DIEs, I didn't check.)
-                    let is_local = var.flags().intersects(LocalVariableFlags::FRAME_BASE | LocalVariableFlags::PARAMETER)
-                        || self.stack[function_depth].pc_ranges.iter().any(|r| r.begin <= entry.range.begin && r.end + 1 >= entry.range.end);
-                    if is_local {
-                        self.stack[subfunction_depth].local_variables.push(var.with_range(entry.data, entry.range));
-                    } else {
-                        // Probably a static variable inside a function. Add both local and global variable.
-                        self.stack[subfunction_depth].local_variables.push(var.with_range(entry.data, entry.range));
+        }
 
-                        // (Add global variable here.)
-                        self.shard.num_global_variables += 1;
+        if is_global {
+            let mut var = var.with_range(gimli::Range {begin: 0, end: u64::MAX});
+            let mut unqualified_name = unsafe {var.name()};
+            let mut demangled = false;
+            // If name is missing, use demangled linkage_name.
+            if unqualified_name.is_empty() && linkage_name.is_some() && self.unit_language.presumably_cpp() {
+                if let Ok(symbol) = cpp_demangle::BorrowedSymbol::new_with_options(linkage_name.unwrap().as_bytes(), &cpp_demangle::ParseOptions::default().recursion_limit(1000)) {
+                    let options = cpp_demangle::DemangleOptions::new().recursion_limit(1000).no_return_type().no_params().hide_expression_literal_types();
+                    if let Ok(r) = symbol.demangle(&options) {
+                        var.set_name(self.shard.temp_global_var_arena.add_str(&r));
+                        if parent_type != ptr::null_mut() {
+                            let i = r.rfind(':').map_or(0, |i| i + 1);
+                            unqualified_name = self.shard.types.temp_types.misc_arena.add_str(&r[i..]);
+                        }
+                        demangled = true;
                     }
-                } else {
-                    // Global variable.
-                    self.shard.num_global_variables += 1;
                 }
             }
-        } else if self.shard.warn.check(line!()) { eprintln!("warning: unexpected form @0x{:x}: {:?}", offset.0, location_attr); }
+            // If name is not missing, prepend it with parent namespace names.
+            if !demangled {
+                self.append_namespace_to_scope_name(unqualified_name, false);
+                var.set_name(self.shard.temp_global_var_arena.add_str(&self.scope_name));
+            }
+            let name = unsafe {var.name()};
+            let vars = unsafe {&mut *self.loader.global_variables[self.shard_idx].get()};
+            let id = VariableIdx::pack(self.shard_idx, vars.len());
+            vars.push(SyncUnsafeCell::new(var));
+
+            // Send the name to shard hash(name)%num_shards for deduplication.
+            let hash = hash(name);
+            let target_shard = hash % self.loader.shards.len();
+            unsafe {(*(*self.loader.send_global_variable_names[self.shard_idx].get())[target_shard].get()).push((name, id))};
+
+            //asdqwe add to parent_type.nested_names
+        }
+
         Ok(())
     }
 
-    fn chase_origin_pointers(&mut self, mut attr_specification_or_origin: Option<Attribute<SliceType>>, name: &mut Option<&'a str>, linkage_name: &mut Option<&'a str>, type_: &mut Option<*const TypeInfo>, mut decl: Option<&mut LineInfo>) -> Result<()> {
+    fn chase_origin_pointers(&mut self, mut attr_specification_or_origin: Option<Attribute<SliceType>>, name: &mut Option<&'static str>, linkage_name: &mut Option<&'static str>, type_: &mut Option<*const TypeInfo>, mut decl: Option<&mut LineInfo>) -> Result<()> {
         let mut cur_unit = self.unit;
         while let Some(specification_or_origin) = attr_specification_or_origin {
             let (next_unit, next_offset) = match specification_or_origin.value() {
@@ -2036,14 +2207,15 @@ impl<'a> DwarfLoader<'a> {
                 // Variables.
                 DW_TAG_variable | DW_TAG_formal_parameter => {
                     // Applicable attributes:
-                    // Useful: DECL, name, linkage_name, location, type, declaration, specification
-                    // Other: artificial, accessibility, alignment, const_expr, const_value, endianity, external, segment, start_scope, visibility
+                    // Useful: DECL, name, linkage_name, location, type, declaration, specification, const_value
+                    // Other: artificial, accessibility, alignment, const_expr, endianity, external, segment, start_scope, visibility
                     // Other (for parameters): default_value, is_optional, variable_parameter
                     let mut name = None;
                     let mut linkage_name = None;
                     let mut type_ = None;
                     let mut attr_specification_or_origin = None;
                     let mut attr_location = None;
+                    let mut attr_const_value = None;
                     for &attr in abbrev.attributes() {
                         match attr.name() {
                             DW_AT_name => name = Some(parse_attr_str(&self.loader.sym.dwarf, self.unit, &Some(cursor.read_attribute(attr)?))?),
@@ -2051,17 +2223,16 @@ impl<'a> DwarfLoader<'a> {
                             DW_AT_type => type_ = Some(self.parse_type_ref(&attr, abbrev.tag(), &mut cursor)?),
                             DW_AT_specification | DW_AT_abstract_origin => attr_specification_or_origin = Some(cursor.read_attribute(attr)?),
                             DW_AT_location => attr_location = Some(cursor.read_attribute(attr)?), 
+                            DW_AT_const_value => attr_const_value = Some(cursor.read_attribute(attr)?), 
                             _ => cursor.skip_attributes(&[attr])?,
                         }
                     }
 
-                    if let Some(loc) = attr_location {
+                    if attr_location.is_some() || attr_const_value.is_some() {
                         self.chase_origin_pointers(attr_specification_or_origin, &mut name, &mut linkage_name, &mut type_, None)?;
-                        let var_flags = if abbrev.tag() == DW_TAG_variable { LocalVariableFlags::empty() } else { LocalVariableFlags::PARAMETER };
-                        let var = LocalVariable {
-                            name_ptr: name.map_or(ptr::null(), |n| n.as_ptr()), name_len: name.map_or(0, |n| n.len().min(u32::MAX as usize) as u32), type_: type_.unwrap_or(self.loader.types.builtin_types.unknown), offset_and_flags: LocalVariable::pack_offset_and_flags(offset, var_flags),
-                            expr: Expression(SliceType::default()), start: 0, len: 0};
-                        self.add_variable_locations(&loc, &var, offset)?;
+                        let var_flags = if abbrev.tag() == DW_TAG_variable { VariableFlags::empty() } else { VariableFlags::PARAMETER };
+                        let var = Variable::new(name.unwrap_or(""), type_.unwrap_or(self.loader.types.builtin_types.unknown), offset, var_flags);
+                        self.add_variable_locations(&attr_location, &attr_const_value, &linkage_name, var, offset)?;
                     }
                 }
 
@@ -2194,10 +2365,8 @@ impl<'a> DwarfLoader<'a> {
                         }
 
                         if let Some(frame_base) = frame_base {
-                            let var = LocalVariable {
-                                name_ptr: "#frame_base".as_ptr(), name_len: "#frame_base".len() as u32, type_: self.loader.types.builtin_types.void_pointer, offset_and_flags: LocalVariable::pack_offset_and_flags(offset, LocalVariableFlags::FRAME_BASE),
-                                expr: Expression(SliceType::default()), start: 0, len: 0};
-                            self.add_variable_locations(&frame_base, &var, offset)?;
+                            let var = Variable::new("#frame_base", self.loader.types.builtin_types.void_pointer, offset, VariableFlags::FRAME_BASE);
+                            self.add_variable_locations(&Some(frame_base), &None, &None, var, offset)?;
                         }
                     }
 
@@ -2414,14 +2583,14 @@ impl<'a> DwarfLoader<'a> {
                 // Fields and enumerators.
                 DW_TAG_inheritance | DW_TAG_member | DW_TAG_enumerator => {
                     // Applicable attributes:
-                    // Useful: DECL, name, artificial, bit_size, byte_size, data_bit_offset, data_member_location, external (seems undocumented), declaration, type
-                    // For enumerators: const_value
+                    // Useful: DECL, name, artificial, bit_size, byte_size, data_bit_offset, data_member_location, external (seems undocumented), declaration, type, const_value
                     // Other: accessibility, mutable, visibility, virtuality
                     let type_ = self.stack[self.depth - 1].exact_type;
                     if type_ == ptr::null_mut() {
                         if self.shard.warn.check(line!()) { eprintln!("warning: {} in {} is not supported", abbrev.tag(), self.stack[self.depth - 1].tag); }
                         cursor.skip_attributes(abbrev.attributes())?;
                     } else {
+                        let mut attr_const_value = None;
                         let mut field = StructField {name: "", flags: FieldFlags::empty(), bit_offset: 0, bit_size: 0, type_: self.loader.types.builtin_types.unknown, discr_value: 0};
                         if let Some(variant) = &self.stack[self.depth - 1].variant {
                             if offset == variant.discriminant_die {
@@ -2474,6 +2643,9 @@ impl<'a> DwarfLoader<'a> {
                                         }
                                     }
                                 }
+                                DW_AT_const_value => {
+                                    attr_const_value = Some(cursor.read_attribute(attr)?);
+                                }
                                 DW_AT_external => { // static field, i.e. not a field at all but a global variable (why are you like this, C++)
                                     cursor.skip_attributes(&[attr])?;
                                     if abbrev.tag() == DW_TAG_member {
@@ -2488,6 +2660,7 @@ impl<'a> DwarfLoader<'a> {
                             }
                         }
                         if abbrev.tag() == DW_TAG_enumerator {
+                            // Enumerand.
                             unsafe {
                                 match &mut (*type_).t {
                                     Type::Enum(e) => self.shard.types.temp_types.add_enumerand(e, Enumerand {value: enum_value, name: field.name, flags: EnumerandFlags::empty()}),
@@ -2495,18 +2668,23 @@ impl<'a> DwarfLoader<'a> {
                                 }
                             }
                         } else {
+                            if field.type_ == self.loader.types.builtin_types.unknown {
+                                if self.shard.warn.check(line!()) { eprintln!("warning: field with no type @0x{:x}", offset.0); }
+                            }
                             if is_static_field {
-                                // (Once we have global variables, actually add the variable here.)
-                                self.shard.num_global_variables += 1;
-                            } else {
-                                if field.type_ == self.loader.types.builtin_types.unknown {
-                                    if self.shard.warn.check(line!()) { eprintln!("warning: field with no type @0x{:x}", offset.0); }
+                                // Static constant inside a struct.
+                                if attr_const_value.is_none() {
+                                    if self.shard.warn.check(line!()) { eprintln!("warning: static field with no DW_AT_const_value at @0x{:x}", offset.0); }
+                                } else {
+                                    let var = Variable::new(field.name, field.type_, offset, VariableFlags::empty());
+                                    self.add_variable_locations(&None, &attr_const_value, &None, var, offset)?;
                                 }
-                                unsafe {
-                                    match &mut (*type_).t {
-                                        Type::Struct(s) => self.shard.types.temp_types.add_field(s, field),
-                                        _ => if self.shard.warn.check(line!()) { eprintln!("warning: {} in {} is not supported", abbrev.tag(), self.stack[self.depth - 1].tag); }
-                                    }
+                            } else {
+                                // Struct field.
+                                let t = unsafe {&mut *type_};
+                                match &mut t.t {
+                                    Type::Struct(s) => self.shard.types.temp_types.add_field(s, field),
+                                    _ => if self.shard.warn.check(line!()) { eprintln!("warning: {} in {} is not supported", abbrev.tag(), self.stack[self.depth - 1].tag); }
                                 }
                             }
                         }
@@ -2753,6 +2931,9 @@ impl<'a> DwarfLoader<'a> {
 
                 // Treat struct template arguments as typedefs, as if e.g. vector<int> had a 'using T = int' inside it.
                 DW_TAG_template_type_parameter => {
+                    // Applicable attributes:
+                    // Useful: DECL, name, type
+                    // Other: default_value
                     let mut name: &'static str = "";
                     let mut type_: *const TypeInfo = ptr::null();
                     for &attr in abbrev.attributes() {
@@ -2767,10 +2948,28 @@ impl<'a> DwarfLoader<'a> {
                     }
                 }
 
-                // TODO: Nested constants.
+                // Treat value template arguments as constant variables.
                 DW_TAG_template_value_parameter => {
-                    skip_subtree = self.depth;
-                    cursor.skip_attributes(abbrev.attributes())?;
+                    // Applicable attributes:
+                    // Useful: DECL, const_value, name, type
+                    // Other: default_value
+                    let mut name: &'static str = "";
+                    let mut type_: *const TypeInfo = ptr::null();
+                    let mut attr_const_value = None;
+                    for &attr in abbrev.attributes() {
+                        match attr.name() {
+                            DW_AT_name => name = unsafe {mem::transmute(parse_attr_str(&self.loader.sym.dwarf, self.unit, &Some(cursor.read_attribute(attr)?))?)},
+                            DW_AT_type => type_ = self.parse_type_ref(&attr, abbrev.tag(), &mut cursor)?,
+                            DW_AT_const_value => attr_const_value = Some(cursor.read_attribute(attr)?),
+                            _ => cursor.skip_attributes(&[attr])?,
+                        }
+                    }
+                    if attr_const_value.is_none() || type_ == ptr::null() {
+                        if self.shard.warn.check(line!()) { eprintln!("warning: DW_TAG_template_value_parameter without DW_AT_const_value or DW_AT_type @0x{:x}", offset.0); }
+                    } else {
+                        let var = Variable::new(name, type_, offset, VariableFlags::empty());
+                        self.add_variable_locations(&None, &attr_const_value, &None, var, offset)?;
+                    }
                 }
 
                 _ => cursor.skip_attributes(abbrev.attributes())?,
@@ -2979,4 +3178,21 @@ fn parse_attr_ranges(dwarf: &Dwarf<SliceType>, unit: &Unit<SliceType>, low_pc: &
         }
     }
     Ok(())
+}
+
+fn parse_attr_const_value(attr: &Attribute<SliceType>, dwarf: &Dwarf<SliceType>, offset: DieOffset, warn: &mut Limiter) -> PackedVariableLocation {
+    let val = attr.value();
+    match val {
+        AttributeValue::Sdata(x) => return PackedVariableLocation::const_usize(x as usize),
+        AttributeValue::Block(x) => return PackedVariableLocation::const_slice(x.slice()),
+        _ => (),
+    }
+    if let Some(x) = val.udata_value() {
+        return PackedVariableLocation::const_usize(x as usize);
+    }
+    if let Some(x) = val.string_value(&dwarf.debug_str) {
+        return PackedVariableLocation::const_slice(x.slice());
+    }
+    if warn.check(line!()) { eprintln!("warning: unexpected form of DW_AT_const_value @0x{:x}: {:?}", offset.0, val); }
+    PackedVariableLocation::Unknown
 }

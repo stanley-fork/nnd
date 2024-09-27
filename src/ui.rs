@@ -517,11 +517,11 @@ impl WatchesWindow {
             if !v.range().contains(&(static_pseudo_addr)) {
                 continue;
             }
-            if v.flags().contains(LocalVariableFlags::FRAME_BASE) {
+            if v.flags().contains(VariableFlags::FRAME_BASE) {
                 // Pseudo-variable internal to eh_frame unwind mechanism. We don't list it here, but it's available as `#frame_base` in watch expressions.
                 continue;
             }
-            let (value, dubious) = match eval_dwarf_expression(v.expr, &mut dwarf_context) {
+            let (value, dubious) = match eval_variable(&v.location, &mut dwarf_context) {
                 Ok((val, dub)) => (Ok(val), dub),
                 Err(e) => (Err(e), false),
             };
@@ -1263,9 +1263,16 @@ impl LocationsWindow {
                     if !v.range().contains(&static_addr) {
                         continue;
                     }
-                    let expr_str = match &encoding {
-                        Ok(e) => format_dwarf_expression(v.expr, *e),
-                        Err(e) => Err(e.clone()) };
+                    let expr_str = match v.location.unpack() {
+                        VariableLocation::Const(s) => Ok(hexdump(s, 100)),
+                        VariableLocation::Unknown => Ok("unknown".to_string()),
+                        VariableLocation::Expr(expr) => {
+                            match &encoding {
+                                Ok(e) => format_dwarf_expression(expr, *e),
+                                Err(e) => Err(e.clone())
+                            }
+                        }
+                    };
 
                     table.start_row(row_idx, ui);
                     row_idx += 1;
@@ -1283,7 +1290,11 @@ impl LocationsWindow {
                     };
                     table.text_cell(ui);
 
-                    ui_writeln!(ui, default, "{:x}", v.offset().0);
+                    if let Some(off) = v.debug_info_offset() {
+                        ui_writeln!(ui, default, "{:x}", off.0);
+                    } else {
+                        ui_writeln!(ui, default, "");
+                    }
                     table.text_cell(ui);
                 }
             }

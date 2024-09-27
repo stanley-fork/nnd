@@ -128,7 +128,7 @@ Currently the language has no loops or conditionals, just expressions. The synta
 (Throughout this document, single quotes '' denote example watch expressions. The quotes themselves are not part of the expression.)
 
 General info:
- * Can access the debugged program's local variables (as seen in the locals window) and registers: 'my_local_var', 'rdi'
+ * Can access the debugged program's local variables (as seen in the locals window), global variables, and registers: 'my_local_var', 'rdi'
  * Has basic C-like things you'd expect: arithmetic and logical operators, literals, array indexing, pointer arithmetic, '&x' to take address, '*x' to dereference.
  * Type cast: 'p as *u8'
  * Field access: 'my_struct.my_field'
@@ -136,6 +136,13 @@ General info:
  * Fields can also be accessed by index: 'my_struct.3' (useful when field names are empty or duplicate).
  * 'p.[n]' to turn pointer 'p' to array of length 'n'. E.g. 'my_string.ptr.[my_string.len]'
  * 'begin..end' to turn a pair of pointers to the array [begin, end). E.g. 'my_vector.begin..my_vector.end'
+ * '^x' looks for variable x in all stack frames
+
+Gotchas:
+ * If a variable has the same name as a register, use '`rax`' to refer to the variable.
+ * If a global variable has the same name as a local variable, use '::foo' to refer to the global variable.
+ * Currently only fully-qualified type names and global variable names are recognized.
+ * Currently types and global variables nested inside functions are difficult to access. The recognized "fully-qualified" name has a "_" instead of the function name.
 
 Types:
  * Can access the types from the debugged program's debug info (structs, classes, enums, unions, primitive types, etc) and typedefs.
@@ -146,7 +153,6 @@ Types:
 Inspecting types:
  * 'type(<name>)' to get information about a type, e.g. 'type(DB::Chunk)' - contains things like size and field offsets.
  * Use backticks to escape type names with templates or weird characters: 'type(`std::__1::atomic<int>`)'
- * Type name must be fully-qualified, and must exactly match the debug info.
    E.g. '`std::__1::atomic<int>`' works (on some version of libc++), but '`std::__1::atomic<int32_t>`', '`std::atomic<int>`', and '`atomic<int>`' don't.
  * 'typeof(<expression>)' to get information about result type of an expression.
    (Currently the expression is partially evaluated in some cases, e.g. 'typeof(*(0 as *mystruct))' works, but 'typeof((0 as *mystruct).myfield)' doesn't.)
@@ -169,8 +175,9 @@ Pretty-printers:
    Not very reliable, currently it often fails when the concrete type is template or is in anonymous namespace.
    (This can be improved to some extent, but can't be made fully reliable because vtable information is poorly structured in DWARF/symtab.)
  * Fields of base classes are inlined. Otherwise the base class is a field named '#base'.
- * There are designated pretty-printers for C++ and Rust vector/slice/string-like containers (turning them into slices), and for shared_ptr (turning it into plain pointer).
-   Hash tables, linked lists, and std::deque are not supported yet.
+ * There are designated pretty-printers for most C++ and Rust containers. If some container is not pretty-printed, maybe you're using libstdc++/libc++ version
+   newer or older than mine - please report and I'll probably make pretty-printers work for it too.
+ * Currently no support for custom pretty-printers.
  * All of the above transformations can be disabled by adding ".#r" to the expression.
 
 Value modifiers:

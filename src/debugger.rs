@@ -1566,17 +1566,16 @@ impl Debugger {
             Some(o) => o,
             None => return Ok(()) };
         let unit = symbols.find_unit(debug_info_offset)?;
-        let no_frame_base = err!(Dwarf, "frame base depends on itself");
-        let mut context = DwarfEvalContext {memory, symbols: Some(symbols), addr_map: &binary.addr_map, encoding: unit.unit.header.encoding(), unit: Some(unit), regs: Some(&frame.regs), frame_base: &no_frame_base, local_variables: &[]};
+        let mut context = DwarfEvalContext {memory, symbols: Some(symbols), addr_map: &binary.addr_map, encoding: unit.unit.header.encoding(), unit: Some(unit), regs: Some(&frame.regs), frame_base: None, local_variables: &[]};
         for v in symbols.local_variables_in_subfunction(root_subfunction, function.shard_idx()) {
-            if !v.flags().contains(LocalVariableFlags::FRAME_BASE) {
+            if !v.flags().contains(VariableFlags::FRAME_BASE) {
                 // Frame bases are always first in the list.
                 break;
             }
             if !v.range().contains(&static_addr) {
                 continue;
             }
-            let (val, dubious) = eval_dwarf_expression(v.expr, &mut context)?;
+            let (val, dubious) = eval_variable(&v.location, &mut context)?;
             
             // Not sure how exactly the result of DW_AT_frame_base expression is meant to be interpreted.
             // I've seen only two different expressions ever used as DW_AT_frame_base:

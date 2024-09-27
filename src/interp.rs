@@ -39,8 +39,8 @@ pub fn adjust_expression_for_appending_child_path(expr_str: &str) -> Result<Stri
 
         // For variable assignment, just use the variable name.
         AST::BinaryOperator(BinaryOperator::Assign) => {
-            if let AST::Variable {name, quoted, from_any_frame, global} = &expr.ast[node.children[0].0].a {
-                if !quoted && !from_any_frame && !global {
+            if let AST::Variable {name, quoted, from_any_frame} = &expr.ast[node.children[0].0].a {
+                if !quoted && !from_any_frame {
                     return Ok(name.clone());
                 }
             }
@@ -88,13 +88,13 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
             };
             Ok(Value {val: AddrOrValueBlob::Blob(v.as_blob()), type_, flags: ValueFlags::empty()})
         }
-        AST::Variable {name, quoted, from_any_frame, global} => {
-            if !quoted && !from_any_frame && !global {
+        AST::Variable {name, quoted, from_any_frame} => {
+            if !quoted && !from_any_frame {
                 if let Some(v) = state.variables.get(name) {
                     return Ok(v.clone());
                 }
             }
-            state.get_variable(context, name, /*maybe_register*/ !*quoted, *from_any_frame, *global, only_type)
+            state.get_variable(context, name, /*maybe_register*/ !*quoted, *from_any_frame, only_type)
         }
         AST::Field {name, quoted} => {
             let mut val = eval_expression(expr, node.children[0], state, context, false)?; // disable only_type here so that pretty-printers don't have to support it
@@ -224,9 +224,14 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
         }
         &AST::BinaryOperator(op) if op == BinaryOperator::Assign => {
             match &expr.ast[node.children[0].0].a {
-                AST::Variable {name, quoted, from_any_frame, global} if !quoted && !from_any_frame && !global => {
-                    if RegisterIdx::parse_ignore_case(name).is_some() {
-                        return err!(NotImplemented, "assigning to registers is not supported");
+                AST::Variable {name, quoted, from_any_frame} if !quoted && !from_any_frame => {
+                    if !state.variables.contains_key(&name[..]) {
+                        // Check that there's no debuggee variable with this name.
+                        match state.get_variable(context, name, /*maybe_register*/ !quoted, *from_any_frame, /*only_type*/ true) {
+                            Err(e) if e.is_no_variable() => (),
+                            Err(e) => return Err(e),
+                            Ok(_) => return err!(Runtime, "assigning to debuggee variables is not supported; to assign to a script variable use a different name (shadowing not allowed)"),
+                        }
                     }
                     let val = eval_expression(expr, node.children[1], state, context, false)?;
                     state.variables.insert(name.clone(), val.clone());
@@ -658,7 +663,7 @@ struct ASTIdx(usize);
 // Syntax and names are partially stolen from https://doc.rust-lang.org/reference/expressions.html
 enum AST {
     Literal(LiteralValue), // 42.69, "foo"
-    Variable {name: String, quoted: bool, from_any_frame: bool, global: bool}, // foo::bar::v, or `v`, or %v, or ^v
+    Variable {name: String, quoted: bool, from_any_frame: bool}, // foo::bar::v, or `v`, or ^v
     UnaryOperator(UnaryOperator), // -x, !f
     BinaryOperator(BinaryOperator), // a + b, x %= 2
     Field {name: String, quoted: bool}, // a.b, a.`b`
@@ -789,6 +794,7 @@ impl<'a> Lexer<'a> {
                 '.' => if self.input.eat_if_eq('.') { Token::BinaryOperator(BinaryOperator::Range) } else { self.previous_dot = true; Token::Char('.') },
                 '!' => if self.input.eat_if_eq('=') { Token::BinaryOperator(BinaryOperator::Ne) } else { Token::UnaryOperator(UnaryOperator::Not) },
                 ',' | '(' | ')' | '[' | ']' | '{' | '}' | ';' | '@' => Token::Char(c),
+                ':' if self.input.peek() != Some(':') => Token::Char(':'),
                 '"' => {
                     let mut s = String::new();
                     loop {
@@ -894,7 +900,7 @@ impl<'a> Lexer<'a> {
                     }
                     Token::Identifier {quoted: true, s}
                 }
-                'a'..='z' | 'A'..='Z' | '_' | '#' | '$' => {
+                'a'..='z' | 'A'..='Z' | '_' | '#' | '$' | ':' => {
                     self.input.uneat();
                     let mut s = String::new();
                     loop {
@@ -1049,7 +1055,7 @@ fn parse_expression(lex: &mut Lexer, expr: &mut Expression, outer_precedence: Pr
     node.a = match token {
         Token::Literal(value) => AST::Literal(value),
         Token::Identifier {s, quoted} => {
-            let mut ast = AST::Variable {name: s.clone(), quoted, from_any_frame: false, global: false};
+            let mut ast = AST::Variable {name: s.clone(), quoted, from_any_frame: false};
             if !quoted {
                 match &s as &str {
                     "struct" => {
@@ -1171,12 +1177,11 @@ fn parse_expression(lex: &mut Lexer, expr: &mut Expression, outer_precedence: Pr
             ast
         }
         Token::BinaryOperator(op) => {
-            if op == BinaryOperator::Rem || op == BinaryOperator::BitXor {
+            if op == BinaryOperator::BitXor {
                 let e = parse_expression(lex, expr, Precedence::Strongest)?;
                 match &mut expr.ast[e.0].a {
-                    AST::Variable {from_any_frame, global, ..} => match op {
-                        BinaryOperator::Rem => *from_any_frame = true,
-                        BinaryOperator::BitXor => *global = true,
+                    AST::Variable {from_any_frame, ..} => match op {
+                        BinaryOperator::BitXor => *from_any_frame = true,
                         _ => panic!("huh"),
                     }
                     _ => return err!(Syntax, "expected variable name after unary {:?} at {}", op, node.range.start),
@@ -1273,7 +1278,7 @@ fn parse_expression(lex: &mut Lexer, expr: &mut Expression, outer_precedence: Pr
                 }
                 lex.eat(1)?;
                 match &expr.ast[node_idx.0].a {
-                    AST::Variable {name, quoted, from_any_frame, global} if !quoted && !from_any_frame && !global => {
+                    AST::Variable {name, quoted, from_any_frame} if !quoted && !from_any_frame => {
                         let name = name.clone();
                         if name == "type" {
                             let t = parse_type(lex, expr)?;

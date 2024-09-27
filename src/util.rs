@@ -1,6 +1,6 @@
 use crate::{*, error::*, log::*};
 use libc::{pid_t, c_char, c_void};
-use std::{io, io::{Read, BufReader, BufRead, Write}, str::FromStr, ptr, mem, mem::ManuallyDrop, fmt, os::fd::RawFd, ffi::{CStr, OsString, CString}, os::unix::ffi::{OsStringExt, OsStrExt}, arch::asm, cell::UnsafeCell, sync::atomic::{AtomicBool, Ordering}, ops::{Deref, DerefMut, FnOnce}, fs::File, collections::{BinaryHeap, hash_map::DefaultHasher}, hash::{Hash, Hasher}, cmp::Ord, cmp, path::{Path, PathBuf}};
+use std::{io, io::{Read, BufReader, BufRead, Write}, str::FromStr, ptr, mem, mem::ManuallyDrop, fmt, fmt::Write as fmtWrite, os::fd::RawFd, ffi::{CStr, OsString, CString}, os::unix::ffi::{OsStringExt, OsStrExt}, arch::asm, cell::UnsafeCell, sync::atomic::{AtomicBool, Ordering}, ops::{Deref, DerefMut, FnOnce}, fs::File, collections::{BinaryHeap, hash_map::DefaultHasher}, hash::{Hash, Hasher}, cmp::Ord, cmp, path::{Path, PathBuf}};
 
 pub fn tgkill(pid: pid_t, tid: pid_t, sig: i32) -> Result<i32> {
     //eprintln!("trace: tgkill({}, {}, {})", pid, tid, sig);
@@ -714,4 +714,15 @@ impl fmt::Write for FmtString<'_> {
         }
         Ok(())
     }
+}
+
+pub fn hexdump(s: &[u8], lim: usize) -> String {
+    let mut r = "0x".to_string();
+    for x in &s[..lim.min(s.len())] {
+        write!(r, "{:x}", x).unwrap();
+    }
+    if s.len() > lim {
+        write!(r, "… {} more bytes", s.len() - lim).unwrap();
+    }
+    r
 }

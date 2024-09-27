@@ -1,3 +1,14 @@
+global variables
+  -constant values in locations window
+  +test with 10-byte values of 16-byte long doubles
+  from symtab
+  research .debug_pubtypes and .debug_pubnames
+  -access from watch expressions
+  search dialog in watches window
+  reflection
+  documentation
+    :: prefix to disambiguate from locals
+    from_any_frame, check what syntax remedybg uses
 investigate `clickhouse local` progress spinner appearing in debugger window despite -t
 fix empty symbols loading stage name near the end
 investigate regression in symbols loading speed (stuck on "parsing drawf" for ~10 seconds)
@@ -17,11 +28,13 @@ test with watches window filled with long arrays (I saw 50ms frames when there a
 
 up/down arrows should close code search, or cycle history
 make symtab/dynsym work when debug info (or debuglink file) is missing
-more built-in pretty printers: hash tables (sparsehash, absl), rb trees, b-trees, deque
+more built-in pretty printers: hash tables (sparsehash, absl), rb trees, b-trees, deque; update documentation when all are done
 hotkey to switch between .h/.cpp (/.cc/.hh/.hpp/.cxx - maybe just all extensions)
 reordering tabs
 rearranging windows
 maximizing windows
+thread-local storage
+const variables
 array types in watch expression (x as *[i32; 10])
 key to freeze value in watches window; can also be used for controlling when to run the expression if it has side effects
 tooltip in status window showing more log lines with line wrapping
@@ -29,14 +42,16 @@ key to send SIGINT to the program
 make return key do something in each window: go from threads to stack -> code -> disassembly -> code; from locals create a watch; from watch sub-value create another watch for that field/element; from breakpoints to code/disassembly/watch (depending on breakpoint type)
 "unexpectedly big memory read" (16 bytes) for f64 local variables on the stack in rust
 floating point and simd registers
+search by file+line, especially for global variables
+allow navigating from source to variables (especially global) and types declared there
 allow to put breakpoint on a whole file
 function pointers and field pointers
 find function by address (like addr2line)
+use actual function name instead of "_" in namespace path, or do something else to make function-static variables usable
 show number of function inlined sites in disassembly window, allow setting breakpoint on it, allow opening inline-only functions
 add decl location to TypeInfo and MetaType
 jump to type decl location in source window when selecting it in watches window
 type search in watches window (when found, add a watch "type(`<name>`)"
-global variables, search dialog for them in watches window; research .debug_pubtypes and .debug_pubnames
 show stop reason in status window, next to "suspended"
 allow cast `foo as typeof(bar)`, also `foo as typeof(bar)::T`
 welcome/help screen, '?' to open, show on first start and save to PersistentState; mention email for reporting bugs, and to include log and preferably binary; document all features of watch expression language; mention hidden profiler hotkey

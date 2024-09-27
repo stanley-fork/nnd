@@ -60,6 +60,19 @@ int main() {
     std::queue<int> que;                 // [no, no]
     que.push(1);
 
+    // Deque exploration.
+    std::deque<std::array<uint64_t, 29>> deq2;
+    for (uint64_t i = 0; i < 40; ++i) {
+        std::array<uint64_t, 29> t;
+        for (uint64_t j = 0; j < t.size(); ++j) t[j] = i*1000 + j;
+        deq2.push_back(t);
+    }
+    deq2.erase(deq2.begin(), deq2.begin() + 3);
+    uint64_t sum = 0;
+    for (auto it = deq2.begin(); it != deq2.end(); ++it) {
+        sum += (*it)[15];
+    }
+
     // Linked lists.
     std::list<int> lst = {1, 2, 3};           // [yes, yes]
     std::forward_list<int> flst = {1, 2, 3};  // [yes, yes]
@@ -109,7 +122,7 @@ int main() {
     volatile int dummy = vec[0] + arr[0] + *uptr + *sptr + short_str[0] + long_str[0] + pair.first + std::get<0>(tuple) + 
         *opt + (int)std::get<double>(var) + std::any_cast<int>(any_val) + func(1) + 
         bits.count() + c.real() + va[0] + sp[0] + *range.begin() + strview[0] + 
-        wstr[0] + u16str[0] + u32str[0] + (*pv)[0];
+        wstr[0] + u16str[0] + u32str[0] + (*pv)[0] + sum;
     (void)dummy;
 
     t.join();

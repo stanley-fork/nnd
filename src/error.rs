@@ -68,6 +68,7 @@ impl Error {
     pub fn is_io_permission_denied(&self) -> bool { match &self.error { ErrorEnum::IO(e) if e.kind() == io::ErrorKind::PermissionDenied => true, _ => false, } }
     pub fn is_not_calculated(&self) -> bool { match &self.error { ErrorEnum::Code(ErrorCode::NotCalculated) => true, _ => false, } }
     pub fn is_no_field(&self) -> bool { match &self.error { ErrorEnum::Code(ErrorCode::NoField) => true, _ => false, } }
+    pub fn is_no_variable(&self) -> bool { match &self.error { ErrorEnum::Code(ErrorCode::NoVariable) => true, _ => false, } }
     pub fn is_not_container(&self) -> bool { match &self.error { ErrorEnum::Code(ErrorCode::NotContainer) => true, _ => false, } }
 }
 

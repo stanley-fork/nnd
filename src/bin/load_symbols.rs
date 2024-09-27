@@ -19,7 +19,7 @@ fn main() -> Result<()> {
     dbg!(mem::size_of::<FunctionInfo>());
     dbg!(mem::size_of::<Subfunction>());
     dbg!(mem::size_of::<SubfunctionPcRange>());
-    dbg!(mem::size_of::<LocalVariable>());
+    dbg!(mem::size_of::<Variable>());
     dbg!(mem::size_of::<LineInfo>());
     dbg!(mem::size_of::<FileInfo>());
 

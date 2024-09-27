@@ -15,7 +15,7 @@ do
     clang -g -O1 -std=c23 -pthread -o "$BASEDIR/build/$name_without_extension" "$BASEDIR/$name"
 done
 
-FLAGS="-g -O0 -std=c++20 -Wno-vla-cxx-extension"
+FLAGS="-g -O1 -std=c++20 -Wno-vla-cxx-extension"
 for name in `ls "$BASEDIR" | grep -P '\.cpp$'`
 do
     name_without_extension="${name%.*}"

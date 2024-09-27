@@ -48,9 +48,6 @@ Vec, String, OSString, PathBuf: {buf: {ptr, cap}, len}
 &[T], &str, Box<[T]>: {data_ptr, length}
 VecDeque: {head, len, buf: {ptr, cap}}
 
-Rust to figure out:
-HashMap, HashSet: ???
-
 Rust meh:
 BinaryHeap: {data: Vec}
 LinkedList: {head: Some({element, next: ..., prev: ...}), tail: Some(...), len}   - traversable by hand

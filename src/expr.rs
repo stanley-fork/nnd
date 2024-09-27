@@ -394,38 +394,54 @@ impl EvalState {
         }
     }
 
-    pub fn get_variable(&mut self, context: &mut EvalContext, name: &str, maybe_register: bool, from_any_frame: bool, global: bool, only_type: bool) -> Result<Value> {
-        if global {
-            return err!(NotImplemented, "global variables not implemented");
-        }
-        if context.stack.frames.is_empty() {
-            return err!(Internal, "no stack");
-        }
-        if maybe_register {
-            if let Some(reg) = RegisterIdx::parse_ignore_case(name) {
-                let type_ = self.builtin_types.u64_;
-                if only_type {
-                    return Ok(Value {val: Default::default(), type_, flags: ValueFlags::empty()});
-                }
-                let frame = &context.stack.frames[context.stack.subframes[context.selected_subframe].frame_idx];
-                return match frame.regs.get_int(reg) {
-                    Ok((v, dub)) => {
-                        self.currently_evaluated_value_dubious |= dub;
-                        Ok(Value {val: AddrOrValueBlob::Blob(ValueBlob::new(v as usize)), type_, flags: ValueFlags::empty()})
+    pub fn get_variable(&mut self, context: &mut EvalContext, name: &str, maybe_register: bool, from_any_frame: bool, only_type: bool) -> Result<Value> {
+        let global_alt_name = if name.starts_with("::") {Some(&name[2..])} else {None};
+        if !context.stack.frames.is_empty() && (global_alt_name.is_none() || from_any_frame) {
+            // Try register.
+            if maybe_register {
+                if let Some(reg) = RegisterIdx::parse_ignore_case(name) {
+                    let type_ = self.builtin_types.u64_;
+                    if only_type {
+                        return Ok(Value {val: Default::default(), type_, flags: ValueFlags::empty()});
                     }
-                    Err(_) => err!(Dwarf, "value of {} register is not known", reg),
-                };
+                    let frame = &context.stack.frames[context.stack.subframes[context.selected_subframe].frame_idx];
+                    return match frame.regs.get_int(reg) {
+                        Ok((v, dub)) => {
+                            self.currently_evaluated_value_dubious |= dub;
+                            Ok(Value {val: AddrOrValueBlob::Blob(ValueBlob::new(v as usize)), type_, flags: ValueFlags::empty()})
+                        }
+                        Err(_) => err!(Dwarf, "value of {} register is not known", reg),
+                    };
+                }
+            }
+
+            // Try local variable.
+            for relative_subframe_idx in 0..context.stack.subframes.len().min(if from_any_frame {usize::MAX} else {1}) {
+                let subframe_idx = (context.selected_subframe + relative_subframe_idx) % context.stack.subframes.len();
+                match self.get_local_variable(context, name, subframe_idx, only_type) {
+                    Ok(v) => return Ok(v),
+                    Err(e) if e.is_no_variable() => (),
+                    Err(e) => return Err(e),
+                }
             }
         }
-        for relative_subframe_idx in 0..context.stack.subframes.len().min(if from_any_frame {usize::MAX} else {1}) {
-            let subframe_idx = (context.selected_subframe + relative_subframe_idx) % context.stack.subframes.len();
-            match self.get_local_variable(context, name, subframe_idx, only_type) {
-                Ok(v) => return Ok(v),
-                Err(e) if !from_any_frame => return Err(e),
-                Err(_) => (),
+
+        // Try global variable.
+        for binary in &self.binaries {
+            let symbols = match &binary.symbols {
+                Ok(x) => x,
+                Err(_) => continue };
+            if let Some(v) = symbols.find_global_variable_by_name(name) {
+                return Self::get_global_variable(&mut self.currently_evaluated_value_dubious, context, v, binary, only_type);
+            }
+            if let &Some(alt) = &global_alt_name {
+                if let Some(v) = symbols.find_global_variable_by_name(alt) {
+                    return Self::get_global_variable(&mut self.currently_evaluated_value_dubious, context, v, binary, only_type);
+                }
             }
         }
-        err!(NoVariable, "local var {} not found in any frame", name)
+
+        err!(NoVariable, "variable {} not found", name)
     }
 
     pub fn get_type(&mut self, context: &mut EvalContext, name: &str) -> Result<*const TypeInfo> {
@@ -454,13 +470,28 @@ impl EvalState {
             if only_type {
                 return Ok(Value {val: Default::default(), type_: v.type_, flags: ValueFlags::empty()});
             }
-            let (value, dubious) = eval_dwarf_expression(v.expr, &mut dwarf_context)?;
-            let val = Value {val: value, type_: v.type_, flags: ValueFlags::empty()};
+            let (val, dubious) = eval_variable(&v.location, &mut dwarf_context)?;
             self.currently_evaluated_value_dubious |= dubious;
-            return Ok(val);
+            return Ok(Value {val, type_: v.type_, flags: ValueFlags::empty()});
         }
-        // TODO: Add " (use ^{} if global variable)" when we have global variables.
-        err!(NoVariable, "local var {} not found", name)
+        err!(NoVariable, "")
+    }
+
+    pub fn get_global_variable(currently_evaluated_value_dubious: &mut bool, context: &mut EvalContext, var: &Variable, binary: &BinaryInfo, only_type: bool) -> Result<Value> {
+        let (val, dubious) = if only_type {
+            (Default::default(), false)
+        } else {
+            match var.location.unpack() {
+                VariableLocation::Const(s) => (AddrOrValueBlob::Blob(ValueBlob::from_slice(s)), false),
+                VariableLocation::Expr(e) => {
+                    let mut dwarf_context = context.make_global_dwarf_eval_context(binary, var.debug_info_offset().unwrap())?;
+                    eval_dwarf_expression(e, &mut dwarf_context)?
+                }
+                VariableLocation::Unknown => return err!(Dwarf, "location unknown"),
+            }
+        };
+        *currently_evaluated_value_dubious |= dubious;
+        Ok(Value {val, type_: var.type_, flags: ValueFlags::empty()})
     }
 }
 
@@ -499,8 +530,14 @@ impl EvalContext<'_> {
         let subfunction = &symbols.shards[shard_idx].subfunctions[subfunction_idx];
         let local_variables = symbols.local_variables_in_subfunction(subfunction, shard_idx);
 
-        let context = DwarfEvalContext {memory: &mut self.memory, symbols: Some(symbols), addr_map: &binary.addr_map, encoding: unit.unit.header.encoding(), unit: Some(unit), regs: Some(&frame.regs), frame_base: &frame.frame_base, local_variables};
+        let context = DwarfEvalContext {memory: &mut self.memory, symbols: Some(symbols), addr_map: &binary.addr_map, encoding: unit.unit.header.encoding(), unit: Some(unit), regs: Some(&frame.regs), frame_base: Some(&frame.frame_base), local_variables};
         Ok((context, function))
+    }
+
+    pub fn make_global_dwarf_eval_context<'a>(&'a mut self, binary: &'a BinaryInfo, die_offset: DebugInfoOffset) -> Result<DwarfEvalContext<'a>> {
+        let symbols = binary.symbols.as_ref_clone_error()?;
+        let unit = symbols.find_unit(die_offset)?;
+        Ok(DwarfEvalContext {memory: &mut self.memory, symbols: Some(symbols), addr_map: &binary.addr_map, encoding: unit.unit.header.encoding(), unit: Some(unit), regs: None, frame_base: None, local_variables: &[]})
     }
 }
 
@@ -1069,9 +1106,9 @@ pub struct DwarfEvalContext<'a> {
 
     // Stack frame. Not required for global variables.
     pub regs: Option<&'a Registers>,
-    pub frame_base: &'a Result<(usize, /*dubious*/ bool)>,
+    pub frame_base: Option<&'a Result<(usize, /*dubious*/ bool)>>,
 
-    pub local_variables: &'a [LocalVariable],
+    pub local_variables: &'a [Variable],
 }
 
 pub fn eval_dwarf_expression(mut expression: Expression<SliceType>, context: &mut DwarfEvalContext) -> Result<(AddrOrValueBlob, /*dubious*/ bool)> {
@@ -1127,7 +1164,10 @@ pub fn eval_dwarf_expression(mut expression: Expression<SliceType>, context: &mu
                 eval.resume_with_register(val)
             }
             EvaluationResult::RequiresFrameBase => {
-                let (v, dub) = context.frame_base.clone()?;
+                let (v, dub) = match &context.frame_base {
+                    None => return err!(Dwarf, "no frame base"),
+                    &Some(x) => x.clone()?,
+                };
                 dubious |= dub;
                 eval.resume_with_frame_base(v as u64)
             }
@@ -1243,6 +1283,14 @@ pub fn eval_dwarf_expression(mut expression: Expression<SliceType>, context: &mu
         res_bits += size_in_bits;
     }
     Ok((AddrOrValueBlob::Blob(res), dubious))
+}
+
+pub fn eval_variable(location: &PackedVariableLocation, context: &mut DwarfEvalContext) -> Result<(AddrOrValueBlob, /*dubious*/ bool)> {
+    match location.unpack() {
+        VariableLocation::Const(s) => Ok((AddrOrValueBlob::Blob(ValueBlob::from_slice(s)), false)),
+        VariableLocation::Expr(e) => eval_dwarf_expression(e, context),
+        VariableLocation::Unknown => err!(Dwarf, "location unknown"),
+    }
 }
 
 // Utility for creating struct type+value at runtime. Used by pretty printers.

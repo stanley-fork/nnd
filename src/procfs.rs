@@ -346,6 +346,9 @@ impl CachedMemReader {
         if buf.is_empty() {
             return Ok(&mut []);
         }
+        if buf.len() > usize::MAX - offset {
+            return err!(Runtime, "bad memory range: 0x{:x} + 0x{:x}", offset, buf.len());
+        }
         let last_page = (offset + buf.len() - 1) & !(PAGE_SIZE - 1);
         // Read non-last pages without populating cache.
         while offset & !(PAGE_SIZE - 1) < last_page {

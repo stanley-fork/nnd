@@ -1,13 +1,13 @@
-use std::{mem, ptr, alloc::{alloc, Layout, handle_alloc_error, dealloc}, slice, marker::PhantomData, io, path::Path, fmt, os::unix::ffi::OsStrExt, io::Write as ioWrite};
+use std::{mem, mem::MaybeUninit, ptr, alloc::{alloc, Layout, handle_alloc_error, dealloc}, slice, marker::PhantomData, io, path::Path, fmt, os::unix::ffi::OsStrExt, io::Write as ioWrite};
 
 // Arena - a simple untyped arena.
 // StringTable - arena equipped with a list of pointers to allocated strings, allowing search.
 //               E.g. put all type names in it, each associated with an id, then iterate over them sequentially for fast search.
 //
 // Rust borrow checker really doesn't combine well with arenas, so we try to use arrays or pools where possible.
-// But for types I couldn't come up with any reasonable way to avoid arenas; I tried implementing it with pools,
+// But for the type system I couldn't come up with any reasonable way to avoid arenas; I tried implementing it with pools,
 // but it quickly got out of hand because types from different pools may interact and even reference each other (when temporary types are introduced in watch expressions).
-// So we use arenas for that, with some manual transmuting of lifetimes.
+// So we use arenas for that, with some manual transmuting of lifetimes and lots of unsafe dereferencing of *const TypeInfo.
 
 #[derive(Default)]
 pub struct Arena {
@@ -48,6 +48,14 @@ impl Arena {
         let start = (c.used + align - 1) & !(align - 1);
         c.used = start + size;
         unsafe {slice::from_raw_parts_mut(c.data.add(c.used-size), size)}
+    }
+
+    pub fn alloc_slice<T>(&mut self, len: usize) -> &mut [MaybeUninit<T>] {
+        assert!(!mem::needs_drop::<T>());
+        unsafe {
+            let r: *mut MaybeUninit<T> = self.alloc(mem::size_of::<T>() * len, mem::align_of::<T>()).as_mut_ptr() as _;
+            slice::from_raw_parts_mut(r, len)
+        }
     }
 
     // Copies an value into this arena, bytewise. Immutable version casts away the lifetime.
@@ -277,6 +285,15 @@ impl StringTable {
     pub fn add_path(&mut self, p: &Path, id: usize) -> &'static Path { unsafe {mem::transmute(self.add_slice(p.as_os_str().as_bytes(), id))} }
 
     pub fn write<'a>(&'a mut self) -> StringTableWrite<'a> { StringTableWrite {table: self, w: self.arena.write()} }
+
+    pub fn binary_search(&self, s: &[u8]) -> Option</*id*/ usize> {
+        let i = self.strings.partition_point(|x| x.s < s);
+        if self.strings.get(i).is_some_and(|x| x.s == s) {
+            Some(self.strings[i].id)
+        } else {
+            None
+        }
+    }
 }
 
 pub struct StringTableWrite<'a> {
@@ -295,6 +312,36 @@ impl StringTableWrite<'_> {
 }
 impl io::Write for StringTableWrite<'_> { fn write(&mut self, buf: &[u8]) -> io::Result<usize> { self.w.write(buf) }  fn flush(&mut self) -> io::Result<()> { Ok(()) } }
 impl cpp_demangle::DemangleWrite for StringTableWrite<'_> { fn write_string(&mut self, s: &str) -> fmt::Result { self.w.write_string(s) } }
+
+// Small helper for appending things like "#2", "#3", etc to names of type/variable/etc to make them unique.
+// Notice that:
+//  * '#' is less than any character we expect to see in type/variable names (there are 3 printable characters less than '#': '"', '!', and ' ').
+//  * Suffixes in the same group of equal names have the same length, e.g. "x#01", "x#02", ..., "x#42".
+// Together these two properties ensure that a sorted list of names remains sorted after appending these suffixes.
+#[derive(Clone, Copy)]
+pub struct DisambiguatingSuffixes {
+    pub num_digits: usize,
+}
+impl DisambiguatingSuffixes {
+    pub fn new(count: usize) -> Self {
+        let num_digits = if count > 1 {
+            ((count + 1) as f64).log10().ceil() as usize
+        } else {
+            0
+        };
+        Self {num_digits}
+    }
+
+    pub fn disambiguate(self, s: &str, idx: usize, id: usize, table: &mut StringTable) -> (&'static str, /*changed*/ bool) {
+        if idx == 0 {
+            (table.add_str(s, id), false)
+        } else {
+            let mut out = table.write();
+            write!(out, "{}#{:0>2$}", s, idx + 1, self.num_digits).unwrap();
+            (out.finish_str(id), true)
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
