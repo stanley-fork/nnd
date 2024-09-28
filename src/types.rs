@@ -201,7 +201,6 @@ pub enum Type {
     // This type is mostly superfluous in the current very-dynamically-typed interpreter, where we can just create a new Array type for each array,
     // but hopefully we'll do something more statically typed later.
     Slice(SliceType),
-    // TODO: Tuple, or maybe use struct with a flag. First check what type Rust tuples translate to.
 }
 impl Type {
     pub fn as_primitive(&self) -> Option<PrimitiveFlags> { match self { &Type::Primitive(f) => Some(f), _ => None } }
