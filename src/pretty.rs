@@ -1,4 +1,4 @@
-use crate::{*, types::*, error::*, expr::*, util::*, settings::*, common_ui::*, procfs::*};
+use crate::{*, types::*, error::*, expr::*, util::*, settings::*, common_ui::*, procfs::*, symbols::*};
 use std::{mem, mem::MaybeUninit, ptr, fmt::Write, borrow::Cow, io::Write as ioWrite, ops::Range};
 use bitflags::*;
 
@@ -167,8 +167,8 @@ pub fn reflect_meta_value(val: &Value, state: &mut EvalState, context: &mut Eval
                     builder.add_field("items", items);
                     builder.add_usize_field("type", e.type_ as usize, state.builtin_types.meta_type);
                 }
-                Type::MetaType | Type::MetaField => {
-                    styled_write_maybe!(out, default, "{}", match &t.t { Type::MetaType => "type", Type::MetaField => "field", _ => panic!("huh") });
+                Type::MetaType | Type::MetaField | Type::MetaVariable => {
+                    styled_write_maybe!(out, default, "{}", match &t.t { Type::MetaType => "type", Type::MetaField => "field", Type::MetaVariable => "variable", _ => panic!("huh") });
                     return builder.finish("", val.flags, &mut state.types);
                 }
             }
@@ -182,14 +182,15 @@ pub fn reflect_meta_value(val: &Value, state: &mut EvalState, context: &mut Eval
                 builder.add_str_field("name", t.name, &mut state.types, &state.builtin_types);
             }
             if !t.nested_names.is_empty() {
-                let mut typedefs = StructBuilder::default();
+                let mut nested = StructBuilder::default();
                 for (name, n) in t.nested_names {
                     match n {
-                        NestedName::Type(type_) => typedefs.add_usize_field(name, *type_ as usize, state.builtin_types.meta_type),
+                        NestedName::Type(type_) => nested.add_usize_field(name, *type_ as usize, state.builtin_types.meta_type),
+                        NestedName::Variable(v) => nested.add_usize_field(name, *v as usize, state.builtin_types.meta_variable),
                     }
                 }
-                let typedefs = typedefs.finish("", val.flags, &mut state.types);
-                builder.add_field("typedefs", typedefs);
+                let nested = nested.finish("", val.flags, &mut state.types);
+                builder.add_field("nested", nested);
             }
             // TODO: Decl file+line.
             if t.die.0 != 0 && t.die.0 < FAKE_DWARF_OFFSET_START {
@@ -219,6 +220,29 @@ pub fn reflect_meta_value(val: &Value, state: &mut EvalState, context: &mut Eval
                 builder.add_usize_field("discriminant_value", f.discr_value, state.builtin_types.u64_);
             }
             // TODO: Decl file+line.
+            builder.finish("", val.flags, &mut state.types)
+        }
+        Type::MetaVariable => {
+            let v = val.val.blob_ref().unwrap().get_usize().unwrap() as *const Variable;
+            let v = unsafe {&*v};
+            builder.add_str_field("name", unsafe {v.name()}, &mut state.types, &state.builtin_types);
+            builder.add_usize_field("type", v.type_ as usize, state.builtin_types.meta_type);
+            match v.location.unpack() {
+                VariableLocation::Const(s) => builder.add_blob_field("const_value", s, v.type_),
+                VariableLocation::Expr(expr) => {
+                    let default_encoding = gimli::Encoding {address_size: 8, format: gimli::Format::Dwarf64, version: 5};
+                    let s = match format_dwarf_expression(expr, default_encoding) {
+                        Ok(s) => s,
+                        Err(e) => format!("<error: {}>", e),
+                    };
+                    builder.add_str_field("dwarf_expr", &s, &mut state.types, &state.builtin_types);
+                }
+                VariableLocation::Unknown => builder.add_str_field("location", "unknown", &mut state.types, &state.builtin_types),
+            }
+            builder.add_str_field("flags", &v.readable_flags(), &mut state.types, &state.builtin_types);
+            if let Some(die) = v.debug_info_offset() {
+                builder.add_usize_field("die", die.0 as usize, state.builtin_types.u64_);
+            }
             builder.finish("", val.flags, &mut state.types)
         }
         _ => panic!("expected meta type/field, got {}", meta_t.t.kind_name()),
@@ -608,6 +632,34 @@ fn find_nested_type(name: &str, type_: *const TypeInfo) -> Result<*const TypeInf
         if *nn == name {
             match n {
                 NestedName::Type(t) => return Ok(*t),
+                _ => (),
+            }
+        }
+    }
+    err!(NoField, "")
+}
+
+fn find_nested_usize_constant(name: &str, type_: *const TypeInfo) -> Result<usize> {
+    let t = unsafe {&*type_};
+    for (nn, n) in t.nested_names {
+        if *nn == name {
+            match n {
+                NestedName::Variable(v) => {
+                    let v = unsafe {&**v};
+                    let val = match v.location.unpack() {
+                        VariableLocation::Const(x) => x,
+                        _ => return err!(NotContainer, ""),
+                    };
+                    let vt = unsafe {&*v.type_};
+                    let vs = vt.calculate_size();
+                    if vs == 0 || vs > 8 || vs > val.len() {
+                        return err!(NotContainer, "");
+                    }
+                    let mut a = [0u8; 8];
+                    a[..vs].copy_from_slice(&val[..vs]);
+                    return Ok(usize::from_le_bytes(a));
+                }
+                _ => (),
             }
         }
     }
@@ -702,6 +754,21 @@ fn recognize_containers(val: &mut Cow<Value>, fields: &mut Cow<[StructField]>, a
         Err(e) => return Err(e),
     }
     match recognize_rust_hash_table(&mut substruct, val, state, context) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.is_no_field() => substruct.clear_used(),
+        Err(e) => return Err(e),
+    }
+    match recognize_libstdcpp_deque(&mut substruct, val, state, context) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.is_no_field() => substruct.clear_used(),
+        Err(e) => return Err(e),
+    }
+    match recognize_libcpp_deque(&mut substruct, val, state, context) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.is_no_field() => substruct.clear_used(),
+        Err(e) => return Err(e),
+    }
+    match recognize_cpp_map(&mut substruct, val, state, context) {
         Ok(()) => return Ok(()),
         Err(e) if e.is_no_field() => substruct.clear_used(),
         Err(e) => return Err(e),
@@ -1077,5 +1144,212 @@ fn recognize_rust_hash_table(substruct: &mut ContainerSubstruct, val: &mut Cow<V
         data.extend_from_slice(&(ctrl - bucket_size * (i + 1)).to_le_bytes());
     }
     make_array_of_references(val, data, bucket_type, is_truncated, state);
+    Ok(())
+}
+
+fn recognize_libstdcpp_deque(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
+    find_field(&["map"], substruct)?;
+    let mut start = find_struct_field(&["start"], substruct)?;
+    let mut finish = find_struct_field(&["finish"], substruct)?;
+    let mut value_type = find_nested_type("value_type", val.type_)?;
+    let start_cur_field = find_pointer_field(&["cur"], &mut start, &mut value_type)?;
+    let start_first_field = find_pointer_field(&["first"], &mut start, &mut value_type)?;
+    let start_last_field = find_pointer_field(&["last"], &mut start, &mut value_type)?;
+    let mut value_ptr_type: *const TypeInfo = ptr::null();
+    let start_node_field = find_pointer_field(&["node"], &mut start, &mut value_ptr_type)?;
+    start.check_all_fields_used()?;
+    let finish_cur_field = find_pointer_field(&["cur"], &mut finish, &mut value_type)?;
+    let finish_first_field = find_pointer_field(&["first"], &mut finish, &mut value_type)?;
+    let finish_last_field = find_pointer_field(&["last"], &mut finish, &mut value_type)?;
+    let finish_node_field = find_pointer_field(&["node"], &mut finish, &mut value_ptr_type)?;
+    finish.check_all_fields_used()?;
+
+    match unsafe {&(*value_ptr_type).t} {
+        Type::Pointer(p) if p.type_ == value_type => (),
+        _ => return err!(NoField, ""),
+    }
+    let value_size = unsafe {(*value_type).calculate_size()};
+    if value_size == 0 {
+        return err!(NotContainer, "");
+    }
+
+    let start_cur = val.val.bit_range(start_cur_field, &mut context.memory)?;
+    let start_first = val.val.bit_range(start_first_field, &mut context.memory)?;
+    let start_last = val.val.bit_range(start_last_field, &mut context.memory)?;
+    let start_node = val.val.bit_range(start_node_field, &mut context.memory)?;
+    let finish_cur = val.val.bit_range(finish_cur_field, &mut context.memory)?;
+    let finish_first = val.val.bit_range(finish_first_field, &mut context.memory)?;
+    let finish_last = val.val.bit_range(finish_last_field, &mut context.memory)?;
+    let finish_node = val.val.bit_range(finish_node_field, &mut context.memory)?;
+
+    if start_cur == finish_cur {
+        // Empty.
+        make_array_of_references(val, Vec::new(), value_type, /*is_truncated*/ false, state);
+        return Ok(());
+    }
+
+    let block_bytes = start_last - start_first;
+    if block_bytes % value_size != 0 || block_bytes != finish_last - finish_first || block_bytes == 0 {
+        return err!(NotContainer, "");
+    }
+    if finish_node < start_node || (finish_node - start_node) % 8 != 0 || start_cur < start_first || start_cur > start_last || (start_cur - start_first) % value_size != 0 || finish_cur < finish_first || finish_cur > finish_last || (finish_cur - finish_first) % value_size != 0 {
+        return err!(NotContainer, "");
+    }
+
+    let mut data: Vec<u8> = Vec::new();
+    let (mut cur, mut block_end, mut block_ptr) = (start_cur, start_last, start_node);
+    let mut is_truncated = false;
+    loop {
+        if data.len() / 8 >= 1000 {
+            is_truncated = true;
+            break;
+        }
+        if block_ptr == finish_node && cur == finish_cur {
+            break;
+        }
+        if cur == block_end {
+            block_ptr += 8;
+            cur = context.memory.read_usize(block_ptr)?;
+            block_end = cur + block_bytes;
+        }
+        if block_ptr == finish_node && cur == finish_cur {
+            break;
+        }
+        data.extend_from_slice(&cur.to_le_bytes());
+        cur += value_size;
+    }
+
+    make_array_of_references(val, data, value_type, is_truncated, state);
+
+    Ok(())
+}
+
+fn recognize_libcpp_deque(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
+    let mut type_ = val.type_;
+    // std::stack and std::queue are pointless trivial wrappers around std::deque. Unwrap.
+    if let Some(t) = optional_field(find_nested_type("container_type", type_))? {
+        type_ = t;
+    }
+
+    let value_type = find_nested_type("value_type", type_)?;
+    let mut map = find_struct_field(&["map"], substruct)?;
+    let start_field = find_int_field(&["start"], substruct)?;
+    let size_field = find_int_field(&["size"], substruct)?;
+    substruct.check_all_fields_used()?;
+
+    let mut value_ptr_type: *const TypeInfo = ptr::null();
+    find_pointer_field(&["first"], &mut map, &mut value_ptr_type)?;
+    let begin_field = find_pointer_field(&["begin"], &mut map, &mut value_ptr_type)?;
+    find_pointer_field(&["end"], &mut map, &mut value_ptr_type)?;
+    find_pointer_field(&["end_cap"], &mut map, &mut value_ptr_type)?;
+    map.check_all_fields_used()?;
+
+    let iterator_type = find_nested_type("iterator", type_)?;
+    let block_size = find_nested_usize_constant("_BS", iterator_type)?;
+    if block_size == 0 {
+        return err!(NotContainer, "");
+    }
+
+    match unsafe {&(*value_ptr_type).t} {
+        Type::Pointer(p) if p.type_ == value_type => (),
+        _ => return err!(NoField, ""),
+    }
+    let value_size = unsafe {(*value_type).calculate_size()};
+
+    let start = val.val.bit_range(start_field, &mut context.memory)?;
+    let size = val.val.bit_range(size_field, &mut context.memory)?;
+    let begin = val.val.bit_range(begin_field, &mut context.memory)?;
+
+    let mut data: Vec<u8> = Vec::new();
+    let mut is_truncated = false;
+    let mut block_start = 0usize;
+    for i in start..start+size {
+        if i - start > 1000 {
+            is_truncated = true;
+            break;
+        }
+        if i == start || i % block_size == 0 {
+            block_start = context.memory.read_usize(begin + i / block_size * 8)?;
+        }
+        let ptr = block_start + i % block_size * value_size;
+        data.extend_from_slice(&ptr.to_le_bytes());
+    }
+
+    make_array_of_references(val, data, value_type, is_truncated, state);
+
+    Ok(())
+}
+
+fn recognize_cpp_map(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
+    let value_type = find_nested_type("value_type", val.type_)?;
+    let root_field;
+    let mut node_type: *const TypeInfo = ptr::null();
+    let mut custom_value_offset: Option<usize> = None;
+    if optional_field(find_int_field(&["node_count"], substruct))?.is_some() {
+        // libstdc++
+        let mut header = find_struct_field(&["header"], substruct)?;
+        root_field = find_pointer_field(&["parent"], &mut header, &mut node_type)?;
+        find_pointer_field(&["left"], &mut header, &mut node_type)?;
+        find_pointer_field(&["right"], &mut header, &mut node_type)?;
+        find_field(&["color"], &mut header)?;
+        header.check_all_fields_used()?;
+    } else {
+        // libc++
+        find_int_field(&["pair3"], substruct)?; // node count
+        root_field = find_pointer_field(&["pair1"], substruct, &mut node_type)?;
+        find_field(&["begin_node"], substruct)?;
+
+        // The base node struct is 3 pointers + 1 byte (color) + 7 bytes of padding = 32 bytes.
+        // If the value type is small, it may be packed into that padding, so the actual offset is not always 32. Find it.
+        // (This problem only came up in libc++ trees, not in libstdc++ trees (because it aligns value to 8 bytes for some reason), and not in linked lists (because the base node struct has no padding).)
+        let tree = find_nested_type("__base", val.type_)?;
+        let np = find_nested_type("__node_pointer", tree)?;
+        let n = match unsafe {&(*np).t} {
+            Type::Pointer(p) => p.type_,
+            _ => return err!(NoField, ""),
+        };
+        let mut ns = container_aux_struct(n)?;
+        let value_field = find_field(&["value"], &mut ns)?;
+        if value_field.bit_offset % 8 != 0 {
+            return err!(NotContainer, "");
+        }
+        custom_value_offset = Some(value_field.bit_offset / 8);
+    }
+    substruct.check_all_fields_used()?;
+
+    let mut node_struct = container_aux_struct(node_type)?;
+    find_pointer_field(&["parent"], &mut node_struct, &mut ptr::null())?;
+    let left_field = find_pointer_field(&["left"], &mut node_struct, &mut node_type)?;
+    let right_field = find_pointer_field(&["right"], &mut node_struct, &mut node_type)?;
+    find_field(&["color", "is_black"], &mut node_struct)?;
+    node_struct.check_all_fields_used()?;
+
+    let node_size = unsafe {(*node_type).calculate_size()};
+    let value_offset = custom_value_offset.unwrap_or(node_size);
+
+    let root = val.val.bit_range(root_field, &mut context.memory)?;
+
+    // (The algorithm is chosen to minimize random reads from debuggee memory: each node is read once.)
+    let mut stack: Vec<(usize, /*pass*/ u8)> = vec![(root, 0)];
+    let mut data: Vec<u8> = Vec::new();
+    for i in 0..1000 {
+        match stack.pop() {
+            None => break,
+            Some((0, _)) => (),
+            Some((node, 0)) => {
+                let node_val = AddrOrValueBlob::Addr(node);
+                let left = node_val.bit_range(left_field.clone(), &mut context.memory)?;
+                let right = node_val.bit_range(right_field.clone(), &mut context.memory)?;
+                stack.push((right, 0));
+                stack.push((node, 1));
+                stack.push((left, 0));
+            }
+            Some((node, 1)) => data.extend_from_slice(&(node + value_offset).to_le_bytes()),
+            _ => panic!("huh"),
+        }
+    }
+
+    make_array_of_references(val, data, value_type, /*is_truncated*/ !stack.is_empty(), state);
+
     Ok(())
 }

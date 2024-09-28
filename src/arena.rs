@@ -141,6 +141,7 @@ impl Arena {
 
     // Intended for single-type arenas.
     pub unsafe fn iter<'a, T: 'a>(&'a self) -> impl Iterator<Item = &'a T> { Iter {arena: self, chunk_idx: 0, offset: 0, _boo: PhantomData::default()} }
+    pub unsafe fn iter_mut<'a, T: 'a>(&'a mut self) -> impl Iterator<Item = &'a mut T> { IterMut {arena: self, chunk_idx: 0, offset: 0, _boo: PhantomData::default()} }
 
     pub fn write<'a>(&'a mut self) -> ArenaWrite<'a> {
         ArenaWrite {arena: self, len: 0, chunk_idx: usize::MAX, start: ptr::null_mut(), capacity: 0}
@@ -211,6 +212,34 @@ impl<'a, T: 'a> Iterator for Iter<'a, T> {
                 continue;
             }
             let r: &'a T = unsafe {&*(chunk.data.add(self.offset) as *const T)};
+            self.offset += entry_size;
+            return Some(r)
+        }
+    }
+}
+
+struct IterMut<'a, T: 'a> {
+    arena: &'a mut Arena,
+    chunk_idx: usize,
+    offset: usize,
+    _boo: PhantomData<&'a mut [T]>,
+}
+impl<'a, T: 'a> Iterator for IterMut<'a, T> {
+    type Item = &'a mut T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let entry_size = mem::size_of::<T>();
+        loop {
+            if self.chunk_idx >= self.arena.chunks.len() {
+                return None;
+            }
+            let chunk = &mut self.arena.chunks[self.chunk_idx];
+            if self.offset + entry_size > chunk.used {
+                self.chunk_idx += 1;
+                self.offset = 0;
+                continue;
+            }
+            let r: &'a mut T = unsafe {&mut *(chunk.data.add(self.offset) as *mut T)};
             self.offset += entry_size;
             return Some(r)
         }

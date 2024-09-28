@@ -119,8 +119,8 @@ pub struct SymbolsShard {
     // the variable to automatically show up in the UI only if we're in that function, not all the time.
     pub local_variables: Vec<Variable>,
 
-    pub global_variables: Vec<Variable>,
-    // Id is VariableIdx. May point to different shards.
+    pub global_variables: Arena, // array of Variable-s (need stable pointers)
+    // Id is *const Variable, can be in different shard.
     pub sorted_global_variable_names: StringTable,
 }
 
@@ -366,6 +366,8 @@ bitflags! { pub struct VariableFlags: u8 {
     const PARAMETER = 0x1;
     // It's a pseudovariable holding the expression from DW_AT_frame_base.
     const FRAME_BASE = 0x2;
+    const TEMPLATE_PARAMETER = 0x4;
+    const GLOBAL = 0x8;
 }}
 
 #[derive(Clone)]
@@ -403,6 +405,7 @@ impl Variable {
         }
     }
     pub fn flags(&self) -> VariableFlags { unsafe{mem::transmute((self.offset_and_flags & 0xff) as u8)} }
+    pub fn add_flags(&mut self, f: VariableFlags) { self.offset_and_flags |= f.bits() as u64; }
 
     fn with_range(&self, range: gimli::Range) -> Self {
         let mut r = self.clone();
@@ -410,15 +413,19 @@ impl Variable {
         r.len = (range.end - range.begin).min(u32::MAX as u64) as u32;
         r
     }
-}
 
-// Packed shard idx and index in global_variables.
-#[derive(Clone, Copy, Debug, Ord, PartialOrd, Eq, PartialEq)]
-pub struct VariableIdx(pub usize);
-impl VariableIdx {
-    pub fn pack(shard_idx: usize, idx: usize) -> Self { Self(shard_idx << 48u32 | idx) }
-    pub fn shard_idx(self) -> usize { self.0 >> 48 }
-    pub fn idx(self) -> usize { self.0 & (usize::MAX >> 16) }
+    pub fn readable_flags(&self) -> String {
+        let mut s = String::new();
+        let flags = self.flags();
+        if flags.contains(VariableFlags::PARAMETER) {s.push_str("parameter | ");}
+        if flags.contains(VariableFlags::FRAME_BASE) {s.push_str("frame_base | ");}
+        if flags.contains(VariableFlags::TEMPLATE_PARAMETER) {s.push_str("template_parameter | ");}
+        if flags.contains(VariableFlags::GLOBAL) {s.push_str("global | ");}
+        if !s.is_empty() {
+            s.replace_range(s.len()-3.., "");
+        }
+        s
+    }
 }
 
 // Source code file. Can be referenced from line number information, functions (to say where the function was defined), etc.
@@ -696,8 +703,8 @@ impl Symbols {
     pub fn find_global_variable_by_name<'a>(&'a self, name: &str) -> Option<&'a Variable> {
         for s in &self.shards {
             if let Some(id) = s.sorted_global_variable_names.binary_search(name.as_bytes()) {
-                let id = VariableIdx(id);
-                return Some(&self.shards[id.shard_idx()].global_variables[id.idx()]);
+                let v = id as *const Variable;
+                return Some(unsafe {&*v});
             }
         }
         None
@@ -828,9 +835,7 @@ pub struct SymbolsLoader {
 
     // Shuffling global variable names across threads for deduplication.
     // [sender][receiver] -> messages
-    send_global_variable_names: Vec<CachePadded<SyncUnsafeCell<Vec<CachePadded<SyncUnsafeCell<Vec<(&'static str, VariableIdx)>>>>>>>,
-    // Same as sym.shards[i].global_variables, but with a hundred wrappers to be able to update names in parallel without UB.
-    global_variables: Vec<CachePadded<SyncUnsafeCell<Vec<SyncUnsafeCell<Variable>>>>>,
+    send_global_variable_names: Vec<CachePadded<SyncUnsafeCell<Vec<CachePadded<SyncUnsafeCell<Vec<GlobalVariableNameMessage>>>>>>>,
 
     // [.strtab, .symtab], [.dynsym, .dynstr]
     strtab_symtab: Vec<[&'static [u8]; 2]>,
@@ -898,6 +903,14 @@ struct FileDedup {
     unit_idx: usize,
     idx_in_unit: usize,
 }
+
+#[derive(Clone, Copy, Ord, PartialOrd, Eq, PartialEq)]
+struct GlobalVariableNameMessage {
+    name: &'static str,
+    ptr: *mut Variable,
+}
+unsafe impl Send for GlobalVariableNameMessage {}
+unsafe impl Sync for GlobalVariableNameMessage {}
 
 // Usage: call new(), then alternate between single-threaded calls to prepare_stage(i) and multi-threaded calls to run(i, shard_idx) (for all shard_idx in parallel); when prepare_stage() returns Ok(false), call into_result().
 impl SymbolsLoader {
@@ -1004,7 +1017,7 @@ impl SymbolsLoader {
 
         let (types_loader, types_shards) = TypesLoader::create(num_shards);
         let mut shards: Vec<SymbolsLoaderShard> = types_shards.into_iter().map(|types| SymbolsLoaderShard {
-            sym: SymbolsShard {addr_to_line: Vec::new(), line_to_addr: Vec::new(), types: Types::new(), misc_arena: Arena::new(), local_variables: Vec::new(), global_variables: Vec::new(), sorted_global_variable_names: StringTable::new(), subfunctions: Vec::new(), subfunction_pc_ranges: Vec::new(), subfunction_levels: Vec::new(), mangled_name_to_function: Vec::new()},
+            sym: SymbolsShard {addr_to_line: Vec::new(), line_to_addr: Vec::new(), types: Types::new(), misc_arena: Arena::new(), local_variables: Vec::new(), global_variables: Arena::new(), sorted_global_variable_names: StringTable::new(), subfunctions: Vec::new(), subfunction_pc_ranges: Vec::new(), subfunction_levels: Vec::new(), mangled_name_to_function: Vec::new()},
             units: Vec::new(), symtab_ranges: Vec::new(), file_dedup: Vec::new(), file_used_lines: Vec::new(), types, base_types: Vec::new(), functions: Vec::new(), vtables: Vec::new(),
             temp_global_var_arena: Arena::new(), max_function_end: 0, functions_before_dedup: 0, warn: Limiter::new()}).collect();
 
@@ -1061,14 +1074,13 @@ impl SymbolsLoader {
         }
 
         // I am a good programmer.
-        let send_global_variable_names: Vec<CachePadded<SyncUnsafeCell<Vec<CachePadded<SyncUnsafeCell<Vec<(&'static str, VariableIdx)>>>>>>> =
+        let send_global_variable_names: Vec<CachePadded<SyncUnsafeCell<Vec<CachePadded<SyncUnsafeCell<Vec<GlobalVariableNameMessage>>>>>>> =
             (0..shards.len()).map(|_| CachePadded::new(SyncUnsafeCell::new((0..shards.len()).map(|_| CachePadded::new(SyncUnsafeCell::new(Vec::new()))).collect()))).collect();
-        let global_variables: Vec<CachePadded<SyncUnsafeCell<Vec<SyncUnsafeCell<Variable>>>>> = (0..shards.len()).map(|_| CachePadded::new(SyncUnsafeCell::new(Vec::new()))).collect();
 
         prepare_time_per_stage_ns[0] = start_time.elapsed().as_nanos() as usize;
         Ok(SymbolsLoader {
             num_shards: shards.len(), sym: Symbols {elf, debuglink_elf, identity: random(), dwarf, units, files: Vec::new(), file_paths: StringTable::new(), path_to_used_file: HashMap::new(), functions: Vec::new(), shards: Vec::new(), builtin_types: BuiltinTypes::invalid(), base_types: Vec::new(), vtables: Vec::new(), code_addr_range},
-            shards: shards.into_iter().map(|s| SyncUnsafeCell::new(CachePadded::new(s))).collect(), die_to_function_shards: (0..num_shards).map(|_| SyncUnsafeCell::new(CachePadded::new(Vec::new()))).collect(), types: types_loader, send_global_variable_names, global_variables, strtab_symtab, status, progress_per_stage,
+            shards: shards.into_iter().map(|s| SyncUnsafeCell::new(CachePadded::new(s))).collect(), die_to_function_shards: (0..num_shards).map(|_| SyncUnsafeCell::new(CachePadded::new(Vec::new()))).collect(), types: types_loader, send_global_variable_names, strtab_symtab, status, progress_per_stage,
             prepare_time_per_stage_ns, run_time_per_stage_ns, shard_progress_ppm: (0..num_shards).map(|_| CachePadded::new(AtomicUsize::new(0))).collect(), stage: 0, types_before_dedup: 0, type_offsets: 0, type_offset_maps_bytes: 0, type_dedup_maps_bytes: 0})
     }
 
@@ -1146,7 +1158,6 @@ impl SymbolsLoader {
             6 => self.types.run(3, shard_idx, &progress_callback),
             7 => {
                 let shard = unsafe {&mut *self.shards[shard_idx].get()};
-                self.finish_global_variables(shard_idx, shard);
                 self.fixup_type_refs(shard_idx, shard);
                 self.fixup_function_refs(shard);
             }
@@ -1357,7 +1368,7 @@ impl SymbolsLoader {
     }
 
     fn sort_global_variable_names(&self, shard_idx: usize, shard: &mut SymbolsLoaderShard) {
-        let mut names: Vec<(&'static str, VariableIdx)> = Vec::new();
+        let mut names: Vec<GlobalVariableNameMessage> = Vec::new();
         for other_shard in &self.send_global_variable_names {
             unsafe {names.append(&mut *(*other_shard.get())[shard_idx].get())};
         }
@@ -1366,14 +1377,14 @@ impl SymbolsLoader {
         let mut start = 0usize;
         while start < names.len() {
             let mut end = start + 1;
-            while end < names.len() && names[end].0 == names[start].0 {
+            while end < names.len() && names[end].name == names[start].name {
                 end += 1;
             }
             let suffix_helper = DisambiguatingSuffixes::new(end - start);
             for i in start..end {
-                let (name, var_idx) = names[i].clone();
-                let (final_name, _) = suffix_helper.disambiguate(name, i - start, var_idx.0, &mut shard.sym.sorted_global_variable_names);
-                unsafe {(*(*self.global_variables[var_idx.shard_idx()].get())[var_idx.idx()].get()).set_name(final_name)};
+                let n = &names[i];
+                let (final_name, _) = suffix_helper.disambiguate(n.name, i - start, n.ptr as usize, &mut shard.sym.sorted_global_variable_names);
+                unsafe {(*n.ptr).set_name(final_name)};
             }
             start = end;
         }
@@ -1510,21 +1521,13 @@ impl SymbolsLoader {
         }
     }
 
-    fn finish_global_variables(&self, shard_idx: usize, shard: &mut SymbolsLoaderShard) {
-        let vars = unsafe {&mut *self.global_variables[shard_idx].get()};
-        shard.sym.global_variables.reserve(vars.len());
-        for var in mem::take(vars) {
-            let mut v = var.into_inner();
-            v.type_ = self.types.find_final_type(DebugInfoOffset(v.type_ as usize));
-            shard.sym.global_variables.push(v);
-        }
-    }
-    
     fn fixup_type_refs(&self, shard_idx: usize, shard: &mut SymbolsLoaderShard) {
         for v in &mut shard.sym.local_variables {
             v.type_ = self.types.find_final_type(DebugInfoOffset(v.type_ as usize));
         }
-        // global_variables are fixed up by by finish_global_variables() instead.
+        for v in unsafe {shard.sym.global_variables.iter_mut::<Variable>()} {
+            v.type_ = self.types.find_final_type(DebugInfoOffset(v.type_ as usize));
+        }
     }
 
     fn finish_types(&mut self) {
@@ -1637,7 +1640,7 @@ impl SymbolsLoader {
             let misc_arena_size: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.misc_arena.capacity()}).sum();
             let lines: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.addr_to_line.len()}).sum();
             let local_variables: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.local_variables.len()}).sum();
-            let global_variables: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.global_variables.len()}).sum();
+            let global_variables: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.global_variables.used() / mem::size_of::<Variable>()}).sum();
             let global_variable_name_bytes: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.sorted_global_variable_names.arena.capacity()}).sum();
             let files_before_dedup: usize = self.sym.units.iter().map(|u| u.file_idx_remap.len()).sum();
 
@@ -1695,7 +1698,7 @@ impl SymbolsLoader {
                        ({:.2}x dedup, {:.2}x unused, {} of paths, {} of remap), \
                        {} functions ({:.2}x dedup, {}, {} of names), {} in misc arena \
                        {} subfunctions ({:.2}x ranges, {} sf, {} ranges, {} levels), \
-                       {} lines ({}), {} local variables ({}), {} global variables ({} of names), \
+                       {} lines ({}), {} local variables ({}), {} global variables ({}, names {}), \
                        {} types ({:.2}x dedup, {:.2}x offsets, {} names ({}), \
                        {} infos, {} fields ({:.2}% growth waste), {} nested names, {} misc, temp {} offset maps, temp {} dedup maps) \
                        ({} base types), {} vtables ({:.2}% unresolved){}",
@@ -1703,7 +1706,7 @@ impl SymbolsLoader {
                       files_before_dedup as f64 / self.sym.files.len() as f64, self.sym.files.len() as f64 / self.sym.path_to_used_file.len() as f64, PrettySize(self.sym.file_paths.arena.used()), PrettySize(files_before_dedup * mem::size_of::<usize>()),
                       PrettyCount(self.sym.functions.len()), funcs_before_dedup as f64 / self.sym.functions.len() as f64, PrettySize(self.sym.functions.len() * mem::size_of::<FunctionInfo>()), PrettySize(function_names_len), PrettySize(misc_arena_size),
                       PrettyCount(subfunctions), subfunction_pc_ranges as f64 / subfunctions as f64, PrettySize(subfunctions * mem::size_of::<Subfunction>()), PrettySize(subfunction_pc_ranges * mem::size_of::<SubfunctionPcRange>()), PrettySize(subfunction_levels * mem::size_of::<usize>()),
-                      PrettyCount(lines), PrettySize(lines * mem::size_of::<LineInfo>() * 2), PrettyCount(local_variables), PrettySize(local_variables * mem::size_of::<Variable>()), PrettyCount(global_variables), PrettySize(global_variable_name_bytes),
+                      PrettyCount(lines), PrettySize(lines * mem::size_of::<LineInfo>() * 2), PrettyCount(local_variables), PrettySize(local_variables * mem::size_of::<Variable>()), PrettyCount(global_variables), PrettySize(global_variables * mem::size_of::<Variable>()), PrettySize(global_variable_name_bytes),
                       PrettyCount(final_types), self.types_before_dedup as f64 / final_types as f64, self.type_offsets as f64 / self.types_before_dedup as f64, PrettyCount(type_names), PrettySize(type_names_len),
                       PrettySize(type_infos_bytes), PrettySize(fields_bytes), fields_bytes as f64 / field_used_bytes as f64 * 100.0 - 100.0, PrettyCount(nested_names), PrettySize(types_misc_bytes), PrettySize(self.type_offset_maps_bytes), PrettySize(self.type_dedup_maps_bytes),
                       PrettyCount(self.sym.base_types.len()), self.sym.vtables.len(), unresolved_vtables as f64 / self.sym.vtables.len() as f64 * 100.0, time_breakdown);
@@ -1993,6 +1996,7 @@ impl<'a> DwarfLoader<'a> {
 
         if is_global {
             let mut var = var.with_range(gimli::Range {begin: 0, end: u64::MAX});
+            var.add_flags(VariableFlags::GLOBAL);
             let mut unqualified_name = unsafe {var.name()};
             let mut demangled = false;
             // If name is missing, use demangled linkage_name.
@@ -2015,16 +2019,17 @@ impl<'a> DwarfLoader<'a> {
                 var.set_name(self.shard.temp_global_var_arena.add_str(&self.scope_name));
             }
             let name = unsafe {var.name()};
-            let vars = unsafe {&mut *self.loader.global_variables[self.shard_idx].get()};
-            let id = VariableIdx::pack(self.shard_idx, vars.len());
-            vars.push(SyncUnsafeCell::new(var));
+            let ptr = self.shard.sym.global_variables.add_mut(var) as *mut Variable;
 
             // Send the name to shard hash(name)%num_shards for deduplication.
             let hash = hash(name);
             let target_shard = hash % self.loader.shards.len();
-            unsafe {(*(*self.loader.send_global_variable_names[self.shard_idx].get())[target_shard].get()).push((name, id))};
+            unsafe {(*(*self.loader.send_global_variable_names[self.shard_idx].get())[target_shard].get()).push(GlobalVariableNameMessage {name, ptr})};
 
-            //asdqwe add to parent_type.nested_names
+            if parent_type != ptr::null_mut() {
+                // TODO: This doesn't cover the case when the declaration is separate from definition. The definition has location, the declaration has parent type, we have to somehow join the two.
+                self.stack[self.depth - 1].nested_names.push((unqualified_name, NestedName::Variable(ptr)));
+            }
         }
 
         Ok(())
@@ -2674,7 +2679,8 @@ impl<'a> DwarfLoader<'a> {
                             if is_static_field {
                                 // Static constant inside a struct.
                                 if attr_const_value.is_none() {
-                                    if self.shard.warn.check(line!()) { eprintln!("warning: static field with no DW_AT_const_value at @0x{:x}", offset.0); }
+                                    // Probably separate declaration and definition.
+                                    //if self.shard.warn.check(line!()) { eprintln!("warning: static field with no DW_AT_const_value at @0x{:x}", offset.0); }
                                 } else {
                                     let var = Variable::new(field.name, field.type_, offset, VariableFlags::empty());
                                     self.add_variable_locations(&None, &attr_const_value, &None, var, offset)?;
@@ -2965,9 +2971,10 @@ impl<'a> DwarfLoader<'a> {
                         }
                     }
                     if attr_const_value.is_none() || type_ == ptr::null() {
-                        if self.shard.warn.check(line!()) { eprintln!("warning: DW_TAG_template_value_parameter without DW_AT_const_value or DW_AT_type @0x{:x}", offset.0); }
+                        // Not sure what this means, but it's possible.
+                        //if self.shard.warn.check(line!()) { eprintln!("warning: DW_TAG_template_value_parameter without DW_AT_const_value or DW_AT_type @0x{:x}", offset.0); }
                     } else {
-                        let var = Variable::new(name, type_, offset, VariableFlags::empty());
+                        let var = Variable::new(name, type_, offset, VariableFlags::TEMPLATE_PARAMETER);
                         self.add_variable_locations(&None, &attr_const_value, &None, var, offset)?;
                     }
                 }

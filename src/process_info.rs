@@ -149,7 +149,7 @@ pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) {
     // Avoid returning (including '?') in this scope.
     {
         let mut prev_binaries = mem::take(&mut debugger.info.binaries);
-        for map in &maps.maps {
+        for (idx, map) in maps.maps.iter().enumerate() {
             let id = match &map.binary_id {
                 None => continue,
                 Some(b) => b,
@@ -177,7 +177,7 @@ pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) {
                 None
             };
 
-            let latest = debugger.symbols.get_or_load(id, &debugger.memory, custom_path);
+            let latest = debugger.symbols.get_or_load(id, &debugger.memory, custom_path, idx);
 
             let mut binary = match prev_binaries.remove(id) {
                 Some(mut bin) => {
@@ -226,8 +226,12 @@ pub fn refresh_all_resource_stats(pid: pid_t, my_stats: &mut ResourceStats, debu
     let now = Instant::now();
     my_stats.update(ProcStat::parse("/proc/self/stat", prof), now, false, settings.periodic_timer_ns);
     let mut any_error = my_stats.error.clone();
-    debuggee_stats.update(ProcStat::parse(&format!("/proc/{}/stat", pid), prof), now, false, settings.periodic_timer_ns);
-    any_error = any_error.or_else(|| debuggee_stats.error.clone());
+    if !threads.is_empty() {
+        debuggee_stats.update(ProcStat::parse(&format!("/proc/{}/stat", pid), prof), now, false, settings.periodic_timer_ns);
+        any_error = any_error.or_else(|| debuggee_stats.error.clone());
+    } else {
+        *debuggee_stats = ResourceStats::default();
+    }
 
     for (tid, t) in threads {
         if !t.exiting {

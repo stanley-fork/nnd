@@ -1,14 +1,3 @@
-global variables
-  -constant values in locations window
-  +test with 10-byte values of 16-byte long doubles
-  from symtab
-  research .debug_pubtypes and .debug_pubnames
-  -access from watch expressions
-  search dialog in watches window
-  reflection
-  documentation
-    :: prefix to disambiguate from locals
-    from_any_frame, check what syntax remedybg uses
 investigate `clickhouse local` progress spinner appearing in debugger window despite -t
 fix empty symbols loading stage name near the end
 investigate regression in symbols loading speed (stuck on "parsing drawf" for ~10 seconds)
@@ -27,8 +16,10 @@ test with 10k threads
 test with watches window filled with long arrays (I saw 50ms frames when there are ~5 of them; maybe just decrease length limit)
 
 up/down arrows should close code search, or cycle history
+global variable search
+global variables from .symtab, maybe from .debug_pubnames (maybe also look into .debug_pubtypes)
 make symtab/dynsym work when debug info (or debuglink file) is missing
-more built-in pretty printers: hash tables (sparsehash, absl), rb trees, b-trees, deque; update documentation when all are done
+more built-in pretty printers: sparsehash, absl, rust b-trees
 hotkey to switch between .h/.cpp (/.cc/.hh/.hpp/.cxx - maybe just all extensions)
 reordering tabs
 rearranging windows

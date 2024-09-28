@@ -481,6 +481,7 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
             }
             // TODO: downcast() to explicitly downcast to concrete type (to be able to typeof() the result)
             // TODO: maybe pretty() to explicitly apply pretty-printers
+            // TODO: var() to get MetaVariable
             _ => return err!(NoFunction, "no builtin function '{}' (calling debuggee functions is not supported)", name),
         }
         AST::Type {..} | AST::PointerType => panic!("unexpected type AST"),
@@ -502,7 +503,7 @@ fn eval_type(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, context
 
 fn follow_references_and_prettify(val: &mut Value, pointers_too: bool, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
     for step in 0..100 {
-        if unsafe {(*val.type_).t.is_meta_type_or_field()} {
+        if unsafe {(*val.type_).t.is_meta()} {
             *val = reflect_meta_value(val, state, context, None);
             return Ok(());
         }

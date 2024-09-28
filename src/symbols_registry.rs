@@ -13,6 +13,9 @@ pub struct BinaryInfo {
 
     // Not known by SymbolsRegistry, populated after taking the BinaryInfo from SymbolsRegistry.
     pub addr_map: AddrMap,
+
+    // Just for sorting in UI.
+    pub initial_idx_in_proc_maps: usize,
 }
 
 pub struct SymbolsRegistry {
@@ -23,7 +26,7 @@ pub struct SymbolsRegistry {
 impl SymbolsRegistry {
     pub fn new(context: Arc<Context>) -> Self { Self {binaries: HashMap::new(), shared: Arc::new(Shared {context, to_main_thread: Mutex::new(VecDeque::new()), wake_main_thread: Arc::new(EventFD::new())})} }
 
-    pub fn get_or_load(&mut self, id: &BinaryId, memory: &MemReader, custom_path: Option<String>) -> BinaryInfo {
+    pub fn get_or_load(&mut self, id: &BinaryId, memory: &MemReader, custom_path: Option<String>, idx_in_proc_maps: usize) -> BinaryInfo {
         self.binaries.entry(id.clone()).or_insert_with(|| {
             let mut elf_contents_maybe: Result<Vec<u8>> = err!(Internal, "no contents");
             match &id.special {
@@ -42,7 +45,7 @@ impl SymbolsRegistry {
             *status.stage.lock().unwrap() = "opening ELF".to_string();
             let (shared_clone, id_clone, status_clone) = (self.shared.clone(), id.clone(), status.clone());
             self.shared.context.executor.add(move || task_load_elf(shared_clone, id_clone, status_clone, elf_contents_maybe, custom_path));
-            (BinaryInfo {id: id.clone(), elf: err!(Loading, "loading symbols"), symbols: err!(Loading, "loading symbols"), unwind: err!(Loading, "loading symbols"), addr_map: AddrMap::new()}, status)
+            (BinaryInfo {id: id.clone(), elf: err!(Loading, "loading symbols"), symbols: err!(Loading, "loading symbols"), unwind: err!(Loading, "loading symbols"), addr_map: AddrMap::new(), initial_idx_in_proc_maps: idx_in_proc_maps}, status)
         }).0.clone()
     }
 

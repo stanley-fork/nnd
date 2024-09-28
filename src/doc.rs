@@ -99,24 +99,20 @@ Debugging tips:
 Please (pretty please!) report all bugs, usability issues, slowness, first impressions, improvement ideas, feature requests, etc.
 If you work at ClickHouse, report to #debugger channel in slack or DM Michael Kolupaev. Otherwise email to mk.al13n+nnd@gmail.com or comment at https://al13n.itch.io/nnd"###),
         "--help-known-problems" =>             println!(r###"Current limitations:
- * There are pretty printers for vector/slice/string/shared_ptr-like standard types in C++ and Rust. No pretty printers for hash tables, linked lists, and std::deque yet.
- * No global variables.
  * Thread filter ('/' in the threads window) is too limited: just a substring match in function name, file name, and thread name. Need to extend it enough to be able to e.g. filter out idle threads waiting for work or epoll.
  * In watch expressions, type names (for casts or type info) have to be spelled *exactly* the same way as they appear in the debug info.
    E.g. `std::vector<int>` doesn't work, you have to write `std::__1::vector<int, std::__1::allocator<int> >` (whitespace matters).
    The plan is to add a fuzzy search dialog for type names, similar to file and function search.
    (There is no plan to actually parse the template type names into their component parts; doing it correctly would be crazy complicated like everything else in C++.)
  * Can't assign to the debugged program's variables or registers
- * Can't add breakpoints in the disassembly window yet.
  * No data breakpoints, whole-file breakpoints, conditional breakpoints, special breakpoints (signals, exceptions/panics, main()).
  * Inside libraries that were dlopen()ed at runtime, breakpoints get disabled on program restart. Manually disable-enable the breakpoint after the dlopen() to reactivate it.
  * The disassembly window can only open functions that appear in .symtab or debug info. Can't disassemble arbitrary memory, e.g. JIT-generated code or code from binaries without .symtab or debug info.
- * The 'locations' window is too cryptic.
  * The debugger gets noticeably slow when the program has > 1K threads, and unusably slow with 20K threads. Part of it is inevitable syscalls
    (to start/stop all n threads we have to do n*const syscalls, then wait for n notifications - that takes a while), but there's a lot of room for improvement anyway
    (reduce the const, do the syscalls in parallel, avoid the remaining O(n^2) work on our side).
  * No customization of colors. Dark theme only.
- * No remote debugging. The debugger works over ssh, but it's inconvenient for production servers: you have to scp the source code and the unstripped binary to it.
+ * No remote debugging. You can use the debugger over ssh, but it can be inconvenient for production servers: you have to scp the source code and the unstripped binary to it.
    And the debugger uses lots of RAM, which may be a problem on small servers.
    (I'm not sure what exactly to do about this. Fully separating the debugger-agent from UI+debuginfo would increase the code complexity a lot and make performance worse.
     Maybe I'll instead run the ~whole debugger on the server and have a thin client that just streams the rendered 'image' (text) from the server and sends the source code files on demand.
@@ -156,7 +152,7 @@ Inspecting types:
    E.g. '`std::__1::atomic<int>`' works (on some version of libc++), but '`std::__1::atomic<int32_t>`', '`std::atomic<int>`', and '`atomic<int>`' don't.
  * 'typeof(<expression>)' to get information about result type of an expression.
    (Currently the expression is partially evaluated in some cases, e.g. 'typeof(*(0 as *mystruct))' works, but 'typeof((0 as *mystruct).myfield)' doesn't.)
- * Casting to typeof is not implementing, coming soon: 'x as typeof(y)'
+ * Casting to typeof is not implemented, coming soon: 'x as typeof(y)'
 
 Script variables:
  * 'x=foo.bar.baz' to assign to a new script variable 'x', which can then be used by later watch expressions.

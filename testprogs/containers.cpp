@@ -54,23 +54,20 @@ int main() {
     auto pv = std::make_shared<std::vector<int>>(std::vector<int>({10, 20, 30}));
 
     // Deque.
-    std::deque<int> deq = {1, 2, 3};     // [no, no]
-    std::stack<int> stk;                 // [no, no]
+    std::deque<int> deq = {1, 2, 3};     // [yes, yes]
+    std::stack<int> stk;                 // [yes, yes]
     stk.push(1);
-    std::queue<int> que;                 // [no, no]
+    std::queue<int> que;                 // [yes, yes]
     que.push(1);
-
-    // Deque exploration.
-    std::deque<std::array<uint64_t, 29>> deq2;
-    for (uint64_t i = 0; i < 40; ++i) {
-        std::array<uint64_t, 29> t;
-        for (uint64_t j = 0; j < t.size(); ++j) t[j] = i*1000 + j;
-        deq2.push_back(t);
+    for (int i = 0; i < 100; ++i) {
+        deq.push_back(i * 10);
+        stk.push(i * 100);
+        que.push(i * 1000);
     }
-    deq2.erase(deq2.begin(), deq2.begin() + 3);
-    uint64_t sum = 0;
-    for (auto it = deq2.begin(); it != deq2.end(); ++it) {
-        sum += (*it)[15];
+    for (int i = 0; i < 50; ++i) {
+        deq.pop_front();
+        stk.pop();
+        que.pop();
     }
 
     // Linked lists.
@@ -78,10 +75,10 @@ int main() {
     std::forward_list<int> flst = {1, 2, 3};  // [yes, yes]
 
     // Trees.
-    std::set<int> set = {1, 2, 3};                                                // [no, no]
-    std::multiset<int> mset = {1, 1, 2, 3};                                       // [no, no]
-    std::map<int, std::string> map = {{1, "one"}, {2, "two"}};                    // [no, no]
-    std::multimap<int, std::string> mmap = {{1, "one"}, {1, "uno"}, {2, "two"}};  // [no, no]
+    std::set<int> set = {1, 2, 3};                                                // [yes, yes]
+    std::multiset<int> mset = {1, 1, 2, 3};                                       // [yes, yes]
+    std::map<int, std::string> map = {{1, "one"}, {2, "two"}};                    // [yes, yes]
+    std::multimap<int, std::string> mmap = {{1, "one"}, {1, "uno"}, {2, "two"}};  // [yes, yes]
 
     // Hash tables.
     std::unordered_set<int> uset = {1, 2, 3};                                                // [yes, yes]
@@ -119,10 +116,10 @@ int main() {
     auto range = std::views::iota(1, 10);
 
     // Prevent optimizations
-    volatile int dummy = vec[0] + arr[0] + *uptr + *sptr + short_str[0] + long_str[0] + pair.first + std::get<0>(tuple) + 
+    volatile int dummy = vec[0] + arr[0] + arr[2] + *uptr + *sptr + short_str[0] + long_str[0] + pair.first + std::get<0>(tuple) + 
         *opt + (int)std::get<double>(var) + std::any_cast<int>(any_val) + func(1) + 
         bits.count() + c.real() + va[0] + sp[0] + *range.begin() + strview[0] + 
-        wstr[0] + u16str[0] + u32str[0] + (*pv)[0] + sum;
+        wstr[0] + u16str[0] + u32str[0] + (*pv)[0];
     (void)dummy;
 
     t.join();

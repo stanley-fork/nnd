@@ -847,7 +847,7 @@ fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut Form
             }
             Err(e) => styled_write!(state.out, state.palette.error, "<{}>", e),
         }
-        Type::MetaType | Type::MetaField => {
+        Type::MetaType | Type::MetaField | Type::MetaVariable => {
             let val = reflect_meta_value(&v, state.state, state.context, Some((state.out, state.palette)));
             children = list_struct_children(&val.val, unsafe {(*val.type_).t.as_struct().unwrap()}, val.flags, state);
         }

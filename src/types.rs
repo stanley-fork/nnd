@@ -1,4 +1,4 @@
-use crate::{util::*, arena::*, log::*, *, settings::*, common_ui::*};
+use crate::{util::*, arena::*, log::*, *, settings::*, common_ui::*, symbols::*};
 use std::{hint, collections::{HashMap, hash_map::{DefaultHasher, Entry}}, hash::{Hash, Hasher}, sync::{Mutex, atomic::{AtomicUsize, Ordering}}, ptr, mem, mem::MaybeUninit, result, io::Write, slice, ops::Range, fmt, fmt::Write as fmtWrite};
 use bitflags::*;
 use gimli::DebugInfoOffset;
@@ -193,8 +193,9 @@ pub enum Type {
     // Only produced by expression interpreter, never appears in Symbols. Unlike Pointer, this pointer is in debugger's address space.
     // We cast pointers to bytes and back, which may stop being possible in rust in future. Maybe we'll have to add a designated pointer to ValueBlob or something.
     MetaType,
-    // Similar to MetaType, but for *StructField.
+    // Similar to MetaType, but for *StructField and *Variable.
     MetaField,
+    MetaVariable,
     // Pointer + count. Currently only produced by pretty-printers; things like Rust slices are represented as structs in debug info,
     // and we don't spend time recognizing them and converting to slices at symbols loading time.
     // This type is mostly superfluous in the current very-dynamically-typed interpreter, where we can just create a new Array type for each array,
@@ -209,7 +210,7 @@ impl Type {
     pub fn as_array_mut(&mut self) -> Option<&mut ArrayType> { match self { Type::Array(a) => Some(a), _ => None } }
     pub fn as_struct(&self) -> Option<&StructType> { match self { Type::Struct(s) => Some(s), _ => None } }
     pub fn as_struct_mut(&mut self) -> Option<&mut StructType> { match self { Type::Struct(s) => Some(s), _ => None } }
-    pub fn is_meta_type_or_field(&self) -> bool { match self { Type::MetaType | Type::MetaField => true, _ => false} }
+    pub fn is_meta(&self) -> bool { match self { Type::MetaType | Type::MetaField | Type::MetaVariable => true, _ => false} }
     pub fn is_primitive_char(&self) -> bool { match self { Type::Primitive(p) if p.contains(PrimitiveFlags::CHAR) => true, _ => false } }
     pub fn kind_name(&self) -> &'static str {
         match self {
@@ -223,7 +224,8 @@ impl Type {
             Type::Struct(_) => "struct",
             Type::Enum(_) => "enum",
             Type::MetaType => "type",
-            Type::MetaField => "field"
+            Type::MetaField => "field",
+            Type::MetaVariable => "variable",
         }
     }
 }    
@@ -249,7 +251,8 @@ pub const FAKE_DWARF_OFFSET_START: usize = (1 << 48) - 1000;
 #[derive(Clone, Copy, Debug)]
 pub enum NestedName {
     Type(*const TypeInfo),
-    // TODO: Global variable.
+    // Global variable, e.g. static field. Points into SymbolsShard.global_variables.
+    Variable(*const Variable),
 }
 
 #[derive(Clone, Debug)]
@@ -281,7 +284,7 @@ impl TypeInfo {
                 return t.size * multiplier;
             }
             match &t.t {
-                Type::Unknown | Type::Primitive(_) | Type::Pointer(_) | Type::MetaType | Type::MetaField => return 8 * multiplier,
+                Type::Unknown | Type::Primitive(_) | Type::Pointer(_) | Type::MetaType | Type::MetaField | Type::MetaVariable => return 8 * multiplier,
                 Type::Slice(_) => return 16 * multiplier,
                 Type::Struct(_) => return 0,
                 Type::Enum(e) => t = unsafe {&*e.type_},
@@ -444,12 +447,13 @@ pub struct BuiltinTypes {
     pub bool_: *const TypeInfo,
     pub meta_type: *const TypeInfo,
     pub meta_field: *const TypeInfo,
+    pub meta_variable: *const TypeInfo,
 }
 impl BuiltinTypes {
-    pub fn invalid() -> Self { Self {void: ptr::null(), void_pointer: ptr::null(), unknown: ptr::null(), u8_: ptr::null(), u16_: ptr::null(), u32_: ptr::null(), u64_: ptr::null(), i8_: ptr::null(), i16_: ptr::null(), i32_: ptr::null(), i64_: ptr::null(), f32_: ptr::null(), f64_: ptr::null(), f128_: ptr::null(), char8: ptr::null(), char32: ptr::null(), bool_: ptr::null(), meta_type: ptr::null(), meta_field: ptr::null()} }
+    pub fn invalid() -> Self { Self {void: ptr::null(), void_pointer: ptr::null(), unknown: ptr::null(), u8_: ptr::null(), u16_: ptr::null(), u32_: ptr::null(), u64_: ptr::null(), i8_: ptr::null(), i16_: ptr::null(), i32_: ptr::null(), i64_: ptr::null(), f32_: ptr::null(), f64_: ptr::null(), f128_: ptr::null(), char8: ptr::null(), char32: ptr::null(), bool_: ptr::null(), meta_type: ptr::null(), meta_field: ptr::null(), meta_variable: ptr::null()} }
 
     fn map<F: FnMut(*const TypeInfo) -> *const TypeInfo>(&self, mut f: F) -> Self {
-        Self {void: f(self.void), void_pointer: f(self.void_pointer), unknown: f(self.unknown), u8_: f(self.u8_), u16_: f(self.u16_), u32_: f(self.u32_), u64_: f(self.u64_), i8_: f(self.i8_), i16_: f(self.i16_), i32_: f(self.i32_), i64_: f(self.i64_), f32_: f(self.f32_), f64_: f(self.f64_), f128_: f(self.f128_), char8: f(self.char8), char32: f(self.char32), bool_: f(self.bool_), meta_type: f(self.meta_type), meta_field: f(self.meta_field)}
+        Self {void: f(self.void), void_pointer: f(self.void_pointer), unknown: f(self.unknown), u8_: f(self.u8_), u16_: f(self.u16_), u32_: f(self.u32_), u64_: f(self.u64_), i8_: f(self.i8_), i16_: f(self.i16_), i32_: f(self.i32_), i64_: f(self.i64_), f32_: f(self.f32_), f64_: f(self.f64_), f128_: f(self.f128_), char8: f(self.char8), char32: f(self.char32), bool_: f(self.bool_), meta_type: f(self.meta_type), meta_field: f(self.meta_field), meta_variable: f(self.meta_variable)}
     }
 
     fn create<F: FnMut(TypeInfo) -> *const TypeInfo>(mut f: F) -> Self {
@@ -475,6 +479,7 @@ impl BuiltinTypes {
             bool_: f(primitive("bool", 1, PrimitiveFlags::BOOL)),
             meta_type: f(TypeInfo {name: "type", size: 8, flags: TypeFlags::SIZE_KNOWN, t: Type::MetaType, ..Default::default()}),
             meta_field: f(TypeInfo {name: "field", size: 8, flags: TypeFlags::SIZE_KNOWN, t: Type::MetaField, ..Default::default()}),
+            meta_variable: f(TypeInfo {name: "variable", size: 8, flags: TypeFlags::SIZE_KNOWN, t: Type::MetaVariable, ..Default::default()}),
         }
     }
 }
@@ -507,6 +512,7 @@ impl fmt::Debug for DumpType {
                 }
                 Type::MetaType => write!(f, "type")?,
                 Type::MetaField => write!(f, "field")?,
+                Type::MetaVariable => write!(f, "field")?,
             }
         }
         Ok(())
@@ -1123,7 +1129,7 @@ impl TypesLoader {
                 let mut dedup_with_name = false;
                 match &mut info.t {
                     Type::Unknown | Type::Primitive(_) => (),
-                    Type::MetaType | Type::MetaField | Type::Slice(_) => (), // these don't appear in debug symbols, but we add them as builtins along the way, so end up participating in deduplication unnecessarily
+                    Type::MetaType | Type::MetaField | Type::MetaVariable | Type::Slice(_) => (), // these don't appear in debug symbols, but we add them as builtins along the way, so end up participating in deduplication unnecessarily
                     Type::Pointer(p) => {
                         unlock();
                         p.type_ = self.find_and_dfs(original_shard_idx, DebugInfoOffset(p.type_ as usize), on_cycle).0;
@@ -1244,6 +1250,7 @@ impl TypesLoader {
                 match n {
                     // (Alternatively, we could do this as a separate loading stage that does find_final_type() without dfs.)
                     NestedName::Type(type_) => *type_ = self.find_and_dfs(original_shard_idx, DebugInfoOffset(*type_ as usize), /*on_cycle*/ false).0,
+                    NestedName::Variable(_) => (),
                 }
             }
             t.nested_names = new_nested_names;
