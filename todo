@@ -4,6 +4,7 @@ investigate regression in symbols loading speed (stuck on "parsing drawf" for ~1
 investigate why many types are not deduped, e.g. there's DB::Block#441
 make stack unwinding work when control is in .plt or .plt.got, see "Recognise PLT entries such as" in libunwind code
 log a message if the process forked away
+investigate why quitting is slow
 
 optimize simple things found by profiler (samply is nice)
 look at profiler on ch server (1500 threads)
@@ -25,7 +26,6 @@ reordering tabs
 rearranging windows
 maximizing windows
 thread-local storage
-const variables
 array types in watch expression (x as *[i32; 10])
 key to freeze value in watches window; can also be used for controlling when to run the expression if it has side effects
 tooltip in status window showing more log lines with line wrapping

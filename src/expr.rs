@@ -1330,7 +1330,7 @@ impl StructBuilder {
     pub fn finish(mut self, name: &'static str, flags: ValueFlags, types: &mut Types) -> Value {
         let fields_slice = types.fields_arena.add_slice(&self.fields);
         let struct_type = StructType {flags: StructFlags::empty(), fields_ptr: fields_slice.as_ptr(), fields_len: fields_slice.len()};
-        let type_ = TypeInfo {name, size: self.value_blob.len(), die: DebugInfoOffset(0), language: LanguageFamily::Internal, nested_names: &[], flags: TypeFlags::SIZE_KNOWN, t: Type::Struct(struct_type)};
+        let type_ = TypeInfo {name, size: self.value_blob.len(), die: DebugInfoOffset(0), symbols_identity: 0, line: LineInfo::invalid(), language: LanguageFamily::Internal, nested_names: &[], flags: TypeFlags::SIZE_KNOWN, t: Type::Struct(struct_type)};
         let type_ = types.types_arena.add(type_);
         let val = AddrOrValueBlob::Blob(ValueBlob::from_vec(mem::take(&mut self.value_blob)));
         Value {val, type_, flags}

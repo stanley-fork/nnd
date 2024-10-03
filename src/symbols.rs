@@ -494,7 +494,7 @@ bitflags! { pub struct LineFlags: usize {
 const LINE_FLAGS_BITS: u32 = 2;
 
 // A machine code location + source code location: address, file, line number, column number.
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct LineInfo {
     // There are tens of millions of instances of this struct, so it's important to make it compact.
     // Currently we bit-pack things into 128 bits like this:
@@ -2414,7 +2414,7 @@ impl<'a> DwarfLoader<'a> {
                             Type::Pointer(PointerType {flags: PointerFlags::empty(), type_: self.loader.types.builtin_types.unknown})
                         }
                         _ => panic!("huh?") };
-                    let mut info = TypeInfo {die: offset, t, language: self.unit_language, ..Default::default()};
+                    let mut info = TypeInfo {die: offset, symbols_identity: 0/*asdqwe*/, line: LineInfo::invalid()/*asdqwe*/, t, language: self.unit_language, ..Default::default()};
                     let mut saw_type = false;
                     let mut is_complex_float = false;
                     let mut unqualified_name: &'static str = "";
@@ -2697,65 +2697,71 @@ impl<'a> DwarfLoader<'a> {
                     }
                 }
 
-                DW_TAG_subrange_type if self.stack[self.depth - 1].tag != DW_TAG_array_type => {
-                    if self.shard.warn.check(line!()) { eprintln!("warning: {} in {} is not supported", abbrev.tag(), self.stack[self.depth - 1].tag); }
-                    cursor.skip_attributes(abbrev.attributes())?;
-                }
-
                 // Array dimensions.
                 DW_TAG_subrange_type => {
                     // Applicable attributes:
                     // Useful: count, byte_stride, bit_stride, byte_size, bit_size, lower_bound, upper_bound, type
                     // Other: alignment, data_location, declaration, threads_scaled
                     // Other: DECL, name, accessibility, allocated, associated, visibility
-                    let mut array = unsafe {(*self.stack[self.depth - 1].exact_type).t.as_array_mut().unwrap()};
-                    if !array.flags.contains(ArrayFlags::PARSED_SUBRANGE) {
-                        array.flags.insert(ArrayFlags::PARSED_SUBRANGE);
-                    } else {
-                        // Turn multidimensional array into array of arrays.
-                        let info = TypeInfo {die: offset, language: self.unit_language, t: Type::Array(ArrayType {flags: ArrayFlags::PARSED_SUBRANGE, type_: array.type_, stride: 0, len: 0}), ..TypeInfo::default()};
-                        let (ptr, off) = self.shard.types.add_type(info);
-                        assert!(ptr != ptr::null());
-                        array.type_ = off;
-                        self.stack[self.depth - 1].exact_type = ptr as *mut TypeInfo;
-                        array = unsafe {(*self.stack[self.depth - 1].exact_type).t.as_array_mut().unwrap()};
-                    }
-
-                    let mut lower_bound: u64 = 0;
-                    let mut upper_bound: Option<u64> = None;
-                    for &attr in abbrev.attributes() {
-                        match attr.name() {
-                            DW_AT_byte_stride | DW_AT_bit_stride => if let Some(s) = parse_attr_stride(cursor.read_attribute(attr)?, offset, &mut self.shard.warn) {
-                                array.stride = s;
-                            },
-                            DW_AT_count => match cursor.read_attribute(attr)?.value().udata_value() {
-                                None => (), // likely VLA
-                                Some(n) => {
-                                    array.len = n as usize;
-                                    array.flags.insert(ArrayFlags::LEN_KNOWN);
-                                }
-                            }
-                            DW_AT_lower_bound => match cursor.read_attribute(attr)?.value().udata_value() {
-                                None => (), // likely VLA
-                                Some(s) => {
-                                    if s != 0 && self.shard.warn.check(line!()) { eprintln!("warning: arrays with nonzero lower bound are not supported (have one @0x{:x})", offset.0); }
-                                    // We calculate length as upper_bound-lower_bound, but don't subtract lower bound when indexing in watch expressions.
-                                    lower_bound = s;
-                                }
-                            }
-                            DW_AT_upper_bound => match cursor.read_attribute(attr)?.value().udata_value() {
-                                None => (), // likely VLA
-                                Some(s) => upper_bound = Some(s),
-                            }
-                            _ => cursor.skip_attributes(&[attr])?,
+                    let t = self.stack[self.depth - 1].exact_type;
+                    if t == ptr::null_mut() || unsafe {(*t).t.as_array_mut().is_none()} {
+                        if self.stack[self.depth - 1].tag != DW_TAG_array_type {
+                            if self.shard.warn.check(line!()) { eprintln!("warning: {} in {} is not supported", abbrev.tag(), self.stack[self.depth - 1].tag); }
+                        } else {
+                            // (Warning would already be printed when parsing the parent.)
                         }
-                    }
-                    if let Some(upper_bound) = upper_bound {
-                        if lower_bound > upper_bound {
-                            if self.shard.warn.check(line!()) { eprintln!("warning: array has lower bound {} > upper bound {} @0x{:x}", lower_bound, upper_bound, offset.0); }
-                        } else if !array.flags.contains(ArrayFlags::LEN_KNOWN) {
-                            array.len = (upper_bound - lower_bound + 1) as usize;
-                            array.flags.insert(ArrayFlags::LEN_KNOWN);
+                        cursor.skip_attributes(abbrev.attributes())?;
+                    } else {
+                        let t = unsafe {&mut *t};
+                        let mut array = t.t.as_array_mut().unwrap();
+                        if !array.flags.contains(ArrayFlags::PARSED_SUBRANGE) {
+                            array.flags.insert(ArrayFlags::PARSED_SUBRANGE);
+                        } else {
+                            // Turn multidimensional array into array of arrays.
+                            let info = TypeInfo {die: offset, symbols_identity: t.symbols_identity, line: t.line, language: self.unit_language, t: Type::Array(ArrayType {flags: ArrayFlags::PARSED_SUBRANGE, type_: array.type_, stride: 0, len: 0}), ..TypeInfo::default()};
+                            let (ptr, off) = self.shard.types.add_type(info);
+                            assert!(ptr != ptr::null());
+                            array.type_ = off;
+                            self.stack[self.depth - 1].exact_type = ptr as *mut TypeInfo;
+                            array = unsafe {(*self.stack[self.depth - 1].exact_type).t.as_array_mut().unwrap()};
+                        }
+
+                        let mut lower_bound: u64 = 0;
+                        let mut upper_bound: Option<u64> = None;
+                        for &attr in abbrev.attributes() {
+                            match attr.name() {
+                                DW_AT_byte_stride | DW_AT_bit_stride => if let Some(s) = parse_attr_stride(cursor.read_attribute(attr)?, offset, &mut self.shard.warn) {
+                                    array.stride = s;
+                                },
+                                DW_AT_count => match cursor.read_attribute(attr)?.value().udata_value() {
+                                    None => (), // likely VLA
+                                    Some(n) => {
+                                        array.len = n as usize;
+                                        array.flags.insert(ArrayFlags::LEN_KNOWN);
+                                    }
+                                }
+                                DW_AT_lower_bound => match cursor.read_attribute(attr)?.value().udata_value() {
+                                    None => (), // likely VLA
+                                    Some(s) => {
+                                        if s != 0 && self.shard.warn.check(line!()) { eprintln!("warning: arrays with nonzero lower bound are not supported (have one @0x{:x})", offset.0); }
+                                        // We calculate length as upper_bound-lower_bound, but don't subtract lower bound when indexing in watch expressions.
+                                        lower_bound = s;
+                                    }
+                                }
+                                DW_AT_upper_bound => match cursor.read_attribute(attr)?.value().udata_value() {
+                                    None => (), // likely VLA
+                                    Some(s) => upper_bound = Some(s),
+                                }
+                                _ => cursor.skip_attributes(&[attr])?,
+                            }
+                        }
+                        if let Some(upper_bound) = upper_bound {
+                            if lower_bound > upper_bound {
+                                if self.shard.warn.check(line!()) { eprintln!("warning: array has lower bound {} > upper bound {} @0x{:x}", lower_bound, upper_bound, offset.0); }
+                            } else if !array.flags.contains(ArrayFlags::LEN_KNOWN) {
+                                array.len = (upper_bound - lower_bound + 1) as usize;
+                                array.flags.insert(ArrayFlags::LEN_KNOWN);
+                            }
                         }
                     }
                 }
@@ -2835,7 +2841,7 @@ impl<'a> DwarfLoader<'a> {
 
                 // TODO: Function pointers and pointers to members.
                 DW_TAG_ptr_to_member_type | DW_TAG_subroutine_type => {
-                    self.shard.types.add_type(TypeInfo {name: "<unsupported>", die: offset, language: self.unit_language, flags: TypeFlags::UNSUPPORTED, ..TypeInfo::default()});
+                    self.shard.types.add_type(TypeInfo {name: "<unsupported>", die: offset, symbols_identity: 0/*asdqwe*/, line: LineInfo::invalid()/*asdqwe*/, language: self.unit_language, flags: TypeFlags::UNSUPPORTED, ..TypeInfo::default()});
                     skip_subtree = self.depth;
                     cursor.skip_attributes(abbrev.attributes())?;
                 }
