@@ -12,8 +12,10 @@ pub struct SymbolSearcher {
 
     state: Arc<SearchState>,
 
-    searched_query: SearchQuery,
-    searched_num_symbols: usize,
+    seen_query: String,
+    seen_num_symbols: usize,
+
+    query: SearchQuery,
 }
 
 const MAX_RESULTS: usize = 1000;
@@ -87,15 +89,36 @@ impl PaddedString {
 pub struct SearchQuery {
     pub s: PaddedString,
     pub case_sensitive: bool,
+
+    pub filename: PaddedString,
+    pub line: Option<usize>,
 }
 impl SearchQuery {
-    pub fn parse(s: &str) -> Self {
+    pub fn parse(s: &str, can_have_file: bool) -> Self {
         let case_sensitive = s.chars().any(|c| c.is_ascii_uppercase());
-        Self {s: PaddedString::new(s), case_sensitive}
+        let mut query = s;
+        let mut filename = "";
+        let mut line = None;
+        if can_have_file {
+            // "query@file:line"
+            if let Some(i) = s.find('@') {
+                query = &s[..i];
+                filename = &s[i+1..];
+                if let Some(j) = filename.find(':') {
+                    if let Ok(n) = filename[j+1..].parse::<usize>() {
+                        filename = &filename[..j];
+                        line = Some(n);
+                    } else if filename[j+1..].is_empty() {
+                        filename = &filename[..j];
+                    }
+                }
+            }
+        }
+        Self {s: PaddedString::new(query), case_sensitive, filename: PaddedString::new(filename), line}
     }
 
     pub fn is_empty(&self) -> bool {
-        self.s.get().is_empty()
+        self.s.get().is_empty() && self.filename.get().is_empty() && self.line.is_none()
     }
 }
 
@@ -108,8 +131,36 @@ impl SearchState {
     fn new() -> Self { Self {results: Mutex::new(SearchResults::new()), cancel: AtomicBool::new(false), tasks_remaining: AtomicUsize::new(0)} }
 }
 
-fn search_task(state: Arc<SearchState>, query: SearchQuery, symbols: Arc<Symbols>, symbols_idx: usize, shard_idx: usize, searcher: Arc<dyn Searcher>, context: Arc<Context>) {
-    searcher.search(&symbols, symbols_idx, shard_idx, &query, &state.cancel, &mut |mut res: Vec<SearchResult>, delta_items_done: usize, delta_items_total: usize, delta_bytes_done: usize| -> bool {
+fn file_search_task(state: Arc<SearchState>, query: SearchQuery, symbols: Arc<Symbols>, symbols_idx: usize, searcher: Arc<dyn Searcher>, properties: SearcherProperties, context: Arc<Context>) {
+    let file_scores = if query.filename.get().is_empty() || !properties.have_files {
+        None
+    } else {
+        let mut _match_ranges: Vec<Range<usize>> = Vec::new();
+        let mut scores: Vec<usize> = Vec::with_capacity(symbols.files.len());
+        for (i, f) in symbols.files.iter().enumerate() {
+            let slice = f.path.as_os_str().as_bytes();
+            _match_ranges.clear();
+            let score = fuzzy_match(slice, &query.filename, query.case_sensitive, &mut _match_ranges);
+            let score = score.unwrap_or(usize::MAX);
+            scores.push(score);
+
+            if i & 127 == 0 && state.cancel.load(Ordering::SeqCst) {
+                return;
+            }
+        }
+        Some(Arc::new(scores))
+    };
+
+    let num_shards = if properties.parallel {symbols.shards.len()} else {1};
+    state.tasks_remaining.fetch_add(num_shards - 1, Ordering::SeqCst);
+    for shard_idx in 0..num_shards {
+        let (state, query, file_scores, symbols, searcher, context_) = (state.clone(), query.clone(), file_scores.clone(), symbols.clone(), searcher.clone(), context.clone());
+        context.executor.add(move || search_task(state, query, file_scores, symbols, symbols_idx, shard_idx, searcher, context_));
+    }
+}
+
+fn search_task(state: Arc<SearchState>, query: SearchQuery, file_scores: Option<Arc<Vec<usize>>>, symbols: Arc<Symbols>, symbols_idx: usize, shard_idx: usize, searcher: Arc<dyn Searcher>, context: Arc<Context>) {
+    searcher.search(&symbols, symbols_idx, shard_idx, &query, file_scores.as_ref().map(|x| x as _), &state.cancel, &mut |mut res: Vec<SearchResult>, delta_items_done: usize, delta_items_total: usize, delta_bytes_done: usize| -> bool {
         if state.cancel.load(Ordering::SeqCst) {
             return false;
         }
@@ -148,13 +199,13 @@ fn sort_and_truncate_results(v: &mut Vec<SearchResult>) {
 
 impl SymbolSearcher {
     pub fn new(searcher: Arc<dyn Searcher>, context: Arc<Context>) -> Self {
-        let s = SymbolSearcher {searcher, context, symbols: Vec::new(), waiting_for_symbols: false, state: Arc::new(SearchState::new()), searched_query: SearchQuery::default(), searched_num_symbols: 0};
+        let s = SymbolSearcher {searcher, context, symbols: Vec::new(), waiting_for_symbols: false, state: Arc::new(SearchState::new()), seen_query: String::new(), query: SearchQuery::default(), seen_num_symbols: 0};
         s.state.results.lock().unwrap().complete = true;
         s
     }
 
     // Returns true if a new search started; the caller should scroll to top in this case.
-    pub fn update(&mut self, registry: &SymbolsRegistry, query: &SearchQuery) -> bool {
+    pub fn update(&mut self, registry: &SymbolsRegistry, query_str: &str) -> bool {
         let seen_binary_ids: HashSet<usize> = self.symbols.iter().map(|t| t.0).collect();
         self.waiting_for_symbols = false;
         for bin in registry.iter() {
@@ -168,32 +219,31 @@ impl SymbolSearcher {
             }
         }
 
-        if (&self.searched_query, self.searched_num_symbols) == (query, self.symbols.len()) {
+        if (&self.seen_query[..], self.seen_num_symbols) == (query_str, self.symbols.len()) {
             return false;
+        }
+        self.seen_query = query_str.to_string();
+        self.seen_num_symbols = self.symbols.len();
+
+        let properties = self.searcher.properties();
+        self.query = SearchQuery::parse(query_str, /*can_have_file*/ properties.have_files && properties.have_names);
+        if properties.have_files && !properties.have_names {
+            self.query.filename = mem::take(&mut self.query.s);
         }
 
         self.state.cancel.store(true, Ordering::SeqCst);
         self.state = Arc::new(SearchState::new());
 
-        self.searched_query = query.clone();
-        self.searched_num_symbols = self.symbols.len();
-
-        let mut tasks: Vec<(/*symbols_idx*/ usize, /*shard_idx*/ usize)> = Vec::new();
-        let properties = self.searcher.properties();
-        for idx in 0..self.symbols.len() {
-            if properties.parallel {
-                for shard_idx in 0..self.symbols[idx].1.shards.len() {
-                    tasks.push((idx, shard_idx));
-                }
+        // First do filename search ('@' in the query) using one thread per binary. Then file_search_task() will schedule main search tasks.
+        self.state.tasks_remaining.store(self.symbols.len(), Ordering::SeqCst);
+        for symbols_idx in 0..self.symbols.len() {
+            let (state, query, symbols, searcher, properties, context) = (self.state.clone(), self.query.clone(), self.symbols[symbols_idx].1.clone(), self.searcher.clone(), properties.clone(), self.context.clone());
+            if query.filename.get().is_empty() {
+                // No filename search needed, just need to schedule main search tasks.
+                file_search_task(state, query, symbols, symbols_idx, searcher, properties, context);
             } else {
-                tasks.push((idx, 0));
+                self.context.executor.add(move || file_search_task(state, query, symbols, symbols_idx, searcher, properties, context));
             }
-        }
-        self.state.tasks_remaining.store(tasks.len(), Ordering::SeqCst); // must happen before starting the tasks
-        for (symbols_idx, shard_idx) in tasks {
-            // TODO: Search by file+line if query starts with '@'; pre-filter file table and call a different method of Searcher.
-            let (state, query, symbols, searcher, context) = (self.state.clone(), self.searched_query.clone(), self.symbols[symbols_idx].1.clone(), self.searcher.clone(), self.context.clone());
-            self.context.executor.add(move || search_task(state, query, symbols, symbols_idx, shard_idx, searcher, context));
         }
 
         true
@@ -205,16 +255,12 @@ impl SymbolSearcher {
 
     pub fn format_result(&self, r: &SearchResult) -> SearchResultInfo {
         let s = &self.symbols[r.symbols_idx];
-        self.searcher.format_result(s.0.clone(), &s.1, &self.searched_query, r)
-    }
-
-    pub fn format_results(&self, results: &[SearchResult]) -> Vec<SearchResultInfo> {
-        let mut res: Vec<SearchResultInfo> = Vec::new();
-        for r in results {
-            let s = &self.symbols[r.symbols_idx];
-            res.push(self.searcher.format_result(s.0.clone(), &s.1, &self.searched_query, r));
+        let mut r = self.searcher.format_result(s.0.clone(), &s.1, &self.query, r);
+        if !r.file.as_os_str().is_empty() {
+            let slice = r.file.as_os_str().as_bytes();
+            fuzzy_match(slice, &self.query.filename, self.query.case_sensitive, &mut r.file_match_ranges);
         }
-        res
+        r
     }
 }
 impl Drop for SymbolSearcher {
@@ -237,7 +283,7 @@ pub struct SearcherProperties {
 }
 
 pub trait Searcher: Sync + Send {
-    fn search(&self, symbols: &Symbols, symbols_idx: usize, shard_idx: usize, query: &SearchQuery, cancel: &AtomicBool, callback: &mut SearchCallback);
+    fn search(&self, symbols: &Symbols, symbols_idx: usize, shard_idx: usize, query: &SearchQuery, file_scores: Option<&Vec<usize>>, cancel: &AtomicBool, callback: &mut SearchCallback);
     fn format_result(&self, binary_id: usize, symbols: &Arc<Symbols>, query: &SearchQuery, res: &SearchResult) -> SearchResultInfo;
     fn properties(&self) -> SearcherProperties;
 }
@@ -245,22 +291,23 @@ pub trait Searcher: Sync + Send {
 pub struct FileSearcher;
 
 impl Searcher for FileSearcher {
-    fn search(&self, symbols: &Symbols, symbols_idx: usize, shard_idx: usize, query: &SearchQuery, cancel: &AtomicBool, callback: &mut SearchCallback) {
+    fn search(&self, symbols: &Symbols, symbols_idx: usize, shard_idx: usize, query: &SearchQuery, file_scores: Option<&Vec<usize>>, cancel: &AtomicBool, callback: &mut SearchCallback) {
         let items_total = symbols.path_to_used_file.len();
         callback(Vec::new(), 0, items_total, 0);
         let mut res: Vec<SearchResult> = Vec::new();
         let mut bytes_done = 0usize;
-        let mut _match_ranges: Vec<Range<usize>> = Vec::new();
-        for (path, &id) in &symbols.path_to_used_file {
-            if cancel.load(Ordering::Relaxed) {
+        for (id, file) in symbols.files.iter().enumerate() {
+            if id & 127 == 0 && cancel.load(Ordering::Relaxed) {
                 return;
             }
-            let slice = path.as_os_str().as_bytes();
-            _match_ranges.clear();
-            if let Some(score) = fuzzy_match(slice, query, &mut _match_ranges) {
+            bytes_done += file.path.as_os_str().len();
+            let score = match &file_scores {
+                Some(v) => v[id],
+                None => 0,
+            };
+            if file.used_lines != 0 && score != usize::MAX {
                 res.push(SearchResult {score, id, symbols_idx});
             }
-            bytes_done += slice.len();
         }
         callback(res, items_total, 0, bytes_done);
     }
@@ -269,8 +316,6 @@ impl Searcher for FileSearcher {
         let file = &symbols.files[res.id];
         let mut res = SearchResultInfo::new(binary_id, symbols.clone(), res.id);
         res.file = file.path.to_owned();
-        let slice = file.path.as_os_str().as_bytes();
-        fuzzy_match(slice, query, &mut res.file_match_ranges);
         res
     }
 
@@ -280,8 +325,8 @@ impl Searcher for FileSearcher {
 pub struct FunctionSearcher;
 
 impl Searcher for FunctionSearcher {
-    fn search(&self, symbols: &Symbols, symbols_idx: usize, shard_idx: usize, query: &SearchQuery, cancel: &AtomicBool, callback: &mut SearchCallback) {
-        let query = modify_query_for_mangled_search(query);
+    fn search(&self, symbols: &Symbols, symbols_idx: usize, shard_idx: usize, full_query: &SearchQuery, file_scores: Option<&Vec<usize>>, cancel: &AtomicBool, callback: &mut SearchCallback) {
+        let query = modify_query_for_mangled_search(full_query);
 
         let range = (symbols.functions.len()*shard_idx/symbols.shards.len())..(symbols.functions.len()*(shard_idx+1)/symbols.shards.len());
         callback(Vec::new(), 0, range.len(), 0);
@@ -297,10 +342,30 @@ impl Searcher for FunctionSearcher {
             if function.flags.contains(FunctionFlags::SENTINEL) {
                 continue;
             }
+            let mut add_score = 0usize;
+            if full_query.line.is_some() || file_scores.is_some() {
+                let sf = match symbols.root_subfunction(function) {
+                    None => continue,
+                    Some((x, _)) => x };
+                let file_idx = match sf.call_line.file_idx() {
+                    None => continue,
+                    Some(x) => x };
+                if let Some(n) = full_query.line.clone() {
+                    if sf.call_line.line() != n {
+                        continue;
+                    }
+                }
+                if let Some(scores) = &file_scores {
+                    add_score = scores[file_idx];
+                    if add_score == usize::MAX {
+                        continue;
+                    }
+                }
+            }
             let slice = function.mangled_name();
             match_ranges.clear();
-            if let Some(score) = fuzzy_match(slice, &query, &mut match_ranges) {
-                res.push(SearchResult {score, id: idx, symbols_idx});
+            if let Some(score) = fuzzy_match(slice, &query.s, query.case_sensitive, &mut match_ranges) {
+                res.push(SearchResult {score: score + add_score, id: idx, symbols_idx});
             }
             items_done += 1;
             bytes_done += slice.len();
@@ -325,8 +390,8 @@ impl Searcher for FunctionSearcher {
             }
         }
         let query = modify_query_for_mangled_search(query);
-        fuzzy_match(res.mangled_name.as_bytes(), &query, &mut res.mangled_name_match_ranges);
-        if fuzzy_match(res.name.as_bytes(), &query, &mut res.name_match_ranges).is_none() {
+        fuzzy_match(res.mangled_name.as_bytes(), &query.s, query.case_sensitive, &mut res.mangled_name_match_ranges);
+        if fuzzy_match(res.name.as_bytes(), &query.s, query.case_sensitive, &mut res.name_match_ranges).is_none() {
             res.name_match_ranges.clear();
         }
         res
@@ -337,10 +402,10 @@ impl Searcher for FunctionSearcher {
 
 fn modify_query_for_mangled_search(query: &SearchQuery) -> SearchQuery {
     let s: String = query.s.get().chars().filter(|&c| c.is_ascii_alphanumeric() || c == '_').collect();
-    SearchQuery::parse(&s)
+    SearchQuery::parse(&s, /*can_have_file*/ false)
 }
 
-fn fuzzy_match(haystack: &[u8], query: &SearchQuery, match_ranges: &mut Vec<Range<usize>>) -> Option<usize> {
+fn fuzzy_match(haystack: &[u8], needle_padded: &PaddedString, case_sensitive: bool, match_ranges: &mut Vec<Range<usize>>) -> Option<usize> {
     // Scoring (smaller tuple - higher in results list):
     //  * 0 if the string is exactly equal to the query string.
     //  * (1, !is_suffix, alphanum_before, alphanum_after, haystack.len()) if the query string is a substring.
@@ -349,21 +414,21 @@ fn fuzzy_match(haystack: &[u8], query: &SearchQuery, match_ranges: &mut Vec<Rang
     //    We should do some approximation instead. Maybe find a subsequence greedily, then do one forward and one backward pass greedily coalescing the pieces.
     //  * MAX if not a match at all.
 
-    let needle = query.s.get();
     assert_eq!(match_ranges.len(), 0);
 
+    let needle = needle_padded.get();
     if needle.len() > haystack.len() {
         return None;
     }
     // Check the suffix separately (in case there are multiple occurrences; because we don't have backwards search).
-    let (case, extra) = if memmem_maybe_case_sensitive(&haystack[haystack.len() - needle.len()..], &query.s, query.case_sensitive).is_some() {
+    let (case, extra) = if memmem_maybe_case_sensitive(&haystack[haystack.len() - needle.len()..], needle_padded, case_sensitive).is_some() {
         if haystack.len() == needle.len() {
             return Some(0);
         }
         match_ranges.push(haystack.len() - needle.len() .. haystack.len());
         let alphanum_before = haystack[haystack.len() - needle.len() - 1].is_ascii_alphanumeric();
         (1, 4usize | ((alphanum_before as usize) << 1))
-    } else if let Some(i) = memmem_maybe_case_sensitive(&haystack[..haystack.len() - 1], &query.s, query.case_sensitive) {
+    } else if let Some(i) = memmem_maybe_case_sensitive(&haystack[..haystack.len() - 1], needle_padded, case_sensitive) {
         match_ranges.push(i..i+needle.len());
         let alphanum_before = i > 0 && haystack[i - 1].is_ascii_alphanumeric();
         let alphanum_after = i + needle.len() < haystack.len() && haystack[i + needle.len()].is_ascii_alphanumeric();
@@ -375,7 +440,7 @@ fn fuzzy_match(haystack: &[u8], query: &SearchQuery, match_ranges: &mut Vec<Rang
         let (mut hay_i, mut needle_i) = (0usize, 0usize);
         while hay_i < haystack.len() && needle_i < needle.len() {
             let c = haystack[hay_i];
-            let c = if query.case_sensitive {c} else {c.to_ascii_lowercase()};
+            let c = if case_sensitive {c} else {c.to_ascii_lowercase()};
             if c == needle[needle_i] {
                 needle_i += 1;
                 if match_start.is_none() {

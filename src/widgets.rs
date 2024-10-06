@@ -1326,8 +1326,7 @@ impl SearchDialog {
         });
         ui.add(widget!().fixed_height(1));
 
-        let query = SearchQuery::parse(&self.input.text);
-        if self.search.update(registry, &query) {
+        if self.search.update(registry, &self.input.text) {
             self.table_state.select(0);
         }
 
@@ -1364,7 +1363,8 @@ impl SearchDialog {
             }
             let mut table = Table::new(mem::take(&mut self.table_state), ui, columns);
             let range = table.lazy(res.results.len(), lines_per_result, ui);
-            for (i, r) in self.search.format_results(&res.results[range]).iter().enumerate() {
+            for (i, result) in res.results[range].iter().enumerate() {
+                let r = self.search.format_result(result);
                 table.start_row(i, ui);
                 let start = ui.text.num_lines();
                 if properties.have_names {

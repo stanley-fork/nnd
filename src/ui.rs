@@ -3026,7 +3026,7 @@ struct CodeSearch {
 impl CodeSearch {
     // Does the search if needed, moves the cursor if needed.
     fn update(&mut self, tab: &mut CodeTab, text: &StyledText, mut select_match: isize) {
-        let query = SearchQuery::parse(&self.bar.text.text);
+        let query = SearchQuery::parse(&self.bar.text.text, /*can_have_file*/ false);
         let query_changed = self.query != query;
         if (&self.query, self.tab_identity) != (&query, tab.identity) {
             (self.query, self.tab_identity) = (query, tab.identity);
@@ -3069,7 +3069,7 @@ impl CodeSearch {
     }
 
     fn needs_update(&mut self, tab: &CodeTab) -> bool {
-        (&self.query, self.tab_identity, (self.match_idx, self.cursor_is_on_a_match)) != (&SearchQuery::parse(&self.bar.text.text), tab.identity, self.calculate_match_idx(tab.area_state.cursor))
+        (&self.query, self.tab_identity, (self.match_idx, self.cursor_is_on_a_match)) != (&SearchQuery::parse(&self.bar.text.text, /*can_have_file*/ false), tab.identity, self.calculate_match_idx(tab.area_state.cursor))
     }
 
     fn calculate_match_idx(&self, cursor: usize) -> (usize, bool) {
