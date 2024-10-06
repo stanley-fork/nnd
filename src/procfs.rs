@@ -260,18 +260,13 @@ pub struct MemReader {
     pid: pid_t,
 }
 impl MemReader {
-    pub fn new(pid: pid_t) -> Self {
-        MemReader {pid: pid}
-    }
-
-    pub fn invalid() -> Self {
-        MemReader {pid: 0}
-    }
+    pub fn new(pid: pid_t) -> Self { MemReader {pid: pid} }
+    pub fn invalid() -> Self { MemReader {pid: 0} }
+    pub fn is_valid(&self) -> bool { self.pid != 0 }
+    pub fn check_valid(&self) -> Result<()> { if self.is_valid() { Ok(()) } else { err!(ProcessState, "no process") } }
 
     pub fn read_uninit<'a>(&self, offset: usize, buf: &'a mut [MaybeUninit<u8>]) -> Result<&'a mut [u8]> {
-        if self.pid == 0 {
-            return err!(ProcessState, "no process");
-        }
+        self.check_valid()?;
         unsafe {
             let local_iov = libc::iovec {iov_base: buf.as_mut_ptr() as *mut c_void, iov_len: buf.len()};
             let mut remote_iov = libc::iovec {iov_base: offset as *mut c_void, iov_len: buf.len()};
@@ -309,9 +304,7 @@ impl MemReader {
 
     // The address range must be flagged as writable, so we can't use this to write to the code.
     pub fn write(&self, offset: usize, buf: &[u8]) -> Result<()> {
-        if self.pid == 0 {
-            return err!(ProcessState, "no process");
-        }
+        self.check_valid()?;
         unsafe {
             let local_iov = libc::iovec {iov_base: buf.as_ptr() as *mut c_void, iov_len: buf.len()};
             let mut remote_iov = libc::iovec {iov_base: offset as *mut c_void, iov_len: buf.len()};

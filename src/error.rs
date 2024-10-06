@@ -18,7 +18,6 @@ pub enum ErrorCode {
     Sanity = 16,
     OutOfHardwareBreakpoints = 17,
     NoCodeLocations = 18,
-    ValueTreePlaceholder = 19,
     TooLong = 20,
     Syntax = 21,
     NoVariable = 22,
@@ -62,7 +61,6 @@ impl Error {
     pub fn is_usage(&self) -> bool { match self.error { ErrorEnum::Code(ErrorCode::Usage) => true, _ => false, } }
     pub fn is_missing_symbols(&self) -> bool { match self.error { ErrorEnum::Code(ErrorCode::MissingSymbols) => true, _ => false, } }
     pub fn is_out_of_hardware_breakpoints(&self) -> bool { match self.error { ErrorEnum::Code(ErrorCode::OutOfHardwareBreakpoints) => true, _ => false, } }
-    pub fn is_value_tree_placeholder(&self) -> bool { match self.error { ErrorEnum::Code(ErrorCode::ValueTreePlaceholder) => true, _ => false, } }
     pub fn is_too_long(&self) -> bool { match self.error { ErrorEnum::Code(ErrorCode::TooLong) => true, _ => false, } }
     pub fn is_io_not_found(&self) -> bool { match &self.error { ErrorEnum::IO(e) if e.kind() == io::ErrorKind::NotFound => true, _ => false, } }
     pub fn is_io_permission_denied(&self) -> bool { match &self.error { ErrorEnum::IO(e) if e.kind() == io::ErrorKind::PermissionDenied => true, _ => false, } }

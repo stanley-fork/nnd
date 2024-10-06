@@ -380,8 +380,6 @@ impl EvalState {
         self.variables.clear();
     }
 
-    pub fn update(&mut self, context: &mut EvalContext) {}
-
     pub fn get_variable(&mut self, context: &mut EvalContext, name: &str, maybe_register: bool, from_any_frame: bool, only_type: bool) -> Result<Value> {
         let global_alt_name = if name.starts_with("::") {Some(&name[2..])} else {None};
         if !context.stack.frames.is_empty() && (global_alt_name.is_none() || from_any_frame) {
@@ -429,6 +427,11 @@ impl EvalState {
             }
         }
 
+        if context.stack.frames.is_empty() && global_alt_name.is_none() {
+            // If the process is running or absent, show error like "<running>" instead of "<variable foo not found>".
+            context.check_has_stack()?;
+        }
+
         err!(NoVariable, "variable {} not found", name)
     }
 
@@ -447,6 +450,7 @@ impl EvalState {
     }
 
     fn get_local_variable(&mut self, context: &mut EvalContext, name: &str, subframe_idx: usize, only_type: bool) -> Result<Value> {
+        context.check_has_stack()?;
         let subframe = &context.stack.subframes[subframe_idx];
         let pseudo_addr = context.stack.frames[subframe.frame_idx].pseudo_addr;
         let (mut dwarf_context, _) = context.make_local_dwarf_eval_context(subframe_idx)?;
@@ -484,16 +488,29 @@ impl EvalState {
 }
 
 pub struct EvalContext<'a> {
+    pub symbols_registry: &'a SymbolsRegistry,
+
+    // If there's no process, reads will return "no process" error.
     pub memory: CachedMemReader,
     pub process_info: &'a ProcessInfo,
-    pub symbols_registry: &'a SymbolsRegistry,
+
     // We include the whole stack to allow watch expressions to use variables from other frames.
-    pub stack: &'a StackTrace,//asdqwe make optional, allow using context with no process or running process
+    // Empty if the thread is running.
+    pub stack: &'a StackTrace,
     pub selected_subframe: usize,
 }
 impl EvalContext<'_> {
+    pub fn check_has_stack(&self) -> Result<()> {
+        self.memory.mem.check_valid()?;
+        if self.stack.frames.is_empty() {
+            return err!(ProcessState, "running");
+        }
+        Ok(())
+    }
+    
     // Collect information needed to retrieve values of local variables.
     pub fn make_local_dwarf_eval_context<'a>(&'a mut self, selected_subframe: usize) -> Result<(DwarfEvalContext<'a>, &'a FunctionInfo)> {
+        self.check_has_stack()?;
         let subframe = &self.stack.subframes[selected_subframe];
         let selected_frame = subframe.frame_idx;
         let frame = &self.stack.frames[selected_frame];
@@ -848,6 +865,7 @@ fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut Form
         Type::MetaType | Type::MetaField | Type::MetaVariable => {
             let val = reflect_meta_value(&v, state.state, state.context, Some((state.out, state.palette)));
             children = list_struct_children(&val.val, unsafe {(*val.type_).t.as_struct().unwrap()}, val.flags, state);
+            //asdqwe click_action for MetaVariable to add watch on the variable
         }
         Type::MetaCodeLocation => {
             styled_write!(state.out, state.palette.filename, "asdqwe");

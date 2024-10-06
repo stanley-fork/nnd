@@ -18,6 +18,7 @@ test with watches window filled with long arrays (I saw 50ms frames when there a
 
 allow stepping when process is not running - start the process and run to exec (if by_instructions) or main (otherwise)
 show disassembly if symbols are missing, whole .text section if all else fails
+tooltip in watches window for copying long values
 up/down arrows should close code search, or cycle history
 global variable search
 global variables from .symtab, maybe from .debug_pubnames (maybe also look into .debug_pubtypes)
@@ -30,6 +31,7 @@ maximizing windows
 thread-local storage
 array types in watch expression (x as *[i32; 10])
 key to freeze value in watches window; can also be used for controlling when to run the expression if it has side effects
+key to add watch value as new watch, maybe cast to type, e.g. *(0x1234 as *DB::Block)
 tooltip in status window showing more log lines with line wrapping
 key to send SIGINT to the program
 make return key do something in each window: go from threads to stack -> code -> disassembly -> code; from locals create a watch; from watch sub-value create another watch for that field/element; from breakpoints to code/disassembly/watch (depending on breakpoint type)

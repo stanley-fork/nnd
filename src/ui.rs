@@ -421,7 +421,7 @@ struct ValueTreeNode {
     layout_frame_idx: usize, // when this node's layout information was updated
     name_line_wrap_width: usize, // what width was used for line_wrapped_name
 }
-impl Default for ValueTreeNode { fn default() -> Self { Self {name: 0..0, line_wrapped_name: None, value: err!(ValueTreePlaceholder, ""), dubious: false, special: None, child_kind: ValueChildKind::Other, deref: 0, click_action: ValueClickAction::None, identity: 0, depth: 0, parent: ValueTreeNodeIdx::invalid(), formatted_value: [None, None, None], has_children: false, children: 0..0, start_y: 0, node_end_y: 0, subtree_end_y: 0, expanded: false, is_text_input: false, layout_frame_idx: 0, name_line_wrap_width: 0} } }
+impl Default for ValueTreeNode { fn default() -> Self { Self {name: 0..0, line_wrapped_name: None, value: err!(Internal, ""), dubious: false, special: None, child_kind: ValueChildKind::Other, deref: 0, click_action: ValueClickAction::None, identity: 0, depth: 0, parent: ValueTreeNodeIdx::invalid(), formatted_value: [None, None, None], has_children: false, children: 0..0, start_y: 0, node_end_y: 0, subtree_end_y: 0, expanded: false, is_text_input: false, layout_frame_idx: 0, name_line_wrap_width: 0} } }
 
 #[derive(Default)]
 struct ValueTree {
@@ -477,8 +477,14 @@ struct WatchesWindow {
     max_indent: usize,
 
     // When this changes, we recalculate everything.
-    seen: (/*thread*/ pid_t, /*selected_subframe*/ usize, /*stop_count*/ usize),
+    seen: (/*thread*/ pid_t, /*selected_subframe*/ usize, /*stop_count*/ usize, ProcessState),
 
+    // Watches window can be in 3 states:
+    //  * The debuggee is suspended, watches show up-to-date values.
+    //  * The debuggee is not suspended (running or no process), watches window shows last seen values. have_good_cached_values = true
+    //  * The debuggee is not suspended, watches window shows errors like "<no process>" or "<running>". have_good_cached_values = false.
+    have_good_cached_values: bool,
+    
     expressions: Vec<WatchExpression>, // watch expressions; parallel to tree.roots
     text_input: Option<(/*identity*/ usize, /*height*/ usize, TextInput)>, // if editing watch expression
     text_input_built: bool,
@@ -487,7 +493,7 @@ struct WatchesWindow {
 }
 impl Default for WatchesWindow {
     fn default() -> Self {
-        let mut r = Self {tree: ValueTree::default(), expanded_nodes: HashSet::new(), cursor_path: Vec::new(), cursor_idx: 0, scroll: 0, scroll_to_cursor: false, name_width: 0, value_width: 0, row_height_limit: 0, indent_width: 0, max_indent: 0, seen: (0, usize::MAX, usize::MAX), expressions: Vec::new(), text_input: None, text_input_built: false, eval_state: EvalState::new() };
+        let mut r = Self {tree: ValueTree::default(), expanded_nodes: HashSet::new(), cursor_path: Vec::new(), cursor_idx: 0, scroll: 0, scroll_to_cursor: false, name_width: 0, value_width: 0, row_height_limit: 0, indent_width: 0, max_indent: 0, seen: (0, usize::MAX, usize::MAX, ProcessState::NoProcess), have_good_cached_values: false, expressions: Vec::new(), text_input: None, text_input_built: false, eval_state: EvalState::new() };
 
         let locals_identity: usize = random();
         r.expanded_nodes.insert(locals_identity);
@@ -544,7 +550,7 @@ impl WatchesWindow {
         }
     }
 
-    fn eval_watches(&mut self, mut context: Option<&mut EvalContext>, palette: &Palette) {
+    fn eval_watches(&mut self, context: &mut EvalContext, palette: &Palette) {
         for i in 0..self.expressions.len() {
             let expr = &self.expressions[i];
             let style = if expr.special.is_some() {palette.default_dim} else {palette.default};
@@ -557,14 +563,12 @@ impl WatchesWindow {
                 continue;
             }
 
-            if let Some(context) = &mut context {
-                match eval_watch_expression(&expr.text, &mut self.eval_state, *context) {
-                    Ok((val, dub)) => {
-                        node.value = Ok(val);
-                        node.dubious = dub;
-                    }
-                    Err(e) => node.value = Err(e),
+            match eval_watch_expression(&expr.text, &mut self.eval_state, context) {
+                Ok((val, dub)) => {
+                    node.value = Ok(val);
+                    node.dubious = dub;
                 }
+                Err(e) => node.value = Err(e),
             }
         }
     }
@@ -572,8 +576,7 @@ impl WatchesWindow {
     // If !node.expanded: populates formatted_value[0], has_children.
     // If  node.expanded: populates formatted_value[1], has_children, children.
     // If already populated, does nothing.
-    // If context is none, may not populate; in this case the caller should show the error from `context` (e.g. "running") instead of formatted_value.
-    fn ensure_node_info(&mut self, node_idx: ValueTreeNodeIdx, mut context: Option<&mut EvalContext>, palette: &Palette) {
+    fn ensure_node_info(&mut self, node_idx: ValueTreeNodeIdx, context: &mut EvalContext, suspended: bool, palette: &Palette) {
         let node = &mut self.tree.nodes[node_idx.0];
         let i = node.expanded as usize;
         if node.formatted_value[i].is_some() {
@@ -583,35 +586,41 @@ impl WatchesWindow {
             (&Some(SpecialWatch::AddWatch), _) => {
                 node.formatted_value = [Some(0..0), Some(0..0), Some(0..0)];
             }
-            (&Some(special), _) => if let Some(context) = &mut context {
+            (&Some(special), _) => {
                 node.formatted_value[0] = Some(0..0);
                 node.has_children = true;
                 if node.expanded {
                     node.formatted_value[1] = Some(0..0);
-                    let start = self.tree.nodes.len();
-                    let what = match special {
-                        SpecialWatch::Locals => {
-                            self.eval_locals(*context, node_idx, palette);
-                            "locals"
-                        }
-                        SpecialWatch::Registers => {
-                            self.eval_registers(*context, node_idx, palette);
-                            "registers"
-                        }
-                        SpecialWatch::AddWatch => panic!("huh"),
-                    };
-                    let end = self.tree.nodes.len();
-                    let node = &mut self.tree.nodes[node_idx.0];
-                    node.children = start..end;
-                    if node.children.is_empty() {
-                        let l = styled_writeln!(self.tree.text, palette.default_dim, "no {}", what);
+                    if let Err(e) = context.check_has_stack() {
+                        let l = styled_writeln!(self.tree.text, palette.default_dim, "<{}>", e);
                         node.formatted_value[1] = Some(l..l+1);
+                    } else {
+                        let start = self.tree.nodes.len();
+                        let what = match special {
+                            SpecialWatch::Locals => {
+                                self.eval_locals(context, node_idx, palette);
+                                "locals"
+                            }
+                            SpecialWatch::Registers => {
+                                self.eval_registers(context, node_idx, palette);
+                                "registers"
+                            }
+                            SpecialWatch::AddWatch => panic!("huh"),
+                        };
+                        let end = self.tree.nodes.len();
+                        let node = &mut self.tree.nodes[node_idx.0];
+                        node.children = start..end;
+                        if node.children.is_empty() {
+                            let l = styled_writeln!(self.tree.text, palette.default_dim, "no {}", what);
+                            node.formatted_value[1] = Some(l..l+1);
+                        }
                     }
                 }
             }
-            (&None, Err(e)) if e.is_value_tree_placeholder() => (),
             (&None, Err(e)) => {
-                let style = if e.is_too_long() {
+                let style = if !suspended {
+                    palette.default_dim
+                } else if e.is_too_long() {
                     palette.warning
                 } else {
                     palette.error
@@ -620,8 +629,8 @@ impl WatchesWindow {
                 node.formatted_value[0] = Some(l..l+1);
                 node.formatted_value[1] = Some(l..l+1);
             }
-            (&None, Ok(value)) => if let Some(context) = &mut context {
-                let (has_children, children, click_action) = format_value(value, node.expanded, &mut self.eval_state, *context, &mut self.tree.temp_text, &mut self.tree.text, palette);
+            (&None, Ok(value)) => {
+                let (has_children, children, click_action) = format_value(value, node.expanded, &mut self.eval_state, context, &mut self.tree.temp_text, &mut self.tree.text, palette);
                 let l = self.tree.temp_text.close_line();
                 let l = self.tree.text.import_lines(&self.tree.temp_text, l..l+1);
                 node.formatted_value[i] = Some(l);
@@ -641,7 +650,7 @@ impl WatchesWindow {
         }
     }
 
-    fn do_layout(&mut self, mut context: Option<&mut EvalContext>, palette: &Palette, frame_idx: usize) -> usize {
+    fn do_layout(&mut self, context: &mut EvalContext, suspended: bool, palette: &Palette, frame_idx: usize) -> usize {
         self.cursor_idx = 0;
         self.tree.rows.clear();
         let mut y = 0isize;
@@ -680,11 +689,7 @@ impl WatchesWindow {
                     height.set_max(node.line_wrapped_name.clone().unwrap().len());
                 }
 
-                // This is silly, Rust. Is there a good way to do this?
-                match &mut context {
-                    Some(context) => self.ensure_node_info(node_idx, Some(*context), palette),
-                    None => self.ensure_node_info(node_idx, None, palette),
-                }
+                self.ensure_node_info(node_idx, context, suspended, palette);
                 let node = &mut self.tree.nodes[node_idx.0];
 
                 if node.formatted_value[2].is_none() && node.formatted_value[1].is_some() {
@@ -714,7 +719,7 @@ impl WatchesWindow {
         y as usize
     }
 
-    fn build_widgets(&mut self, visible_y: Range<isize>, context: &mut Result<EvalContext>, state: &mut UIState, ui: &mut UI) {
+    fn build_widgets(&mut self, visible_y: Range<isize>, context: &mut EvalContext, suspended: bool, state: &mut UIState, ui: &mut UI) {
         self.text_input_built = false;
         let mut stack: Vec<ValueTreeNodeIdx> = self.tree.roots.iter().copied().rev().collect();
         let mut should_start_editing: Option<usize> = None;
@@ -740,20 +745,15 @@ impl WatchesWindow {
             //    3a. Create value widget.
             //    3b. Create name or text input widget. It may partially cover the value widget if it's a text input.
 
-            let formatted = if node.expanded {
-                node.formatted_value[2].clone()
+            let lines = if node.expanded {
+                node.formatted_value[2].clone().unwrap()
             } else {
-                self.ensure_node_info(node_idx, context.as_mut().ok(), &ui.palette);
-                self.tree.nodes[node_idx.0].formatted_value[0].clone()
+                self.ensure_node_info(node_idx, context, suspended, &ui.palette);
+                self.tree.nodes[node_idx.0].formatted_value[0].clone().unwrap()
             };
             let node = &self.tree.nodes[node_idx.0];
             let value_start = ui.text.num_lines();
-            if let Some(lines) = formatted {
-                ui.text.import_lines(&self.tree.text, lines);
-            } else {
-                // We don't do line wrap on this error message, but that's ok, it's short (something like "<running>" or "<no process>").
-                ui_writeln!(ui, default_dim, "<{}>", context.as_ref().err().unwrap());
-            }
+            ui.text.import_lines(&self.tree.text, lines);
             let value_end = ui.text.num_lines();
 
             // Draw vertical line showing indentation, and arrow showing whether the node is expanded or expandable.
@@ -809,7 +809,7 @@ impl WatchesWindow {
                     let name_effective_width = self.name_width.saturating_sub(row_x);
 
                     let mut w = widget!().fixed_x(name_effective_width as isize + 1).fixed_width(self.value_width).text_lines(value_start..value_end);
-                    if node.dubious || context.is_err() {
+                    if node.dubious || !suspended {
                         w.style_adjustment.update(ui.palette.value_dubious);
                     }
                     ui.add(w);
@@ -842,7 +842,7 @@ impl WatchesWindow {
                         let lines = ui.text.import_lines(&self.tree.text, lines);
                         let mut w = widget!().text_lines(lines).fixed_width(name_effective_width);
                         // Dim the *name* if parent's value is dubious, i.e. the existence of this node is dubious.
-                        if node.depth > 0 && (self.tree.nodes[node.parent.0].dubious || context.is_err()) {
+                        if node.depth > 0 && (self.tree.nodes[node.parent.0].dubious || !suspended) {
                             w.style_adjustment.update(ui.palette.value_dubious);
                         }
                         ui.add(w);
@@ -1064,32 +1064,32 @@ impl WindowContent for WatchesWindow {
             refresh_data = true;
         }
 
-        //asdqwe
-        // See if we're able to evaluate expressions.
-        let stack = state.stack.clone();
-        let mut eval_context: Result<EvalContext> = match debugger.threads.get(&state.selected_thread) {
-            None => err!(ProcessState, "no process"),
-            Some(thread) if thread.state != ThreadState::Suspended || state.stack.frames.is_empty() => err!(ProcessState, "running"),
-            Some(thread) => {
-                let t = (state.selected_thread, state.selected_subframe, thread.stop_count);
-                if t != self.seen {
-                    self.seen = t;
-                    refresh_data = true;
-                }
-                Ok(debugger.make_eval_context(&stack, state.selected_subframe))
+        let mut suspended = false;
+        let mut stop_count = 0usize;
+        if let Some(thread) = debugger.threads.get(&state.selected_thread) {
+            if thread.state == ThreadState::Suspended && !state.stack.frames.is_empty() {
+                suspended = true;
+                stop_count = thread.stop_count;
             }
-        };
+        }
+        let t = (state.selected_thread, state.selected_subframe, stop_count, debugger.target_state);
+        if t != self.seen {
+            self.seen = t;
+            if suspended || !self.have_good_cached_values {
+                refresh_data = true;
+            }
+        }
+        let stack = state.stack.clone();
+        let mut eval_context = debugger.make_eval_context(&stack, state.selected_subframe);
 
         // Recalculate everything if needed.
         if refresh_data {
             self.tree.clear();
             self.eval_state.clear();
             self.scroll_to_cursor = true;
+            self.have_good_cached_values = suspended;
 
-            if let Ok(context) = &mut eval_context {
-                self.eval_state.update(context);
-            }
-            self.eval_watches(eval_context.as_mut().ok(), &ui.palette);
+            self.eval_watches(&mut eval_context, &ui.palette);
         }
 
         // Create container widgets.
@@ -1134,7 +1134,7 @@ impl WindowContent for WatchesWindow {
 
         // Determine positions and sizes of all nodes, do line wrapping (unless cached). Also assign cursor_idx.
         // We currently do this on each frame because determining if anything changed would be error-prone.
-        let content_height = self.do_layout(eval_context.as_mut().ok(), &ui.palette, ui.frame_idx);
+        let content_height = self.do_layout(&mut eval_context, suspended, &ui.palette, ui.frame_idx);
 
         // Do cursor movement and scrolling.
         let visible_y: Range<isize>;
@@ -1165,7 +1165,7 @@ impl WindowContent for WatchesWindow {
 
         // Create widgets for visible nodes, handle mouse clicks.
         with_parent!(ui, content_widget, {
-            self.build_widgets(visible_y, &mut eval_context, state, ui);
+            self.build_widgets(visible_y, &mut eval_context, suspended, state, ui);
         });
 
         if self.text_input.is_some() && !self.text_input_built {
