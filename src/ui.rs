@@ -26,10 +26,9 @@ pub struct UIState {
     selected_subframe: usize,
 
     // Selected in disassembly window.
-    selected_addr: Option<(BinaryId, /*function_idx*/ usize, /*addr*/ usize)>,
+    selected_addr: Option<(/*binary_id*/ usize, /*function_idx*/ usize, /*addr*/ usize)>,
 
     // Redundant copies of information from Debugger. Updated on every frame. Used for convenience and for consistent ordering.
-    binaries: Vec<BinaryId>, // assigned by BinariesWindow
     stack: StackTrace, // assigned by StackWindow
 
     // Communication between windows, for interactions like:
@@ -60,8 +59,7 @@ struct SourceScrollTarget {
 }
 
 struct DisassemblyScrollTarget {
-    binary_id: BinaryId,
-    symbols_identity: usize,
+    binary_id: usize,
     function_idx: usize,
     static_pseudo_addr: usize,
     subfunction_level: u16,
@@ -150,10 +148,10 @@ impl DebuggerUI {
         // +---------+ disas +-------------+
         // | status  |       |             |
         // +---------+-------+    stack    |
-        // | locals  |       |             |
+        // |         |       |             |
         // | watches | code  +-------------+
-        // |  regs   |       |   threads   |
-        // |  locs   |       |             |
+        // |  locs   |       |   threads   |
+        // |         |       |             |
         // +---------+-------+-------------+
         //
         // Other windows we could add: terminal, memory, detached watch.
@@ -399,6 +397,7 @@ struct ValueTreeNode {
 
     child_kind: ValueChildKind,
     deref: usize,
+    click_action: ValueClickAction,
 
     // Unique identifier of this node. Hash of identities (field names or array indices or similar) of nodes on the path from the root to here.
     // For remembering which subtrtees were expanded and where the cursor was, in a way that survives recalculation or partial change of the values.
@@ -422,7 +421,7 @@ struct ValueTreeNode {
     layout_frame_idx: usize, // when this node's layout information was updated
     name_line_wrap_width: usize, // what width was used for line_wrapped_name
 }
-impl Default for ValueTreeNode { fn default() -> Self { Self {name: 0..0, line_wrapped_name: None, value: err!(ValueTreePlaceholder, ""), dubious: false, special: None, child_kind: ValueChildKind::Other, deref: 0, identity: 0, depth: 0, parent: ValueTreeNodeIdx::invalid(), formatted_value: [None, None, None], has_children: false, children: 0..0, start_y: 0, node_end_y: 0, subtree_end_y: 0, expanded: false, is_text_input: false, layout_frame_idx: 0, name_line_wrap_width: 0} } }
+impl Default for ValueTreeNode { fn default() -> Self { Self {name: 0..0, line_wrapped_name: None, value: err!(ValueTreePlaceholder, ""), dubious: false, special: None, child_kind: ValueChildKind::Other, deref: 0, click_action: ValueClickAction::None, identity: 0, depth: 0, parent: ValueTreeNodeIdx::invalid(), formatted_value: [None, None, None], has_children: false, children: 0..0, start_y: 0, node_end_y: 0, subtree_end_y: 0, expanded: false, is_text_input: false, layout_frame_idx: 0, name_line_wrap_width: 0} } }
 
 #[derive(Default)]
 struct ValueTree {
@@ -622,11 +621,12 @@ impl WatchesWindow {
                 node.formatted_value[1] = Some(l..l+1);
             }
             (&None, Ok(value)) => if let Some(context) = &mut context {
-                let (has_children, children) = format_value(value, node.expanded, &mut self.eval_state, *context, &mut self.tree.temp_text, &mut self.tree.text, palette);
+                let (has_children, children, click_action) = format_value(value, node.expanded, &mut self.eval_state, *context, &mut self.tree.temp_text, &mut self.tree.text, palette);
                 let l = self.tree.temp_text.close_line();
                 let l = self.tree.text.import_lines(&self.tree.temp_text, l..l+1);
                 node.formatted_value[i] = Some(l);
                 node.has_children = has_children;
+                node.click_action = click_action;
 
                 if i == 1 {
                     let dubious = node.dubious;
@@ -714,7 +714,7 @@ impl WatchesWindow {
         y as usize
     }
 
-    fn build_widgets(&mut self, visible_y: Range<isize>, context: &mut Result<EvalContext>, ui: &mut UI) {
+    fn build_widgets(&mut self, visible_y: Range<isize>, context: &mut Result<EvalContext>, state: &mut UIState, ui: &mut UI) {
         self.text_input_built = false;
         let mut stack: Vec<ValueTreeNodeIdx> = self.tree.roots.iter().copied().rev().collect();
         let mut should_start_editing: Option<usize> = None;
@@ -850,7 +850,9 @@ impl WatchesWindow {
 
                     if ui.check_mouse(MouseActions::CLICK_SUBTREE) {
                         let moved = Self::set_cursor_path_from_node(node_idx, &mut self.cursor_path, &self.tree);
-                        if !moved && clicked_name && node.depth == 0 {
+                        if node.click_action != ValueClickAction::None {
+                            Self::perform_click_action(&node.click_action, state, ui);
+                        } else if !moved && clicked_name && node.depth == 0 {
                             if let Some(expr_idx) = self.tree.roots.iter().position(|ix| *ix == node_idx) {
                                 if self.expressions[expr_idx].is_editable() {
                                     // Can't assign self.text_input right here because a later iteration of this loop may incorrectly use it.
@@ -888,12 +890,22 @@ impl WatchesWindow {
         true
     }
 
+    fn perform_click_action(action: &ValueClickAction, state: &mut UIState, ui: &mut UI) {
+        match action {
+            ValueClickAction::None => panic!("huh"),
+            ValueClickAction::CodeLocation((binary_id, line)) => {
+                //asdqwe
+                ui.should_redraw = true;
+            }
+        }
+    }
+
     fn start_editing_expression(node: &ValueTreeNode, expr: &WatchExpression, text_input: &mut Option<(usize, usize, TextInput)>) {
         let height_estimate = (node.node_end_y - node.start_y).max(1) as usize;
         let text = if expr.special.is_some() {String::new()} else {expr.text.clone()};
         *text_input = Some((node.identity, height_estimate, TextInput::new_multiline(text)));
     }
-    
+
     fn make_expression_for_tree_node(&self, mut node_idx: ValueTreeNodeIdx) -> Option<String> {
         let mut components: Vec<(/*deref*/ usize, /*suffix*/ String)> = Vec::new();
         loop {
@@ -1007,20 +1019,21 @@ impl WindowContent for WatchesWindow {
                         Self::start_editing_expression(node, &self.expressions[expr_idx.unwrap()], &mut self.text_input);
                     }
                 }
-                KeyAction::DuplicateRow if expr_idx.is_some_and(|i| self.expressions[i].special.is_none()) => {
-                    let i = expr_idx.unwrap();
-                    let text = self.expressions[i].text.clone();
-                    let mut i = self.expressions.len();
-                    if self.expressions.last().is_some_and(|e| &e.special == &Some(SpecialWatch::AddWatch)) {
-                        i -= 1;
-                    }
-                    let identity: usize = random();
-                    self.expressions.insert(i, WatchExpression {identity, text, special: None});
-                    self.cursor_path = vec![identity];
-                    refresh_data = true;
+                KeyAction::Enter if node.click_action != ValueClickAction::None => {
+                    Self::perform_click_action(&node.click_action, state, ui);
                 }
                 KeyAction::Enter | KeyAction::DuplicateRow => {
-                    if let Some(s) = self.make_expression_for_tree_node(node_idx) {
+                    let s = if action == KeyAction::DuplicateRow && expr_idx.is_some() {
+                        let e = &self.expressions[expr_idx.clone().unwrap()];
+                        if e.special.is_none() {
+                            Some(e.text.clone())
+                        } else {
+                            None
+                        }
+                    } else {
+                        self.make_expression_for_tree_node(node_idx)
+                    };
+                    if let Some(s) = s {
                         let mut i = self.expressions.len();
                         if self.expressions.last().is_some_and(|e| &e.special == &Some(SpecialWatch::AddWatch)) {
                             i -= 1;
@@ -1051,7 +1064,9 @@ impl WindowContent for WatchesWindow {
             refresh_data = true;
         }
 
+        //asdqwe
         // See if we're able to evaluate expressions.
+        let stack = state.stack.clone();
         let mut eval_context: Result<EvalContext> = match debugger.threads.get(&state.selected_thread) {
             None => err!(ProcessState, "no process"),
             Some(thread) if thread.state != ThreadState::Suspended || state.stack.frames.is_empty() => err!(ProcessState, "running"),
@@ -1061,7 +1076,7 @@ impl WindowContent for WatchesWindow {
                     self.seen = t;
                     refresh_data = true;
                 }
-                Ok(debugger.make_eval_context(&state.stack, state.selected_subframe))
+                Ok(debugger.make_eval_context(&stack, state.selected_subframe))
             }
         };
 
@@ -1150,7 +1165,7 @@ impl WindowContent for WatchesWindow {
 
         // Create widgets for visible nodes, handle mouse clicks.
         with_parent!(ui, content_widget, {
-            self.build_widgets(visible_y, &mut eval_context, ui);
+            self.build_widgets(visible_y, &mut eval_context, state, ui);
         });
 
         if self.text_input.is_some() && !self.text_input_built {
@@ -1240,7 +1255,7 @@ impl WindowContent for LocationsWindow {
 impl LocationsWindow {
     fn fill_table(&mut self, table: &mut Table, state: &mut UIState, debugger: &Debugger, ui: &mut UI) -> Result<()> {
         let (binary_id, function_idx, addr) = match state.selected_addr.clone() { Some(x) => x, None => return Ok(()) };
-        let binary = match debugger.info.binaries.get(&binary_id) {
+        let binary = match debugger.symbols.get(binary_id) {
             Some(x) => x,
             None => return err!(ProcessState, "binary not mapped"),
         };
@@ -1311,13 +1326,12 @@ struct DisassemblyTab {
 
     // Cases:
     //  * locator is None, error is Some - couldn't find function for current address; this is a tab for the error message about that,
-    //  * locator is Some, error is Some - couldn't find function, but may try again later (drop_caches() unsets error),
+    //  * locator is Some, error is Some - couldn't find function, but may try again later (after drop_caches()),
     //  * locator is Some, error is None, cached_function_idx is None - didn't try finding the function yet (loaded from save file) or the Symbols was deloaded,
     //  * locator is Some, error is None, cached_function_idx is Some - found the function is Symbols.
-    // The symbols_identity needs to be re-checked before using the function_idx, in case Symbols gets reloaded for the same BinaryId (which invalidates function_idx due to nondeterminism).
     locator: Option<FunctionLocator>,
     error: Option<Error>,
-    cached_function_idx: Option<(/*symbols_identity*/ usize, /*function_idx*/ usize)>,
+    cached_function_idx: Option<(/*binary_id*/ usize, /*function_idx*/ usize)>,
 
     // When moving cursor through disassembly, we automatically scroll source code to the corresponding line.
     // But if the cursor is inside some inlined functions, which of them do we scroll to? This depth number determines that.
@@ -1329,10 +1343,10 @@ struct DisassemblyTab {
 
 struct DisassemblyWindow {
     tabs: Vec<DisassemblyTab>,
-    cache: HashMap<(/*symbols_identity*/ usize, /*function_idx*/ usize), Disassembly>,
+    cache: HashMap<(/*binary_id*/ usize, /*function_idx*/ usize), Disassembly>,
     tabs_state: TabsState,
     search_dialog: Option<SearchDialog>,
-    source_scrolled_to: Option<(/*symbols_identity*/ usize, /*function_idx*/ usize, /*disas_line*/ usize, /*selected_subfunction_level*/ u16)>,
+    source_scrolled_to: Option<(/*binary_id*/ usize, /*function_idx*/ usize, /*disas_line*/ usize, /*selected_subfunction_level*/ u16)>,
 }
 
 impl Default for DisassemblyWindow { fn default() -> Self { Self {tabs: Vec::new(), cache: HashMap::new(), tabs_state: TabsState::default(), search_dialog: None, source_scrolled_to: None} } }
@@ -1349,21 +1363,21 @@ impl DisassemblyWindow {
         };
         for i in 0..self.tabs.len() {
             if let Some((binary, function_idx)) = self.resolve_function_for_tab(i, debugger) {
-                if binary.id.matches_incomplete(&target.binary_id) && function_idx == target.function_idx && binary.symbols.as_ref().unwrap().identity == target.symbols_identity {
+                if binary.id == target.binary_id && function_idx == target.function_idx {
                     self.tabs_state.select(i);
                     return Ok(());
                 }
             }
         }
 
-        let binary = Debugger::find_binary_fuzzy(&debugger.info, Some(&debugger.symbols), &target.binary_id)?;
+        let binary = debugger.symbols.get(target.binary_id).unwrap();
         let symbols = binary.symbols.as_ref_clone_error()?;
         let function = &symbols.functions[target.function_idx];
         let demangled_name = function.demangle_name();
         let title = Self::make_title(&demangled_name);
         self.tabs.push(DisassemblyTab {
-            identity: random(), locator: Some(FunctionLocator {binary_id: binary.id.clone(), mangled_name: function.mangled_name().to_owned(), addr: function.addr, demangled_name}),
-            cached_function_idx: Some((symbols.identity, target.function_idx)), title, ephemeral: true, selected_subfunction_level: u16::MAX, ..Default::default()});
+            identity: random(), locator: Some(FunctionLocator {binary_locator: binary.locator.clone(), mangled_name: function.mangled_name().to_owned(), addr: function.addr, demangled_name}),
+            cached_function_idx: Some((target.binary_id, target.function_idx)), title, ephemeral: true, selected_subfunction_level: u16::MAX, ..Default::default()});
         self.tabs_state.select(self.tabs.len() - 1);
 
         Ok(())
@@ -1402,7 +1416,7 @@ impl DisassemblyWindow {
         r
     }
 
-    fn resolve_function_for_tab<'a>(&mut self, tab_idx: usize, debugger: &'a Debugger) -> Option<(&'a BinaryInfo, /*function_idx*/ usize)> {
+    fn resolve_function_for_tab<'a>(&mut self, tab_idx: usize, debugger: &'a Debugger) -> Option<(&'a Binary, /*function_idx*/ usize)> {
         let tab = &mut self.tabs[tab_idx];
         if tab.error.is_some() {
             return None;
@@ -1411,14 +1425,13 @@ impl DisassemblyWindow {
             None => return None,
             Some(x) => x };
 
-        // If binary is mapped, get BinaryInfo from debugger.info, where it has AddrMap. Otherwise take it from SymbolsLoader, and disassembly will show static addresses.
-        let binary = match Debugger::find_binary_fuzzy(&debugger.info, Some(&debugger.symbols), &locator.binary_id) {
+        let binary = match Debugger::find_binary_fuzzy(&debugger.symbols, &locator.binary_locator) {
             Err(e) => {
                 tab.error = Some(e);
                 return None;
             }
             Ok(x) => x };
-        locator.binary_id = binary.id.clone();
+        locator.binary_locator = binary.locator.clone();
 
         let symbols = match binary.symbols.as_ref() {
             Ok(x) => x,
@@ -1428,8 +1441,8 @@ impl DisassemblyWindow {
             }
         };
 
-        if let &Some((symbols_identity, function_idx)) = &tab.cached_function_idx {
-            if symbols_identity == symbols.identity {
+        if let &Some((binary_id, function_idx)) = &tab.cached_function_idx {
+            if binary_id == binary.id {
                 return Some((binary, function_idx));
             }
             tab.cached_function_idx = None;
@@ -1451,9 +1464,9 @@ impl DisassemblyWindow {
         Some((binary, function_idx))
     }
 
-    fn find_or_disassemble_function<'a>(cache: &'a mut HashMap<(usize, usize), Disassembly>, binary: &BinaryInfo, function_idx: usize, palette: &Palette) -> &'a Disassembly {
+    fn find_or_disassemble_function<'a>(cache: &'a mut HashMap<(usize, usize), Disassembly>, binary: &Binary, function_idx: usize, palette: &Palette) -> &'a Disassembly {
         let indent_width = str_width(&palette.tree_indent.0);
-        let e = cache.entry((binary.symbols.as_ref().unwrap().identity, function_idx));
+        let e = cache.entry((binary.id, function_idx));
         match e {
             Entry::Occupied(o) if o.get().indent_width == indent_width => o.into_mut(),
             _ => {
@@ -1474,13 +1487,13 @@ impl DisassemblyWindow {
     }
 
     // Would be nice to also support disassembling arbitrary memory, regardless of functions or binaries. E.g. for JIT-generated code.
-    fn disassemble_function(binary: &BinaryInfo, function_idx: usize, palette: &Palette) -> Result<Disassembly> {
+    fn disassemble_function(binary: &Binary, function_idx: usize, palette: &Palette) -> Result<Disassembly> {
         let symbols = binary.symbols.as_ref().unwrap();
         let ranges = symbols.function_addr_ranges(function_idx);
         let function = &symbols.functions[function_idx];
 
         let mut prelude = StyledText::default();
-        styled_write!(prelude, palette.default_dim, "{}", binary.id.path);
+        styled_write!(prelude, palette.default_dim, "{}", binary.locator.path);
         prelude.close_line();
         match function.debug_info_offset() {
             Some(off) => styled_write!(prelude, palette.default_dim, "dwarf offset: 0x{:x}", off.0),
@@ -1546,7 +1559,7 @@ impl DisassemblyWindow {
         }
 
         if let Some(res) = mem::take(&mut d.should_open_document) {
-            match self.open_function(Ok(DisassemblyScrollTarget {binary_id: res.binary, symbols_identity: res.symbols.identity, function_idx: res.id, static_pseudo_addr: 0, subfunction_level: u16::MAX}), debugger) {
+            match self.open_function(Ok(DisassemblyScrollTarget {binary_id: res.binary_id, function_idx: res.id, static_pseudo_addr: 0, subfunction_level: u16::MAX}), debugger) {
                 Ok(()) => self.tabs[self.tabs_state.selected].ephemeral = false,
                 Err(e) => log!(debugger.log, "{}", e),
             }
@@ -1680,7 +1693,7 @@ impl WindowContent for DisassemblyWindow {
         state.selected_addr = state.stack.frames.get(state.selected_frame).and_then(|f| {
             let sf = &state.stack.subframes[f.subframes.end-1];
             match (&f.binary_id, &sf.function_idx) {
-                (Some(b), Ok(function_idx)) => Some((b.clone(), *function_idx, f.pseudo_addr)),
+                (Some(b), Ok(function_idx)) => Some((*b, *function_idx, f.pseudo_addr)),
                 _ => None,
             }
         });
@@ -1745,7 +1758,7 @@ impl WindowContent for DisassemblyWindow {
             let mut cursor_addr = usize::MAX;
             if cursor_static_addr != usize::MAX {
                 cursor_addr = binary.addr_map.static_to_dynamic(cursor_static_addr);
-                state.selected_addr = Some((binary.id.clone(), function_idx, cursor_addr));
+                state.selected_addr = Some((binary.id, function_idx, cursor_addr));
             }
 
             for action in ui.check_keys(&[KeyAction::ToggleBreakpoint, KeyAction::DisableBreakpoint, KeyAction::StepToCursor, KeyAction::PreviousLocation, KeyAction::NextLocation]) {
@@ -1794,7 +1807,7 @@ impl WindowContent for DisassemblyWindow {
                 source_line = Some(SourceScrollTarget {path: file.path.to_owned(), version: file.version.clone(), line: line.line()});
             }
         }
-        let key = (symbols.identity, function_idx, tab.area_state.cursor, tab.selected_subfunction_level);
+        let key = (binary.id, function_idx, tab.area_state.cursor, tab.selected_subfunction_level);
         if self.source_scrolled_to.as_ref() != Some(&key) {
             self.source_scrolled_to = Some(key);
             if !suppress_code_autoscroll {
@@ -2306,15 +2319,6 @@ struct BinariesWindow {
 }
 impl WindowContent for BinariesWindow {
     fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
-        // Listed in order of mmap address, so the main executable is usually first, which is nice.
-        state.binaries = debugger.info.maps.list_binaries();
-        // List previously seen unloaded binaries too, because they're visible to file/function open dialogs, especially if there's no debuggee process.
-        for id in debugger.symbols.list() {
-            if !debugger.info.binaries.contains_key(&id) {
-                state.binaries.push(id);
-            }
-        }
-
         let mut table = Table::new(mem::take(&mut self.table_state), ui, vec![
             Column::new("idx", AutoSize::Fixed(3), false),
             Column::new("name", AutoSize::Remainder(1.0), false),
@@ -2322,12 +2326,10 @@ impl WindowContent for BinariesWindow {
             Column::new("file", AutoSize::Fixed(PrettySize::MAX_LEN), false),
         ]);
         table.hide_cursor_if_unfocused = true;
-        for (idx, id) in state.binaries.iter().enumerate() {
-            let binary = debugger.symbols.get_if_present(id).unwrap();
-            let mapped_binary = debugger.info.binaries.get(id);
-            table.start_row(hash(id), ui);
+        for binary in debugger.symbols.iter() {
+            table.start_row(binary.id, ui);
 
-            ui_writeln!(ui, default_dim, "{}", idx + 1);
+            ui_writeln!(ui, default_dim, "{}", binary.priority_idx + 1);
             table.text_cell(ui);
 
             // Path, progress bar, error message.
@@ -2335,14 +2337,14 @@ impl WindowContent for BinariesWindow {
                 ui.cur_mut().axes[Axis::Y].flags.insert(AxisFlags::STACK);
 
                 // Path.
-                let style = if mapped_binary.is_some() {ui.palette.default} else {ui.palette.default_dim};
-                let l = styled_writeln!(ui.text, style, "{}", id.path);
+                let style = if binary.is_mapped {ui.palette.default} else {ui.palette.default_dim};
+                let l = styled_writeln!(ui.text, style, "{}", binary.locator.path);
                 ui.add(widget!().height(AutoSize::Text).flags(WidgetFlags::TEXT_TRUNCATION_ALIGN_RIGHT).text(l));
 
                 // Progress bar.
                 let mut indicated_loading = false;
                 if binary.symbols.as_ref().is_err_and(|e| e.is_loading()) {
-                    let (progress_ppm, loading_stage) = debugger.symbols.get_progress(id);
+                    let (progress_ppm, loading_stage) = debugger.symbols.get_progress(binary.id);
                     let l = ui_writeln!(ui, default, "{}% ({})", (progress_ppm + 5000) / 10000, loading_stage);
                     let mut w = widget!().height(AutoSize::Text).text(l);
                     w.draw_progress_bar = Some((progress_ppm as f64 / 1e6, ui.palette.progress_bar));
@@ -2379,8 +2381,8 @@ impl WindowContent for BinariesWindow {
                 }
             });
 
-            if let &Some(b) = &mapped_binary {
-                ui_writeln!(ui, default_dim, "{:>12x}", b.addr_map.static_to_dynamic(0) & 0xffffffffffff);
+            if binary.is_mapped {
+                ui_writeln!(ui, default_dim, "{:>12x}", binary.addr_map.static_to_dynamic(0) & 0xffffffffffff);
             }
             table.text_cell(ui);
 
@@ -2689,7 +2691,7 @@ impl WindowContent for ThreadsWindow {
                     table.text_cell(ui);
 
                     match &f.binary_id {
-                        Some(binary_id) => ui_writeln!(ui, default_dim, "{}", state.binaries.iter().position(|b| b == binary_id).unwrap() + 1),
+                        Some(binary_id) => ui_writeln!(ui, default_dim, "{}", debugger.symbols.get(*binary_id).unwrap().priority_idx + 1),
                         None => ui_writeln!(ui, default_dim, "?"),
                     };
                     table.text_cell(ui);
@@ -2895,7 +2897,7 @@ impl WindowContent for StackWindow {
             if is_inlined {
                 ui.text.close_line();
             } else if let Some(b) = &frame.binary_id {
-                ui_writeln!(ui, default_dim, "{}", state.binaries.iter().position(|x| x == b).unwrap() + 1);
+                ui_writeln!(ui, default_dim, "{}", debugger.symbols.get(*b).unwrap().priority_idx + 1);
             } else {
                 ui_writeln!(ui, default_dim, "?");
             }
@@ -2935,7 +2937,7 @@ impl WindowContent for StackWindow {
             if scroll_source_and_disassembly || rerequest_scroll {
                 state.should_scroll_source = Some((subframe.line.as_ref().map(|line| SourceScrollTarget {path: line.path.clone(), version: line.version.clone(), line: line.line.line()}), !scroll_source_and_disassembly));
                 state.should_scroll_disassembly = Some((match &state.stack.subframes[frame.subframes.end - 1].function_idx {
-                    &Ok(function_idx) => Ok(DisassemblyScrollTarget {binary_id: frame.binary_id.clone().unwrap(), symbols_identity: frame.symbols_identity, function_idx, static_pseudo_addr: frame.pseudo_addr.wrapping_sub(frame.addr_static_to_dynamic),
+                    &Ok(function_idx) => Ok(DisassemblyScrollTarget {binary_id: frame.binary_id.clone().unwrap(), function_idx, static_pseudo_addr: frame.pseudo_addr.wrapping_sub(frame.addr_static_to_dynamic),
                                                                          subfunction_level: (frame.subframes.end - state.selected_subframe - 1) as u16}),
                     Err(e) => Err(e.clone()),
                 }, !scroll_source_and_disassembly));
@@ -3212,7 +3214,7 @@ impl CodeWindow {
     fn read_and_format_file(input: &mut dyn Read, debugger: &Debugger, res: &mut SourceFile, path_in_symbols: &Path, palette: &Palette) -> Result<(usize, [u8; 16])> {
         // Highlight all line+column locations where we can stop (statements and inlined function call sites).
         let mut markers: Vec<LineInfo> = Vec::new();
-        for (_, binary) in debugger.symbols.iter() {
+        for binary in debugger.symbols.iter() {
             let symbols = match &binary.symbols {
                 Ok(s) => s,
                 Err(_) => continue };
@@ -3396,7 +3398,7 @@ impl CodeWindow {
             return;
         }
 
-        for (binary_id, binary) in &debugger.info.binaries {
+        for binary in debugger.symbols.iter() {
             let symbols = match &binary.symbols {
                 Ok(s) => s,
                 Err(_) => continue,
@@ -3427,7 +3429,7 @@ impl CodeWindow {
             // (e.g. autoselected based on stack trace) - then jumping to a totally different function would be jarring.
             // So I guess we should pick the address that's "closest" to the disassembly cursor, where "closest" means it's is in the
             // same function and has the lowest lowest-common-ancestor in subfunction tree. That's what we do here.
-            // This can be pretty annoying though: if you randomly scroll back and forth in the source file, the disassembly will probably
+            // This can still be pretty annoying though: if you randomly scroll back and forth in the source file, the disassembly will probably
             // jump to a different function at some point and will forget the relevant inlined site; maybe we should take stack trace into account too?
             let mut closest_idx = addrs.iter().position(|&(function_idx, level, static_addr)| {
                 if level == 0 {
@@ -3446,7 +3448,7 @@ impl CodeWindow {
             }).unwrap_or(0);
             let mut selected_idx: Option<usize> = None;
             if let Some((binary_id, selected_function_idx, selected_addr)) = &state.selected_addr {
-                if let Some(binary) = debugger.info.binaries.get(binary_id) {
+                if let Some(binary) = debugger.symbols.get(*binary_id) {
                     let selected_static_addr = binary.addr_map.dynamic_to_static(*selected_addr);
                     let symbols = binary.symbols.as_ref().unwrap();
                     let function = &symbols.functions[*selected_function_idx];
@@ -3485,7 +3487,7 @@ impl CodeWindow {
                 None => closest_idx,
             };
 
-            state.should_scroll_disassembly = Some((Ok(DisassemblyScrollTarget {binary_id: binary_id.clone(), symbols_identity: symbols.identity, function_idx: addrs[idx].0, static_pseudo_addr: addrs[idx].2, subfunction_level: addrs[idx].1}), false));
+            state.should_scroll_disassembly = Some((Ok(DisassemblyScrollTarget {binary_id: binary.id, function_idx: addrs[idx].0, static_pseudo_addr: addrs[idx].2, subfunction_level: addrs[idx].1}), false));
 
             break;
         }
@@ -3987,12 +3989,12 @@ impl WindowContent for BreakpointsWindow {
                     }
                     BreakpointOn::Address(on) => {
                         if let Some((locator, offset)) = &on.function {
-                            if let Ok(binary) = Debugger::find_binary_fuzzy(&debugger.info, None, &locator.binary_id) {
+                            if let Ok(binary) = Debugger::find_binary_fuzzy(&debugger.symbols, &locator.binary_locator) {
                                 if let Ok(symbols) = &binary.symbols {
                                     if let Some(function_idx) = symbols.find_nearest_function(&locator.mangled_name, locator.addr) {
                                         let function = &symbols.functions[function_idx];
                                         state.should_scroll_disassembly = Some((Ok(DisassemblyScrollTarget {
-                                            binary_id: locator.binary_id.clone(), symbols_identity: symbols.identity, function_idx, static_pseudo_addr: function.addr.0 + offset, subfunction_level: on.subfunction_level}), false));
+                                            binary_id: binary.id, function_idx, static_pseudo_addr: function.addr.0 + offset, subfunction_level: on.subfunction_level}), false));
                                     }
                                 }
                             }

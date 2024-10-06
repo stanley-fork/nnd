@@ -7,8 +7,6 @@ use libc::pid_t;
 pub struct ProcessInfo {
     pub maps: MemMapsInfo,
     pub exe_inode: u64,
-    // Pointers to symbols for all mapped binaries. Guaranteed to be present in SymbolsRegistry.
-    pub binaries: HashMap<BinaryId, BinaryInfo>,
 
     // CPU and memory usage, total across all threads, recalculated periodically.
     pub total_resource_stats: ResourceStats,
@@ -95,21 +93,19 @@ impl ResourceStats {
 }
 
 impl ProcessInfo {
-    pub fn addr_to_binary(&self, addr: usize) -> Result<&BinaryInfo> {
+    pub fn addr_to_binary_id(&self, addr: usize) -> Result<usize> {
         let idx = self.maps.maps.partition_point(|m| m.start + m.len <= addr);
         if idx == self.maps.maps.len() || self.maps.maps[idx].start > addr {
             return err!(ProcessState, "address not mapped");
         }
-        let id = match &self.maps.maps[idx].binary_id {
-            None => return err!(ProcessState, "address not mapped to executable file"),
-            Some(b) => b
-        };
-        Ok(self.binaries.get(id).unwrap())
+        match self.maps.maps[idx].binary_id.clone() {
+            None => err!(ProcessState, "address not mapped to executable file"),
+            Some(id) => Ok(id),
+        }
     }
 
     pub fn clear(&mut self) {
         self.maps.clear();
-        self.binaries.clear();
     }
 }
 
@@ -137,68 +133,46 @@ pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) {
         }
     }
 
-    let maps = match MemMapsInfo::read_proc_maps(debugger.pid) {
+    let mut maps = match MemMapsInfo::read_proc_maps(debugger.pid) {
         Err(e) => {
             eprintln!("error: failed to read maps: {}", e);
             return;
         }
         Ok(m) => m };
 
-    let mut binaries: HashMap<BinaryId, BinaryInfo> = HashMap::new();
-
-    // Avoid returning (including '?') in this scope.
-    {
-        let mut prev_binaries = mem::take(&mut debugger.info.binaries);
-        for (idx, map) in maps.maps.iter().enumerate() {
-            let id = match &map.binary_id {
-                None => continue,
-                Some(b) => b,
-            };
-            let new_entry = match binaries.entry(id.clone()) {
-                Entry::Occupied(mut e) => {
-                    let bin = e.get_mut();
-                    if let Ok(elf) = &bin.elf {
-                        bin.addr_map.update(map, elf, &id.path);
+    debugger.symbols.mark_all_as_unmapped();
+    for (idx, map) in maps.maps.iter_mut().enumerate() {
+        let locator = match &map.binary_locator {
+            None => continue,
+            Some(b) => b,
+        };
+        let bin = match debugger.symbols.locator_to_id.get(locator) {
+            Some(id) => debugger.symbols.get_mut(*id).unwrap(),
+            None => {
+                let custom_path = if locator.inode == debugger.info.exe_inode {
+                    if let Some(p) = debugger.context.settings.unstripped_executable_path.clone() {
+                        Some(p)
+                    } else {
+                        // Use this special symlink instead of the regular path because it's available even after the file is deleted.
+                        // Useful when recompiling the program without closing the debugger.
+                        Some(format!("/proc/{}/exe", debugger.pid))
                     }
-                    continue;
-                }
-                Entry::Vacant(v) => v,
-            };
-
-            let custom_path = if id.inode == debugger.info.exe_inode {
-                if let Some(p) = debugger.context.settings.unstripped_executable_path.clone() {
-                    Some(p)
                 } else {
-                    // Use this special symlink instead of the regular path because it's available even after the file is deleted.
-                    // Useful when recompiling the program without closing the debugger.
-                    Some(format!("/proc/{}/exe", debugger.pid))
-                }
-            } else {
-                None
-            };
-
-            let latest = debugger.symbols.get_or_load(id, &debugger.memory, custom_path, idx);
-
-            let mut binary = match prev_binaries.remove(id) {
-                Some(mut bin) => {
-                    bin.elf = bin.elf.or(latest.elf);
-                    bin.symbols = bin.symbols.or(latest.symbols);
-                    bin.unwind = bin.unwind.or(latest.unwind);
-                    bin
-                }
-                None => latest,
-            };
-
-            if let Ok(elf) = &binary.elf {
-                binary.addr_map.update(map, elf, &id.path);
+                    None
+                };
+                debugger.symbols.add(locator.clone(), &debugger.memory, custom_path)
             }
-
-            new_entry.insert(binary);
+        };
+        map.binary_id = Some(bin.id);
+        bin.is_mapped = true;
+        if let Ok(elf) = &bin.elf {
+            bin.addr_map.update(map, elf, &locator.path);
         }
-
-        debugger.info.maps = maps;
-        debugger.info.binaries = binaries;
+        bin.mmap_idx = idx;
     }
+    debugger.symbols.update_priority_order();
+
+    debugger.info.maps = maps;
 }
 
 // Must be called when the thread gets suspended (and not immediately resumed) - to assign registers, so we can unwind the stack.

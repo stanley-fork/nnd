@@ -38,15 +38,13 @@ pub struct StackFrame {
     pub lsda: Option<gimli::Pointer>,
 
     // If we found a mapped binary corresponding to this address, these two are set.
-    pub binary_id: Option<BinaryId>,
+    pub binary_id: Option<usize>,
     pub addr_static_to_dynamic: usize,
-    // If we had a loaded Symbols for that Binary, this is set. Always present if any of this frame's subframes have function_idx, subfunction_idx, or line.
-    pub symbols_identity: usize,
 
     // Indices in StackTrace.subframes, from innermost to outermost inlined functions. Last one represents the frame. Not empty.
     pub subframes: Range<usize>,
 }
-impl Default for StackFrame { fn default() -> Self { Self {addr: 0, pseudo_addr: 0, regs: Registers::default(), frame_base: err!(Dwarf, "no frame base"), binary_id: None, addr_static_to_dynamic: 0, symbols_identity: 0, subframes: 0..0, fde_initial_address: 0, lsda: None} } }
+impl Default for StackFrame { fn default() -> Self { Self {addr: 0, pseudo_addr: 0, regs: Registers::default(), frame_base: err!(Dwarf, "no frame base"), binary_id: None, addr_static_to_dynamic: 0, subframes: 0..0, fde_initial_address: 0, lsda: None} } }
 
 #[derive(Clone)]
 pub struct StackSubframe {
@@ -75,7 +73,7 @@ impl StackTrace {
         let cfa = match frame.regs.get_int(RegisterIdx::Cfa) {
             Ok((c, _)) => c,
             Err(_) => return 0 };
-        let frame_identity = cfa as usize ^ frame.symbols_identity;
+        let frame_identity = (cfa as usize, frame.binary_id.clone().unwrap_or(usize::MAX));
         if let Some(i) = subframe.subfunction_idx.as_ref() {
             hash(&(frame_identity, *i, 0usize))
         } else if let Ok(i) = subframe.function_idx.as_ref() {

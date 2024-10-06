@@ -5,7 +5,7 @@ use bitflags::*;
 use libc::{pid_t, c_void};
 
 #[derive(Eq, PartialEq, Ord, PartialOrd, Hash, Default, Clone, Debug)]
-pub struct BinaryId {
+pub struct BinaryLocator {
     pub path: String,
     // Inode number, to notice if binary version doesn't match, e.g. if it was recompiled.
     // Doesn't notice if the file was modified in place, but that hardly ever happens in practice.
@@ -15,18 +15,18 @@ pub struct BinaryId {
     // If it's an executable segment not backed by an ELF file.
     pub special: SpecialSegmentId,
 }
-impl BinaryId {
-    // When a BinaryId is saved and loaded across debugger restarts, we don't want to save inode number or vdso address, because they may change (e.g. if the binary was recompiled).
-    // So a loaded BinaryId is "incomplete" and needs to be searched in the list of loaded binaries at runtime.
+impl BinaryLocator {
+    // When a BinaryLocator is saved and loaded across debugger restarts, we don't want to save inode number or vdso address, because they may change (e.g. if the binary was recompiled).
+    // So a loaded BinaryLocator is "incomplete" and needs to be searched in the list of loaded binaries at runtime.
     pub fn save_state_incomplete(&self, out: &mut Vec<u8>) -> Result<()> {
         out.write_str(&self.path)?;
         out.write_u8(self.special.is_vdso() as u8)?;
         Ok(())
     }
     pub fn load_state_incomplete(inp: &mut &[u8]) -> Result<Self> {
-        Ok(Self {path: inp.read_str()?, inode: 0, special: if inp.read_u8()? == 1 {SpecialSegmentId::Vdso(0..0)} else {SpecialSegmentId::None}})
+        Ok(Self {path: inp.read_str()?, inode: 0, special: if inp.read_u8()? == 1 {SpecialSegmentId::Vdso((0, 0..0))} else {SpecialSegmentId::None}})
     }
-    pub fn matches_incomplete(&self, incomplete: &BinaryId) -> bool {
+    pub fn matches_incomplete(&self, incomplete: &BinaryLocator) -> bool {
         (&self.path, self.special.is_vdso()) == (&incomplete.path, incomplete.special.is_vdso())
     }
 }
@@ -34,12 +34,12 @@ impl BinaryId {
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
 pub enum SpecialSegmentId {
     None,
-    Vdso(Range<usize>),
+    Vdso((libc::pid_t, Range<usize>)),
 }
 impl Default for SpecialSegmentId { fn default() -> Self { Self::None } }
 impl Ord for SpecialSegmentId {
     fn cmp(&self, other: &Self) -> Ordering {
-        let key = |s: &Self| -> (usize, usize, usize) { match s { Self::None => (0, 0, 0), Self::Vdso(r) => (1, r.start, r.end) } };
+        let key = |s: &Self| -> (libc::pid_t, usize, usize) { match s { Self::None => (0, 0, 0), Self::Vdso((pid, r)) => (*pid, r.start, r.end) } };
         key(self).cmp(&key(other))
     }
 }
@@ -56,8 +56,9 @@ pub struct MemMapInfo {
     pub inode: u64,
     pub path: Option<String>,
 
-    // Just `path` and `inode` bundled together, but present only if this appears to be an executable or shared library.
-    pub binary_id: Option<BinaryId>,
+    // If this mapping appears to be an executable or shared library.
+    pub binary_locator: Option<BinaryLocator>,
+    pub binary_id: Option<usize>, // if added to SymbolsRegistry
 }
 
 bitflags! {
@@ -89,11 +90,8 @@ pub struct AddrMap {
     // Not to be confused with the difference between address and file offset - this difference may be different for different sections, we make no assumptions about that.
     consistent: bool,
 }
+impl Default for AddrMap { fn default() -> Self { Self {diff: 0, known: false, consistent: true} } }
 impl AddrMap {
-    pub fn new() -> Self {
-        Self {diff: 0, known: false, consistent: true}
-    }
-
     pub fn update(&mut self, map: &MemMapInfo, elf: &ElfFile, /* just for logging */ path: &str) {
         // We assume that all mmaps backed by ELF files are created by the ELF loader, and so correspond to ELF sections and have consistent difference between dynamic and static addresses.
         // (So if the program manually mmap()s its own executable or some dynamic library it's using, we may get incorrect `diff` value and fail to use debug symbols correctly and even fail to unwind stacks correctly.)
@@ -102,9 +100,9 @@ impl AddrMap {
         if !map.perms.contains(MemMapPermissions::EXECUTE) {
             return;
         }
-        match &map.binary_id.as_ref().unwrap().special {
+        match &map.binary_locator.as_ref().unwrap().special {
             SpecialSegmentId::None => (),
-            SpecialSegmentId::Vdso(range) => {
+            SpecialSegmentId::Vdso((_, range)) => {
                 self.diff = range.start;
                 self.known = true;
                 return;
@@ -142,7 +140,7 @@ impl MemMapsInfo {
     pub fn read_proc_maps(pid: pid_t) -> Result<MemMapsInfo> {
         let reader = BufReader::new(File::open(format!("/proc/{}/maps", pid))?);
         let mut res: Vec<MemMapInfo> = Vec::new();
-        let mut executables: HashSet<BinaryId> = HashSet::new();
+        let mut executables: HashSet<BinaryLocator> = HashSet::new();
         for line in reader.lines() {
             let line = line?;
 
@@ -192,35 +190,35 @@ impl MemMapsInfo {
 
             let path = match rest { None => None, Some(p) => Some(p.trim_start().to_string()) };
 
-            let mut binary_id: Option<BinaryId> = None;
+            let mut binary_locator: Option<BinaryLocator> = None;
             if let Some(p) = &path {
                 if p == "[vdso]" && permissions.contains(MemMapPermissions::EXECUTE) {
-                    binary_id = Some(BinaryId {path: p.clone(), inode: pid as u64, special: SpecialSegmentId::Vdso(start..end)});
+                    binary_locator = Some(BinaryLocator {path: p.clone(), inode: pid as u64, special: SpecialSegmentId::Vdso((pid, start..end))});
                 } else if !p.is_empty() && !p.starts_with('[') {
                     // If the executable file was deleted (e.g. recompiled), /proc/maps shows its filename as "/path/to/executable (deleted)". Discard this suffix.
                     // It's also possible that the executable is named literally "/path/to/executable (deleted)" and not deleted - we'll fail to find it in this case;
                     // in this case we'll fail to find it; AFAICT there's no reliable way to distinguish these cases
                     // (but we may try harder if needed, e.g. check if this file exists; it'll always be vulnerable to race conditions with renaming the file).
                     let path = p.strip_suffix(" (deleted)").unwrap_or(p).to_string();
-                    binary_id = Some(BinaryId {path, inode, special: SpecialSegmentId::None});
+                    binary_locator = Some(BinaryLocator {path, inode, special: SpecialSegmentId::None});
                 }
                 // We currently ignore executable anon (p.is_empty()) mappings, e.g. JITted code.
             }
             if permissions.contains(MemMapPermissions::EXECUTE) {
-                if let Some(id) = &binary_id {
+                if let Some(id) = &binary_locator {
                     executables.insert(id.clone());
                 }
             }
 
-            res.push(MemMapInfo {start, len: end - start, perms: permissions, offset, inode, path, binary_id});
+            res.push(MemMapInfo {start, len: end - start, perms: permissions, offset, inode, path, binary_locator, binary_id: None});
         }
 
         // Distinguish dynamic libraries vs mmapped data files. If the file is mapped as executable at least once,
-        // consider it an executable file and assign binary_id for all its mapped segments (including non-executable, e.g. .rodata).
+        // consider it an executable file and assign binary_locator for all its mapped segments (including non-executable, e.g. .rodata).
         for m in &mut res {
-            if let Some(id) = &m.binary_id {
+            if let Some(id) = &m.binary_locator {
                 if !executables.contains(id) {
-                    m.binary_id = None;
+                    m.binary_locator = None;
                 }
             }
         }
@@ -230,10 +228,10 @@ impl MemMapsInfo {
         Ok(MemMapsInfo {maps: res})
     }
 
-    pub fn list_binaries(&self) -> Vec<BinaryId> {
-        let mut v: Vec<(usize, &BinaryId)> = Vec::new();
+    pub fn list_binaries(&self) -> Vec<BinaryLocator> {
+        let mut v: Vec<(usize, &BinaryLocator)> = Vec::new();
         for i in 0..self.maps.len() {
-            let id = match &self.maps[i].binary_id {
+            let id = match &self.maps[i].binary_locator {
                 None => continue,
                 Some(i) => i };
             v.push((i, id));
@@ -251,10 +249,6 @@ impl MemMapsInfo {
         } else {
             None
         }
-    }
-
-    pub fn offset_to_map(&self, binary_id: &BinaryId, offset: usize) -> Option<&MemMapInfo> {
-        self.maps.iter().find_map(|m| if m.binary_id.as_ref() == Some(binary_id) && m.offset <= offset && m.offset + m.len > offset { Some(m) } else { None })
     }
 
     pub fn clear(&mut self) { self.maps.clear(); }
@@ -275,6 +269,9 @@ impl MemReader {
     }
 
     pub fn read_uninit<'a>(&self, offset: usize, buf: &'a mut [MaybeUninit<u8>]) -> Result<&'a mut [u8]> {
+        if self.pid == 0 {
+            return err!(ProcessState, "no process");
+        }
         unsafe {
             let local_iov = libc::iovec {iov_base: buf.as_mut_ptr() as *mut c_void, iov_len: buf.len()};
             let mut remote_iov = libc::iovec {iov_base: offset as *mut c_void, iov_len: buf.len()};
@@ -312,6 +309,9 @@ impl MemReader {
 
     // The address range must be flagged as writable, so we can't use this to write to the code.
     pub fn write(&self, offset: usize, buf: &[u8]) -> Result<()> {
+        if self.pid == 0 {
+            return err!(ProcessState, "no process");
+        }
         unsafe {
             let local_iov = libc::iovec {iov_base: buf.as_ptr() as *mut c_void, iov_len: buf.len()};
             let mut remote_iov = libc::iovec {iov_base: offset as *mut c_void, iov_len: buf.len()};

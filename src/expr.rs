@@ -361,7 +361,6 @@ pub fn format_dwarf_expression<'a>(expr: Expression<EndianSlice<'a, LittleEndian
 }
 
 pub struct EvalState {
-    binaries: Vec<BinaryInfo>,
     pub currently_evaluated_value_dubious: bool,
     pub types: Types,
     pub builtin_types: BuiltinTypes,
@@ -373,26 +372,15 @@ impl EvalState {
     pub fn new() -> Self {
         let mut types = Types::new();
         let builtin_types = types.add_builtins();
-        Self { binaries: Vec::new(), currently_evaluated_value_dubious: false, types, builtin_types, variables: HashMap::new() } }
+        Self { currently_evaluated_value_dubious: false, types, builtin_types, variables: HashMap::new() } }
 
     pub fn clear(&mut self) {
-        self.binaries.clear();
         self.types = Types::new();
         self.builtin_types = self.types.add_builtins();
         self.variables.clear();
     }
 
-    pub fn update(&mut self, context: &mut EvalContext) {
-        let mut seen_binaries: HashSet<BinaryId> = HashSet::new();
-        for b in &self.binaries {
-            seen_binaries.insert(b.id.clone());
-        }
-        for (id, info) in &context.process_info.binaries {
-            if info.symbols.is_ok() && !seen_binaries.contains(id) {
-                self.binaries.push(info.clone());
-            }
-        }
-    }
+    pub fn update(&mut self, context: &mut EvalContext) {}
 
     pub fn get_variable(&mut self, context: &mut EvalContext, name: &str, maybe_register: bool, from_any_frame: bool, only_type: bool) -> Result<Value> {
         let global_alt_name = if name.starts_with("::") {Some(&name[2..])} else {None};
@@ -427,7 +415,7 @@ impl EvalState {
         }
 
         // Try global variable.
-        for binary in &self.binaries {
+        for binary in context.symbols_registry.iter() {
             let symbols = match &binary.symbols {
                 Ok(x) => x,
                 Err(_) => continue };
@@ -445,7 +433,7 @@ impl EvalState {
     }
 
     pub fn get_type(&mut self, context: &mut EvalContext, name: &str) -> Result<*const TypeInfo> {
-        for binary in &self.binaries {
+        for binary in context.symbols_registry.iter() {
             let symbols = match &binary.symbols {
                 Ok(x) => x,
                 Err(_) => continue };
@@ -477,7 +465,7 @@ impl EvalState {
         err!(NoVariable, "")
     }
 
-    pub fn get_global_variable(currently_evaluated_value_dubious: &mut bool, context: &mut EvalContext, var: &Variable, binary: &BinaryInfo, only_type: bool) -> Result<Value> {
+    pub fn get_global_variable(currently_evaluated_value_dubious: &mut bool, context: &mut EvalContext, var: &Variable, binary: &Binary, only_type: bool) -> Result<Value> {
         let (val, dubious) = if only_type {
             (Default::default(), false)
         } else {
@@ -498,8 +486,9 @@ impl EvalState {
 pub struct EvalContext<'a> {
     pub memory: CachedMemReader,
     pub process_info: &'a ProcessInfo,
+    pub symbols_registry: &'a SymbolsRegistry,
     // We include the whole stack to allow watch expressions to use variables from other frames.
-    pub stack: &'a StackTrace,
+    pub stack: &'a StackTrace,//asdqwe make optional, allow using context with no process or running process
     pub selected_subframe: usize,
 }
 impl EvalContext<'_> {
@@ -509,7 +498,7 @@ impl EvalContext<'_> {
         let selected_frame = subframe.frame_idx;
         let frame = &self.stack.frames[selected_frame];
         let function_idx = self.stack.subframes[frame.subframes.end-1].function_idx.clone()?;
-        let binary_id = match frame.binary_id.as_ref() {
+        let binary_id = match frame.binary_id.clone() {
             None => return err!(ProcessState, "no binary for address {:x}", frame.pseudo_addr),
             Some(b) => b,
         };
@@ -517,11 +506,11 @@ impl EvalContext<'_> {
             None => return err!(Dwarf, "function has no debug info"),
             Some(x) => *x,
         };
-        let binary = self.process_info.binaries.get(binary_id).unwrap();
+        let binary = match self.symbols_registry.get(binary_id) {
+            None => return err!(Internal, "binary was unloaded after generating backtrace"),
+            Some(x) => x,
+        };
         let symbols = binary.symbols.as_ref_clone_error()?;
-        if symbols.identity != frame.symbols_identity {
-            return err!(Internal, "symbols were reloaded after generating backtrace");
-        }
         let function = &symbols.functions[function_idx];
         let unit = match function.debug_info_offset() {
             None => return err!(ProcessState, "function has no debug info"),
@@ -534,7 +523,7 @@ impl EvalContext<'_> {
         Ok((context, function))
     }
 
-    pub fn make_global_dwarf_eval_context<'a>(&'a mut self, binary: &'a BinaryInfo, die_offset: DebugInfoOffset) -> Result<DwarfEvalContext<'a>> {
+    pub fn make_global_dwarf_eval_context<'a>(&'a mut self, binary: &'a Binary, die_offset: DebugInfoOffset) -> Result<DwarfEvalContext<'a>> {
         let symbols = binary.symbols.as_ref_clone_error()?;
         let unit = symbols.find_unit(die_offset)?;
         Ok(DwarfEvalContext {memory: &mut self.memory, symbols: Some(symbols), addr_map: &binary.addr_map, encoding: unit.unit.header.encoding(), unit: Some(unit), regs: None, frame_base: None, local_variables: &[]})
@@ -549,7 +538,7 @@ bitflags! { pub struct ValueFlags: u8 {
     const BIN = 0x4;
 
     // Similar to RAW, disables automatic unwrapping of single-field structs by prettifier. Doesn't do any of the other RAW things.
-    // Can't be changed by the user. Used for structs produced by MetaType/MetaField.
+    // Can't be changed by the user. Used for structs produced by MetaType/MetaField/etc.
     const NO_UNWRAPPING_INTERNAL = 0x8;
     // When formatting value, print struct name. Used after automatic downcasting. Not inherited by fields.
     const SHOW_TYPE_NAME = 0x10;
@@ -573,6 +562,13 @@ pub enum ValueChildKind {
     Other,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum ValueClickAction {
+    None,
+    // This value represents code location, jump to it on click.
+    CodeLocation((/*binary_id*/ usize, LineInfo)),
+}
+
 pub struct ValueChildInfo {
     pub identity: usize,
     pub name_line: usize, // line in `names_out` given to format_value()
@@ -586,7 +582,7 @@ pub struct ValueChildInfo {
 // `has_children` is returned even if expanded = false; it tells whether the value "logically" has children, even if there are 0 of them (e.g. empty array).
 // The format can depend on `expanded`, e.g. array and struct contents are omitted (because they should be visible as children instead).
 // Doesn't close the line in `out`, the caller should do it.
-pub fn format_value(v: &Value, expanded: bool, state: &mut EvalState, context: &mut EvalContext, out: &mut StyledText, names_out: &mut StyledText, palette: &Palette) -> (/*has_children*/ bool, /*children*/ Vec<ValueChildInfo>) {
+pub fn format_value(v: &Value, expanded: bool, state: &mut EvalState, context: &mut EvalContext, out: &mut StyledText, names_out: &mut StyledText, palette: &Palette) -> (/*has_children*/ bool, /*children*/ Vec<ValueChildInfo>, ValueClickAction) {
     let (text_start_lines, text_start_chars) = (out.lines.len(), out.chars.len());
     format_value_recurse(v, false, &mut FormatValueState {expanded, state, context, out, names_out, palette, text_start_lines, text_start_chars})
 }
@@ -608,11 +604,13 @@ impl<'a, 'b> FormatValueState<'a, 'b> {
     }
 }
 
-fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut FormatValueState) -> (/*has_children*/ bool, /*children*/ Vec<ValueChildInfo>) {
+fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut FormatValueState) -> (/*has_children*/ bool, /*children*/ Vec<ValueChildInfo>, ValueClickAction) {
+    let mut click_action = ValueClickAction::None;
+
     // Output length limit. Also acts as recursion depth limit.
     if state.over_output_limit() {
         styled_write!(state.out, state.palette.truncation_indicator.2, "{}", state.palette.truncation_indicator.1);
-        return (false, Vec::new());
+        return (false, Vec::new(), click_action);
     }
 
     let write_address = |addr: usize, state: &mut FormatValueState| {
@@ -650,7 +648,7 @@ fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut Form
             Err(e) => {
                 write_val_address_if_needed(&v.val, state);
                 styled_write!(state.out, state.palette.error, "<{}>", e);
-                return (false, Vec::new());
+                return (false, Vec::new(), click_action);
             }
         }
     }
@@ -670,7 +668,7 @@ fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut Form
             Err(e) => {
                 write_val_address_if_needed(&v.val, state);
                 styled_write!(state.out, state.palette.error, "<{}>", e);
-                return (false, children);
+                return (false, children, click_action);
             }
         }
     };
@@ -728,25 +726,25 @@ fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut Form
                 styled_write!(state.out, if state.expanded {state.palette.value_misc} else {state.palette.value}, "*0x{:x} ", x);
                 let t = unsafe {&*p.type_};
                 if x == 0 || (t.flags.contains(TypeFlags::SIZE_KNOWN) && t.size == 0) { // don't expand nullptr and void*
-                    return (false, children);
+                    return (false, children, click_action);
                 }
                 if !state.expanded {
-                    return (true, children);
+                    return (true, children, click_action);
                 }
                 if !try_format_as_string(Some(x), None, p.type_, None, false, v.flags, &mut state.context.memory, "", state.out, state.palette) {
                     // If expanded, act like a reference, i.e. expand the pointee.
-                    (_, children) = format_value_recurse(&Value {val: AddrOrValueBlob::Addr(x), type_: p.type_, flags: v.flags.inherit()}, true, state);
+                    (_, children, _) = format_value_recurse(&Value {val: AddrOrValueBlob::Addr(x), type_: p.type_, flags: v.flags.inherit()}, true, state);
                     for c in &mut children {
                         c.deref += 1;
                     }
                 }
-                return (true, children);
+                return (true, children, click_action);
             }
             Err(e) => styled_write!(state.out, state.palette.error, "<{}>", e),
         }
         Type::Array(a) => {
             format_array(a.type_, if a.flags.contains(ArrayFlags::LEN_KNOWN) {Some(a.len)} else {None}, a.stride, value, v.val.addr(), a.flags.contains(ArrayFlags::UTF_STRING), a.flags.contains(ArrayFlags::TRUNCATED), v.flags, state, &mut children);
-            return (true, children);
+            return (true, children, click_action);
         }
         Type::Slice(s) => {
             let addr = value.get_usize_at(0).unwrap();
@@ -758,11 +756,11 @@ fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut Form
                 Err(e) => {
                     write_val_address_if_needed(&v.val, state);
                     styled_write!(state.out, state.palette.error, "<{}>", e);
-                    return (false, children);
+                    return (false, children, click_action);
                 }
             };
             format_array(s.type_, Some(len), 0, &contents, Some(addr), s.flags.contains(SliceFlags::UTF_STRING), /*is_truncated*/ false, v.flags, state, &mut children);
-            return (true, children);
+            return (true, children, click_action);
         }
         Type::Struct(s) => {
             let value = match temp_value.blob_ref() {
@@ -851,8 +849,12 @@ fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut Form
             let val = reflect_meta_value(&v, state.state, state.context, Some((state.out, state.palette)));
             children = list_struct_children(&val.val, unsafe {(*val.type_).t.as_struct().unwrap()}, val.flags, state);
         }
+        Type::MetaCodeLocation => {
+            styled_write!(state.out, state.palette.filename, "asdqwe");
+            //asdqwe
+        }
     }
-    (!children.is_empty(), children)
+    (!children.is_empty(), children, click_action)
 }
 
 // x0 must be already sign-extended to 8 bytes if signed.
@@ -1315,6 +1317,9 @@ impl StructBuilder {
     pub fn add_usize_field(&mut self, name: &'static str, value: usize, type_: *const TypeInfo) {
         self.add_blob_field(name, &value.to_le_bytes(), type_);
     }
+    pub fn add_usize_blob_field(&mut self, name: &'static str, value: &[usize], type_: *const TypeInfo) {
+        unsafe {self.add_blob_field(name, std::slice::from_raw_parts(value.as_ptr() as *const u8, value.len() * 8), type_)};
+    }
     pub fn add_str_field(&mut self, name: &'static str, value: &str, types: &mut Types, builtin_types: &BuiltinTypes) {
         let array_type = types.add_array(builtin_types.char8, value.len(), ArrayFlags::UTF_STRING);
         self.add_blob_field(name, value.as_bytes(), array_type);
@@ -1330,7 +1335,7 @@ impl StructBuilder {
     pub fn finish(mut self, name: &'static str, flags: ValueFlags, types: &mut Types) -> Value {
         let fields_slice = types.fields_arena.add_slice(&self.fields);
         let struct_type = StructType {flags: StructFlags::empty(), fields_ptr: fields_slice.as_ptr(), fields_len: fields_slice.len()};
-        let type_ = TypeInfo {name, size: self.value_blob.len(), die: DebugInfoOffset(0), symbols_identity: 0, line: LineInfo::invalid(), language: LanguageFamily::Internal, nested_names: &[], flags: TypeFlags::SIZE_KNOWN, t: Type::Struct(struct_type)};
+        let type_ = TypeInfo {name, size: self.value_blob.len(), die: DebugInfoOffset(0), binary_id: usize::MAX, line: LineInfo::invalid(), language: LanguageFamily::Internal, nested_names: &[], flags: TypeFlags::SIZE_KNOWN, t: Type::Struct(struct_type)};
         let type_ = types.types_arena.add(type_);
         let val = AddrOrValueBlob::Blob(ValueBlob::from_vec(mem::take(&mut self.value_blob)));
         Value {val, type_, flags}

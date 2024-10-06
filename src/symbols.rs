@@ -3,7 +3,6 @@ use std::{cmp, str, mem, rc::Rc, fs::File, path::{Path, PathBuf}, sync::atomic::
 use memmap2::Mmap;
 use gimli::*;
 use bitflags::*;
-use rand::random;
 use std::ops::Range;
 
 // Data structures for the program information: functions, variables, struct fields, etc.
@@ -127,7 +126,6 @@ pub struct SymbolsShard {
 pub struct Symbols {
     pub elf: Arc<ElfFile>,
     pub debuglink_elf: Option<ElfFile>,
-    pub identity: usize, // randomly generated identifier of this specific Symbols instance; changes if we reload the symbols even for the exact same binary (to reflect the fact that Symbols loading is not deterministic, e.g. functions may end up in different shards)
 
     // .debug_info, .debug_line, etc - sections describing things in the source code (functions, line numbers, structs and their fields, etc) and how they map to address ranges.
     // If some or all sections are missing, we treat them as empty, and no special handling is needed because empty sections parse as valid DWARF debug info with 0 units.
@@ -310,25 +308,25 @@ impl FunctionInfo {
 // Less specific (e.g. name) to be likely to find the correct function if the binary changed a little.
 #[derive(Debug, Clone)]
 pub struct FunctionLocator {
-    pub binary_id: BinaryId,
+    pub binary_locator: BinaryLocator,
     pub mangled_name: Vec<u8>,
     pub demangled_name: String,
     pub addr: FunctionAddr,
 }
 impl FunctionLocator {
     pub fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {
-        self.binary_id.save_state_incomplete(out)?;
+        self.binary_locator.save_state_incomplete(out)?;
         out.write_slice(&self.mangled_name)?;
         out.write_str(&self.demangled_name)?; // can't just demangle on load because we don't know the language (alernatively we could save the language here)
         out.write_usize(self.addr.0)?;
         Ok(())
     }
     pub fn load_state(inp: &mut &[u8]) -> Result<Self> {
-        Ok(Self {binary_id: BinaryId::load_state_incomplete(inp)?, mangled_name: inp.read_slice()?, demangled_name: inp.read_str()?, addr: FunctionAddr(inp.read_usize()?)})
+        Ok(Self {binary_locator: BinaryLocator::load_state_incomplete(inp)?, mangled_name: inp.read_slice()?, demangled_name: inp.read_str()?, addr: FunctionAddr(inp.read_usize()?)})
     }
 
     pub fn matches_incomplete(&self, other: &Self) -> bool {
-        self.binary_id.matches_incomplete(&other.binary_id) && self.mangled_name == other.mangled_name && (!self.mangled_name.is_empty() || self.addr == other.addr)
+        self.binary_locator.matches_incomplete(&other.binary_locator) && self.mangled_name == other.mangled_name && (!self.mangled_name.is_empty() || self.addr == other.addr)
     }
 }
 
@@ -382,13 +380,14 @@ pub struct Variable {
     // Pc range in which this variable exists.
     pub start: usize,
     pub len: u32,
+    pub line: LineInfo,
     offset_and_flags: u64, // DieOffset and VariableFlags
 }
 unsafe impl Send for Variable {}
 unsafe impl Sync for Variable {}
 impl Variable {
-    fn new(name: &'static str, type_: *const TypeInfo, offset: DieOffset, flags: VariableFlags) -> Self {
-        Self {name_ptr: name.as_ptr(), name_len: name.len().min(u32::MAX as usize) as u32, type_, offset_and_flags: Variable::pack_offset_and_flags(offset, flags),
+    fn new(name: &'static str, type_: *const TypeInfo, offset: DieOffset, line: LineInfo, flags: VariableFlags) -> Self {
+        Self {name_ptr: name.as_ptr(), name_len: name.len().min(u32::MAX as usize) as u32, type_, line, offset_and_flags: Variable::pack_offset_and_flags(offset, flags),
               location: PackedVariableLocation::Unknown, start: 0, len: 0}
     }
     
@@ -511,7 +510,7 @@ pub struct LineInfo {
     //    line number "program" execution is just the gimli::read::LineRow struct, and the whole thing is pretty simple if you read the gimli code around it,
     //    so this seems very doable if needed; (I'm guessing what people usually do is have an index of "sequences" (DWARF term), but those can be >100k rows, so we should split them up, which is easy;)
     //    I went with the copy-everything-out approach to make it easier to support other platforms or split-DWARF in future if needed.)
-    data: [usize; 2],
+    pub data: [usize; 2],
 }
 
 static PRINTED_LINE_INFO_OVERFLOW_WARNING: AtomicUsize = AtomicUsize::new(0);
@@ -832,6 +831,7 @@ pub struct SymbolsLoader {
     shards: Vec<SyncUnsafeCell<CachePadded<SymbolsLoaderShard>>>,
     die_to_function_shards: Vec<SyncUnsafeCell<CachePadded<Vec<(DieOffset, usize)>>>>,
     types: TypesLoader,
+    binary_id: usize,
 
     // Shuffling global variable names across threads for deduplication.
     // [sender][receiver] -> messages
@@ -914,7 +914,7 @@ unsafe impl Sync for GlobalVariableNameMessage {}
 
 // Usage: call new(), then alternate between single-threaded calls to prepare_stage(i) and multi-threaded calls to run(i, shard_idx) (for all shard_idx in parallel); when prepare_stage() returns Ok(false), call into_result().
 impl SymbolsLoader {
-    pub fn new(elf: Arc<ElfFile>, max_shards: usize, status: Arc<SymbolsLoadingStatus>) -> Result<Self> {
+    pub fn new(elf: Arc<ElfFile>, binary_id: usize, max_shards: usize, status: Arc<SymbolsLoadingStatus>) -> Result<Self> {
         let start_time = Instant::now();
 
         *status.stage.lock().unwrap() = "opening debuglink".to_string();
@@ -1079,7 +1079,7 @@ impl SymbolsLoader {
 
         prepare_time_per_stage_ns[0] = start_time.elapsed().as_nanos() as usize;
         Ok(SymbolsLoader {
-            num_shards: shards.len(), sym: Symbols {elf, debuglink_elf, identity: random(), dwarf, units, files: Vec::new(), file_paths: StringTable::new(), path_to_used_file: HashMap::new(), functions: Vec::new(), shards: Vec::new(), builtin_types: BuiltinTypes::invalid(), base_types: Vec::new(), vtables: Vec::new(), code_addr_range},
+            num_shards: shards.len(), binary_id, sym: Symbols {elf, debuglink_elf, dwarf, units, files: Vec::new(), file_paths: StringTable::new(), path_to_used_file: HashMap::new(), functions: Vec::new(), shards: Vec::new(), builtin_types: BuiltinTypes::invalid(), base_types: Vec::new(), vtables: Vec::new(), code_addr_range},
             shards: shards.into_iter().map(|s| SyncUnsafeCell::new(CachePadded::new(s))).collect(), die_to_function_shards: (0..num_shards).map(|_| SyncUnsafeCell::new(CachePadded::new(Vec::new()))).collect(), types: types_loader, send_global_variable_names, strtab_symtab, status, progress_per_stage,
             prepare_time_per_stage_ns, run_time_per_stage_ns, shard_progress_ppm: (0..num_shards).map(|_| CachePadded::new(AtomicUsize::new(0))).collect(), stage: 0, types_before_dedup: 0, type_offsets: 0, type_offset_maps_bytes: 0, type_dedup_maps_bytes: 0})
     }
@@ -2221,6 +2221,7 @@ impl<'a> DwarfLoader<'a> {
                     let mut attr_specification_or_origin = None;
                     let mut attr_location = None;
                     let mut attr_const_value = None;
+                    let (mut decl_file, mut decl_line, mut decl_column) = (None, None, None);
                     for &attr in abbrev.attributes() {
                         match attr.name() {
                             DW_AT_name => name = Some(parse_attr_str(&self.loader.sym.dwarf, self.unit, &Some(cursor.read_attribute(attr)?))?),
@@ -2229,14 +2230,18 @@ impl<'a> DwarfLoader<'a> {
                             DW_AT_specification | DW_AT_abstract_origin => attr_specification_or_origin = Some(cursor.read_attribute(attr)?),
                             DW_AT_location => attr_location = Some(cursor.read_attribute(attr)?), 
                             DW_AT_const_value => attr_const_value = Some(cursor.read_attribute(attr)?), 
+                            DW_AT_decl_file => decl_file = Some(cursor.read_attribute(attr)?),
+                            DW_AT_decl_line => decl_line = Some(cursor.read_attribute(attr)?),
+                            DW_AT_decl_column => decl_column = Some(cursor.read_attribute(attr)?),
                             _ => cursor.skip_attributes(&[attr])?,
                         }
                     }
 
                     if attr_location.is_some() || attr_const_value.is_some() {
-                        self.chase_origin_pointers(attr_specification_or_origin, &mut name, &mut linkage_name, &mut type_, None)?;
+                        let mut decl = self.parse_line_info(decl_file, decl_line, decl_column);
+                        self.chase_origin_pointers(attr_specification_or_origin, &mut name, &mut linkage_name, &mut type_, Some(&mut decl))?;
                         let var_flags = if abbrev.tag() == DW_TAG_variable { VariableFlags::empty() } else { VariableFlags::PARAMETER };
-                        let var = Variable::new(name.unwrap_or(""), type_.unwrap_or(self.loader.types.builtin_types.unknown), offset, var_flags);
+                        let var = Variable::new(name.unwrap_or(""), type_.unwrap_or(self.loader.types.builtin_types.unknown), offset, decl, var_flags);
                         self.add_variable_locations(&attr_location, &attr_const_value, &linkage_name, var, offset)?;
                     }
                 }
@@ -2370,7 +2375,7 @@ impl<'a> DwarfLoader<'a> {
                         }
 
                         if let Some(frame_base) = frame_base {
-                            let var = Variable::new("#frame_base", self.loader.types.builtin_types.void_pointer, offset, VariableFlags::FRAME_BASE);
+                            let var = Variable::new("#frame_base", self.loader.types.builtin_types.void_pointer, offset, LineInfo::invalid(), VariableFlags::FRAME_BASE);
                             self.add_variable_locations(&Some(frame_base), &None, &None, var, offset)?;
                         }
                     }
@@ -2414,12 +2419,16 @@ impl<'a> DwarfLoader<'a> {
                             Type::Pointer(PointerType {flags: PointerFlags::empty(), type_: self.loader.types.builtin_types.unknown})
                         }
                         _ => panic!("huh?") };
-                    let mut info = TypeInfo {die: offset, symbols_identity: 0/*asdqwe*/, line: LineInfo::invalid()/*asdqwe*/, t, language: self.unit_language, ..Default::default()};
+                    let mut info = TypeInfo {die: offset, binary_id: self.loader.binary_id, line: LineInfo::invalid(), t, language: self.unit_language, ..Default::default()};
                     let mut saw_type = false;
                     let mut is_complex_float = false;
                     let mut unqualified_name: &'static str = "";
+                    let (mut decl_file, mut decl_line, mut decl_column) = (None, None, None);
                     for &attr in abbrev.attributes() {
                         match attr.name() {
+                            DW_AT_decl_file => decl_file = Some(cursor.read_attribute(attr)?),
+                            DW_AT_decl_line => decl_line = Some(cursor.read_attribute(attr)?),
+                            DW_AT_decl_column => decl_column = Some(cursor.read_attribute(attr)?),
                             DW_AT_name => {
                                 unqualified_name = parse_attr_str(&self.loader.sym.dwarf, self.unit, &Some(cursor.read_attribute(attr)?))?;
                                 self.append_namespace_to_scope_name(unqualified_name, true);
@@ -2503,6 +2512,7 @@ impl<'a> DwarfLoader<'a> {
                     if info.name.is_empty() {
                         self.append_namespace_to_scope_name("_", false);
                     }
+                    info.line = self.parse_line_info(decl_file, decl_line, decl_column);
 
                     if is_complex_float {
                         // Treat complex float as a struct rather than primitive type.
@@ -2610,6 +2620,7 @@ impl<'a> DwarfLoader<'a> {
                         }
                         let mut enum_value = 0usize;
                         let mut is_static_field = false;
+                        let (mut decl_file, mut decl_line, mut decl_column) = (None, None, None);
                         for &attr in abbrev.attributes() {
                             match attr.name() {
                                 DW_AT_name => field.name = unsafe {mem::transmute(parse_attr_str(&self.loader.sym.dwarf, self.unit, &Some(cursor.read_attribute(attr)?))?)},
@@ -2661,6 +2672,9 @@ impl<'a> DwarfLoader<'a> {
                                     cursor.skip_attributes(&[attr])?;
                                     field.flags.insert(FieldFlags::ARTIFICIAL);
                                 }
+                                DW_AT_decl_file => decl_file = Some(cursor.read_attribute(attr)?),
+                                DW_AT_decl_line => decl_line = Some(cursor.read_attribute(attr)?),
+                                DW_AT_decl_column => decl_column = Some(cursor.read_attribute(attr)?),
                                 _ => cursor.skip_attributes(&[attr])?,
                             }
                         }
@@ -2682,7 +2696,8 @@ impl<'a> DwarfLoader<'a> {
                                     // Probably separate declaration and definition.
                                     //if self.shard.warn.check(line!()) { eprintln!("warning: static field with no DW_AT_const_value at @0x{:x}", offset.0); }
                                 } else {
-                                    let var = Variable::new(field.name, field.type_, offset, VariableFlags::empty());
+                                    let decl = self.parse_line_info(decl_file, decl_line, decl_column);
+                                    let var = Variable::new(field.name, field.type_, offset, decl, VariableFlags::empty());
                                     self.add_variable_locations(&None, &attr_const_value, &None, var, offset)?;
                                 }
                             } else {
@@ -2718,7 +2733,7 @@ impl<'a> DwarfLoader<'a> {
                             array.flags.insert(ArrayFlags::PARSED_SUBRANGE);
                         } else {
                             // Turn multidimensional array into array of arrays.
-                            let info = TypeInfo {die: offset, symbols_identity: t.symbols_identity, line: t.line, language: self.unit_language, t: Type::Array(ArrayType {flags: ArrayFlags::PARSED_SUBRANGE, type_: array.type_, stride: 0, len: 0}), ..TypeInfo::default()};
+                            let info = TypeInfo {die: offset, binary_id: t.binary_id, line: t.line, language: self.unit_language, t: Type::Array(ArrayType {flags: ArrayFlags::PARSED_SUBRANGE, type_: array.type_, stride: 0, len: 0}), ..TypeInfo::default()};
                             let (ptr, off) = self.shard.types.add_type(info);
                             assert!(ptr != ptr::null());
                             array.type_ = off;
@@ -2841,7 +2856,7 @@ impl<'a> DwarfLoader<'a> {
 
                 // TODO: Function pointers and pointers to members.
                 DW_TAG_ptr_to_member_type | DW_TAG_subroutine_type => {
-                    self.shard.types.add_type(TypeInfo {name: "<unsupported>", die: offset, symbols_identity: 0/*asdqwe*/, line: LineInfo::invalid()/*asdqwe*/, language: self.unit_language, flags: TypeFlags::UNSUPPORTED, ..TypeInfo::default()});
+                    self.shard.types.add_type(TypeInfo {name: "<unsupported>", die: offset, binary_id: self.loader.binary_id, language: self.unit_language, flags: TypeFlags::UNSUPPORTED, ..TypeInfo::default()});
                     skip_subtree = self.depth;
                     cursor.skip_attributes(abbrev.attributes())?;
                 }
@@ -2968,11 +2983,15 @@ impl<'a> DwarfLoader<'a> {
                     let mut name: &'static str = "";
                     let mut type_: *const TypeInfo = ptr::null();
                     let mut attr_const_value = None;
+                    let (mut decl_file, mut decl_line, mut decl_column) = (None, None, None);
                     for &attr in abbrev.attributes() {
                         match attr.name() {
                             DW_AT_name => name = unsafe {mem::transmute(parse_attr_str(&self.loader.sym.dwarf, self.unit, &Some(cursor.read_attribute(attr)?))?)},
                             DW_AT_type => type_ = self.parse_type_ref(&attr, abbrev.tag(), &mut cursor)?,
                             DW_AT_const_value => attr_const_value = Some(cursor.read_attribute(attr)?),
+                            DW_AT_decl_file => decl_file = Some(cursor.read_attribute(attr)?),
+                            DW_AT_decl_line => decl_line = Some(cursor.read_attribute(attr)?),
+                            DW_AT_decl_column => decl_column = Some(cursor.read_attribute(attr)?),
                             _ => cursor.skip_attributes(&[attr])?,
                         }
                     }
@@ -2980,7 +2999,8 @@ impl<'a> DwarfLoader<'a> {
                         // Not sure what this means, but it's possible.
                         //if self.shard.warn.check(line!()) { eprintln!("warning: DW_TAG_template_value_parameter without DW_AT_const_value or DW_AT_type @0x{:x}", offset.0); }
                     } else {
-                        let var = Variable::new(name, type_, offset, VariableFlags::TEMPLATE_PARAMETER);
+                        let decl = self.parse_line_info(decl_file, decl_line, decl_column);
+                        let var = Variable::new(name, type_, offset, decl, VariableFlags::TEMPLATE_PARAMETER);
                         self.add_variable_locations(&None, &attr_const_value, &None, var, offset)?;
                     }
                 }

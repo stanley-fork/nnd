@@ -7,7 +7,7 @@ pub struct SymbolSearcher {
     pub searcher: Arc<dyn Searcher>,
     context: Arc<Context>,
 
-    symbols: Vec<(BinaryId, Arc<Symbols>)>,
+    symbols: Vec<(/*binary_id*/ usize, Arc<Symbols>)>,
     pub waiting_for_symbols: bool, // if true, the `symbols` array is incomplete, but we may still be searching and have some results
 
     state: Arc<SearchState>,
@@ -44,7 +44,7 @@ pub struct SearchResult {
 #[derive(Clone)]
 pub struct SearchResultInfo {
     pub id: usize,
-    pub binary: BinaryId,
+    pub binary_id: usize,
     pub symbols: Arc<Symbols>,
 
     pub name: String,
@@ -57,7 +57,7 @@ pub struct SearchResultInfo {
     pub mangled_name_match_ranges: Vec<Range<usize>>,
 }
 impl SearchResultInfo {
-    fn new(binary: BinaryId, symbols: Arc<Symbols>, id: usize) -> Self { Self {binary, symbols, id, name: String::new(), mangled_name: String::new(), file: PathBuf::new(), line: LineInfo::invalid(), name_match_ranges: Vec::new(), file_match_ranges: Vec::new(), mangled_name_match_ranges: Vec::new()} }
+    fn new(binary_id: usize, symbols: Arc<Symbols>, id: usize) -> Self { Self {binary_id, symbols, id, name: String::new(), mangled_name: String::new(), file: PathBuf::new(), line: LineInfo::invalid(), name_match_ranges: Vec::new(), file_match_ranges: Vec::new(), mangled_name_match_ranges: Vec::new()} }
 }
 
 // String with at least 32 bytes of readable memory before and after it, unless empty.
@@ -155,16 +155,14 @@ impl SymbolSearcher {
 
     // Returns true if a new search started; the caller should scroll to top in this case.
     pub fn update(&mut self, registry: &SymbolsRegistry, query: &SearchQuery) -> bool {
-        let seen_binary_ids: HashSet<BinaryId> = self.symbols.iter().map(|t| t.0.clone()).collect();
+        let seen_binary_ids: HashSet<usize> = self.symbols.iter().map(|t| t.0).collect();
         self.waiting_for_symbols = false;
-        let binaries = registry.list();
-        for id in binaries {
-            if seen_binary_ids.contains(&id) {
+        for bin in registry.iter() {
+            if seen_binary_ids.contains(&bin.id) {
                 continue;
             }
-            let bin = registry.get_if_present(&id).unwrap();
             match &bin.symbols {
-                Ok(s) => self.symbols.push((id.clone(), s.clone())),
+                Ok(s) => self.symbols.push((bin.id, s.clone())),
                 Err(e) if e.is_loading() => self.waiting_for_symbols = true,
                 Err(_) => (),
             }
@@ -240,7 +238,7 @@ pub struct SearcherProperties {
 
 pub trait Searcher: Sync + Send {
     fn search(&self, symbols: &Symbols, symbols_idx: usize, shard_idx: usize, query: &SearchQuery, cancel: &AtomicBool, callback: &mut SearchCallback);
-    fn format_result(&self, binary: BinaryId, symbols: &Arc<Symbols>, query: &SearchQuery, res: &SearchResult) -> SearchResultInfo;
+    fn format_result(&self, binary_id: usize, symbols: &Arc<Symbols>, query: &SearchQuery, res: &SearchResult) -> SearchResultInfo;
     fn properties(&self) -> SearcherProperties;
 }
 
@@ -267,9 +265,9 @@ impl Searcher for FileSearcher {
         callback(res, items_total, 0, bytes_done);
     }
 
-    fn format_result(&self, binary: BinaryId, symbols: &Arc<Symbols>, query: &SearchQuery, res: &SearchResult) -> SearchResultInfo {
+    fn format_result(&self, binary_id: usize, symbols: &Arc<Symbols>, query: &SearchQuery, res: &SearchResult) -> SearchResultInfo {
         let file = &symbols.files[res.id];
-        let mut res = SearchResultInfo::new(binary, symbols.clone(), res.id);
+        let mut res = SearchResultInfo::new(binary_id, symbols.clone(), res.id);
         res.file = file.path.to_owned();
         let slice = file.path.as_os_str().as_bytes();
         fuzzy_match(slice, query, &mut res.file_match_ranges);
@@ -315,9 +313,9 @@ impl Searcher for FunctionSearcher {
         callback(res, items_done, 0, bytes_done);
     }
 
-    fn format_result(&self, binary: BinaryId, symbols: &Arc<Symbols>, query: &SearchQuery, res: &SearchResult) -> SearchResultInfo {
+    fn format_result(&self, binary_id: usize, symbols: &Arc<Symbols>, query: &SearchQuery, res: &SearchResult) -> SearchResultInfo {
         let function = &symbols.functions[res.id];
-        let mut res = SearchResultInfo::new(binary, symbols.clone(), res.id);
+        let mut res = SearchResultInfo::new(binary_id, symbols.clone(), res.id);
         res.name = function.demangle_name();
         res.mangled_name = String::from_utf8_lossy(function.mangled_name()).into_owned();
         if let Some((sf, _)) = symbols.root_subfunction(function) {

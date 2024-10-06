@@ -782,29 +782,9 @@ impl Debugger {
         if refresh_info && (self.target_state == ProcessState::Suspended || self.target_state == ProcessState::Running || self.target_state == ProcessState::Stepping) {
             // TODO: Instead of re-reading /proc/<pid>/maps after every event, detect dynamic library loads using r_debug protocol (is that what it's called?), and maybe also every second.
             refresh_maps_and_binaries_info(self);
+            drop_caches |= self.symbols.do_eviction();
 
             if is_initial_exec {
-                // Eviction from SymbolsRegistry is tricky. Considerations:
-                //  * There are two main purposes of SymbolsRegistry:
-                //     - preserve loaded Symbols across debuggee restarts,
-                //     - when there's no debuggee process, we want to keep something like "last the set of binaries" to allow opening files/functions
-                //       (e.g. to set breakpoints before starting the debuggee again); this means we shouldn't evict too aggressively.
-                //  * The main practical need of eviction is when the debuggee was recompiled and restarted without restarting the debugger. Eviction in this case is needed because:
-                //     - don't want to keep Symbols for multiple versions of the executable becase that would use lots of memory,
-                //     - don't want file/function open dialogs to see things from obsolete binaries, especially when it clashes with latest binaries.
-                //  * There's no point during debuggee's lifetime where we can confidently say "ok, all dynamic libraries are loaded, we can evict everything else from SymbolsRegistry".
-                //    Initial PTRACE_EVENT_EXEC (is_initial_exec) is close to such point - it happens after the regular dynamic library loader has mapped the libraries.
-                //    But the debuggee may also have custom dynamic library loading code, e.g. just some dlopen() calls anywhere.
-                //  * Some code in ui caches things like subfunction_idx, which is only valid for the one Symbols instance; i.e. invalid if the same binary was evicted and loaded again.
-                //    So we drop caches when any Symbols are evicted.
-                //  * (Also note that we shouldn't rely on Arc use count for detecting whether a Symbols is in use because the Arc may be held by caches or dialogs.)
-                //  * (Maybe we should rethink SymbolsRegistry et al, hopefully there's a less tricky way to meet these requirements.)
-                // With all that in mind, we do eviction only on is_initial_exec, only evict binaries for which a newer version exists, and drop caches when anything is evicted.
-                self.symbols.do_eviction(&self.info.binaries);
-
-                // Binaries could be loaded at different addresses, need to refresh disassemblies (which show dynamic addresses).
-                drop_caches = true;
-
                 // The executable and the dynamic libraries should be mmapped by now (except the ones dlopen()ed at runtime, e.g. by custom dynamic linkers). Activate breakpoints.
                 self.activate_breakpoints(self.breakpoints.iter().map(|t| t.0).collect())?;
             }
@@ -1091,11 +1071,10 @@ impl Debugger {
             assert!(!by_instructions);
 
             let function_idx = stack.subframes[frame.subframes.end - 1].function_idx.clone()?;
-            let binary = self.info.binaries.get(frame.binary_id.as_ref().unwrap()).unwrap();
+            let binary = match self.symbols.get(frame.binary_id.clone().unwrap()) {
+                None => return err!(Internal, "binary was unloaded after generating backtrace"),
+                Some(x) => x };
             let symbols = binary.symbols.as_ref_clone_error()?;
-            if symbols.identity != frame.symbols_identity {
-                return err!(Internal, "symbols were reloaded after generating backtrace");
-            }
             unwind = Some((binary.unwind.clone()?, binary.addr_map.clone()));
             let function = &symbols.functions[function_idx];
             let static_pseudo_addr = binary.addr_map.dynamic_to_static(frame.pseudo_addr);
@@ -1205,10 +1184,10 @@ impl Debugger {
         } else {
             // Need unwind information, potentially for all binaries (if we wind up checking for step completion while in another function).
             // (Unwind info is separate from symbols and loads much faster, so it's hard to run into this in practice.)
-            if self.info.binaries.iter().any(|(_, b)| b.unwind.as_ref().is_err_and(|e| e.is_loading())) {
+            if self.symbols.iter().any(|b| b.is_mapped && b.unwind.as_ref().is_err_and(|e| e.is_loading())) {
                 return err!(Loading, "can't step while loading unwind info");
             }
-            
+
             step.cfa = frame.regs.get_int(RegisterIdx::Cfa)?.0 as usize;
         }
 
@@ -1381,7 +1360,7 @@ impl Debugger {
         }
 
         let mut breakpoint = Breakpoint {on: cursor, hits: 0, addrs: err!(NotCalculated, ""), enabled: true, active: false};
-        Self::determine_locations_for_breakpoint(&self.info, &mut breakpoint);
+        Self::determine_locations_for_breakpoint(&self.symbols, &mut breakpoint);
         let addrs = breakpoint.addrs?;
 
         eprintln!("info: step to cursor thread {} cursor {:?}", tid, breakpoint.on);
@@ -1495,7 +1474,7 @@ impl Debugger {
             // Would be nice to fall back to unwinding using some default ABI (rbp and callee cleanup, or something).
             // But for now we just stop if we can't find the binary (may be a problem for JIT-generated code) or .eh_frame section in it.
             let (_, mut static_pseudo_addr, binary, _) = self.addr_to_binary(pseudo_addr)?;
-            frame.binary_id = Some(binary.id.clone());
+            frame.binary_id = Some(binary.id);
             frame.addr_static_to_dynamic = binary.addr_map.static_to_dynamic(static_pseudo_addr).wrapping_sub(static_pseudo_addr);
 
             // This populates CFA "register", so needs to happen before symbolizing the frame (because frame_base expression might use CFA).
@@ -1534,34 +1513,32 @@ impl Debugger {
         }
     }
 
-    pub fn addr_to_binary(&self, addr: usize) -> Result<(/* offset */ usize, /* static addr */ usize, &BinaryInfo, &MemMapInfo)> {
+    pub fn addr_to_binary(&self, addr: usize) -> Result<(/* offset */ usize, /* static addr */ usize, &Binary, &MemMapInfo)> {
         let map = match self.info.maps.addr_to_map(addr) {
             None => return err!(ProcessState, "address not mapped"),
             Some(m) => m,
         };
         let binary_id = match &map.binary_id {
             None => return err!(ProcessState, "address not mapped to a binary"),
-            Some(b) => b,
+            Some(b) => *b,
         };
-        let binary = self.info.binaries.get(binary_id).unwrap();
+        let binary = self.symbols.get(binary_id).unwrap();
         Ok((addr - map.start + map.offset, binary.addr_map.dynamic_to_static(addr), binary, map))
     }
 
-    pub fn find_binary_fuzzy<'a>(info: &'a ProcessInfo, symbols: Option<&'a SymbolsRegistry>, binary_id: &BinaryId) -> Result<&'a BinaryInfo> {
-        Ok(if let Some(binary) = info.binaries.get(binary_id) {
-            binary
-        } else if let Some(Some(binary)) = symbols.map(|s| s.get_if_present(binary_id)) {
-            binary
-        } else if let Some((_, binary)) = info.binaries.iter().find(|(id, _)| id.matches_incomplete(binary_id)) {
-            binary
-        } else if let Some((_, binary)) = info.binaries.iter().find(|(id, _)| id.matches_incomplete(binary_id)) {
-            binary
+    pub fn find_binary_fuzzy<'a>(symbols: &'a SymbolsRegistry, binary_locator: &BinaryLocator) -> Result<&'a Binary> {
+        Ok(if let Some(id) = symbols.locator_to_id.get(binary_locator) {
+            symbols.get(*id).unwrap()
+        } else if let Some(b) = symbols.iter().find(|b| b.is_mapped && b.locator.matches_incomplete(binary_locator)) {
+            b
+        } else if let Some(b) = symbols.iter().find(|b| b.locator.matches_incomplete(binary_locator)) {
+            b
         } else {
-            return err!(NoFunction, "binary not mapped: {}", binary_id.path);
+            return err!(NoFunction, "no binary: {}", binary_locator.path);
         })
     }
 
-    fn calculate_frame_base(&self, frame: &mut StackFrame, static_addr: usize, binary: &BinaryInfo, symbols: &Symbols, function: &FunctionInfo, root_subfunction: &Subfunction, memory: &mut CachedMemReader) -> Result<()> {
+    fn calculate_frame_base(&self, frame: &mut StackFrame, static_addr: usize, binary: &Binary, symbols: &Symbols, function: &FunctionInfo, root_subfunction: &Subfunction, memory: &mut CachedMemReader) -> Result<()> {
         let debug_info_offset = match function.debug_info_offset() {
             Some(o) => o,
             None => return Ok(()) };
@@ -1595,7 +1572,7 @@ impl Debugger {
         Ok(())
     }
     
-    fn symbolize_stack_frame(&self, static_addr: usize, binary: &BinaryInfo, frame: &mut StackFrame, subframes: &mut Vec<StackSubframe>, memory: &mut CachedMemReader) {
+    fn symbolize_stack_frame(&self, static_addr: usize, binary: &Binary, frame: &mut StackFrame, subframes: &mut Vec<StackSubframe>, memory: &mut CachedMemReader) {
         assert!(frame.subframes.len() == 1 && frame.subframes.start + 1 == subframes.len());
         let frame_idx = subframes.last().unwrap().frame_idx;
         let symbols = match binary.symbols.as_ref_clone_error() {
@@ -1605,7 +1582,6 @@ impl Debugger {
                 return;
             }
         };
-        frame.symbols_identity = symbols.identity;
 
         let make_file_line_info = |line: LineInfo| -> FileLineInfo {
             let file = &symbols.files[line.file_idx().unwrap()];
@@ -1660,13 +1636,13 @@ impl Debugger {
     }
 
     pub fn make_eval_context<'a>(&'a self, stack: &'a StackTrace, selected_subframe: usize) -> EvalContext<'a> {
-        EvalContext {memory: CachedMemReader::new(self.memory.clone()), process_info: &self.info, stack, selected_subframe}
+        EvalContext {memory: CachedMemReader::new(self.memory.clone()), process_info: &self.info, symbols_registry: &self.symbols, stack, selected_subframe}
     }
 
     pub fn add_breakpoint(&mut self, on: BreakpointOn) -> Result<BreakpointId> {
         let mut breakpoint = Breakpoint {on, hits: 0, addrs: err!(NotCalculated, ""), enabled: true, active: false};
         if self.target_state.breakpoints_should_be_active() {
-            Self::determine_locations_for_breakpoint(&self.info, &mut breakpoint);
+            Self::determine_locations_for_breakpoint(&self.symbols, &mut breakpoint);
             if let Err(e) = breakpoint.addrs {
                 return Err(e);
             }
@@ -1711,7 +1687,7 @@ impl Debugger {
                 continue;
             }
             if b.addrs.is_err() {
-                Self::determine_locations_for_breakpoint(&self.info, b);
+                Self::determine_locations_for_breakpoint(&self.symbols, b);
             }
             if let Ok(addrs) = &b.addrs {
                 assert!(!addrs.is_empty());
@@ -1738,14 +1714,17 @@ impl Debugger {
         }
     }
 
-    fn determine_locations_for_breakpoint(info: &ProcessInfo, breakpoint: &mut Breakpoint) {
+    fn determine_locations_for_breakpoint(symbols_registry: &SymbolsRegistry, breakpoint: &mut Breakpoint) {
         assert!(breakpoint.addrs.is_err());
         match &mut breakpoint.on {
             BreakpointOn::Line(ref mut bp) => {
                 bp.adjusted_line = None;
                 let mut res: (usize, Vec<(usize, u16)>) = (usize::MAX, Vec::new());
                 let (mut loading, mut found_file) = (false, false);
-                for (binary_id, binary) in &info.binaries {
+                for binary in symbols_registry.iter() {
+                    if !binary.is_mapped {
+                        continue;
+                    }
                     let symbols = match &binary.symbols {
                         Ok(s) => s,
                         Err(e) if e.is_loading() => {
@@ -1820,7 +1799,7 @@ impl Debugger {
             }
             BreakpointOn::Address(bp) => {
                 if let Some((locator, offset)) = &mut bp.function {
-                    if let Ok(a) = Self::resolve_function_breakpoint_location(info, locator, *offset) {
+                    if let Ok(a) = Self::resolve_function_breakpoint_location(symbols_registry, locator, *offset) {
                         bp.addr = a;
                     }
                 }
@@ -1829,9 +1808,12 @@ impl Debugger {
         }
     }
 
-    fn resolve_function_breakpoint_location(info: &ProcessInfo, locator: &mut FunctionLocator, offset: usize) -> Result<usize> {
-        let binary = Self::find_binary_fuzzy(info, None, &locator.binary_id)?;
-        locator.binary_id = binary.id.clone();
+    fn resolve_function_breakpoint_location(symbols_registry: &SymbolsRegistry, locator: &mut FunctionLocator, offset: usize) -> Result<usize> {
+        let binary = Self::find_binary_fuzzy(symbols_registry, &locator.binary_locator)?;
+        if !binary.is_mapped {
+            return err!(ProcessState, "binary not mapped: {}", locator.binary_locator.path);
+        }
+        locator.binary_locator = binary.locator.clone();
         let symbols = binary.symbols.as_ref_clone_error()?;
         let function_idx = match symbols.find_nearest_function(&locator.mangled_name, locator.addr) {
             Some(x) => x,
@@ -2037,7 +2019,7 @@ impl Debugger {
             return !in_ranges;
         }
         let step = self.stepping.as_ref().unwrap();
-        let cfa = Self::get_cfa_for_step(&self.info, &mut self.log, &self.memory, addr, regs);
+        let cfa = Self::get_cfa_for_step(&self.info, &self.symbols, &mut self.log, &self.memory, addr, regs);
         let cfa = match cfa {
             None => return step.internal_kind == StepKind::Into,
             Some(c) => c };
@@ -2072,7 +2054,7 @@ impl Debugger {
         Some(stack.subframes.len() - suf)
     }
 
-    fn get_cfa_for_step(info: &ProcessInfo, log: &mut Log, memory: &MemReader, addr: usize, regs: &Registers) -> Option<usize> {
+    fn get_cfa_for_step(info: &ProcessInfo, symbols_registry: &SymbolsRegistry, log: &mut Log, memory: &MemReader, addr: usize, regs: &Registers) -> Option<usize> {
         // This is called while handling SIGTRAP, when `info` is not necessarily up-to-date, so this
         // in theory may incorrectly fail if a dynamic library was loaded during a step, and the step ended up hitting it (not sure how).
         let map = match info.maps.addr_to_map(addr) {
@@ -2082,14 +2064,14 @@ impl Debugger {
                 return None;
             }
             Some(m) => m };
-        let binary_id = match &map.binary_id {
+        let binary_id = match map.binary_id.clone() {
             None => {
                 log!(log, "address 0x{:x} not mapped to a binary", addr);
                 eprintln!("warning: address 0x{:x} not mapped to a binary (when determining cfa for step)", addr);
                 return None;
             }
             Some(b) => b };
-        let binary = info.binaries.get(binary_id).unwrap();
+        let binary = symbols_registry.get(binary_id).unwrap();
         let unwind = match &binary.unwind {
             Err(e) => {
                 log!(log, "no unwind: {}", e);

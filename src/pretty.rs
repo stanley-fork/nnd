@@ -167,8 +167,8 @@ pub fn reflect_meta_value(val: &Value, state: &mut EvalState, context: &mut Eval
                     builder.add_field("items", items);
                     builder.add_usize_field("type", e.type_ as usize, state.builtin_types.meta_type);
                 }
-                Type::MetaType | Type::MetaField | Type::MetaVariable => {
-                    styled_write_maybe!(out, default, "{}", match &t.t { Type::MetaType => "type", Type::MetaField => "field", Type::MetaVariable => "variable", _ => panic!("huh") });
+                Type::MetaType | Type::MetaField | Type::MetaVariable | Type::MetaCodeLocation => {
+                    styled_write_maybe!(out, default, "{}", match &t.t { Type::MetaType => "type", Type::MetaField => "field", Type::MetaVariable => "variable", Type::MetaCodeLocation => "location", _ => panic!("huh") });
                     return builder.finish("", val.flags, &mut state.types);
                 }
             }
@@ -177,6 +177,10 @@ pub fn reflect_meta_value(val: &Value, state: &mut EvalState, context: &mut Eval
                 styled_write_maybe!(out, default, " ({} bytes):", size);
             }
             builder.add_usize_field("size", size, state.builtin_types.u64_);
+            if t.line != LineInfo::invalid() {
+                let d: [usize; 2] = t.line.data.clone();
+                builder.add_usize_blob_field("decl", &[t.binary_id, d[0], d[1]], state.builtin_types.meta_code_location);
+            }
             if !t.name.is_empty() {
                 styled_write_maybe!(out, default, " {}", t.name);
                 builder.add_str_field("name", t.name, &mut state.types, &state.builtin_types);
@@ -186,7 +190,7 @@ pub fn reflect_meta_value(val: &Value, state: &mut EvalState, context: &mut Eval
                 for (name, n) in t.nested_names {
                     match n {
                         NestedName::Type(type_) => nested.add_usize_field(name, *type_ as usize, state.builtin_types.meta_type),
-                        NestedName::Variable(v) => nested.add_usize_field(name, *v as usize, state.builtin_types.meta_variable),
+                        NestedName::Variable(v) => nested.add_usize_blob_field(name, &[t.binary_id, *v as usize], state.builtin_types.meta_variable),
                     }
                 }
                 let nested = nested.finish("", val.flags, &mut state.types);
@@ -219,14 +223,19 @@ pub fn reflect_meta_value(val: &Value, state: &mut EvalState, context: &mut Eval
             if f.flags.contains(FieldFlags::VARIANT) {
                 builder.add_usize_field("discriminant_value", f.discr_value, state.builtin_types.u64_);
             }
-            // TODO: Decl file+line.
             builder.finish("", val.flags, &mut state.types)
         }
         Type::MetaVariable => {
-            let v = val.val.blob_ref().unwrap().get_usize().unwrap() as *const Variable;
+            let blob = val.val.blob_ref().unwrap();
+            let binary_id = blob.get_usize_at(0).unwrap();
+            let v = blob.get_usize_at(8).unwrap() as *const Variable;
             let v = unsafe {&*v};
             builder.add_str_field("name", unsafe {v.name()}, &mut state.types, &state.builtin_types);
             builder.add_usize_field("type", v.type_ as usize, state.builtin_types.meta_type);
+            if v.line != LineInfo::invalid() {
+                let d: [usize; 2] = v.line.data.clone();
+                builder.add_usize_blob_field("decl", &[binary_id, d[0], d[1]], state.builtin_types.meta_code_location);
+            }
             match v.location.unpack() {
                 VariableLocation::Const(s) => builder.add_blob_field("const_value", s, v.type_),
                 VariableLocation::Expr(expr) => {
@@ -245,6 +254,7 @@ pub fn reflect_meta_value(val: &Value, state: &mut EvalState, context: &mut Eval
             }
             builder.finish("", val.flags, &mut state.types)
         }
+        Type::MetaCodeLocation => val.clone(),
         _ => panic!("expected meta type/field, got {}", meta_t.t.kind_name()),
     }
 }
@@ -396,7 +406,8 @@ fn downcast_to_concrete_type(val: &mut Cow<Value>, vtable_ptr_field_offset: usiz
     //  * 8 bytes: whatever
     //  * <vptr field points here>
     //  * function pointers
-    let binary = context.process_info.addr_to_binary(vptr)?;
+    let binary_id = context.process_info.addr_to_binary_id(vptr)?;
+    let binary = context.symbols_registry.get(binary_id).unwrap();
     let symbols = binary.symbols.clone()?;
     let static_vptr = binary.addr_map.dynamic_to_static(vptr);
     let vtable = symbols.find_vtable(static_vptr)?;

@@ -16,6 +16,8 @@ test with 10k threads
   maybe avoid duplicate POKEUSER calls for debug registers if the thread already had them assigned
 test with watches window filled with long arrays (I saw 50ms frames when there are ~5 of them; maybe just decrease length limit)
 
+allow stepping when process is not running - start the process and run to exec (if by_instructions) or main (otherwise)
+show disassembly if symbols are missing, whole .text section if all else fails
 up/down arrows should close code search, or cycle history
 global variable search
 global variables from .symtab, maybe from .debug_pubnames (maybe also look into .debug_pubtypes)
@@ -53,7 +55,7 @@ key to follow a jump in disas
 allow line-based steps in .plt* (maybe by just turning them into single-instruction-steps)
 in disassembly window, make 'left' key jump to the start of inlined function
 maximizing windows (hot key and button in a corner)
-special breakpoints: panic (rust_panic, core::panicking::panic_fmt, or maybe std::panicking::rust_panic_with_hook; maybe disable find_catch_blocks() for rust at least when panic bp is enabled), exception (__cxa_throw), signals, program start (replacing -c), main function entry, dynamic library load
+special breakpoints: panic (rust_panic, core::panicking::panic_fmt, or maybe std::panicking::rust_panic_with_hook; maybe disable find_catch_blocks() for rust at least when panic bp is enabled), exception (__cxa_throw), signals, main function (replacing -s), dynamic library load
 make source window autoscroll horizontally in addition to vertically
 -v for build datetime
 handle partially-optimized-out struct values (common in rust)
