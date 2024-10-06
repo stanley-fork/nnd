@@ -1,5 +1,5 @@
 use crate::{*, error::{*, Result, Error}, util::*, registers::*, types::*, procfs::*, symbols_registry::*, process_info::*, unwind::*, symbols::*, arena::*, pretty::*, settings::*, common_ui::*};
-use std::{fmt, fmt::Write, mem, collections::{HashMap, HashSet}, io::Write as ioWrite, borrow::Cow, ops::Range};
+use std::{fmt, fmt::Write, mem, collections::{HashMap, HashSet}, io::Write as ioWrite, borrow::Cow, ops::Range, path::Path};
 use gimli::{Operation, EndianSlice, LittleEndian, Expression, Encoding, EvaluationResult, ValueType, DieReference, DW_AT_location, Location, DebugInfoOffset};
 use bitflags::*;
 use rand::random;
@@ -404,10 +404,11 @@ impl EvalState {
             // Try local variable.
             for relative_subframe_idx in 0..context.stack.subframes.len().min(if from_any_frame {usize::MAX} else {1}) {
                 let subframe_idx = (context.selected_subframe + relative_subframe_idx) % context.stack.subframes.len();
-                match self.get_local_variable(context, name, subframe_idx, only_type) {
+                let mut found = false;
+                match self.get_local_variable(context, name, subframe_idx, only_type, &mut found) {
                     Ok(v) => return Ok(v),
-                    Err(e) if e.is_no_variable() => (),
-                    Err(e) => return Err(e),
+                    Err(e) if found => return Err(e),
+                    Err(_) => (),
                 }
             }
         }
@@ -449,7 +450,7 @@ impl EvalState {
         err!(TypeMismatch, "no type '{}'", name)
     }
 
-    fn get_local_variable(&mut self, context: &mut EvalContext, name: &str, subframe_idx: usize, only_type: bool) -> Result<Value> {
+    fn get_local_variable(&mut self, context: &mut EvalContext, name: &str, subframe_idx: usize, only_type: bool, found: &mut bool) -> Result<Value> {
         context.check_has_stack()?;
         let subframe = &context.stack.subframes[subframe_idx];
         let pseudo_addr = context.stack.frames[subframe.frame_idx].pseudo_addr;
@@ -459,6 +460,7 @@ impl EvalState {
             if !v.range().contains(&(static_pseudo_addr)) || unsafe {v.name()} != name {
                 continue;
             }
+            *found = true;
             if only_type {
                 return Ok(Value {val: Default::default(), type_: v.type_, flags: ValueFlags::empty()});
             }
@@ -579,11 +581,14 @@ pub enum ValueChildKind {
     Other,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone)]
 pub enum ValueClickAction {
     None,
     // This value represents code location, jump to it on click.
-    CodeLocation((/*binary_id*/ usize, LineInfo)),
+    CodeLocation(FileLineInfo),
+}
+impl ValueClickAction {
+    pub fn is_none(&self) -> bool { match self { Self::None => true, _ => false } }
 }
 
 pub struct ValueChildInfo {
@@ -865,11 +870,27 @@ fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut Form
         Type::MetaType | Type::MetaField | Type::MetaVariable => {
             let val = reflect_meta_value(&v, state.state, state.context, Some((state.out, state.palette)));
             children = list_struct_children(&val.val, unsafe {(*val.type_).t.as_struct().unwrap()}, val.flags, state);
-            //asdqwe click_action for MetaVariable to add watch on the variable
         }
         Type::MetaCodeLocation => {
-            styled_write!(state.out, state.palette.filename, "asdqwe");
-            //asdqwe
+            let binary_id = value.get_usize_at(0).unwrap();
+            let line = LineInfo {data: [value.get_usize_at(8).unwrap(), value.get_usize_at(16).unwrap()]};
+            match state.context.symbols_registry.get(binary_id) {
+                None => styled_write!(state.out, state.palette.error, "binary unloaded"),
+                Some(binary) => {
+                    let symbols = binary.symbols.as_ref().unwrap();
+                    let file = &symbols.files[line.file_idx().unwrap()];
+                    let name = file.filename.file_name().unwrap_or(std::ffi::OsStr::new("")).to_string_lossy();
+                    styled_write!(state.out, state.palette.filename, "{}", name);
+                    if line.line() != 0 {
+                        styled_write!(state.out, state.palette.line_number, ":{}", line.line());
+                        if line.column() != 0 {
+                            styled_write!(state.out, state.palette.column_number, ":{}", line.column());
+                        }
+                    }
+                    let info = FileLineInfo {line, filename: file.filename.to_owned(), path: file.path.to_owned(), version: file.version.clone()};
+                    click_action = ValueClickAction::CodeLocation(info);
+                }
+            }
         }
     }
     (!children.is_empty(), children, click_action)

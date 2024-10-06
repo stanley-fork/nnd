@@ -850,8 +850,8 @@ impl WatchesWindow {
 
                     if ui.check_mouse(MouseActions::CLICK_SUBTREE) {
                         let moved = Self::set_cursor_path_from_node(node_idx, &mut self.cursor_path, &self.tree);
-                        if node.click_action != ValueClickAction::None {
-                            Self::perform_click_action(&node.click_action, state, ui);
+                        if !node.click_action.is_none() {
+                            Self::perform_click_action(&node.click_action, context.symbols_registry, state, ui);
                         } else if !moved && clicked_name && node.depth == 0 {
                             if let Some(expr_idx) = self.tree.roots.iter().position(|ix| *ix == node_idx) {
                                 if self.expressions[expr_idx].is_editable() {
@@ -890,11 +890,12 @@ impl WatchesWindow {
         true
     }
 
-    fn perform_click_action(action: &ValueClickAction, state: &mut UIState, ui: &mut UI) {
+    fn perform_click_action(action: &ValueClickAction, symbols_registry: &SymbolsRegistry, state: &mut UIState, ui: &mut UI) {
         match action {
             ValueClickAction::None => panic!("huh"),
-            ValueClickAction::CodeLocation((binary_id, line)) => {
-                //asdqwe
+            ValueClickAction::CodeLocation(line) => {
+                let target = SourceScrollTarget {path: line.path.clone(), version: line.version.clone(), line: line.line.line()};
+                state.should_scroll_source = Some((Some(target), /*only_if_on_error_tab*/ false));
                 ui.should_redraw = true;
             }
         }
@@ -1019,8 +1020,8 @@ impl WindowContent for WatchesWindow {
                         Self::start_editing_expression(node, &self.expressions[expr_idx.unwrap()], &mut self.text_input);
                     }
                 }
-                KeyAction::Enter if node.click_action != ValueClickAction::None => {
-                    Self::perform_click_action(&node.click_action, state, ui);
+                KeyAction::Enter if !node.click_action.is_none() => {
+                    Self::perform_click_action(&node.click_action, &debugger.symbols, state, ui);
                 }
                 KeyAction::Enter | KeyAction::DuplicateRow => {
                     let s = if action == KeyAction::DuplicateRow && expr_idx.is_some() {
@@ -2864,16 +2865,14 @@ impl WindowContent for StackWindow {
                 if let Some(info) = &subframe.line {
                     let name = info.path.as_os_str().to_string_lossy();
                     ui_write!(ui, filename, "{}", name);
-                } else {
-                    ui_write!(ui, default_dim, "?");
-                }
-                if let Some(info) = &subframe.line {
                     if info.line.line() != 0 {
                         ui_write!(ui, line_number, ":{}", info.line.line());
                         if info.line.column() != 0 {
                             ui_write!(ui, column_number, ":{}", info.line.column());
                         }
                     }
+                } else {
+                    ui_write!(ui, default_dim, "?");
                 }
                 let l = ui.text.close_line();
                 ui.add(widget!().height(AutoSize::Text).text(l).flags(WidgetFlags::TEXT_TRUNCATION_ALIGN_RIGHT));
