@@ -124,21 +124,24 @@ Currently the language has no loops or conditionals, just expressions. The synta
 (Throughout this document, single quotes '' denote example watch expressions. The quotes themselves are not part of the expression.)
 
 General info:
- * Can access the debugged program's local variables (as seen in the locals window), global variables, and registers: 'my_local_var', 'rdi'
+ * Can access the debugged program's local variables (as seen in the locals window), global variables, and registers: 'my_local_var', 'rdi'.
  * Has basic C-like things you'd expect: arithmetic and logical operators, literals, array indexing, pointer arithmetic, '&x' to take address, '*x' to dereference.
- * Type cast: 'p as *u8'
- * Field access: 'my_struct.my_field'
+ * Type cast: 'p as *u8'.
+ * Field access: 'my_struct.my_field'.
  * There's no '->' operator, use '.' instead (it auto-dereferences pointers).
  * Fields can also be accessed by index: 'my_struct.3' (useful when field names are empty or duplicate).
- * 'p.[n]' to turn pointer 'p' to array of length 'n'. E.g. 'my_string.ptr.[my_string.len]'
- * 'begin..end' to turn a pair of pointers to the array [begin, end). E.g. 'my_vector.begin..my_vector.end'
- * '^x' looks for variable x in all stack frames
+ * 'p.[n]' to turn pointer 'p' to array of length 'n'. E.g. 'my_string.ptr.[my_string.len]'.
+ * 'begin..end' to turn a pair of pointers to the array [begin, end). E.g. 'my_vector.begin..my_vector.end'.
+ * '^x' looks for variable x in all stack frames.
+ * 'var(x)' shows additional information about variable x.
 
 Gotchas:
+ * 'var(x)' and 'type(t)'/'typeof(x)' show variable/type declaration site (if present in debug info). Press enter on it (or click) to open in code window.
  * If a variable has the same name as a register, use '`rax`' to refer to the variable.
  * If a global variable has the same name as a local variable, use '::foo' to refer to the global variable.
  * Currently only fully-qualified type names and global variable names are recognized.
  * Currently types and global variables nested inside functions are difficult to access. The recognized "fully-qualified" name has a "_" instead of the function name.
+   Use variable search (watches window, 'o' key by default), start the query with '@' to search by filename, add ":<number>" to filter by line number.
 
 Types:
  * Can access the types from the debugged program's debug info (structs, classes, enums, unions, primitive types, etc) and typedefs.
@@ -152,7 +155,6 @@ Inspecting types:
    E.g. '`std::__1::atomic<int>`' works (on some version of libc++), but '`std::__1::atomic<int32_t>`', '`std::atomic<int>`', and '`atomic<int>`' don't.
  * 'typeof(<expression>)' to get information about result type of an expression.
    (Currently the expression is partially evaluated in some cases, e.g. 'typeof(*(0 as *mystruct))' works, but 'typeof((0 as *mystruct).myfield)' doesn't.)
- * Casting to typeof is not implemented, coming soon: 'x as typeof(y)'
 
 Script variables:
  * 'x=foo.bar.baz' to assign to a new script variable 'x', which can then be used by later watch expressions.

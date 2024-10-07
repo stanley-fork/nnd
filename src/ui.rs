@@ -1251,6 +1251,7 @@ impl WindowContent for WatchesWindow {
             KeyHint::key(KeyAction::DuplicateRow, "duplicate"),
             KeyHint::key(KeyAction::DeleteRow, "delete"),
             KeyHint::keys(&[KeyAction::CursorRight, KeyAction::CursorLeft], "expand/collapse"),
+            KeyHint::keys(&[KeyAction::Open, KeyAction::FindType], "find variable/type"),
         ]);
     }
 

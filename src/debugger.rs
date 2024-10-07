@@ -155,13 +155,6 @@ pub enum StepKind {
     Cursor,
 }
 
-// TODO: Uh oh, exceptions ruin step-over/step-out, even at instruction level. Detecting when an exception is thrown out of a function is super hard for some reason.
-//       We need to do one of:
-//        * Implement all steps using repeated single-instruction stepping, checking the stack trace after each step. Sounds extremely slow.
-//        * Put a (maybe permanent) internal breakpoint on __cxa_throw and show a warning when an exception is thrown anywhere in current thread while we're stepping.
-//          Saying something like "step possibly missed, exceptions not fully supported".
-//        * Bite the bullet and implement the damn thing. I guess this would involve understanding the stack unwinding procedure from System V ABI, then
-//          setting a bunch of internal breakpoints in it to track the unwinding and detect when it reaches the stack frame in which we're stepping.
 #[derive(Debug)]
 pub struct StepState {
     pub tid: pid_t,

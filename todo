@@ -4,8 +4,9 @@ investigate regression in symbols loading speed (stuck on "parsing drawf" for ~1
 investigate why many types are not deduped, e.g. there's DB::Block#441
 make stack unwinding work when control is in .plt or .plt.got, see "Recognise PLT entries such as" in libunwind code
 log a message if the process forked away
-investigate why quitting is slow
+fix incorrect column numbers with tab indentation (tabs should be counted as 1 column, but we turn them into multiple spaces)
 
+investigate why quitting is slow
 optimize simple things found by profiler (samply is nice)
 look at profiler on ch server (1500 threads)
 test with 10k threads
@@ -46,7 +47,6 @@ add decl location to TypeInfo and MetaType
 jump to type decl location in source window when selecting it in watches window
 show stop reason in status window, next to "suspended"
 allow cast `foo as typeof(bar)`, also `foo as typeof(bar)::T`
-welcome/help screen, '?' to open, show on first start and save to PersistentState; mention email for reporting bugs, and to include log and preferably binary; document all features of watch expression language; mention hidden profiler hotkey
 show argument values in stack trace
 detect dynamic library loads using r_debug thing
 hotkey to step to end of basic block or next call/ret

@@ -1336,20 +1336,25 @@ impl SearchDialog {
         self.loading = !res.complete;
 
         let mut w = widget!().height(AutoSize::Text);
-        let l = if self.search.waiting_for_symbols {
+        let start = ui.text.num_lines();
+        ui_writeln!(ui, default, "fuzzy search{}",
+                    if properties.have_files && properties.have_names {
+                        ", use '@filename' to search by file, add ':number' to filter by line number"
+                    } else {""});
+        if self.search.waiting_for_symbols {
             ui_writeln!(ui, warning, "waiting for symbols to load (see 'binaries' window for progress)")
         } else if res.complete {
             if res.results.len() == res.total_results {
-                ui_writeln!(ui, default, "{} matches ({} searched)", res.results.len(), PrettySize(res.bytes_done))
+                ui_writeln!(ui, default_dim, "{} matches ({} searched)", res.results.len(), PrettySize(res.bytes_done))
             } else {
-                ui_writeln!(ui, default, "showing {}/{} matches ({} searched)", res.results.len(), res.total_results, PrettySize(res.bytes_done))
+                ui_writeln!(ui, default_dim, "showing {}/{} matches ({} searched)", res.results.len(), res.total_results, PrettySize(res.bytes_done))
             }
         } else {
             let progress = res.items_done as f64 / res.items_total.max(1) as f64;
             w.draw_progress_bar = Some((progress, ui.palette.progress_bar));
             ui_writeln!(ui, default, "{}", PrettySize(res.bytes_done))
         };
-        w = w.text(l);
+        w = w.text_lines(start..ui.text.num_lines());
         ui.add(w);
 
         let table_widget = ui.add(widget!().identity("table").height(AutoSize::Remainder(1.0)));
