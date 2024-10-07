@@ -57,12 +57,29 @@ pub fn adjust_expression_for_appending_child_path(expr_str: &str) -> Result<Stri
     }
 }
 
-pub fn make_expression_for_local_variable(name: &str) -> String {
-    if RegisterIdx::parse_ignore_case(name).is_some() {
+pub fn make_expression_for_variable(name: &str) -> String {
+    if should_quote_identifier(name) {
         format!("`{}`", name)
     } else {
         name.to_string()
     }
+}
+
+fn should_quote_identifier(name: &str) -> bool {
+    if RegisterIdx::parse_ignore_case(name).is_some() {
+        return true;
+    }
+    if name.is_empty() {
+        return true;
+    }
+    for (i, c) in name.char_indices() {
+        match c {
+            'a'..='z' | 'A'..='Z' | '_' | '#' | '$' | ':' => (),
+            '0'..='9' if i != 0 => (),
+            _ => return true,
+        }
+    }
+    false
 }
 
 // Slow dumb interpreter that walks the AST directly.

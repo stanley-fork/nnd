@@ -1366,26 +1366,28 @@ impl SearchDialog {
             for (i, result) in res.results[range].iter().enumerate() {
                 let r = self.search.format_result(result);
                 table.start_row(i, ui);
-                let start = ui.text.num_lines();
-                if properties.have_names {
-                    let l = styled_writeln!(ui.scratch_text, ui.palette.function_name, "{}", r.name);
-                    let adj: Vec<(Range<usize>, StyleAdjustment)> = r.name_match_ranges.iter().map(|r| (r.clone(), ui.palette.search_result)).collect();
-                    ui.text.import_line_with_adjustments(&ui.scratch_text, l, &adj);
-                }
-                if properties.have_files {
-                    styled_write!(ui.scratch_text, ui.palette.filename, "{}", r.file.as_os_str().to_string_lossy());
-                    if r.line.file_idx().is_some() && r.line.line() != 0 {
-                        styled_write!(ui.scratch_text, ui.palette.line_number, ":{}", r.line.line());
-                        if r.line.column() != 0 {
-                            styled_write!(ui.scratch_text, ui.palette.column_number, ":{}", r.line.column());
-                        }
+                with_parent!(ui, table.start_cell(ui), {
+                    ui.cur_mut().axes[Axis::Y].flags.insert(AxisFlags::STACK);
+                    if properties.have_names {
+                        let l = styled_writeln!(ui.scratch_text, ui.palette.function_name, "{}", r.name);
+                        let adj: Vec<(Range<usize>, StyleAdjustment)> = r.name_match_ranges.iter().map(|r| (r.clone(), ui.palette.search_result)).collect();
+                        let l = ui.text.import_line_with_adjustments(&ui.scratch_text, l, &adj);
+                        ui.add(widget!().height(AutoSize::Text).flags(WidgetFlags::TEXT_TRUNCATION_ALIGN_RIGHT).text(l));
                     }
-                    let l = ui.scratch_text.close_line();
-                    let adj: Vec<(Range<usize>, StyleAdjustment)> = r.file_match_ranges.iter().map(|r| (r.clone(), ui.palette.search_result)).collect();
-                    ui.text.import_line_with_adjustments(&ui.scratch_text, l, &adj);
-                }
-                let end = ui.text.num_lines();
-                table.text_cell_lines(start..end, ui);
+                    if properties.have_files {
+                        styled_write!(ui.scratch_text, ui.palette.filename, "{}", r.file.as_os_str().to_string_lossy());
+                        if r.line.file_idx().is_some() && r.line.line() != 0 {
+                            styled_write!(ui.scratch_text, ui.palette.line_number, ":{}", r.line.line());
+                            if r.line.column() != 0 {
+                                styled_write!(ui.scratch_text, ui.palette.column_number, ":{}", r.line.column());
+                            }
+                        }
+                        let l = ui.scratch_text.close_line();
+                        let adj: Vec<(Range<usize>, StyleAdjustment)> = r.file_match_ranges.iter().map(|r| (r.clone(), ui.palette.search_result)).collect();
+                        let l = ui.text.import_line_with_adjustments(&ui.scratch_text, l, &adj);
+                        ui.add(widget!().height(AutoSize::Text).flags(WidgetFlags::TEXT_TRUNCATION_ALIGN_RIGHT).text(l));
+                    }
+                });
 
                 if properties.have_mangled_names {
                     let l = styled_writeln!(ui.scratch_text, ui.palette.default, "{}", r.mangled_name);

@@ -490,10 +490,13 @@ struct WatchesWindow {
     text_input_built: bool,
 
     eval_state: EvalState,
+
+    variable_search_dialog: Option<SearchDialog>,
+    type_search_dialog: Option<SearchDialog>,
 }
 impl Default for WatchesWindow {
     fn default() -> Self {
-        let mut r = Self {tree: ValueTree::default(), expanded_nodes: HashSet::new(), cursor_path: Vec::new(), cursor_idx: 0, scroll: 0, scroll_to_cursor: false, name_width: 0, value_width: 0, row_height_limit: 0, indent_width: 0, max_indent: 0, seen: (0, usize::MAX, usize::MAX, ProcessState::NoProcess), have_good_cached_values: false, expressions: Vec::new(), text_input: None, text_input_built: false, eval_state: EvalState::new() };
+        let mut r = Self {tree: ValueTree::default(), expanded_nodes: HashSet::new(), cursor_path: Vec::new(), cursor_idx: 0, scroll: 0, scroll_to_cursor: false, name_width: 0, value_width: 0, row_height_limit: 0, indent_width: 0, max_indent: 0, seen: (0, usize::MAX, usize::MAX, ProcessState::NoProcess), have_good_cached_values: false, expressions: Vec::new(), text_input: None, text_input_built: false, eval_state: EvalState::new(), variable_search_dialog: None, type_search_dialog: None };
 
         let locals_identity: usize = random();
         r.expanded_nodes.insert(locals_identity);
@@ -928,7 +931,7 @@ impl WatchesWindow {
             let parent = &self.tree.nodes[node.parent.0];
             match &parent.special {
                 Some(SpecialWatch::Locals) => {
-                    components.push((0, make_expression_for_local_variable(name)));
+                    components.push((0, make_expression_for_variable(name)));
                     break;
                 }
                 Some(SpecialWatch::Registers) => {
@@ -957,6 +960,64 @@ impl WatchesWindow {
         }
         Some(res)
     }
+
+    fn add_watch(&mut self, s: String, refresh_data: &mut bool) {
+        let mut i = self.expressions.len();
+        if self.expressions.last().is_some_and(|e| &e.special == &Some(SpecialWatch::AddWatch)) {
+            i -= 1;
+        }
+        let identity: usize = random();
+        self.expressions.insert(i, WatchExpression {identity, text: s, special: None});
+        self.cursor_path = vec![identity];
+        *refresh_data = true;
+    }
+
+    fn build_variable_search_dialog(&mut self, create: bool, refresh_data: &mut bool, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
+        let dialog_widget = match make_dialog_frame(create, AutoSize::Remainder(0.75), AutoSize::Remainder(0.83), ui.palette.dialog, ui.palette.field_name, "find global variable", ui) {
+            None => {
+                self.variable_search_dialog = None;
+                return;
+            }
+            Some(x) => x };
+
+        let d = self.variable_search_dialog.get_or_insert_with(|| SearchDialog::new(Arc::new(GlobalVariableSearcher), debugger.context.clone()));
+        with_parent!(ui, dialog_widget, {
+            d.build(&debugger.symbols, ui);
+        });
+
+        if d.should_close_dialog {
+            ui.close_dialog();
+        }
+
+        if let Some(res) = mem::take(&mut d.should_open_document) {
+            self.add_watch(make_expression_for_variable(&format!("::{}", res.name)), refresh_data);
+        }
+    }
+
+    fn build_type_search_dialog(&mut self, create: bool, refresh_data: &mut bool, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
+        let dialog_widget = with_parent!(ui, ui.add(widget!().identity("ts").fixed_width(0).fixed_height(0)), { // the two potential dialogs must have different owner widgets
+            make_dialog_frame(create, AutoSize::Remainder(0.75), AutoSize::Remainder(0.83), ui.palette.dialog, ui.palette.type_name, "find type", ui)
+        });
+        let dialog_widget = match dialog_widget {
+            None => {
+                self.type_search_dialog = None;
+                return;
+            }
+            Some(x) => x };
+
+        let d = self.type_search_dialog.get_or_insert_with(|| SearchDialog::new(Arc::new(TypeSearcher), debugger.context.clone()));
+        with_parent!(ui, dialog_widget, {
+            d.build(&debugger.symbols, ui);
+        });
+
+        if d.should_close_dialog {
+            ui.close_dialog();
+        }
+
+        if let Some(res) = mem::take(&mut d.should_open_document) {
+            self.add_watch(format!("type({})", make_expression_for_variable(&res.name)), refresh_data);
+        }
+    }
 }
 
 impl WindowContent for WatchesWindow {
@@ -970,7 +1031,8 @@ impl WindowContent for WatchesWindow {
 
         // Keyboard input.
         let mut refresh_data = self.tree.roots.is_empty();
-        for action in ui.check_keys(&[KeyAction::Cancel, KeyAction::CursorRight, KeyAction::CursorLeft, KeyAction::Enter, KeyAction::DeleteRow, KeyAction::DuplicateRow]) {
+        let (mut open_variable_search, mut open_type_search) = (false, false);
+        for action in ui.check_keys(&[KeyAction::Cancel, KeyAction::CursorRight, KeyAction::CursorLeft, KeyAction::Enter, KeyAction::DeleteRow, KeyAction::DuplicateRow, KeyAction::Open, KeyAction::FindType]) {
             self.scroll_to_cursor = true;
 
             if action == KeyAction::Cancel {
@@ -1035,14 +1097,7 @@ impl WindowContent for WatchesWindow {
                         self.make_expression_for_tree_node(node_idx)
                     };
                     if let Some(s) = s {
-                        let mut i = self.expressions.len();
-                        if self.expressions.last().is_some_and(|e| &e.special == &Some(SpecialWatch::AddWatch)) {
-                            i -= 1;
-                        }
-                        let identity: usize = random();
-                        self.expressions.insert(i, WatchExpression {identity, text: s, special: None});
-                        self.cursor_path = vec![identity];
-                        refresh_data = true;
+                        self.add_watch(s, &mut refresh_data);
                     }
                 }
                 KeyAction::DeleteRow if expr_idx.is_some_and(|i| self.expressions[i].special.is_none()) => {
@@ -1053,9 +1108,15 @@ impl WindowContent for WatchesWindow {
                         self.cursor_path = vec![self.expressions[i.min(self.expressions.len()-1)].identity];
                     }
                 }
+                KeyAction::Open => open_variable_search = true,
+                KeyAction::FindType => open_type_search = true,
                 _ => (),
             }
         }
+
+        open_type_search &= !open_variable_search;
+        self.build_variable_search_dialog(open_variable_search, &mut refresh_data, state, debugger, ui);
+        self.build_type_search_dialog(open_type_search, &mut refresh_data, state, debugger, ui);
 
         // Add the "<add watch>" placeholder watch.
         if self.expressions.iter().position(|e| &e.special == &Some(SpecialWatch::AddWatch)).is_none() {

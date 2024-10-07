@@ -1,5 +1,5 @@
-use crate::{*, symbols::*, arena::*, procfs::*, symbols_registry::*, util::*, context::*, executor::*};
-use std::{mem, path::PathBuf, sync::{Arc, Mutex, atomic::{AtomicBool, AtomicUsize, Ordering}}, collections::HashSet, cmp, ops::Range, os::unix::ffi::OsStrExt, path::Path};
+use crate::{*, symbols::*, arena::*, procfs::*, symbols_registry::*, util::*, context::*, executor::*, types::*};
+use std::{mem, path::PathBuf, sync::{Arc, Mutex, atomic::{AtomicBool, AtomicUsize, Ordering}}, collections::HashSet, cmp, ops::Range, os::unix::ffi::OsStrExt, path::Path, str};
 use std::arch::x86_64::*;
 use rand::{random, distributions::Alphanumeric, thread_rng, Rng};
 
@@ -70,9 +70,9 @@ pub struct PaddedString {
 impl PaddedString {
     pub fn new(a: &str) -> Self {
         let mut s = String::with_capacity(64 + a.len());
-        s.push_str(unsafe {std::str::from_utf8_unchecked(&[0; 32])});
+        s.push_str(unsafe {str::from_utf8_unchecked(&[0; 32])});
         s.push_str(a);
-        s.push_str(unsafe {std::str::from_utf8_unchecked(&[0; 32])});
+        s.push_str(unsafe {str::from_utf8_unchecked(&[0; 32])});
         Self {s}
     }
 
@@ -405,6 +405,144 @@ fn modify_query_for_mangled_search(query: &SearchQuery) -> SearchQuery {
     SearchQuery::parse(&s, /*can_have_file*/ false)
 }
 
+pub struct GlobalVariableSearcher;
+
+impl Searcher for GlobalVariableSearcher {
+    fn search(&self, symbols: &Symbols, symbols_idx: usize, shard_idx: usize, query: &SearchQuery, file_scores: Option<&Vec<usize>>, cancel: &AtomicBool, callback: &mut SearchCallback) {
+        let names = &symbols.shards[shard_idx].sorted_global_variable_names;
+        callback(Vec::new(), 0, names.strings.len(), 0);
+        let mut items_done = 0usize;
+        let mut bytes_done = 0usize;
+        let mut res: Vec<SearchResult> = Vec::new();
+        let mut match_ranges: Vec<Range<usize>> = Vec::new();
+        for (idx, name) in names.strings.iter().enumerate() {
+            if idx & 127 == 0 && cancel.load(Ordering::Relaxed) {
+                return;
+            }
+
+            let mut add_score = 0usize;
+            if query.line.is_some() || file_scores.is_some() {
+                let var = unsafe {&*(name.id as *const Variable)};
+                let file_idx = match var.line.file_idx() {
+                    None => continue,
+                    Some(x) => x };
+                if let Some(scores) = &file_scores {
+                    add_score = scores[file_idx];
+                    if add_score == usize::MAX {
+                        continue;
+                    }
+                }
+                if let Some(n) = query.line.clone() {
+                    if var.line.line() != n {
+                        continue;
+                    }
+                }
+            }
+
+            let slice = name.s;
+            match_ranges.clear();
+            if let Some(score) = fuzzy_match(slice, &query.s, query.case_sensitive, &mut match_ranges) {
+                res.push(SearchResult {score: score + add_score, id: name.id, symbols_idx});
+            }
+            items_done += 1;
+            bytes_done += slice.len();
+            if items_done > (1 << 16) {
+                if !callback(mem::take(&mut res), mem::take(&mut items_done), 0, mem::take(&mut bytes_done)) {
+                    return;
+                }
+            }
+        }
+        callback(res, items_done, 0, bytes_done);
+    }
+
+    fn format_result(&self, binary_id: usize, symbols: &Arc<Symbols>, query: &SearchQuery, res: &SearchResult) -> SearchResultInfo {
+        let var = unsafe {&*(res.id as *const Variable)};
+        let mut res = SearchResultInfo::new(binary_id, symbols.clone(), res.id);
+        res.name = unsafe {var.name()}.to_string();
+        if let Some(file_idx) = var.line.file_idx() {
+            res.file = symbols.files[file_idx].path.to_owned();
+            res.line = var.line.clone();
+        }
+        fuzzy_match(res.name.as_bytes(), &query.s, query.case_sensitive, &mut res.name_match_ranges);
+        res
+    }
+
+    fn properties(&self) -> SearcherProperties { SearcherProperties {have_names: true, have_files: true, have_mangled_names: false, parallel: true} }
+}
+
+pub struct TypeSearcher;
+
+impl Searcher for TypeSearcher {
+    fn search(&self, symbols: &Symbols, symbols_idx: usize, shard_idx: usize, query: &SearchQuery, file_scores: Option<&Vec<usize>>, cancel: &AtomicBool, callback: &mut SearchCallback) {
+        let types = &symbols.shards[shard_idx].types;
+        let tables = [&types.sorted_type_names, &types.unsorted_type_names];
+        callback(Vec::new(), 0, tables.iter().map(|t| t.strings.len()).sum(), 0);
+        let mut items_done = 0usize;
+        let mut bytes_done = 0usize;
+        let mut res: Vec<SearchResult> = Vec::new();
+        let mut match_ranges: Vec<Range<usize>> = Vec::new();
+        for (table_idx, names) in tables.into_iter().enumerate() {
+            for (idx, name) in names.strings.iter().enumerate() {
+                if idx & 127 == 0 && cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+
+                let mut add_score = 0usize;
+                if query.line.is_some() || file_scores.is_some() {
+                    let type_ = unsafe {&*(name.id as *const TypeInfo)};
+                    let file_idx = match type_.line.file_idx() {
+                        None => continue,
+                        Some(x) => x };
+                    if let Some(scores) = &file_scores {
+                        add_score = scores[file_idx];
+                        if add_score == usize::MAX {
+                            continue;
+                        }
+                    }
+                    if let Some(n) = query.line.clone() {
+                        if type_.line.line() != n {
+                            continue;
+                        }
+                    }
+                }
+
+                match_ranges.clear();
+                if let Some(score) = fuzzy_match(name.s, &query.s, query.case_sensitive, &mut match_ranges) {
+                    let id = shard_idx << 48 | table_idx << 47 | idx;
+                    res.push(SearchResult {score: score + add_score, id, symbols_idx});
+                }
+                items_done += 1;
+                bytes_done += name.s.len();
+                if items_done > (1 << 16) {
+                    if !callback(mem::take(&mut res), mem::take(&mut items_done), 0, mem::take(&mut bytes_done)) {
+                        return;
+                    }
+                }
+            }
+        }
+        callback(res, items_done, 0, bytes_done);
+    }
+
+    fn format_result(&self, binary_id: usize, symbols: &Arc<Symbols>, query: &SearchQuery, res: &SearchResult) -> SearchResultInfo {
+        let (shard_idx, table_idx, idx) = (res.id >> 48, (res.id >> 47) & 1, res.id & usize::MAX >> 17);
+        let types = &symbols.shards[shard_idx].types;
+        let tables = [&types.sorted_type_names, &types.unsorted_type_names];
+        let name = tables[table_idx].strings[idx];
+        let type_ = unsafe {&*(name.id as *const TypeInfo)};
+
+        let mut res = SearchResultInfo::new(binary_id, symbols.clone(), name.id);
+        res.name = str::from_utf8(name.s).unwrap().to_string();
+        if let Some(file_idx) = type_.line.file_idx() {
+            res.file = symbols.files[file_idx].path.to_owned();
+            res.line = type_.line.clone();
+        }
+        fuzzy_match(res.name.as_bytes(), &query.s, query.case_sensitive, &mut res.name_match_ranges);
+        res
+    }
+
+    fn properties(&self) -> SearcherProperties { SearcherProperties {have_names: true, have_files: true, have_mangled_names: false, parallel: true} }
+}
+
 fn fuzzy_match(haystack: &[u8], needle_padded: &PaddedString, case_sensitive: bool, match_ranges: &mut Vec<Range<usize>>) -> Option<usize> {
     // Scoring (smaller tuple - higher in results list):
     //  * 0 if the string is exactly equal to the query string.
@@ -601,7 +739,7 @@ mod tests {
             } else if bad_needle {
                 None
             } else {
-                hay.as_bytes().windows(needle_len).position(|w| unsafe {std::str::from_utf8_unchecked(w).eq_ignore_ascii_case(needle)})
+                hay.as_bytes().windows(needle_len).position(|w| unsafe {str::from_utf8_unchecked(w).eq_ignore_ascii_case(needle)})
             };
 
             let found = memmem_maybe_case_sensitive(hay.as_bytes(), &PaddedString::new(needle), case_sensitive);

@@ -20,7 +20,7 @@ allow stepping when process is not running - start the process and run to exec (
 show disassembly if symbols are missing, whole .text section if all else fails
 tooltip in watches window for copying long values
 up/down arrows should close code search, or cycle history
-global variable search
+var() expression for MetaVariable
 global variables from .symtab, maybe from .debug_pubnames (maybe also look into .debug_pubtypes)
 make symtab/dynsym work when debug info (or debuglink file) is missing
 more built-in pretty printers: sparsehash, absl, rust b-trees
@@ -37,7 +37,6 @@ key to send SIGINT to the program
 make return key do something in each window: go from threads to stack -> code -> disassembly -> code; from locals create a watch; from watch sub-value create another watch for that field/element; from breakpoints to code/disassembly/watch (depending on breakpoint type)
 "unexpectedly big memory read" (16 bytes) for f64 local variables on the stack in rust
 floating point and simd registers
-search by file+line, especially for global variables
 allow navigating from source to variables (especially global) and types declared there
 allow to put breakpoint on a whole file
 function pointers and field pointers
@@ -46,7 +45,6 @@ use actual function name instead of "_" in namespace path, or do something else 
 show number of function inlined sites in disassembly window, allow setting breakpoint on it, allow opening inline-only functions
 add decl location to TypeInfo and MetaType
 jump to type decl location in source window when selecting it in watches window
-type search in watches window (when found, add a watch "type(`<name>`)"
 show stop reason in status window, next to "suspended"
 allow cast `foo as typeof(bar)`, also `foo as typeof(bar)::T`
 welcome/help screen, '?' to open, show on first start and save to PersistentState; mention email for reporting bugs, and to include log and preferably binary; document all features of watch expression language; mention hidden profiler hotkey
