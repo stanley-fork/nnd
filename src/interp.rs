@@ -111,7 +111,7 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                     return Ok(v.clone());
                 }
             }
-            state.get_variable(context, name, /*maybe_register*/ !*quoted, *from_any_frame, only_type)
+            state.get_variable(context, name, /*maybe_register*/ !*quoted, *from_any_frame, only_type, /*meta*/ false)
         }
         AST::Field {name, quoted} => {
             let mut val = eval_expression(expr, node.children[0], state, context, false)?; // disable only_type here so that pretty-printers don't have to support it
@@ -244,7 +244,7 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                 AST::Variable {name, quoted, from_any_frame} if !quoted && !from_any_frame => {
                     if !state.variables.contains_key(&name[..]) {
                         // Check that there's no debuggee variable with this name.
-                        match state.get_variable(context, name, /*maybe_register*/ !quoted, *from_any_frame, /*only_type*/ true) {
+                        match state.get_variable(context, name, /*maybe_register*/ !quoted, *from_any_frame, /*only_type*/ true, /*meta*/ false) {
                             Err(e) if e.is_no_variable() => (),
                             Err(e) => return Err(e),
                             Ok(_) => return err!(Runtime, "assigning to debuggee variables is not supported; to assign to a script variable use a different name (shadowing not allowed)"),
@@ -496,9 +496,19 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                 let val = eval_expression(expr, node.children[0], state, context, true)?;
                 Ok(Value {val: AddrOrValueBlob::Blob(ValueBlob::new(val.type_ as usize)), type_: state.types.types_arena.add(TypeInfo {name: "type", size: 8, flags: TypeFlags::SIZE_KNOWN, t: Type::MetaType, ..Default::default()}), flags: ValueFlags::empty()})
             }
+            "var" => {
+                if node.children.len() != 1 {
+                    return err!(TypeMismatch, "var() expects 1 argument, got {}", node.children.len());
+                }
+                match &expr.ast[node.children[0].0].a {
+                    AST::Variable {name, quoted, from_any_frame} => {
+                        Ok(state.get_variable(context, name, /*maybe_register*/ false, *from_any_frame, /*only_type*/ false, /*meta*/ true)?)
+                    }
+                    _ => return err!(Syntax, "var() argument must be a variable name"),
+                }
+            }
             // TODO: downcast() to explicitly downcast to concrete type (to be able to typeof() the result)
             // TODO: maybe pretty() to explicitly apply pretty-printers
-            // TODO: var() to get MetaVariable
             _ => return err!(NoFunction, "no builtin function '{}' (calling debuggee functions is not supported)", name),
         }
         AST::Type {..} | AST::PointerType => panic!("unexpected type AST"),

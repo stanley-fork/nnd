@@ -20,7 +20,6 @@ allow stepping when process is not running - start the process and run to exec (
 show disassembly if symbols are missing, whole .text section if all else fails
 tooltip in watches window for copying long values
 up/down arrows should close code search, or cycle history
-var() expression for MetaVariable
 global variables from .symtab, maybe from .debug_pubnames (maybe also look into .debug_pubtypes)
 make symtab/dynsym work when debug info (or debuglink file) is missing
 more built-in pretty printers: sparsehash, absl, rust b-trees

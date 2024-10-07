@@ -236,8 +236,12 @@ pub fn reflect_meta_value(val: &Value, state: &mut EvalState, context: &mut Eval
                 let d: [usize; 2] = v.line.data.clone();
                 builder.add_usize_blob_field("decl", &[binary_id, d[0], d[1]], state.builtin_types.meta_code_location);
             }
+            let mut is_const = false;
             match v.location.unpack() {
-                VariableLocation::Const(s) => builder.add_blob_field("const_value", s, v.type_),
+                VariableLocation::Const(s) => {
+                    is_const = true;
+                    builder.add_blob_field("const_value", s, v.type_)
+                }
                 VariableLocation::Expr(expr) => {
                     let default_encoding = gimli::Encoding {address_size: 8, format: gimli::Format::Dwarf64, version: 5};
                     let s = match format_dwarf_expression(expr, default_encoding) {
@@ -252,6 +256,15 @@ pub fn reflect_meta_value(val: &Value, state: &mut EvalState, context: &mut Eval
             if let Some(die) = v.debug_info_offset() {
                 builder.add_usize_field("die", die.0 as usize, state.builtin_types.u64_);
             }
+
+            if v.flags().contains(VariableFlags::PARAMETER) {
+                styled_write_maybe!(out, default_dim, "function parameter");
+            } else {
+                styled_write_maybe!(out, default_dim, "{} {}",
+                                    if v.flags().contains(VariableFlags::GLOBAL) {"global"} else {"local"},
+                                    if is_const {"constant"} else {"variable"});
+            }
+
             builder.finish("", val.flags, &mut state.types)
         }
         Type::MetaCodeLocation => val.clone(),

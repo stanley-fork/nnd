@@ -380,7 +380,8 @@ impl EvalState {
         self.variables.clear();
     }
 
-    pub fn get_variable(&mut self, context: &mut EvalContext, name: &str, maybe_register: bool, from_any_frame: bool, only_type: bool) -> Result<Value> {
+    pub fn get_variable(&mut self, context: &mut EvalContext, name: &str, maybe_register: bool, from_any_frame: bool, only_type: bool, meta: bool) -> Result<Value> {
+        assert!(!meta || (!maybe_register && !only_type));
         let global_alt_name = if name.starts_with("::") {Some(&name[2..])} else {None};
         if !context.stack.frames.is_empty() && (global_alt_name.is_none() || from_any_frame) {
             // Try register.
@@ -405,7 +406,7 @@ impl EvalState {
             for relative_subframe_idx in 0..context.stack.subframes.len().min(if from_any_frame {usize::MAX} else {1}) {
                 let subframe_idx = (context.selected_subframe + relative_subframe_idx) % context.stack.subframes.len();
                 let mut found = false;
-                match self.get_local_variable(context, name, subframe_idx, only_type, &mut found) {
+                match self.get_local_variable(context, name, subframe_idx, only_type, meta, &mut found) {
                     Ok(v) => return Ok(v),
                     Err(e) if found => return Err(e),
                     Err(_) => (),
@@ -418,14 +419,25 @@ impl EvalState {
             let symbols = match &binary.symbols {
                 Ok(x) => x,
                 Err(_) => continue };
-            if let Some(v) = symbols.find_global_variable_by_name(name) {
-                return Self::get_global_variable(&mut self.currently_evaluated_value_dubious, context, v, binary, only_type);
-            }
-            if let &Some(alt) = &global_alt_name {
-                if let Some(v) = symbols.find_global_variable_by_name(alt) {
-                    return Self::get_global_variable(&mut self.currently_evaluated_value_dubious, context, v, binary, only_type);
+            let mut v = symbols.find_global_variable_by_name(name);
+            if v.is_none() {
+                if let &Some(alt) = &global_alt_name {
+                    v = symbols.find_global_variable_by_name(alt);
                 }
             }
+            let v = match v {
+                Some(x) => x,
+                None => continue,
+            };
+            if meta {
+                let type_ = symbols.builtin_types.meta_variable;
+                let blob = ValueBlob::from_two_usizes([binary.id, v as *const Variable as usize]);
+                return Ok(Value {val: AddrOrValueBlob::Blob(blob), type_, flags: ValueFlags::empty()});
+            }
+            if only_type {
+                return Ok(Value {val: Default::default(), type_: v.type_, flags: ValueFlags::empty()});
+            }
+            return Self::get_global_variable(&mut self.currently_evaluated_value_dubious, context, v, binary, only_type);
         }
 
         if context.stack.frames.is_empty() && global_alt_name.is_none() {
@@ -450,10 +462,11 @@ impl EvalState {
         err!(TypeMismatch, "no type '{}'", name)
     }
 
-    fn get_local_variable(&mut self, context: &mut EvalContext, name: &str, subframe_idx: usize, only_type: bool, found: &mut bool) -> Result<Value> {
+    fn get_local_variable(&mut self, context: &mut EvalContext, name: &str, subframe_idx: usize, only_type: bool, meta: bool, found: &mut bool) -> Result<Value> {
         context.check_has_stack()?;
         let subframe = &context.stack.subframes[subframe_idx];
-        let pseudo_addr = context.stack.frames[subframe.frame_idx].pseudo_addr;
+        let frame = &context.stack.frames[subframe.frame_idx];
+        let pseudo_addr = frame.pseudo_addr;
         let (mut dwarf_context, _) = context.make_local_dwarf_eval_context(subframe_idx)?;
         let static_pseudo_addr = dwarf_context.addr_map.dynamic_to_static(pseudo_addr);
         for v in dwarf_context.local_variables {
@@ -461,6 +474,11 @@ impl EvalState {
                 continue;
             }
             *found = true;
+            if meta {
+                let type_ = dwarf_context.symbols.clone().unwrap().builtin_types.meta_variable;
+                let blob = ValueBlob::from_two_usizes([frame.binary_id.clone().unwrap(), v as *const Variable as usize]);
+                return Ok(Value {val: AddrOrValueBlob::Blob(blob), type_, flags: ValueFlags::empty()});
+            }
             if only_type {
                 return Ok(Value {val: Default::default(), type_: v.type_, flags: ValueFlags::empty()});
             }
