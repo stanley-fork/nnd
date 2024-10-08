@@ -1337,7 +1337,7 @@ impl SearchDialog {
 
         let mut w = widget!().height(AutoSize::Text);
         let start = ui.text.num_lines();
-        ui_writeln!(ui, default, "fuzzy search{}",
+        ui_writeln!(ui, default_dim, "fuzzy search{}",
                     if properties.have_files && properties.have_names {
                         ", use '@filename' to search by file, add ':number' to filter by line number"
                     } else {""});

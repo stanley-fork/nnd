@@ -154,6 +154,7 @@ impl SymbolsRegistry {
             assert!(removed);
             self.binaries[id] = None;
         }
+        self.update_priority_order();
         true
     }
 }
