@@ -15,7 +15,7 @@ sudo {0} -p pid   - attach to an existing process
 Additional arguments:
 --stdin/--stdout/--stderr path   - redirect stdin/stdout/stderr to file
 --tty path   - equivalent to --stdin path --stdout path, see --help-tty
--s   - suspend the program right after starting it
+-s   - suspend the program right after starting it (after exec(), long before main())
 -d path   - directory in which to look for source code; if specified multiple times, multiple directories will be searched; default: current directory
 --unstripped path   - path to executable from which to load debug symbols; useful if the running executable is stripped and you have an unstripped version on the side
 -m full|no-hover|disabled   - mouse mode; 'no-hover' to react only to clicking and dragging, 'disabled' to disable mouse altogether; default is 'full' (if it doesn't work, check if mouse reporting is enabled in the terminal application)
@@ -74,6 +74,7 @@ UI tips:
  * If you use tmux, the escape key is unreliable, consider using ctrl-g instead. Tmux adds 0.5s delay before passing the escape key through, and if you press another key during that time,
    the two key presses get incorrectly interpreted as alt+keypress (that's how ansi escape codes work, unfortunately).
  * Windows can be resized by dragging the boundaries with the mouse. Rearranging windows is not implemented yet.
+ * Press 'tab' (default) to open a tooltip. Supported in tables (binaries, stack, etc) and watches window. Useful for long values or paths, and might contain additional information. Also available in search dialogs.
 
 Debugging tips:
  * The highlighted characters in the source code window are locations of statements and inlined function calls, as listed in the debug info.
@@ -85,8 +86,9 @@ Debugging tips:
    Step-over steps over the calls inside the currently selected stack frame, i.e. it may involve an internal step-out.
    (This may seem like an unnecessary feature, but if you think through how stepping interacts with inlined functions, it's pretty much required, things get very confusing otherwise.)
  * While a step is in progress, breakpoints are automatically disabled for the duration of the step.
- * Stepping can be interrupted with the suspend key ('C' by default). Useful e.g. if you try to step-over a function, but the function turns out to be too slow.
- * Run-to-cursor works like a step: it runs until the selected (not any) thread hits the requested like, and it disables other breakpoints for the duration of the step.
+ * Stepping can be interrupted with the suspend key ('p' by default). Useful e.g. if you try to step-over a function, but the function turns out to be too slow.
+ * Run-to-cursor works like a step: it runs until the selected (not any) thread hits the requested line, and it disables other breakpoints for the duration of the step.
+ * To start the program and run to start of main(), press step-into ('s' by default) when the program is not running (e.g. after killing it with 'k' key).
  * Step-into-instruction ('S' key by default) works no matter what, even if there's no debug info or if disassembly or stack unwinding fails. Use it when other steps fail.
  * Breakpoints are preserved across debugger restarts, but they're put into disabled state on startup. Use Enter key in breakpoints window to reactivate.
  * The function search (in disassembly window, 'o' key by default) currently does fuzzy search over *mangled* function names (for peformance reasons).

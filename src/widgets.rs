@@ -1421,12 +1421,11 @@ pub struct SearchBar {
     pub editing: bool,
 
     pub hide_when_not_editing: bool,
-    pub do_not_capture_enter_key: bool,
 }
 impl SearchBar {
     // Sets cur_parent's height to 0 or 1.
     pub fn build(&mut self, left_text: Option<usize>, right_text: Option<usize>, ui: &mut UI) {
-        if self.editing && !self.do_not_capture_enter_key && ui.check_key(KeyAction::Enter) {
+        if self.editing && ui.check_key(KeyAction::Enter) {
             self.editing = false;
         }
         if self.visible && ui.check_key(KeyAction::Cancel) {

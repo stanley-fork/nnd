@@ -123,9 +123,20 @@ pub struct SymbolsShard {
     pub sorted_global_variable_names: StringTable,
 }
 
+// Some location in machine code that we may want to put special breakpoints on. E.g. start of main(), or __cxa_throw().
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Debug, Hash)]
+pub enum PointOfInterest {
+    MainFunction,
+    // TODO: Throw, Panic, LibraryLoad
+}
+
 pub struct Symbols {
     pub elf: Arc<ElfFile>,
-    pub debuglink_elf: Option<ElfFile>,
+    // Unstripped binary or debuglink file.
+    pub additional_elves: Vec<ElfFile>,
+
+    pub warnings: Vec<String>,
+    pub notices: Vec<String>,
 
     // .debug_info, .debug_line, etc - sections describing things in the source code (functions, line numbers, structs and their fields, etc) and how they map to address ranges.
     // If some or all sections are missing, we treat them as empty, and no special handling is needed because empty sections parse as valid DWARF debug info with 0 units.
@@ -163,6 +174,9 @@ pub struct Symbols {
 
     // C++ vtables addresses, sorted. Comes from .symtab. Used for automatically downcasting to concrete types.
     pub vtables: Vec<VTableInfo>,
+
+    // Addresses of things like main() and __cxa_throw().
+    pub points_of_interest: HashMap<PointOfInterest, Vec<usize>>,
 }
 
 pub struct CompilationUnit {
@@ -888,6 +902,7 @@ struct SymbolsLoaderShard {
     max_function_end: usize,
 
     vtables: Vec<VTableInfo>,
+    points_of_interest: HashMap<PointOfInterest, Vec<usize>>,
 
     temp_global_var_arena: Arena,
 
@@ -914,16 +929,36 @@ unsafe impl Sync for GlobalVariableNameMessage {}
 
 // Usage: call new(), then alternate between single-threaded calls to prepare_stage(i) and multi-threaded calls to run(i, shard_idx) (for all shard_idx in parallel); when prepare_stage() returns Ok(false), call into_result().
 impl SymbolsLoader {
-    pub fn new(elf: Arc<ElfFile>, binary_id: usize, max_shards: usize, status: Arc<SymbolsLoadingStatus>) -> Result<Self> {
+    pub fn new(elf: Arc<ElfFile>, additional_elf_paths: Vec<String>, binary_id: usize, max_shards: usize, status: Arc<SymbolsLoadingStatus>) -> Result<Self> {
         let start_time = Instant::now();
 
-        *status.stage.lock().unwrap() = "opening debuglink".to_string();
-        let debuglink_elf = open_debuglink(&elf)?;
+        *status.stage.lock().unwrap() = "opening additional elves".to_string();
+
+        let mut warnings: Vec<String> = Vec::new();
+        let mut notices: Vec<String> = Vec::new();
+        let mut additional_elves: Vec<ElfFile> = Vec::new();
+
+        for path in additional_elf_paths {
+            match open_additional_elf(&elf, path.clone(), "additional", None) {
+                Ok(x) => {
+                    notices.push(format!("additional binary: {}", path));
+                    additional_elves.push(x);
+                }
+                Err(e) => warnings.push(format!("{}", e)),
+            };
+        }
+
+        match open_debuglink(&elf) {
+            Ok(None) => (),
+            Ok(Some(x)) => {
+                notices.push(format!("debuglink file: {}", x.name));
+                additional_elves.push(x);
+            }
+            Err(e) => warnings.push(format!("{}", e)),
+        }
 
         let mut elves: Vec<&ElfFile> = vec![&elf];
-        if let Some(d) = &debuglink_elf {
-            elves.push(d);
-        }
+        elves.extend(&additional_elves);
 
         let load_section = |id: SectionId| -> std::result::Result<EndianSlice<'static, LittleEndian>, gimli::Error> {
             for &elf in &elves {
@@ -954,8 +989,8 @@ impl SymbolsLoader {
         }
         *status.stage.lock().unwrap() = "listing units".to_string();
 
-        if dwarf.debug_info.reader().is_empty() {
-            return err!(MissingSymbols, "no debug symbols");
+        if dwarf.debug_info.reader().is_empty() && warnings.is_empty() {
+            warnings.push("no debug symbols".to_string());
         }
 
         if !dwarf.debug_types.reader().is_empty() {
@@ -1018,7 +1053,7 @@ impl SymbolsLoader {
         let (types_loader, types_shards) = TypesLoader::create(num_shards);
         let mut shards: Vec<SymbolsLoaderShard> = types_shards.into_iter().map(|types| SymbolsLoaderShard {
             sym: SymbolsShard {addr_to_line: Vec::new(), line_to_addr: Vec::new(), types: Types::new(), misc_arena: Arena::new(), local_variables: Vec::new(), global_variables: Arena::new(), sorted_global_variable_names: StringTable::new(), subfunctions: Vec::new(), subfunction_pc_ranges: Vec::new(), subfunction_levels: Vec::new(), mangled_name_to_function: Vec::new()},
-            units: Vec::new(), symtab_ranges: Vec::new(), file_dedup: Vec::new(), file_used_lines: Vec::new(), types, base_types: Vec::new(), functions: Vec::new(), vtables: Vec::new(),
+            units: Vec::new(), symtab_ranges: Vec::new(), file_dedup: Vec::new(), file_used_lines: Vec::new(), types, base_types: Vec::new(), functions: Vec::new(), vtables: Vec::new(), points_of_interest: HashMap::new(),
             temp_global_var_arena: Arena::new(), max_function_end: 0, functions_before_dedup: 0, warn: Limiter::new()}).collect();
 
         let mut round_robin_shard = 0usize;
@@ -1079,13 +1114,13 @@ impl SymbolsLoader {
 
         prepare_time_per_stage_ns[0] = start_time.elapsed().as_nanos() as usize;
         Ok(SymbolsLoader {
-            num_shards: shards.len(), binary_id, sym: Symbols {elf, debuglink_elf, dwarf, units, files: Vec::new(), file_paths: StringTable::new(), path_to_used_file: HashMap::new(), functions: Vec::new(), shards: Vec::new(), builtin_types: BuiltinTypes::invalid(), base_types: Vec::new(), vtables: Vec::new(), code_addr_range},
+            num_shards: shards.len(), binary_id, sym: Symbols {elf, additional_elves, warnings, notices, dwarf, units, files: Vec::new(), file_paths: StringTable::new(), path_to_used_file: HashMap::new(), functions: Vec::new(), shards: Vec::new(), builtin_types: BuiltinTypes::invalid(), base_types: Vec::new(), vtables: Vec::new(), points_of_interest: HashMap::new(), code_addr_range},
             shards: shards.into_iter().map(|s| SyncUnsafeCell::new(CachePadded::new(s))).collect(), die_to_function_shards: (0..num_shards).map(|_| SyncUnsafeCell::new(CachePadded::new(Vec::new()))).collect(), types: types_loader, send_global_variable_names, strtab_symtab, status, progress_per_stage,
             prepare_time_per_stage_ns, run_time_per_stage_ns, shard_progress_ppm: (0..num_shards).map(|_| CachePadded::new(AtomicUsize::new(0))).collect(), stage: 0, types_before_dedup: 0, type_offsets: 0, type_offset_maps_bytes: 0, type_dedup_maps_bytes: 0})
     }
 
-    // The loading procedure alternates between single-threaded and multithreaded (sharded) parts. This is the single-threaded part, run() is the multithreaded part.
-    // Returns Ok(false) if there are no more stages, and into_result() should be called instead.
+    // The loading procedure alternates between single-threaded and multithreaded (sharded) parts. This is the single-threaded part, while run() is the multithreaded part.
+    // Returns Ok(false) if there are no more stages; into_result() should be called in that case.
     pub fn prepare_stage(&mut self, stage: usize) -> Result<bool> {
         self.check_cancellation()?;
         let start_time = Instant::now();
@@ -1118,7 +1153,7 @@ impl SymbolsLoader {
 
                 self.finish_types();
                 self.merge_base_types();
-                self.collect_vtables();
+                self.collect_vtables_and_points_of_interest(); // must be after build_name_to_function_map()
 
                 self.prepare_time_per_stage_ns[self.stage] = start_time.elapsed().as_nanos() as usize;
                 self.log_timing_and_stats();
@@ -1546,10 +1581,29 @@ impl SymbolsLoader {
         self.sym.base_types.sort_unstable();
     }
 
-    fn collect_vtables(&mut self) {
+    fn collect_vtables_and_points_of_interest(&mut self) {
         // There are usually only tens of thousands of vtables, so it's ok to process them in one thread.
         for shard in &mut self.shards {
             self.sym.vtables.append(&mut mem::take(&mut shard.get_mut().vtables));
+            for (p, addrs) in &shard.get_mut().points_of_interest {
+                self.sym.points_of_interest.entry(*p).or_default().extend(addrs.iter().copied());
+            }
+        }
+        // (A separate loop to make sure the function with DW_AT_main_subprogram takes precedence over the function named "main", if both are present.)
+        for shard in &mut self.shards {
+            let mut find_function = |name: &[u8], p: PointOfInterest, sym: &mut Symbols| {
+                let v = &shard.get_mut().sym.mangled_name_to_function;
+                let i = v.partition_point(|(n, _, _)| *n < name);
+                if i < v.len() && v[i].0 == name {
+                    if let Some(a) = v[i].1.addr() {
+                        sym.points_of_interest.entry(p).or_default().push(a);
+                    }
+                }
+            };
+            if !self.sym.points_of_interest.contains_key(&PointOfInterest::MainFunction) {
+                find_function(b"main", PointOfInterest::MainFunction, &mut self.sym);
+            }
+            // TODO: __cxa_throw, _ZN3std9panicking20rust_panic_with_hook17.{17}E, test that it works with regular panics and overflow checks, with and without handler, with and without catch, and for uncaught C++ exceptions
         }
         self.sym.vtables.sort_unstable_by_key(|v| v.start);
         for v in &mut self.sym.vtables {
@@ -1714,6 +1768,33 @@ impl SymbolsLoader {
     }
 }
 
+fn open_additional_elf(main_elf: &ElfFile, path: String, name_for_logging: &str, expected_crc32: Option<u32>) -> Result<ElfFile> {
+    eprintln!("info: opening {} file for {} at {}", name_for_logging, main_elf.name, path);
+    let file = match File::open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return err!(MissingSymbols, "{} file not found: {}", name_for_logging, path),
+        Err(e) => return Err(e.into()),
+    };
+    let mmap = unsafe { Mmap::map(&file)? };
+
+    if let Some(crc32) = expected_crc32 {
+        let actual_crc32 = crc32fast::hash(&mmap[..]);
+        if actual_crc32 != crc32 { return err!(Dwarf, "{} file checksum mismatch: expected {}, found {} in {}", name_for_logging, crc32, actual_crc32, path); }
+    }
+
+    let res = ElfFile::from_mmap(path, mmap)?;
+
+    // Check that the two binaries are not obviously mismatched.
+    if let (&Some(main_idx), &Some(res_idx)) = (&main_elf.text_section, &res.text_section) {
+        let (main_text, res_text) = (&main_elf.sections[main_idx], &res.sections[res_idx]);
+        if (main_text.address, main_text.size) != (res_text.address, res_text.size) {
+            return err!(Usage, "{} file doesn't seem to match the main binary: .text section has different address or size", name_for_logging);
+        }
+    }
+
+    Ok(res)
+}
+    
 fn open_debuglink(elf: &ElfFile) -> Result<Option<ElfFile>> {
     match (elf.section_by_name.get(".gnu_debuglink"), elf.section_by_name.get(".note.gnu.build-id")) {
         (Some(&debuglink), Some(&build_id)) => {
@@ -1729,23 +1810,12 @@ fn open_debuglink(elf: &ElfFile) -> Result<Option<ElfFile>> {
             let build_id = elf.parse_note(build_id)?;
             if build_id.desc.len() < 1 { return err!(Dwarf, ".note.gnu.build-id descr is too short: {}", build_id.desc.len()); }
 
-            let path: String = format!("/usr/lib/debug/.build-id/{:02x}/{}", build_id.desc[0], filename);
-            eprintln!("info: opening debuglink file for {} at {}", elf.name, path);
-            let file = match File::open(&path) {
-                Ok(f) => f,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => return err!(MissingSymbols, "debuglink file not found: {}", path),
-                Err(e) => return Err(e.into()),
-            };
-            let mmap = unsafe { Mmap::map(&file)? };
-
-            let actual_crc32 = crc32fast::hash(&mmap[..]);
-            if actual_crc32 != crc32 { return err!(Dwarf, "debuglink checksum mismatch: expected {}, found {} in {}", crc32, actual_crc32, path); }
-
-            let res = ElfFile::from_mmap(path, mmap)?;
-            return Ok(Some(res));
+            let path = format!("/usr/lib/debug/.build-id/{:02x}/{}", build_id.desc[0], filename);
+            let res = open_additional_elf(elf, path, "debuglink", Some(crc32))?;
+            Ok(Some(res))
         }
-        _ => return Ok(None),
-    };
+        _ => Ok(None),
+    }
 }
 
 // A thing that traverses the tree of DIEs, one unit at a time.
@@ -2261,7 +2331,7 @@ impl<'a> DwarfLoader<'a> {
                 // Functions.
                 DW_TAG_subprogram => {
                     // Applicable attributes:
-                    // Useful: declaration, specification, frame_base, low_pc, high_pc, ranges, name, linkage_name, main_subprogram (sometimes missing for some reason), object_pointer, return_addr, type, inline
+                    // Useful: declaration, specification, frame_base, low_pc, high_pc, ranges, name, linkage_name, main_subprogram, object_pointer, return_addr, type, inline
                     // Other: artificial, calling_convention, entry_pc, start_scope (haven't seen it in practice), trampoline, virtuality, vtable_elem_location
                     // Other: accessibility, address_class, alignment, defaulted, deleted, elemental, pure, explicit, external, noreturn, prototyped, recursive, reference, rvalue_reference, segment, static_link, visibility
                     let mut low_pc = None;
@@ -2272,7 +2342,7 @@ impl<'a> DwarfLoader<'a> {
                     let mut type_ = None;
                     let mut attr_specification_or_origin = None;
                     let mut frame_base = None;
-                    let mut is_inlined = false;
+                    let (mut is_inlined, mut is_main) = (false, false);
                     let (mut decl_file, mut decl_line, mut decl_column) = (None, None, None);
                     for &attr in abbrev.attributes() {
                         match attr.name() {
@@ -2287,6 +2357,12 @@ impl<'a> DwarfLoader<'a> {
                             DW_AT_decl_file => decl_file = Some(cursor.read_attribute(attr)?),
                             DW_AT_decl_line => decl_line = Some(cursor.read_attribute(attr)?),
                             DW_AT_decl_column => decl_column = Some(cursor.read_attribute(attr)?),
+                            DW_AT_main_subprogram => {
+                                // In C/C++ this is attribute is usually missing, and we have to look for function called "main" instead.
+                                // In Rust, this attribute is present, and function name is something like "nnd::main::h464aebdd7dc3a93e".
+                                cursor.read_attribute(attr)?;
+                                is_main = true;
+                            }
                             DW_AT_inline => {
                                 let val = cursor.read_attribute(attr)?.value();
                                 match &val {
@@ -2371,6 +2447,10 @@ impl<'a> DwarfLoader<'a> {
 
                                 // Functions often overlap, especially with .symtab functions, idk why. So don't add function end markers.
                                 self.shard.max_function_end = self.shard.max_function_end.max(range.end as usize);
+                            }
+
+                            if is_main {
+                                self.shard.points_of_interest.entry(PointOfInterest::MainFunction).or_default().push(top.pc_ranges[0].begin as usize);
                             }
                         }
 

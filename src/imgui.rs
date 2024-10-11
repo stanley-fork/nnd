@@ -86,7 +86,7 @@ impl Axis {
 
 bitflags! {
 #[derive(Default)]
-pub struct WidgetFlags : u32 {
+pub struct WidgetFlags: u32 {
     // By default, if text doesn't fit horizontally or vertically in its Widget's width, a "…" is shown at the end. This flag disables this behavior.
     const TEXT_TRUNCATION_INDICATOR_DISABLE = 0x1;
     // If the text doesn't fit horizontally, keep a suffix rather than a prefix, and put the "…" at the start. If the text is not truncated, it's aligned left.

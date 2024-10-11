@@ -252,7 +252,7 @@ impl DebuggerUI {
                     return Ok(());
                 }
                 Some(KeyAction::Run) => {
-                    let r = debugger.start_child();
+                    let r = debugger.start_child(InitialStep::None);
                     report_result(&mut self.state, &r);
                 }
                 Some(KeyAction::Continue) => {
@@ -316,8 +316,10 @@ impl DebuggerUI {
                 KeyHint::key(KeyAction::Continue, "continue"),
                 KeyHint::keys(&[KeyAction::StepIntoLine, KeyAction::StepOverLine, KeyAction::StepOut, KeyAction::StepOverColumn], "step into/over/out/column"),
                 KeyHint::keys(&[KeyAction::StepIntoInstruction, KeyAction::StepOverInstruction], "step into/over instruction")]),
-            ProcessState::NoProcess if debugger.mode == RunMode::Run => hints.push(
-                KeyHint::key(KeyAction::Run, "start")),
+            ProcessState::NoProcess if debugger.mode == RunMode::Run => hints.extend([
+                KeyHint::key(KeyAction::Run, "start"),
+                KeyHint::key(KeyAction::StepIntoLine, "run to main()"),
+                KeyHint::key(KeyAction::StepIntoInstruction, "run to early start")]),
             _ => (),
         }
         if debugger.mode == RunMode::Run && debugger.target_state != ProcessState::NoProcess {
@@ -350,7 +352,17 @@ impl DebuggerUI {
                 Some(KeyAction::StepOutNoInline) => (StepKind::Out, true, false),
                 _ => continue,
             };
-            let r = debugger.step(self.state.selected_thread, self.state.selected_subframe, kind, by_instructions, use_line_number_with_column);
+            let r = if debugger.target_state == ProcessState::NoProcess {
+                // If the program is not running, start it and step to start of main() or to initial exec.
+                let initial_step = if by_instructions {
+                    InitialStep::Exec
+                } else {
+                    InitialStep::Main
+                };
+                debugger.start_child(initial_step)
+            } else {
+                debugger.step(self.state.selected_thread, self.state.selected_subframe, kind, by_instructions, use_line_number_with_column)
+            };
             report_result(&mut self.state, &r);
             self.ui.should_redraw = true;
         }
@@ -805,6 +817,26 @@ impl WatchesWindow {
                         let a = ui.palette.selected;
                         ui.cur_mut().style_adjustment.update(a);
                         ui.focus();
+
+                        if let Some(tooltip) = ui.check_tooltip() {
+                            if self.text_input.is_none() {
+                                with_parent!(ui, tooltip, {
+                                    ui.cur_mut().axes[Axis::Y].flags.insert(AxisFlags::STACK);
+
+                                    let start = ui.text.num_lines();
+                                    ui.text.import_lines(&self.tree.text, node.name.clone());
+                                    ui_writeln!(ui, default_dim, "──────────");
+                                    ui.text.import_lines(&self.tree.text, node.formatted_value[node.expanded as usize].clone().unwrap());
+
+                                    let lines = start..ui.text.num_lines();
+                                    let width = ui.text.widest_line(lines.clone());
+                                    ui.add(widget!().height(AutoSize::Text).text_lines(lines).flags(WidgetFlags::LINE_WRAP));
+
+                                    let max_width = ui.cur().axes[Axis::X].max_size;
+                                    ui.cur_mut().axes[Axis::X].set_fixed_size(width.min(max_width));
+                                });
+                            }
+                        }
                     }
 
                     let node = &self.tree.nodes[node_idx.0];
@@ -1252,6 +1284,7 @@ impl WindowContent for WatchesWindow {
             KeyHint::key(KeyAction::DeleteRow, "delete"),
             KeyHint::keys(&[KeyAction::CursorRight, KeyAction::CursorLeft], "expand/collapse"),
             KeyHint::keys(&[KeyAction::Open, KeyAction::FindType], "find variable/type"),
+            KeyHint::key(KeyAction::Tooltip, "tooltip"),
         ]);
     }
 
@@ -1814,9 +1847,13 @@ impl WindowContent for DisassemblyWindow {
 
         if let Some(disas_line) = disas.lines.get(tab.area_state.cursor) {
             let mut cursor_static_addr = disas_line.static_addr;
+            let mut source_line_info = disas_line.leaf_line.clone();
             if cursor_static_addr == 0 {
                 // If the cursor is in the header, use first instruction address.
-                cursor_static_addr = disas.lines.iter().find(|l| l.static_addr != 0).map_or(usize::MAX, |l| l.static_addr);
+                (cursor_static_addr, source_line_info) = match disas.lines.iter().find(|l| l.static_addr != 0) {
+                    None => (usize::MAX, None),
+                    Some(line) => (line.static_addr, line.leaf_line.clone()),
+                }
             }
             let mut cursor_addr = usize::MAX;
             if cursor_static_addr != usize::MAX {
@@ -1848,7 +1885,6 @@ impl WindowContent for DisassemblyWindow {
                 }
             }
 
-            let mut source_line_info = disas_line.leaf_line.clone();
             let level = tab.selected_subfunction_level.min(disas_line.subfunction_level);
             if let &Some(mut sf_idx) = &disas_line.subfunction {
                 while symbols_shard.subfunctions[sf_idx].level > level.saturating_add(1) {
@@ -2387,6 +2423,8 @@ impl WindowContent for BinariesWindow {
             Column::new("name", AutoSize::Remainder(1.0), false),
             Column::new("offset", AutoSize::Fixed(12), false),
             Column::new("file", AutoSize::Fixed(PrettySize::MAX_LEN), false),
+            // Hidden column only visible in the tooltip.
+            Column::new("", AutoSize::Fixed(0), false),
         ]);
         table.hide_cursor_if_unfocused = true;
         for binary in debugger.symbols.iter() {
@@ -2434,11 +2472,14 @@ impl WindowContent for BinariesWindow {
                     if let Err(e) = &binary.unwind {
                         print_error(e);
                     }
-                    if let Err(e) = &binary.symbols {
-                        print_error(e);
+                    match &binary.symbols {
+                        Err(e) => print_error(e),
+                        Ok(s) => for w in &s.warnings {
+                            ui_writeln!(ui, default_dim, "{}", w);
+                        }
                     }
                 }
-                let end = ui.text.num_lines() - start;
+                let end = ui.text.num_lines();
                 if end > start {
                     ui.add(widget!().height(AutoSize::Text).text_lines(start..end));
                 }
@@ -2456,6 +2497,15 @@ impl WindowContent for BinariesWindow {
                 Ok(elf) => ui_writeln!(ui, default_dim, "{}", PrettySize(elf.data().len())),
             };
             table.text_cell(ui);
+
+            let start = ui.text.num_lines();
+            if let Ok(s) = &binary.symbols {
+                for s in &s.notices {
+                    ui_writeln!(ui, default_dim, "{}", s);
+                }
+            }
+            let end = ui.text.num_lines();
+            table.text_cell_lines(start..end, ui);
         }
 
         self.table_state = table.finish(ui);
@@ -3675,11 +3725,6 @@ impl WindowContent for CodeWindow {
         with_parent!(ui, tabs_widget, {ui.multifocus();});
 
         with_parent!(ui, search_bar, {
-            self.search.bar.do_not_capture_enter_key = true;
-            if ui.check_key(KeyAction::Enter) {
-                search_select_match += 1;
-            }
-
             self.search.update(tab, &file.text, search_select_match);
 
             let l = ui_writeln!(ui, default, "find: ");
@@ -3900,6 +3945,7 @@ impl WindowContent for CodeWindow {
 struct BreakpointsWindow {
     table_state: TableState,
     selected_breakpoint: Option<BreakpointId>,
+    special_expanded: bool,
 }
 impl WindowContent for BreakpointsWindow {
     fn get_key_hints(&self, out: &mut Vec<KeyHint>) {
@@ -3930,6 +3976,7 @@ impl WindowContent for BreakpointsWindow {
             Column::new("hits", AutoSize::Text, false),
         ]);
         table.hide_cursor_if_unfocused = true;
+        table.enable_selection_icon = false;
 
         for action in ui.check_keys(&[KeyAction::DeleteRow, KeyAction::ToggleBreakpoint, KeyAction::DisableBreakpoint, KeyAction::Enter]) {
             let id = match &self.selected_breakpoint {

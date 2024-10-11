@@ -274,7 +274,13 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, command_line: Option<Vec<S
         unsafe { *DEBUGGER_TO_DROP_ON_PANIC.get() = Some(&mut *debugger); }
     } else {
         debugger = Pin::new(Box::new(Debugger::from_command_line(&command_line.unwrap(), context.clone(), persistent)));
-        debugger.start_child()?;
+        // TODO: stop_on_main, make it wait for symbols to load, indicating it in UI and allowing to cancel it like steps
+        let initial_step = if context.settings.stop_on_initial_exec {
+            InitialStep::Exec
+        } else {
+            InitialStep::None
+        };
+        debugger.start_child(initial_step)?;
     }
     defer! { unsafe { *DEBUGGER_TO_DROP_ON_PANIC.get() = None; } }
 

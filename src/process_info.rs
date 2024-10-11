@@ -149,18 +149,19 @@ pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) {
         let bin = match debugger.symbols.locator_to_id.get(locator) {
             Some(id) => debugger.symbols.get_mut(*id).unwrap(),
             None => {
+                let mut additional_elf_paths: Vec<String> = Vec::new();
                 let custom_path = if locator.inode == debugger.info.exe_inode {
                     if let Some(p) = debugger.context.settings.unstripped_executable_path.clone() {
-                        Some(p)
-                    } else {
-                        // Use this special symlink instead of the regular path because it's available even after the file is deleted.
-                        // Useful when recompiling the program without closing the debugger.
-                        Some(format!("/proc/{}/exe", debugger.pid))
+                        additional_elf_paths.push(p);
                     }
+
+                    // Use this special symlink instead of the regular path because it's available even after the file is deleted.
+                    // Useful when recompiling the program without closing the debugger.
+                    Some(format!("/proc/{}/exe", debugger.pid))
                 } else {
                     None
                 };
-                debugger.symbols.add(locator.clone(), &debugger.memory, custom_path)
+                debugger.symbols.add(locator.clone(), &debugger.memory, custom_path, additional_elf_paths)
             }
         };
         map.binary_id = Some(bin.id);

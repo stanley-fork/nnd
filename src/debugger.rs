@@ -7,7 +7,7 @@ use std::{io, ptr, rc::Rc, collections::{HashMap, VecDeque, HashSet}, mem, path:
 pub enum RunMode {
     Run, // start the program inside the debugger
     Attach, // attach to a running process
-    // CoreDump,
+    // TODO: CoreDump,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -132,6 +132,7 @@ pub struct Debugger {
     pub stopping_to_handle_breakpoints: bool,
 
     pub stepping: Option<StepState>,
+    pub initial_step: InitialStep,
 
     pub breakpoint_locations: Vec<BreakpointLocation>, // sorted by address
     pub breakpoints: Pool<Breakpoint>,
@@ -153,6 +154,14 @@ pub enum StepKind {
     Out,
     // Run-to-cursor.
     Cursor,
+}
+
+// Where to stop a newly started process. E.g. if the user presses "step into" when the program is not running, we'll start the program and run to the start of function "main".
+pub enum InitialStep {
+    None,
+    Exec, // right after initial exec (PTRACE_EVENT_EXEC)
+    Main, // start of main function
+    Cursor(BreakpointOn), // when main thread hits a given instruction
 }
 
 #[derive(Debug)]
@@ -323,7 +332,7 @@ impl Thread {
 
 impl Debugger {
     fn new(mode: RunMode, command_line: Vec<String>, context: Arc<Context>, symbols: SymbolsRegistry, breakpoints: Pool<Breakpoint>, persistent: PersistentState, my_resource_stats: ResourceStats, prof: Profiling) -> Self {
-        Debugger {mode, command_line, context, pid: 0, target_state: ProcessState::NoProcess, log: Log::new(), prof, threads: HashMap::new(), pending_wait_events: VecDeque::new(), next_thread_idx: 1, info: ProcessInfo::default(), my_resource_stats, symbols, memory: MemReader::invalid(), waiting_for_initial_sigstop: false, stepping: None, breakpoint_locations: Vec::new(), breakpoints, stopping_to_handle_breakpoints: false, hardware_breakpoints: std::array::from_fn(|_| HardwareBreakpoint {active: false, thread_specific: None, addr: 0}), persistent}
+        Debugger {mode, command_line, context, pid: 0, target_state: ProcessState::NoProcess, log: Log::new(), prof, threads: HashMap::new(), pending_wait_events: VecDeque::new(), next_thread_idx: 1, info: ProcessInfo::default(), my_resource_stats, symbols, memory: MemReader::invalid(), waiting_for_initial_sigstop: false, stepping: None, initial_step: InitialStep::None, breakpoint_locations: Vec::new(), breakpoints, stopping_to_handle_breakpoints: false, hardware_breakpoints: std::array::from_fn(|_| HardwareBreakpoint {active: false, thread_specific: None, addr: 0}), persistent}
     }
 
     pub fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {
@@ -397,7 +406,7 @@ impl Debugger {
         Ok(r)
     }
 
-    pub fn start_child(&mut self) -> Result<()> {
+    pub fn start_child(&mut self, initial_step: InitialStep) -> Result<()> {
         if self.mode != RunMode::Run { return err!(Usage, "can't start new process in attach mode"); }
         if self.target_state != ProcessState::NoProcess { return err!(Usage, "already debugging, can't start"); }
         eprintln!("info: starting child");
@@ -531,6 +540,7 @@ impl Debugger {
 
         self.pid = pid;
         self.target_state = ProcessState::Starting;
+        self.initial_step = initial_step;
         self.waiting_for_initial_sigstop = true;
         self.memory = MemReader::new(pid);
         let thread = Thread::new(self.next_thread_idx, pid, ThreadState::Running);
@@ -661,10 +671,9 @@ impl Debugger {
                                 assert!(!self.waiting_for_initial_sigstop);
 
                                 if self.target_state == ProcessState::Starting {
+                                    // This is a point after dynamic libraries are loaded, but before main() or any static variable initialization.
                                     is_initial_exec = true;
-
-                                    // Good place for initial stop. It's after dynamic libraries are loaded, but before main() or any static variable initialization.
-                                    self.target_state = if self.context.settings.stop_on_initial_exec { ProcessState::Suspended } else { ProcessState::Running };
+                                    self.target_state = ProcessState::Suspended; // will resume below if needed
                                 }
 
                                 // Here we're supposed to also handle the case when a multi-threaded process does an exec, and all its threads vanish.
@@ -781,6 +790,7 @@ impl Debugger {
             if is_initial_exec {
                 // The executable and the dynamic libraries should be mmapped by now (except the ones dlopen()ed at runtime, e.g. by custom dynamic linkers). Activate breakpoints.
                 self.activate_breakpoints(self.breakpoints.iter().map(|t| t.0).collect())?;
+                self.handle_initial_exec();
             }
 
             // This looks O(n^2): any_thread_in_state iterates over all threads, and this happens after each thread stopping.
@@ -922,6 +932,52 @@ impl Debugger {
         Ok(())
     }
 
+    fn handle_initial_exec(&mut self) {
+        let mut step_to: Option<BreakpointOn> = None;
+        match mem::replace(&mut self.initial_step, InitialStep::None) {
+            InitialStep::None => (),
+            InitialStep::Exec => return, // stay suspended
+            InitialStep::Cursor(on) => step_to = Some(on),
+            InitialStep::Main => {
+                let mut is_loading = false;
+                for binary in self.symbols.iter() {
+                    let symbols = match &binary.symbols {
+                        Ok(s) if binary.is_mapped => s,
+                        Err(e) if e.is_loading() => {
+                            is_loading = true;
+                            continue;
+                        }
+                        _ => continue,
+                    };
+                    if let Some(static_addrs) = symbols.points_of_interest.get(&PointOfInterest::MainFunction) {
+                        let addr = binary.addr_map.static_to_dynamic(static_addrs[0]);
+                        step_to = Some(BreakpointOn::Address(AddressBreakpoint {function: None, addr, subfunction_level: u16::MAX}));
+                        break;
+                    }
+                }
+                if step_to.is_none() {
+                    if is_loading {
+                        log!(self.log, "symbols not loaded, stopping early");
+                    } else {
+                        log!(self.log, "main function not found");
+                    }
+                    // Stop on exec instead.
+                    return;
+                }
+            }
+        }
+        if let Some(step_to) = step_to {
+            match self.step_to_cursor(self.pid, step_to) {
+                Ok(()) => return,
+                Err(e) => log!(self.log, "{}", e), // unexpected
+            }
+        }
+        match self.resume() {
+            Ok(()) => (),
+            Err(e) => log!(self.log, "{}", e), // unexpected
+        }
+    }
+    
     fn make_instruction_decoder<'a>(&self, range: Range<usize>, buf: &'a mut Vec<u8>) -> Result<iced_x86::Decoder<'a>> {
         if range.len() > 100_000_000 { return err!(Sanity, "{} MB code range, suspiciously long", range.len() / 1_000_000); }
         buf.resize(range.len(), 0);

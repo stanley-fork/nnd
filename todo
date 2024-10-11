@@ -17,17 +17,14 @@ test with 10k threads
   maybe avoid duplicate POKEUSER calls for debug registers if the thread already had them assigned
 test with watches window filled with long arrays (I saw 50ms frames when there are ~5 of them; maybe just decrease length limit)
 
-allow stepping when process is not running - start the process and run to exec (if by_instructions) or main (otherwise)
-show disassembly if symbols are missing, whole .text section if all else fails
-tooltip in watches window for copying long values
-up/down arrows should close code search, or cycle history
 global variables from .symtab, maybe from .debug_pubnames (maybe also look into .debug_pubtypes)
-make symtab/dynsym work when debug info (or debuglink file) is missing
 more built-in pretty printers: sparsehash, absl, rust b-trees
-hotkey to switch between .h/.cpp (/.cc/.hh/.hpp/.cxx - maybe just all extensions)
+hotkey to switch between .h/.cpp (/.cc/.hh/.hpp/.cxx - maybe just cycle all extensions)
+reordering watches
 reordering tabs
 rearranging windows
 maximizing windows
+get debug info from debuginfod; (maybe also source, though it seems always unavailable)
 thread-local storage
 array types in watch expression (x as *[i32; 10])
 key to freeze value in watches window; can also be used for controlling when to run the expression if it has side effects
@@ -37,6 +34,7 @@ key to send SIGINT to the program
 make return key do something in each window: go from threads to stack -> code -> disassembly -> code; from locals create a watch; from watch sub-value create another watch for that field/element; from breakpoints to code/disassembly/watch (depending on breakpoint type)
 "unexpectedly big memory read" (16 bytes) for f64 local variables on the stack in rust
 floating point and simd registers
+make -s stop on main, waiting for symbols to load (with proper indication in ui and ability to cancel it like steps)
 allow navigating from source to variables (especially global) and types declared there
 allow to put breakpoint on a whole file
 function pointers and field pointers
@@ -54,7 +52,7 @@ key to follow a jump in disas
 allow line-based steps in .plt* (maybe by just turning them into single-instruction-steps)
 in disassembly window, make 'left' key jump to the start of inlined function
 maximizing windows (hot key and button in a corner)
-special breakpoints: panic (rust_panic, core::panicking::panic_fmt, or maybe std::panicking::rust_panic_with_hook; maybe disable find_catch_blocks() for rust at least when panic bp is enabled), exception (__cxa_throw), signals, main function (replacing -s), dynamic library load
+special breakpoints: panic (rust_panic, core::panicking::panic_fmt, or maybe std::panicking::rust_panic_with_hook; maybe disable find_catch_blocks() for rust at least when panic bp is enabled), exception (__cxa_throw), signals, main function, dynamic library load
 make source window autoscroll horizontally in addition to vertically
 -v for build datetime
 handle partially-optimized-out struct values (common in rust)
@@ -66,7 +64,6 @@ watches, expressions
   first, implement simple expression watches
   second, write many pretty printers in imaginary language, figure out what it should be; std::vector, unordered_map, unique_ptr, shared_ptr, list, optional, Rust Vec, HashMap, Option, Box, deb's Pool, etc; see if per-field format options are needed
   stateful expression interpreter, yield, functions
-  evaluate watches in order, preserving variables (including functions), UI to reorder watches
   associating print expressions with types (by substring match to cover templates?)
   always show raw value as one of the children, including for container elements (yield raw value when recursing)
   print options: hex, raw, array length (expression), expanded (i.e. omit array contents etc)

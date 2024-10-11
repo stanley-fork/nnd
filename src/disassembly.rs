@@ -203,13 +203,9 @@ pub fn disassemble_function(function_idx: usize, mut static_addr_ranges: Vec<Ran
         };
 
         if addr_range_idx != 0 {
+            styled_write!(res.text, palette.disas_default,  "──────────");
             res.text.close_line();
-            styled_write!(res.text, palette.disas_default,  "----------");
-            res.text.close_line();
-            res.text.close_line();
-            for i in 0..3 {
-                res.lines.push(DisassemblyLineInfo {kind: DisassemblyLineKind::Separator, static_addr: static_addr_range.start, ..Default::default()});
-            }
+            res.lines.push(DisassemblyLineInfo {kind: DisassemblyLineKind::Separator, static_addr: static_addr_range.start, ..Default::default()});
         }
 
         let resolver = Resolver {symbols: symbols.clone(), current_function: static_addr_range.clone()};

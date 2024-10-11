@@ -49,7 +49,7 @@ impl SymbolsRegistry {
         self.priority_order.iter().map(|id| &self.binaries[*id].as_ref().unwrap().0)
     }
 
-    pub fn add(&mut self, locator: BinaryLocator, memory: &MemReader, custom_path: Option<String>) -> &mut Binary {
+    pub fn add(&mut self, locator: BinaryLocator, memory: &MemReader, custom_path: Option<String>, additional_elf_paths: Vec<String>) -> &mut Binary {
         let id = self.binaries.len();
         let mut elf_contents_maybe: Result<Vec<u8>> = err!(Internal, "no contents");
         match &locator.special {
@@ -71,7 +71,7 @@ impl SymbolsRegistry {
         let inserted = self.locator_to_id.insert(locator.clone(), id).is_none();
         assert!(inserted);
         let shared_clone = self.shared.clone();
-        self.shared.context.executor.add(move || task_load_elf(shared_clone, locator, id, status, elf_contents_maybe, custom_path));
+        self.shared.context.executor.add(move || task_load_elf(shared_clone, locator, id, status, elf_contents_maybe, custom_path, additional_elf_paths));
         &mut self.binaries.last_mut().unwrap().as_mut().unwrap().0
     }
 
@@ -171,7 +171,7 @@ enum Message {
     Unwind {id: usize, unwind: Result<UnwindInfo>},
 }
 
-fn task_load_elf(shared: Arc<Shared>, locator: BinaryLocator, id: usize, status: Arc<SymbolsLoadingStatus>, elf_contents_maybe: Result<Vec<u8>>, custom_path: Option<String>) {
+fn task_load_elf(shared: Arc<Shared>, locator: BinaryLocator, id: usize, status: Arc<SymbolsLoadingStatus>, elf_contents_maybe: Result<Vec<u8>>, custom_path: Option<String>, additional_elf_paths: Vec<String>) {
     let elf;
     {
         let _prof = ProfileScope::with_threshold(0.01, format!("opening elf {}", locator.path));
@@ -187,7 +187,7 @@ fn task_load_elf(shared: Arc<Shared>, locator: BinaryLocator, id: usize, status:
     if let Ok(elf) = elf {
         let (shared_clone, elf_clone) = (shared.clone(), elf.clone());
         shared.context.executor.add(move || task_load_unwind(shared_clone, id, elf_clone));
-        LoadScheduler::start(id, elf, shared, status);
+        LoadScheduler::start(id, elf, additional_elf_paths, shared, status);
     }
 }
 
@@ -241,10 +241,10 @@ struct LoadScheduler {
 }
 
 impl LoadScheduler {
-    fn start(id: usize, elf: Arc<ElfFile>, shared: Arc<Shared>, status: Arc<SymbolsLoadingStatus>) {
+    fn start(id: usize, elf: Arc<ElfFile>, additional_elf_paths: Vec<String>, shared: Arc<Shared>, status: Arc<SymbolsLoadingStatus>) {
         let mut scheduler = LoadScheduler {id, name: elf.name.clone(), loader: SyncUnsafeCell::new(None), num_shards: 0, shared: shared.clone(), status: status.clone(), failed: AtomicBool::new(false), stage: AtomicUsize::new(0), tasks_left: AtomicUsize::new(1)};
         let max_shards = (shared.context.executor.num_threads - 1).max(1);
-        let loader = match SymbolsLoader::new(elf, id, max_shards, status) {
+        let loader = match SymbolsLoader::new(elf, additional_elf_paths, id, max_shards, status) {
             Ok(l) => l,
             Err(e) => {
                 scheduler.handle_fail(e);
