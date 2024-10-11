@@ -332,7 +332,7 @@ impl Layout {
             }
         }
 
-        // User of Layout mostly cares about windows and not regions, so we have public active_region field.
+        // User of Layout mostly cares about windows and not regions, so we have public active_window field.
         // But the build() procedure mostly cares about regions and not windows.
         // So we map active_window to active_leaf here, then map it back near the end of build().
         let mut found = false;

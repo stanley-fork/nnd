@@ -21,8 +21,12 @@ pub fn parse_watch_expression(s: &str) -> Result<Expression> {
 
 pub fn eval_watch_expression(expr_str: &str, state: &mut EvalState, context: &mut EvalContext) -> Result<(Value, /*dubious*/ bool)> {
     let expr = parse_watch_expression(expr_str)?;
+    eval_parsed_expression(&expr, state, context)
+}
+
+pub fn eval_parsed_expression(expr: &Expression, state: &mut EvalState, context: &mut EvalContext) -> Result<(Value, /*dubious*/ bool)> {
     state.currently_evaluated_value_dubious = false;
-    Ok((eval_expression(&expr, expr.root, state, context, false)?, state.currently_evaluated_value_dubious))
+    Ok((eval_expression(expr, expr.root, state, context, false)?, state.currently_evaluated_value_dubious))
 }
 
 // Make expression suitable for appending things like "[5]" or ".foo" to it. Used when adding a watch from a node in value tree.
@@ -63,6 +67,16 @@ pub fn make_expression_for_variable(name: &str) -> String {
     } else {
         name.to_string()
     }
+}
+
+pub fn does_expression_need_full_stack(expr: &Expression) -> bool {
+    for node in &expr.ast {
+        match &node.a {
+            &AST::Variable {from_any_frame, ..} if from_any_frame => return true,
+            _ => (),
+        }
+    }
+    false
 }
 
 fn should_quote_identifier(name: &str) -> bool {

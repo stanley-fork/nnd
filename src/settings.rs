@@ -308,8 +308,7 @@ pub enum KeyAction {
 
     Open,
     FindType,
-    ToggleBreakpoint,
-    DisableBreakpoint,
+    EditCondition,
     Find,
     GoToLine,
 
@@ -620,8 +619,7 @@ impl Default for KeyBinds {
             (Key::Char('+').plain(), KeyAction::ToggleSort),
             (Key::Char('o').plain(), KeyAction::Open),
             (Key::Char('t').plain(), KeyAction::FindType),
-            (Key::Char('b').plain(), KeyAction::ToggleBreakpoint),
-            (Key::Char('B').plain(), KeyAction::DisableBreakpoint),
+            (Key::Char('\n').alt(), KeyAction::EditCondition),
             (Key::Char('/').plain(), KeyAction::Find),
             (Key::Char('g').plain(), KeyAction::GoToLine),
             (Key::Char('d').plain(), KeyAction::DuplicateRow),

@@ -815,8 +815,43 @@ impl UI {
                 continue;
             }
 
+            let axis = &w.axes[ax];
             match &axis.auto_size {
                 _ if axis.flags.contains(AxisFlags::SIZE_KNOWN) => (),
+                AutoSize::Text if ax == Axis::Y && w.flags.contains(WidgetFlags::LINE_WRAP) && !w.axes[Axis::X].flags.contains(AxisFlags::SIZE_KNOWN) => {
+                    // Need to know width to calculate height. Try to calculate width. This doesn't cover all cases currently.
+                    let mut p_idx = idx;
+                    let mut path: Vec<WidgetIdx> = Vec::new();
+                    let width;
+                    loop {
+                        assert!(p_idx.is_valid());
+                        let p = &mut self.tree[p_idx.0];
+                        if p.axes[Axis::X].flags.contains(AxisFlags::SIZE_KNOWN) {
+                            width = p.axes[Axis::X].size;
+                            break;
+                        }
+                        match &p.axes[Axis::X].auto_size {
+                            AutoSize::Fixed(_) => {
+                                Self::try_calculate_simple_size(p, Axis::X, &mut self.text, &self.palette);
+                                width = p.axes[Axis::X].size;
+                                break;
+                            }
+                            AutoSize::Text | AutoSize::Remainder(_) | AutoSize::Children => panic!("widget (line {}) has width {:?}, which is not supported with LINE_WRAP", p.source_line, p.axes[Axis::X].auto_size),
+                            AutoSize::Parent => {
+                                path.push(p_idx);
+                                p_idx = p.parent;
+                            }
+                        }
+                    }
+                    for p_idx in path {
+                        let ax = &mut self.tree[p_idx.0].axes[Axis::X];
+                        ax.size = width;
+                        ax.flags.insert(AxisFlags::SIZE_KNOWN);
+                    }
+
+                    // Finally calculate height.
+                    Self::try_calculate_simple_size(&mut self.tree[idx.0], Axis::Y, &mut self.text, &self.palette);
+                }
                 AutoSize::Fixed(_) | AutoSize::Text => { Self::try_calculate_simple_size(w, ax, &mut self.text, &self.palette); }
                 AutoSize::Parent => assert!(all, "can't calculate widget (line {}) size early because it depends on parent", w.source_line),
                 AutoSize::Remainder(_) => assert!(all, "can't calculate widget (line {}) size early because it depends on siblings", w.source_line),

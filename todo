@@ -1,3 +1,6 @@
+conditional breakpoints
+  render conditional breakpoints using red/blue/dim (c) icon instead of the circle
+
 investigate `clickhouse local` progress spinner appearing in debugger window despite -t
 fix empty symbols loading stage name near the end
 investigate regression in symbols loading speed (stuck on "parsing drawf" for ~10 seconds)
@@ -24,6 +27,7 @@ reordering watches
 reordering tabs
 rearranging windows
 maximizing windows
+meta functions like checking for field presense of superclass type, and also just slice length etc, for use in conditions
 get debug info from debuginfod; (maybe also source, though it seems always unavailable)
 thread-local storage
 array types in watch expression (x as *[i32; 10])
@@ -32,6 +36,7 @@ key to add watch value as new watch, maybe cast to type, e.g. *(0x1234 as *DB::B
 tooltip in status window showing more log lines with line wrapping
 key to send SIGINT to the program
 make return key do something in each window: go from threads to stack -> code -> disassembly -> code; from locals create a watch; from watch sub-value create another watch for that field/element; from breakpoints to code/disassembly/watch (depending on breakpoint type)
+allow expressions (especially conditions) to have multiple statements separated by ';'
 "unexpectedly big memory read" (16 bytes) for f64 local variables on the stack in rust
 floating point and simd registers
 make -s stop on main, waiting for symbols to load (with proper indication in ui and ability to cancel it like steps)

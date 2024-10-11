@@ -91,6 +91,7 @@ Debugging tips:
  * To start the program and run to start of main(), press step-into ('s' by default) when the program is not running (e.g. after killing it with 'k' key).
  * Step-into-instruction ('S' key by default) works no matter what, even if there's no debug info or if disassembly or stack unwinding fails. Use it when other steps fail.
  * Breakpoints are preserved across debugger restarts, but they're put into disabled state on startup. Use Enter key in breakpoints window to reactivate.
+ * To make a conditional breakpoint, press M-enter (by default) on a regular breakpoint and edit the condition expression (in breakpoints window).
  * The function search (in disassembly window, 'o' key by default) currently does fuzzy search over *mangled* function names (for peformance reasons).
    The search results display demangled names, i.e. slightly different from what's actually searched. Press tab to see mangled name.
  * In watches window, on non-root tree nodes press Enter to add a corresponding watch. E.g. for local variable or struct field or array element.
@@ -107,7 +108,8 @@ If you work at ClickHouse, report to #debugger channel in slack or DM Michael Ko
    The plan is to add a fuzzy search dialog for type names, similar to file and function search.
    (There is no plan to actually parse the template type names into their component parts; doing it correctly would be crazy complicated like everything else in C++.)
  * Can't assign to the debugged program's variables or registers
- * No data breakpoints, whole-file breakpoints, conditional breakpoints, special breakpoints (signals, exceptions/panics, main()).
+ * No data breakpoints, whole-file breakpoints, special breakpoints (signals, exceptions/panics).
+ * Conditional breakpoints are not fast: a few thousand evaluations per second.
  * Inside libraries that were dlopen()ed at runtime, breakpoints get disabled on program restart. Manually disable-enable the breakpoint after the dlopen() to reactivate it.
  * The disassembly window can only open functions that appear in .symtab or debug info. Can't disassemble arbitrary memory, e.g. JIT-generated code or code from binaries without .symtab or debug info.
  * The debugger gets noticeably slow when the program has > 1K threads, and unusably slow with 20K threads. Part of it is inevitable syscalls

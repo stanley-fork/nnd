@@ -1,4 +1,4 @@
-use crate::{*, elf::*, error::*, util::*, log::*, symbols::*, process_info::*, symbols_registry::*, unwind::*, procfs::*, registers::*, disassembly::*, pool::*, settings::*, context::*, disassembly::*, expr::*, persistent::*};
+use crate::{*, elf::*, error::*, util::*, log::*, symbols::*, process_info::*, symbols_registry::*, unwind::*, procfs::*, registers::*, disassembly::*, pool::*, settings::*, context::*, disassembly::*, expr::*, persistent::*, interp::*};
 use libc::{pid_t, c_char, c_void};
 use iced_x86::FlowControl;
 use std::{io, ptr, rc::Rc, collections::{HashMap, VecDeque, HashSet}, mem, path::{Path, PathBuf}, sync::Arc, ffi::CStr, ops::Range, os::fd::AsRawFd, fs, time::{Instant, Duration}};
@@ -262,7 +262,8 @@ pub enum BreakpointOn {
 
 pub struct Breakpoint {
     pub on: BreakpointOn,
-    pub hits: usize,
+    pub condition: Option<(String, Result<Expression>, Option<Error>)>,
+    pub hits: usize, // including spurious stops of all kinds
     // Cached list of addresses, determined using the BreakpointOn and debug symbols. NotCalculated if we didn't resolve this yet.
     // The addresses are dynamic, not static, so we clear this list when restarting the debuggee as runtime addresses may have changed.
     // If the breakpoint is on a line that has inlined function call, subfunction_level is the depth of that inlined call.
@@ -297,6 +298,12 @@ impl Breakpoint {
                 out.write_u16(b.subfunction_level)?;
             }
         }
+        if let Some((s, _, _)) = &self.condition {
+            out.write_u8(1)?;
+            out.write_str(s)?;
+        } else {
+            out.write_u8(0)?;
+        }
         Ok(())
     }
 
@@ -313,7 +320,16 @@ impl Breakpoint {
             }
             x => return err!(Environment, "unexpected breakpoint type in save file: {}", x),
         };
-        Ok(Breakpoint {on, hits: 0, addrs: err!(NotCalculated, ""), enabled: false, active: false})
+        let condition = match inp.read_u8()? {
+            0 => None,
+            1 => {
+                let s = inp.read_str()?;
+                let expr = parse_watch_expression(&s);                
+                Some((s, expr, None))
+            }
+            x => return err!(Environment, "unexpected breakpoint condition flag in save file: {}", x),
+        };
+        Ok(Breakpoint {on, condition, hits: 0, addrs: err!(NotCalculated, ""), enabled: false, active: false})
     }
 }
 
@@ -1403,13 +1419,14 @@ impl Debugger {
     pub fn step_to_cursor(&mut self, tid: pid_t, cursor: BreakpointOn) -> Result<()> {
         match self.target_state {
             ProcessState::Suspended | ProcessState::Running | ProcessState::Stepping => (),
-            ProcessState::NoProcess | ProcessState::Starting | ProcessState::Exiting => return err!(Usage, "no process"),
+            ProcessState::NoProcess => return self.start_child(InitialStep::Cursor(cursor)),
+            ProcessState::Starting | ProcessState::Exiting => return err!(Usage, "not ready"),
         }
         if self.threads.get(&tid).is_none() {
             return err!(Usage, "no thread");
         }
 
-        let mut breakpoint = Breakpoint {on: cursor, hits: 0, addrs: err!(NotCalculated, ""), enabled: true, active: false};
+        let mut breakpoint = Breakpoint {on: cursor, condition: None, hits: 0, addrs: err!(NotCalculated, ""), enabled: true, active: false};
         Self::determine_locations_for_breakpoint(&self.symbols, &mut breakpoint);
         let addrs = breakpoint.addrs?;
 
@@ -1506,7 +1523,7 @@ impl Debugger {
 
         let mut regs = thread.info.regs.clone();
         let mut scratch = UnwindScratchBuffer::default();
-        let mut pseudo_addr = regs.get_int(RegisterIdx::Rip).unwrap().0 as usize;
+        let mut pseudo_addr = regs.get_int(RegisterIdx::Rip)?.0 as usize;
         let mut memory = CachedMemReader::new(self.memory.clone());
 
         loop {
@@ -1690,7 +1707,7 @@ impl Debugger {
     }
 
     pub fn add_breakpoint(&mut self, on: BreakpointOn) -> Result<BreakpointId> {
-        let mut breakpoint = Breakpoint {on, hits: 0, addrs: err!(NotCalculated, ""), enabled: true, active: false};
+        let mut breakpoint = Breakpoint {on, condition: None, hits: 0, addrs: err!(NotCalculated, ""), enabled: true, active: false};
         if self.target_state.breakpoints_should_be_active() {
             Self::determine_locations_for_breakpoint(&self.symbols, &mut breakpoint);
             if let Err(e) = breakpoint.addrs {
@@ -1726,6 +1743,18 @@ impl Debugger {
             self.activate_breakpoints(vec![id])?;
         }
         Ok(true)
+    }
+
+    pub fn set_breakpoint_condition(&mut self, id: BreakpointId, condition: Option<String>) {
+        let b = match self.breakpoints.try_get_mut(id) {
+            None => return,
+            Some(x) => x };
+        if let Some(condition) = condition {
+            let expr = parse_watch_expression(&condition);
+            b.condition = Some((condition, expr, None));
+        } else {
+            b.condition = None;
+        }
     }
 
     fn activate_breakpoints(&mut self, ids: Vec<BreakpointId>) -> Result<()> {
@@ -2203,9 +2232,9 @@ impl Debugger {
                 // Lazily deactivate obsolete breakpoint location if we hit it. This is just for performance, to avoid repeatedly hitting+ignoring a deleted hot breakpoint.
                 self.deactivate_breakpoint_location(idx, tid)?;
             }
-            let location = &mut self.breakpoint_locations[idx];
 
-            for b in &location.breakpoints {
+            for bp_i in 0..self.breakpoint_locations[idx].breakpoints.len() {
+                let b = &self.breakpoint_locations[idx].breakpoints[bp_i];
                 match b {
                     BreakpointRef::Step(t) => {
                         let step = self.stepping.as_ref().unwrap();
@@ -2220,7 +2249,10 @@ impl Debugger {
                             }
                         }
                     }
-                    BreakpointRef::Id {id, subfunction_level} => {
+                    &BreakpointRef::Id {id, subfunction_level} => {
+                        let bp = self.breakpoints.get_mut(id);
+                        bp.hits += 1;
+
                         if spurious_stop {
                             // Spurious stop after converting breakpoint from software to hardware, or initial hit after adding a breakpoint on current line.
                             if self.context.settings.trace_logging { eprintln!("trace: ignoring spurious stop on hw breakpoint {:x}", addr); }
@@ -2245,17 +2277,30 @@ impl Debugger {
                             // If this turns out to be a problem, replace this with a different mechanism (maybe a flag in Thread saying "ignore breakpoints in this thread until it's suspended").
                             continue;
                         }
+                        if let Some((_, Ok(_), _)) = &bp.condition {
+                            let r = self.eval_breakpoint_condition(tid, id, subfunction_level);
+                            let bp = self.breakpoints.get_mut(id);
+                            let cond = &mut bp.condition.as_mut().unwrap();
+                            match r {
+                                Ok(hit) => {
+                                    cond.2 = None;
+                                    if !hit {
+                                        continue;
+                                    }
+                                }
+                                Err(e) => cond.2 = Some(e), // put error into the breakpoint to be shown in UI, and stop
+                            }
+                        }
 
-                        let bp = self.breakpoints.get_mut(*id);
-                        bp.hits += 1;
-                        stop_reasons.push(StopReason::Breakpoint(*id));
-                        if *subfunction_level != u16::MAX {
-                            stack_digest_to_select = Some((Vec::new(), false, *subfunction_level));
+                        stop_reasons.push(StopReason::Breakpoint(id));
+                        if subfunction_level != u16::MAX {
+                            stack_digest_to_select = Some((Vec::new(), false, subfunction_level));
                         }
                         hit = true;
                     }
                 }
             }
+            let location = &mut self.breakpoint_locations[idx];
 
             if !location.hardware {
                 // Stop all threads so that we can convert the breakpoint into hardware breakpoint (or single-step past it).
@@ -2289,6 +2334,26 @@ impl Debugger {
         }
 
         Ok((hit, regs, stack_digest_to_select))
+    }
+
+    fn eval_breakpoint_condition(&mut self, tid: pid_t, id: BreakpointId, subfunction_level: u16) -> Result<bool> {
+        // All of this is slow.
+        let bp = self.breakpoints.get(id);
+        let expr = bp.condition.as_ref().unwrap().1.as_ref().unwrap();
+        let need_full_stack = does_expression_need_full_stack(expr);
+        self.threads.get_mut(&tid).unwrap().info.regs = ptrace_getregs(tid, &mut self.prof.bucket)?;
+        let stack = self.get_stack_trace(tid, /*partial*/ !need_full_stack);
+        let selected_subframe = if subfunction_level != u16::MAX && !stack.frames.is_empty() {
+            stack.frames[0].subframes.end.saturating_sub(subfunction_level as usize + 1)
+        } else {
+            0
+        };
+        let bp = self.breakpoints.get(id);
+        let expr = bp.condition.as_ref().unwrap().1.as_ref().unwrap();
+        let mut eval_state = EvalState::new();
+        let mut eval_context = self.make_eval_context(&stack, selected_subframe);
+        let (val, _dubious) = eval_parsed_expression(expr, &mut eval_state, &mut eval_context)?;
+        Ok(is_value_truthy(&val, &mut eval_context.memory)?)
     }
 }
 

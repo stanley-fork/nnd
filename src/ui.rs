@@ -39,6 +39,7 @@ pub struct UIState {
     // so we set this flag, which tells the windows to scroll only if the error tab is selected.
     should_scroll_source: Option<(Option<SourceScrollTarget>, /*only_if_on_error_tab*/ bool)>,
     should_scroll_disassembly: Option<(Result<DisassemblyScrollTarget>, /*only_if_on_error_tab*/ bool)>,
+    should_edit_breakpoint_condition: Option<BreakpointId>,
 }
 
 #[derive(Default)]
@@ -288,6 +289,16 @@ impl DebuggerUI {
             } else {
                 w.fixed_size[Axis::Y] = Some(HintsWindow::NORMAL_HEIGHT);
                 w.title = "controls".to_string();
+            }
+        }
+
+        if self.state.should_edit_breakpoint_condition.is_some() {
+            match self.layout.any_window_by_type(WindowType::Breakpoints) {
+                Some(id) => self.layout.active_window = Some(id),
+                None => {
+                    log!(debugger.log, "no breakpoints window");
+                    self.state.should_edit_breakpoint_condition = None;
+                }
             }
         }
 
@@ -1674,7 +1685,7 @@ impl DisassemblyWindow {
         bp.addr
     }
 
-    fn toggle_breakpoint(new_breakpoint: AddressBreakpoint, disable: bool, tab: &DisassemblyTab, addr_map: &AddrMap, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
+    fn toggle_breakpoint(new_breakpoint: AddressBreakpoint, delete: bool, edit_condition: bool, tab: &DisassemblyTab, addr_map: &AddrMap, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
         ui.should_redraw = true;
 
         let mut existing_id = None;
@@ -1690,24 +1701,31 @@ impl DisassemblyWindow {
                 }
             }
         }
-        if let Some(id) = existing_id {
-            if disable {
-                let r = debugger.set_breakpoint_enabled(id, false);
-                report_result(state, &r);
-            } else if !debugger.breakpoints.get(id).enabled {
-                let r = debugger.set_breakpoint_enabled(id, true);
-                report_result(state, &r);
-            } else {
+        if delete {
+            if let Some(id) = existing_id {
                 debugger.remove_breakpoint(id);
+            } else {
+                state.last_error = "no breakpoint".to_string();
             }
             return;
         }
-
-        if disable {
-            state.last_error = "no breakpoint".to_string();
+        let id = if let Some(id) = existing_id {
+            if !edit_condition {
+                let enable = !debugger.breakpoints.get(id).enabled;
+                let r = debugger.set_breakpoint_enabled(id, enable);
+                report_result(state, &r);
+            }
+            id
         } else {
             let r = debugger.add_breakpoint(BreakpointOn::Address(new_breakpoint));
             report_result(state, &r);
+            match r {
+                Ok(id) => id,
+                Err(_) => return,
+            }
+        };
+        if edit_condition {
+            state.should_edit_breakpoint_condition = Some(id);
         }
     }
 }
@@ -1861,12 +1879,12 @@ impl WindowContent for DisassemblyWindow {
                 state.selected_addr = Some((binary.id, function_idx, cursor_addr));
             }
 
-            for action in ui.check_keys(&[KeyAction::ToggleBreakpoint, KeyAction::DisableBreakpoint, KeyAction::StepToCursor, KeyAction::PreviousLocation, KeyAction::NextLocation]) {
+            for action in ui.check_keys(&[KeyAction::Enter, KeyAction::DeleteRow, KeyAction::EditCondition, KeyAction::StepToCursor, KeyAction::PreviousLocation, KeyAction::NextLocation]) {
                 match action {
-                    KeyAction::ToggleBreakpoint | KeyAction::DisableBreakpoint if cursor_addr != usize::MAX => {
+                    KeyAction::Enter | KeyAction::DeleteRow | KeyAction::EditCondition if cursor_addr != usize::MAX => {
                         let offset = cursor_static_addr - function.addr.0;
                         let new_breakpoint = AddressBreakpoint {function: Some((tab.locator.clone().unwrap(), offset)), addr: cursor_addr, subfunction_level: tab.selected_subfunction_level};
-                        Self::toggle_breakpoint(new_breakpoint, action == KeyAction::DisableBreakpoint, tab, &binary.addr_map, state, debugger, ui);
+                        Self::toggle_breakpoint(new_breakpoint, action == KeyAction::DeleteRow, action == KeyAction::EditCondition, tab, &binary.addr_map, state, debugger, ui);
                     }
                     KeyAction::StepToCursor if cursor_addr != usize::MAX => {
                         ui.should_redraw = true;
@@ -2077,7 +2095,7 @@ impl WindowContent for DisassemblyWindow {
         out.extend([
             KeyHint::key(KeyAction::Open, "find function"),
             KeyHint::key(KeyAction::CloseTab, "close/pin tab"),
-            KeyHint::keys(&[KeyAction::ToggleBreakpoint, KeyAction::DisableBreakpoint], "toggle/disable breakpoint"),
+            KeyHint::keys(&[KeyAction::Enter, KeyAction::DeleteRow, KeyAction::EditCondition], "toggle/delete/edit breakpoint"),
             KeyHint::key(KeyAction::StepToCursor, "run to cursor"),
             KeyHint::keys(&[KeyAction::PreviousLocation, KeyAction::NextLocation], "select level")]);
     }
@@ -3431,33 +3449,48 @@ impl CodeWindow {
         self.tabs_state.select(self.tabs.len() - 1);
     }
 
-    fn toggle_breakpoint(tab: &CodeTab, disable: bool, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
+    fn toggle_breakpoint(tab: &CodeTab, delete: bool, edit_condition: bool, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
         if tab.path_in_symbols.as_os_str().is_empty() {
             return;
         }
         ui.should_redraw = true;
+        let mut breakpoint_id = None;
         for (id, breakpoint) in debugger.breakpoints.iter() {
             match &breakpoint.on {
                 BreakpointOn::Line(bp) if bp.path == tab.path_in_symbols && (bp.line == tab.area_state.cursor + 1 || bp.adjusted_line == Some(tab.area_state.cursor + 1)) => {
-                    if disable {
-                        let r = debugger.set_breakpoint_enabled(id, false);
-                        report_result(state, &r);
-                    } else if !breakpoint.enabled {
-                        let r = debugger.set_breakpoint_enabled(id, true);
-                        report_result(state, &r);
-                    } else {
+                    if delete {
                         debugger.remove_breakpoint(id);
+                        return;
                     }
-                    return;
+                    breakpoint_id = Some(id.clone());
+                    if !edit_condition {
+                        let enable = !breakpoint.enabled;
+                        let r = debugger.set_breakpoint_enabled(id, enable);
+                        report_result(state, &r);
+                    }
+                    break;
                 }
                 _ => (),
             }
         }
-        if disable {
+        if delete {
+            assert!(breakpoint_id.is_none());
             state.last_error = "no breakpoint".to_string();
-        } else {
-            let r = debugger.add_breakpoint(Self::make_breakpoint_for_current_line(tab));
-            report_result(state, &r);
+            return;
+        }
+        let breakpoint_id = match breakpoint_id {
+            Some(x) => x,
+            None => {
+                let r = debugger.add_breakpoint(Self::make_breakpoint_for_current_line(tab));
+                report_result(state, &r);
+                match r {
+                    Ok(x) => x,
+                    Err(_) => return,
+                }
+            }
+        };
+        if edit_condition {
+            state.should_edit_breakpoint_condition = Some(breakpoint_id);
         }
     }
 
@@ -3704,12 +3737,11 @@ impl WindowContent for CodeWindow {
         let file = Self::find_or_open_file(&mut self.file_cache, &tab.path_in_symbols, &tab.version_in_symbols, debugger, &ui.palette);
 
         let mut select_disassembly_address: isize = 0;
-        for action in ui.check_keys(&[KeyAction::ToggleBreakpoint, KeyAction::DisableBreakpoint, KeyAction::PreviousLocation, KeyAction::NextLocation, KeyAction::StepToCursor]) {
+        for action in ui.check_keys(&[KeyAction::Enter, KeyAction::EditCondition, KeyAction::DeleteRow, KeyAction::PreviousLocation, KeyAction::NextLocation, KeyAction::StepToCursor]) {
             match action {
                 KeyAction::PreviousLocation => select_disassembly_address -= 1,
                 KeyAction::NextLocation => select_disassembly_address += 1,
-                KeyAction::ToggleBreakpoint => Self::toggle_breakpoint(tab, false, state, debugger, ui),
-                KeyAction::DisableBreakpoint => Self::toggle_breakpoint(tab, true, state, debugger, ui),
+                KeyAction::Enter | KeyAction::DeleteRow | KeyAction::EditCondition => Self::toggle_breakpoint(tab, action == KeyAction::DeleteRow, action == KeyAction::EditCondition, state, debugger, ui),
                 KeyAction::StepToCursor => Self::step_to_cursor(tab, state, debugger, ui),
                 _ => (),
             }
@@ -3899,7 +3931,7 @@ impl WindowContent for CodeWindow {
         out.extend([
             KeyHint::key(KeyAction::Open, "open file"),
             KeyHint::key(KeyAction::CloseTab, "close/pin tab"),
-            KeyHint::keys(&[KeyAction::ToggleBreakpoint, KeyAction::DisableBreakpoint], "toggle/disable breakpoint"),
+            KeyHint::keys(&[KeyAction::Enter, KeyAction::DeleteRow, KeyAction::EditCondition], "toggle/delete/edit breakpoint"),
             KeyHint::key(KeyAction::StepToCursor, "run to cursor"),
             KeyHint::keys(&[KeyAction::PreviousLocation, KeyAction::NextLocation], "cycle disasm addrs"),
             KeyHint::key(KeyAction::GoToLine, "go to line"),
@@ -3945,7 +3977,7 @@ impl WindowContent for CodeWindow {
 struct BreakpointsWindow {
     table_state: TableState,
     selected_breakpoint: Option<BreakpointId>,
-    special_expanded: bool,
+    condition_input: Option<(BreakpointId, TextInput)>,
 }
 impl WindowContent for BreakpointsWindow {
     fn get_key_hints(&self, out: &mut Vec<KeyHint>) {
@@ -3970,15 +4002,23 @@ impl WindowContent for BreakpointsWindow {
 
         let mut table = Table::new(mem::take(&mut self.table_state), ui, vec![
             Column::new("idx", AutoSize::Text, false),
-            Column::new("", AutoSize::Fixed(2), false),
+            Column::new("", AutoSize::Fixed(4), false),
             Column::new("on", AutoSize::Remainder(1.0), false),
             Column::new("locs", AutoSize::Text, false),
             Column::new("hits", AutoSize::Text, false),
         ]);
         table.hide_cursor_if_unfocused = true;
-        table.enable_selection_icon = false;
 
-        for action in ui.check_keys(&[KeyAction::DeleteRow, KeyAction::ToggleBreakpoint, KeyAction::DisableBreakpoint, KeyAction::Enter]) {
+        let mut start_editing_condition = false;
+        if let Some(id) = mem::take(&mut state.should_edit_breakpoint_condition) {
+            self.selected_breakpoint = Some(id);
+            start_editing_condition = true;
+        }
+
+        for action in ui.check_keys(&[KeyAction::DeleteRow, KeyAction::Enter, KeyAction::EditCondition, KeyAction::Cancel]) {
+            if action == KeyAction::Cancel {
+                self.condition_input = None;
+            }
             let id = match &self.selected_breakpoint {
                 None => continue,
                 &Some(x) => x };
@@ -3987,7 +4027,13 @@ impl WindowContent for BreakpointsWindow {
                 Some(x) => x };
             match action {
                 KeyAction::DeleteRow => {debugger.remove_breakpoint(id);}
-                KeyAction::ToggleBreakpoint | KeyAction::DisableBreakpoint | KeyAction::Enter => {
+                KeyAction::Enter | KeyAction::EditCondition if self.condition_input.as_ref().is_some_and(|(idd, _)| *idd == id) => {
+                    let text = mem::take(&mut self.condition_input).unwrap().1.text;
+                    let condition = if text.is_empty() {None} else {Some(text)};
+                    debugger.set_breakpoint_condition(id, condition);
+                }
+                KeyAction::EditCondition => start_editing_condition = true,
+                KeyAction::Enter => {
                     let enable = !breakpoint.enabled;
                     let r = debugger.set_breakpoint_enabled(id, enable);
                     report_result(state, &r);
@@ -3996,12 +4042,21 @@ impl WindowContent for BreakpointsWindow {
             }
         }
 
+        if start_editing_condition {
+            if let &Some(id) = &self.selected_breakpoint {
+                if let Some(breakpoint) = debugger.breakpoints.try_get(id) {
+                    let text = breakpoint.condition.as_ref().map_or(String::new(), |(s, _, _)| s.clone());
+                    self.condition_input = Some((id, TextInput::new_multiline(text)));
+                }
+            }
+        }
+
         let mut breakpoints: Vec<BreakpointId> = debugger.breakpoints.iter().map(|p| p.0).collect();
         breakpoints.sort_by_key(|id| id.seqno);
 
         if let &Some(id) = &self.selected_breakpoint {
             if let Some(idx) = breakpoints.iter().position(|b| b == &id) {
-                self.table_state.cursor = idx;
+                table.state.cursor = idx;
             }
         }
 
@@ -4015,6 +4070,7 @@ impl WindowContent for BreakpointsWindow {
         }
         locations.sort();
 
+        let mut text_input_parent_widget = None;
         for &id in &breakpoints {
             let b = debugger.breakpoints.get(id);
             let is_hit = hit_breakpoints.binary_search(&id).is_ok();
@@ -4026,9 +4082,8 @@ impl WindowContent for BreakpointsWindow {
             ui_writeln!(ui, default_dim, "{}", id.seqno);
             table.text_cell(ui);
 
-            if is_hit {
-                ui_writeln!(ui, instruction_pointer, "⮕ ");
-            } else if !b.enabled {
+            ui_write!(ui, instruction_pointer, "{}", if is_hit {"⮕ "} else {"  "});
+            if !b.enabled {
                 ui_writeln!(ui, secondary_breakpoint, "○ ");
             } else if !b.active || locs_begin == locs_end {
                 ui_writeln!(ui, breakpoint, "○ ");
@@ -4065,11 +4120,28 @@ impl WindowContent for BreakpointsWindow {
                     }
                 }
             }
+            let row_is_focused = ui.check_focus();
             let l = ui.text.close_line();
             with_parent!(ui, table.start_cell(ui), {
-                ui.cur_mut().flags.insert(WidgetFlags::TEXT_TRUNCATION_ALIGN_RIGHT);
-                ui.cur_mut().axes[Axis::Y].auto_size = AutoSize::Text;
-                ui.cur_mut().draw_text = Some(l..l+1);
+                ui.cur_mut().set_vstack();
+
+                ui.add(widget!().height(AutoSize::Text).text(l).flags(WidgetFlags::TEXT_TRUNCATION_ALIGN_RIGHT));
+
+                if (row_is_focused || start_editing_condition) && self.condition_input.as_ref().is_some_and(|(idd, _)| *idd == id) {
+                    text_input_parent_widget = Some(ui.cur_parent);
+                } else if let Some((text, expr, err)) = &b.condition {
+                    let l = ui_writeln!(ui, default, "{}", text);
+                    let lines = ui.text.split_by_newline_character(l, None);
+                    ui.add(widget!().height(AutoSize::Text).text_lines(lines).flags(WidgetFlags::LINE_WRAP));
+
+                    if let Err(e) = expr {
+                        let l = ui_writeln!(ui, error, "{}", e);
+                        ui.add(widget!().height(AutoSize::Text).text(l).flags(WidgetFlags::LINE_WRAP));
+                    } else if let Some(e) = err {
+                        let l = ui_writeln!(ui, error, "{}", e);
+                        ui.add(widget!().height(AutoSize::Text).text(l).flags(WidgetFlags::LINE_WRAP));
+                    }
+                }
             });
 
             ui_writeln!(ui, default_dim, "{}", locs_end - locs_begin);
@@ -4083,6 +4155,19 @@ impl WindowContent for BreakpointsWindow {
                 let a = ui.palette.breakpoint_error;
                 ui.get_mut(row_widget).style_adjustment.update(a);
             }
+        }
+
+        table.finish_horizontal_layout(ui);
+        if let Some(input_parent_widget) = text_input_parent_widget {
+            // Build the text input once we know the table column width.
+            let input_widget = ui.add(widget!().parent(input_parent_widget).identity(&'i').height(AutoSize::Children));
+            with_parent!(ui, input_widget, {
+                let input = &mut self.condition_input.as_mut().unwrap().1;
+                let changed = input.build(ui);
+                table.state.scroll_to_cursor |= changed;
+            });
+        } else {
+            self.condition_input = None;
         }
 
         self.table_state = table.finish(ui);

@@ -1399,6 +1399,19 @@ impl StructBuilder {
     }
 }
 
+pub fn is_value_truthy(val: &Value, memory: &mut CachedMemReader) -> Result<bool> {
+    let t = unsafe {&*val.type_};
+    let size = t.calculate_size();
+    match &t.t {
+        Type::Primitive(f) if f.contains(PrimitiveFlags::UNSPECIFIED) || size == 0 => err!(TypeMismatch, "got void value instead of a boolean"),
+        Type::Primitive(_) => {
+            let v = val.val.clone().into_value(size, memory)?;
+            Ok(v.as_slice()[..size].iter().copied().any(|x| x != 0))
+        }
+        _ => err!(TypeMismatch, "got value of {} type instead of a boolean", t.t.kind_name()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::expr::*;
