@@ -1446,8 +1446,6 @@ impl SearchBar {
             return;
         }
 
-        // TODO: Up and down keys to navigate history.
-
         ui.cur_mut().set_fixed_height(1);
         ui.cur_mut().axes[Axis::X].flags.insert(AxisFlags::STACK);
         if let Some(l) = left_text {

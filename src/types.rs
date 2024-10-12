@@ -270,7 +270,6 @@ pub struct TypeInfo {
     // Doesn't include enum enumerands (to save memory).
     // &'static is either static or in misc_arena.
     pub nested_names: &'static [(&'static str, NestedName)],
-    // TODO: Add LineInfo for declaration/definition.
     pub t: Type,
 }
 impl Default for TypeInfo { fn default() -> Self { Self {name: "", size: 0, die: DebugInfoOffset(0), binary_id: usize::MAX, line: LineInfo::invalid(), flags: TypeFlags::empty(), language: LanguageFamily::Internal, nested_names: &[], t: Type::Unknown} } }
@@ -567,7 +566,6 @@ pub fn print_type_name(t: *const TypeInfo, out: &mut StyledText, palette: &Palet
             _ => (),
         }
         if t.name.is_empty() {
-            // TODO: Print file+line instead of DIE offset.
             styled_write!(out, palette.type_name, "<{} @{:x}>", t.t.kind_name(), t.die.0);
         } else {
             styled_write!(out, palette.type_name, "{}", t.name);

@@ -39,7 +39,7 @@ pub fn adjust_expression_for_appending_child_path(expr_str: &str) -> Result<Stri
         AST::Literal(_) | AST::Variable {..} | AST::Field {..} | AST::Array | AST::Tuple | AST::StructExpression(_) | AST::TupleIndexing(_) | AST::Call(_) | AST::Block | AST::TypeInfo => false,
         AST::BinaryOperator(BinaryOperator::Index) | AST::BinaryOperator(BinaryOperator::Slicify) => false,
         // These are unexpected at top level of a watch expression.
-        AST::Type {..} | AST::PointerType | AST::Continue | AST::Break | AST::Return => false,
+        AST::Type {..} | AST::PointerType | AST::ArrayType(_) | AST::Continue | AST::Break | AST::Return => false,
 
         // For variable assignment, just use the variable name.
         AST::BinaryOperator(BinaryOperator::Assign) => {
@@ -525,7 +525,7 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
             // TODO: maybe pretty() to explicitly apply pretty-printers
             _ => return err!(NoFunction, "no builtin function '{}' (calling debuggee functions is not supported)", name),
         }
-        AST::Type {..} | AST::PointerType => panic!("unexpected type AST"),
+        AST::Type {..} | AST::PointerType | AST::ArrayType(_) => panic!("unexpected type AST"),
         _ => return err!(NotImplemented, "not implemented"),
     }
 }
@@ -537,6 +537,10 @@ fn eval_type(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, context
         AST::PointerType => {
             let inner = eval_type(expr, node.children[0], state, context)?;
             Ok(state.types.add_pointer(inner, PointerFlags::empty()))
+        }
+        &AST::ArrayType(len) => {
+            let inner = eval_type(expr, node.children[0], state, context)?;
+            Ok(state.types.add_array(inner, len, ArrayFlags::empty()))
         }
         _ => panic!("unexpected non-type AST"),
     }
@@ -712,6 +716,7 @@ enum AST {
     TypeCast, // a as i64
     Type {name: String, quoted: bool}, // Foo
     PointerType, // *Foo
+    ArrayType(/*len*/ usize), // [Foo; 10]
 
     Array, // [a, 42, b]
     Tuple, // (a, 42, "foo", b)
@@ -1082,7 +1087,17 @@ fn parse_type(lex: &mut Lexer, expr: &mut Expression) -> Result<ASTIdx> {
         }
         Token::BinaryOperator(op) if op == BinaryOperator::BitAnd => return err!(Syntax, "references not supported, use pointers"),
         Token::Identifier {s, quoted} => AST::Type {name: s, quoted},
-        // TODO: Arrays: [type; length]
+        Token::Char('[') => {
+            node.children.push(parse_type(lex, expr)?);
+            lex.expect("';'", |t| t.is_char(';'))?;
+            let (r, t) = lex.eat(1)?;
+            let len = match t {
+                Token::Literal(LiteralValue::Basic(BasicValue::U(len))) => len,
+                _ => return err!(Syntax, "expected nonnegative number, got {:?} at {}", t, r.start),
+            };
+            lex.expect("']'", |t| t.is_char(']'))?;
+            AST::ArrayType(len)
+        }
         _ => return err!(Syntax, "expected type, got {:?} at {}", token, node.range.start),
     };
     node.range.end = lex.previous_token_end;

@@ -4083,6 +4083,7 @@ impl WindowContent for BreakpointsWindow {
             table.text_cell(ui);
 
             ui_write!(ui, instruction_pointer, "{}", if is_hit {"⮕ "} else {"  "});
+            //asdqwe different icon for conditional bp, reuse in code and disas windows
             if !b.enabled {
                 ui_writeln!(ui, secondary_breakpoint, "○ ");
             } else if !b.active || locs_begin == locs_end {

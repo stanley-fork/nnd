@@ -196,7 +196,6 @@ pub fn reflect_meta_value(val: &Value, state: &mut EvalState, context: &mut Eval
                 let nested = nested.finish("", val.flags, &mut state.types);
                 builder.add_field("nested", nested);
             }
-            // TODO: Decl file+line.
             if t.die.0 != 0 && t.die.0 < FAKE_DWARF_OFFSET_START {
                 builder.add_usize_field("dwarf_offset", t.die.0 as usize, state.builtin_types.u64_);
             }
