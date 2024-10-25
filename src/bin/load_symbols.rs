@@ -33,7 +33,7 @@ fn main() -> Result<()> {
 
         let status = Arc::new(SymbolsLoadingStatus::new());
         let num_threads = thread::available_parallelism().map_or(8, |n| n.get()) - 1;
-        let loader = Arc::new(SyncUnsafeCell::new(SymbolsLoader::new(elf, 1, num_threads, status.clone())?));
+        let loader = Arc::new(SyncUnsafeCell::new(SymbolsLoader::new(elf, Vec::new(), 1, num_threads, status.clone())?));
         let num_shards = unsafe {&*loader.get()}.num_shards;
         let mut stage_idx = 1usize;
         while unsafe {&mut *loader.get()}.prepare_stage(stage_idx)? {

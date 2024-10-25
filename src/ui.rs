@@ -3983,7 +3983,7 @@ impl WindowContent for BreakpointsWindow {
     fn get_key_hints(&self, out: &mut Vec<KeyHint>) {
         out.extend([
             KeyHint::key(KeyAction::DeleteRow, "delete breakpoint"),
-            KeyHint::key(KeyAction::Enter, "enable/disable breakpoint"),
+            KeyHint::keys(&[KeyAction::Enter, KeyAction::EditCondition], "enable/disable/edit breakpoint"),
             KeyHint::key(KeyAction::Tooltip, "tooltip"),
         ]);
     }

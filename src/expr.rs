@@ -243,7 +243,7 @@ impl AddrOrValueBlob {
                 }
                 a[..byte_offset.len()].copy_from_slice(&b.as_slice()[byte_offset.clone()]);
             }
-            Self::Addr(addr) => memory.read(*addr + byte_offset.start, &mut a[..byte_offset.len()])?,
+            Self::Addr(addr) => memory.read(addr.saturating_add(byte_offset.start), &mut a[..byte_offset.len()])?,
         }
 
         // Why, Rust?

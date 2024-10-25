@@ -1119,7 +1119,7 @@ fn recognize_cpp_list(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, 
             is_truncated = true;
             break;
         }
-        let elem_addr = node_addr + sizeof_node + value_offset;
+        let elem_addr = node_addr.saturating_add(sizeof_node).saturating_add(value_offset);
         data.extend_from_slice(&elem_addr.to_le_bytes());
         node_addr = AddrOrValueBlob::Addr(node_addr).bit_range(next_field.clone(), &mut context.memory)?;
     }

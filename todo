@@ -5,6 +5,7 @@ investigate why many types are not deduped, e.g. there's DB::Block#441
 make stack unwinding work when control is in .plt or .plt.got, see "Recognise PLT entries such as" in libunwind code
 log a message if the process forked away
 fix incorrect column numbers with tab indentation (tabs should be counted as 1 column, but we turn them into multiple spaces)
+investigate why exception-aware step-over doesn't work in clickhouse, at least sometimes
 
 investigate why quitting is slow
 optimize simple things found by profiler (samply is nice)
@@ -17,9 +18,12 @@ test with 10k threads
   maybe avoid duplicate POKEUSER calls for debug registers if the thread already had them assigned
 test with watches window filled with long arrays (I saw 50ms frames when there are ~5 of them; maybe just decrease length limit)
 
+edit breakpoint condition on click
+`in` operator, e.g. x in [1, 2, 3]
 global variables from .symtab, maybe from .debug_pubnames (maybe also look into .debug_pubtypes)
 more built-in pretty printers: sparsehash, absl, rust b-trees
 hotkey to switch between .h/.cpp (/.cc/.hh/.hpp/.cxx - maybe just anything after '.')
+when stopping in exception handler, indicate it in the UI clearly, as a new stop reason perhaps (and show stop reason in status window btw, with a different color, e.g. purple), because it can be in some obscure destructor call instead of an obvious catch block
 reordering watches
 reordering tabs
 rearranging windows
@@ -35,6 +39,7 @@ make return key do something in each window: go from threads to stack -> code ->
 allow expressions (especially conditions) to have multiple statements separated by ';'
 "unexpectedly big memory read" (16 bytes) for f64 local variables on the stack in rust
 floating point and simd registers
+some kind of non-stop mode to prevent clickhouse server from losing keeper connection when stepping through the code
 make -s stop on main, waiting for symbols to load (with proper indication in ui and ability to cancel it like steps)
 allow navigating from source to variables (especially global) and types declared there
 allow to put breakpoint on a whole file
