@@ -18,8 +18,12 @@ test with 10k threads
   maybe avoid duplicate POKEUSER calls for debug registers if the thread already had them assigned
 test with watches window filled with long arrays (I saw 50ms frames when there are ~5 of them; maybe just decrease length limit)
 
+do something for downcasts in conditional breakpoints (coalesce()? maybe()? ?()? ()?? checkbox to stop on error? 'is' operator? explicit checked downcast? also function to check field presense without evaluating it)
 edit breakpoint condition on click
 `in` operator, e.g. x in [1, 2, 3]
+scroll code to next breakpoint when deleting breakpoint in breakpoints window
+make '^' apply to expressions instead of variable names, e.g. ^(this.query_context)
+allow adding unconditional breakpoint on the same line as conditional one, somehow
 global variables from .symtab, maybe from .debug_pubnames (maybe also look into .debug_pubtypes)
 more built-in pretty printers: sparsehash, absl, rust b-trees
 hotkey to switch between .h/.cpp (/.cc/.hh/.hpp/.cxx - maybe just anything after '.')
@@ -29,7 +33,7 @@ reordering tabs
 rearranging windows
 maximizing windows
 meta functions like checking for field presense of superclass type, and also just slice length etc, for use in conditions
-get debug info from debuginfod; (maybe also source, though it seems always unavailable)
+get debug info from debuginfod; (maybe also source code, though it seems always unavailable)
 thread-local storage
 key to freeze value in watches window; can also be used for controlling when to run the expression if it has side effects
 key to add watch value as new watch, maybe cast to type, e.g. *(0x1234 as *DB::Block)
@@ -40,7 +44,6 @@ allow expressions (especially conditions) to have multiple statements separated 
 "unexpectedly big memory read" (16 bytes) for f64 local variables on the stack in rust
 floating point and simd registers
 some kind of non-stop mode to prevent clickhouse server from losing keeper connection when stepping through the code
-make -s stop on main, waiting for symbols to load (with proper indication in ui and ability to cancel it like steps)
 allow navigating from source to variables (especially global) and types declared there
 allow to put breakpoint on a whole file
 function pointers and field pointers

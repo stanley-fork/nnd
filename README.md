@@ -6,6 +6,6 @@ Or: `curl 'https://www.dropbox.com/scl/fi/tc2fnxjt7ksi8n5qq9602/nnd?rlkey=ovplk7
 Build:
 ```
 rustup target add x86_64-unknown-linux-musl  # run this once to install musl
-cargo build -r --bin nnd
-# the executable is at target/x86_64-unknown-linux-musl/release/nnd
+cargo build --profile dbgo --bin nnd
+# the executable is at target/x86_64-unknown-linux-musl/dbgo/nnd
 ```

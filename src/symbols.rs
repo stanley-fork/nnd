@@ -129,6 +129,20 @@ pub enum PointOfInterest {
     MainFunction,
     // TODO: Throw, Panic, LibraryLoad
 }
+impl PointOfInterest {
+    pub fn save_state(self, out: &mut Vec<u8>) -> Result<()> {
+        match self { Self::MainFunction => out.write_u8(0)? } Ok(())
+    }
+    pub fn load_state(inp: &mut &[u8]) -> Result<Self> {
+        Ok(match inp.read_u8()? { 0 => Self::MainFunction, x => return err!(Environment, "unexpected PointOfInterest in save file: {}", x) })
+    }
+
+    pub fn name_for_ui(self) -> &'static str {
+        match self {
+            Self::MainFunction => "main function",
+        }
+    }
+}
 
 pub struct Symbols {
     pub elf: Arc<ElfFile>,

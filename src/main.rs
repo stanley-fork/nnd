@@ -83,6 +83,8 @@ fn main() {
         } else if let Some(v) = parse_arg(&mut args, "--stderr", "", false) {
             settings.stderr_file = Some(v);
         } else if let Some(_) = parse_arg(&mut args, "--stop", "-s", true) {
+            settings.stop_on_main = true;
+        } else if let Some(_) = parse_arg(&mut args, "--stop-early", "-ss", true) {
             settings.stop_on_initial_exec = true;
         } else if let Some(m) = parse_arg(&mut args, "--mouse", "-m", false) {
             settings.mouse_mode = match &m.to_lowercase()[..] {
@@ -274,11 +276,14 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, command_line: Option<Vec<S
         unsafe { *DEBUGGER_TO_DROP_ON_PANIC.get() = Some(&mut *debugger); }
     } else {
         debugger = Pin::new(Box::new(Debugger::from_command_line(&command_line.unwrap(), context.clone(), persistent)));
-        // TODO: stop_on_main, make it wait for symbols to load, indicating it in UI and allowing to cancel it like steps
+
+        // Apply this only for the first time we start the program. For subsequent starts, the user can use steps instead (e.g. 's' to start and run to main()).
         let initial_step = if context.settings.stop_on_initial_exec {
-            InitialStep::Exec
+            Some(BreakpointOn::InitialExec)
+        } else if context.settings.stop_on_main {
+            Some(BreakpointOn::PointOfInterest(PointOfInterest::MainFunction))
         } else {
-            InitialStep::None
+            None
         };
         debugger.start_child(initial_step)?;
     }
@@ -339,11 +344,8 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, command_line: Option<Vec<S
             } else if fd == symbols_event_fd.fd {
                 let drop_caches = debugger.symbols.process_events();
                 if drop_caches {
-                    // After symbols are loaded, recalculate things like stack traces.
-                    // Currently this is somewhat incomplete: disassembly doesn't automatically scroll, and source window doesn't automatically open the file.
-                    // Doing it in a non-janky way seems like a lot of code, and the janky way seems worse than nothing (e.g. if we *always* scroll the disassembly
-                    // and source to current instruction when any symbols are loaded, it'll be annoying when some inconsequential small dynamic library was
-                    // loaded in the middle of execution while the user is looking at code).
+                    // After symbols are loaded, recalculate things like stack traces, retry activating breakpoints, etc.
+                    // (As currently implemented, this call can't be omitted or delayed, Debugger has some asserts that rely on drop_caches() being called after symbols are loaded before anything else happens.)
                     debugger.drop_caches()?;
                     ui.drop_caches();
                 }

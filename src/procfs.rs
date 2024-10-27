@@ -84,7 +84,7 @@ pub struct MemMapsInfo {
 #[derive(Clone)]
 pub struct AddrMap {
     // `dynamic - static`. May be "negative", use wrapping_add.
-    diff: usize,
+    pub diff: usize,
     known: bool,
     // If different sections are offset by a different amount, this is set to false, so that we can render some warning in the UI or something.
     // Not to be confused with the difference between address and file offset - this difference may be different for different sections, we make no assumptions about that.

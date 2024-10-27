@@ -253,7 +253,7 @@ impl DebuggerUI {
                     return Ok(());
                 }
                 Some(KeyAction::Run) => {
-                    let r = debugger.start_child(InitialStep::None);
+                    let r = debugger.start_child(None);
                     report_result(&mut self.state, &r);
                 }
                 Some(KeyAction::Continue) => {
@@ -366,11 +366,11 @@ impl DebuggerUI {
             let r = if debugger.target_state == ProcessState::NoProcess {
                 // If the program is not running, start it and step to start of main() or to initial exec.
                 let initial_step = if by_instructions {
-                    InitialStep::Exec
+                    BreakpointOn::InitialExec
                 } else {
-                    InitialStep::Main
+                    BreakpointOn::PointOfInterest(PointOfInterest::MainFunction)
                 };
-                debugger.start_child(initial_step)
+                debugger.start_child(Some(initial_step))
             } else {
                 debugger.step(self.state.selected_thread, self.state.selected_subframe, kind, by_instructions, use_line_number_with_column)
             };
@@ -393,6 +393,36 @@ fn report_result<R>(state: &mut UIState, r: &Result<R>) {
         state.last_error = format!("{}", e);
         if !e.is_usage() {
             eprintln!("warning: {}", e);
+        }
+    }
+}
+
+fn get_breakpoint_icon(enabled: bool, active: bool, secondary: bool, conditional: bool, palette: &Palette) -> (&'static str, Style) {
+    if !enabled {
+        if conditional {
+            ("© ", palette.secondary_breakpoint)
+        } else {
+            ("○ ", palette.secondary_breakpoint)
+        }
+    } else if !active {
+        if conditional {
+            ("© ", palette.breakpoint)
+        } else {
+            ("○ ", palette.breakpoint)
+        }
+    } else {
+        if secondary {
+            if conditional {
+                ("Ⓒ ", palette.secondary_breakpoint)
+            } else {
+                ("● ", palette.secondary_breakpoint)
+            }
+        } else {
+            if conditional {
+                ("Ⓒ ", palette.breakpoint)
+            } else {
+                ("● ", palette.breakpoint)
+            }
         }
     }
 }
@@ -1881,16 +1911,16 @@ impl WindowContent for DisassemblyWindow {
 
             for action in ui.check_keys(&[KeyAction::Enter, KeyAction::DeleteRow, KeyAction::EditCondition, KeyAction::StepToCursor, KeyAction::PreviousLocation, KeyAction::NextLocation]) {
                 match action {
-                    KeyAction::Enter | KeyAction::DeleteRow | KeyAction::EditCondition if cursor_addr != usize::MAX => {
+                    KeyAction::Enter | KeyAction::DeleteRow | KeyAction::EditCondition | KeyAction::StepToCursor if cursor_addr != usize::MAX => {
                         let offset = cursor_static_addr - function.addr.0;
                         let new_breakpoint = AddressBreakpoint {function: Some((tab.locator.clone().unwrap(), offset)), addr: cursor_addr, subfunction_level: tab.selected_subfunction_level};
-                        Self::toggle_breakpoint(new_breakpoint, action == KeyAction::DeleteRow, action == KeyAction::EditCondition, tab, &binary.addr_map, state, debugger, ui);
-                    }
-                    KeyAction::StepToCursor if cursor_addr != usize::MAX => {
-                        ui.should_redraw = true;
-                        let temp_breakpoint = AddressBreakpoint {function: None, addr: cursor_addr, subfunction_level: tab.selected_subfunction_level};
-                        let r = debugger.step_to_cursor(state.selected_thread, BreakpointOn::Address(temp_breakpoint));
-                        report_result(state, &r);
+                        if action == KeyAction::StepToCursor {
+                            ui.should_redraw = true;
+                            let r = debugger.step_to_cursor(state.selected_thread, BreakpointOn::Address(new_breakpoint));
+                            report_result(state, &r);
+                        } else {
+                            Self::toggle_breakpoint(new_breakpoint, action == KeyAction::DeleteRow, action == KeyAction::EditCondition, tab, &binary.addr_map, state, debugger, ui);
+                        }
                     }
                     KeyAction::PreviousLocation => tab.selected_subfunction_level = tab.selected_subfunction_level.min(disas_line.subfunction_level).saturating_sub(1),
                     KeyAction::NextLocation => {
@@ -1989,6 +2019,7 @@ impl WindowContent for DisassemblyWindow {
                         let loc_idx = debugger.breakpoint_locations.partition_point(|loc| loc.addr < addr);
                         if loc_idx < debugger.breakpoint_locations.len() {
                             let loc = &debugger.breakpoint_locations[loc_idx];
+                            //asdqwe
                             if loc.addr == addr && loc.breakpoints.iter().any(|b| match b { BreakpointRef::Id {..} => true, BreakpointRef::Step(_) => false }) {
                                 marker = if loc.active { "● " } else { "○ " }
                             }
@@ -1998,6 +2029,7 @@ impl WindowContent for DisassemblyWindow {
                         if bp_idx < address_breakpoints.len() {
                             let &(a, enabled, location_active) = &address_breakpoints[bp_idx];
                             if a == addr {
+                                //asdqwe
                                 if !enabled {
                                     marker = "○ ";
                                 } else {
@@ -2171,13 +2203,40 @@ impl WindowContent for StatusWindow {
     fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
         ui.cur_mut().axes[Axis::Y].flags.insert(AxisFlags::STACK);
 
+        let mut symbols_progress_pct = 0;
+        if debugger.target_state.process_ready() {
+            if let &Some(binary_id) = &debugger.stopped_until_symbols_are_loaded {
+                let (progress, _stage) = debugger.symbols.get_progress(binary_id);
+                symbols_progress_pct = progress / 10000;
+            }
+        }
+
         let l = match debugger.target_state {
             ProcessState::NoProcess => ui_writeln!(ui, default_dim, "no process"),
             ProcessState::Starting => ui_writeln!(ui, state_other, "starting"),
             ProcessState::Exiting => ui_writeln!(ui, state_other, "exiting"),
+            ProcessState::Stepping if debugger.stopped_until_symbols_are_loaded.is_some() => ui_writeln!(ui, state_other, "loading symbols ({}%), then stepping", symbols_progress_pct),
             ProcessState::Stepping => ui_writeln!(ui, state_other, "stepping"),
+            ProcessState::Running if debugger.stopped_until_symbols_are_loaded.is_some() => ui_writeln!(ui, state_other, "loading symbols ({}%), then running", symbols_progress_pct),
             ProcessState::Running => ui_writeln!(ui, state_running, "running"),
-            ProcessState::Suspended => ui_writeln!(ui, state_suspended, "suspended"),
+            ProcessState::Suspended => {
+                let mut stop_reason: (isize, Option<StopReason>) = (-1, None);
+                for (tid, thread) in &debugger.threads {
+                    for reason in &thread.stop_reasons {
+                        let p = reason.priority();
+                        if p > stop_reason.0 {
+                            stop_reason = (p, Some(reason.clone()));
+                        }
+                    }
+                }
+                match stop_reason.1 {
+                    None => ui_writeln!(ui, state_suspended, "suspended"),
+                    Some(StopReason::Breakpoint(_)) => ui_writeln!(ui, state_suspended, "suspended (hit breakpoint)"),
+                    Some(StopReason::Step) => ui_writeln!(ui, state_suspended, "suspended (stepped)"),
+                    Some(StopReason::Exception) => ui_writeln!(ui, state_suspended, "suspended (exception during step)"),
+                    Some(StopReason::Signal(s)) => styled_writeln!(ui.text, ui.palette.thread_crash.apply(ui.palette.state_suspended), "suspended (signal {})", signal_name(s)),
+                }
+            }
         };
         let style = ui.text.spans.last().clone().unwrap().1;
         ui.add(widget!().height(AutoSize::Text).text(l).fill(' ', style));
@@ -2717,13 +2776,9 @@ impl WindowContent for ThreadsWindow {
                 continue;
             }
             for reason in &thread.stop_reasons {
-                let priority: isize = match reason {
-                    StopReason::Breakpoint(_) => 0,
-                    StopReason::Step => 1,
-                    StopReason::Signal(_) => 2,
-                };
-                if priority > switch_to.0 {
-                    switch_to = (priority, *tid);
+                let p = reason.priority();
+                if p > switch_to.0 {
+                    switch_to = (p, *tid);
                 }
             }
         }
@@ -2850,7 +2905,7 @@ impl WindowContent for ThreadsWindow {
                         break;
                     }
                     StopReason::Breakpoint(_) => style_adjustment = ui.palette.thread_breakpoint_hit,
-                    StopReason::Step => (),
+                    StopReason::Step | StopReason::Exception => (),
                 }
             }
             ui.get_mut(row_widget).style_adjustment.update(style_adjustment);
@@ -3880,6 +3935,7 @@ impl WindowContent for CodeWindow {
                 let idx = breakpoint_lines.partition_point(|t| t.line < i + 1);
                 if idx < breakpoint_lines.len() && breakpoint_lines[idx].line == i + 1 {
                     let l = &breakpoint_lines[idx];
+                    //asdqwe
                     if !l.enabled {
                         ui_write!(ui, secondary_breakpoint, "○ ");
                     } else {
@@ -4060,15 +4116,15 @@ impl WindowContent for BreakpointsWindow {
             }
         }
 
-        let mut locations: Vec<(BreakpointId, /*error*/ bool)> = Vec::new();
-        for loc in &debugger.breakpoint_locations {
+        let mut locations: Vec<(BreakpointId, /*is_error*/ bool, /*i*/ usize)> = Vec::new();
+        for (i, loc) in debugger.breakpoint_locations.iter().enumerate() {
             for b in &loc.breakpoints {
                 match b {
-                    BreakpointRef::Id {id, ..} => locations.push((*id, loc.error.is_some())),
+                    BreakpointRef::Id {id, ..} => locations.push((*id, loc.error.is_some(), i)),
                     _ => ()}
             }
         }
-        locations.sort();
+        locations.sort_unstable_by_key(|(id, _, _)| *id);
 
         let mut text_input_parent_widget = None;
         for &id in &breakpoints {
@@ -4077,13 +4133,26 @@ impl WindowContent for BreakpointsWindow {
             let locs_begin = locations.partition_point(|t| t.0 < id);
             let locs_end = locations.partition_point(|t| t.0 <= id);
 
+            let mut error: Option<Error> = None;
+            if b.enabled {
+                match &b.addrs {
+                    Err(e) if !e.is_not_calculated() && !e.is_loading() => error = Some(e.clone()),
+                    _ => for &(_, is_error, loc_idx) in &locations[locs_begin..locs_end] {
+                        if is_error {
+                            error = Some(debugger.breakpoint_locations[loc_idx].error.clone().unwrap());
+                            break;
+                        }
+                    }
+                }
+            }
+
             let row_widget = table.start_row(id.seqno, ui);
 
             ui_writeln!(ui, default_dim, "{}", id.seqno);
             table.text_cell(ui);
 
             ui_write!(ui, instruction_pointer, "{}", if is_hit {"⮕ "} else {"  "});
-            //asdqwe different icon for conditional bp, reuse in code and disas windows
+            //asdqwe
             if !b.enabled {
                 ui_writeln!(ui, secondary_breakpoint, "○ ");
             } else if !b.active || locs_begin == locs_end {
@@ -4120,6 +4189,8 @@ impl WindowContent for BreakpointsWindow {
                         ui_write!(ui, default, "{:x}", on.addr);
                     }
                 }
+                BreakpointOn::InitialExec => ui_write!(ui, default, "early during startup"),
+                BreakpointOn::PointOfInterest(point) => ui_write!(ui, default, "{}", point.name_for_ui()),
             }
             let row_is_focused = ui.check_focus();
             let l = ui.text.close_line();
@@ -4143,6 +4214,11 @@ impl WindowContent for BreakpointsWindow {
                         ui.add(widget!().height(AutoSize::Text).text(l).flags(WidgetFlags::LINE_WRAP));
                     }
                 }
+
+                if let Some(e) = &error {
+                    let l = ui_writeln!(ui, error, "{}", e);
+                    ui.add(widget!().height(AutoSize::Text).text(l).flags(WidgetFlags::LINE_WRAP));
+                }
             });
 
             ui_writeln!(ui, default_dim, "{}", locs_end - locs_begin);
@@ -4151,8 +4227,7 @@ impl WindowContent for BreakpointsWindow {
             ui_writeln!(ui, default_dim, "{}", b.hits);
             table.text_cell(ui);
 
-            let error = b.addrs.as_ref().is_err_and(|e| !e.is_not_calculated()) || locations[locs_begin..locs_end].iter().any(|t| t.1);
-            if error {
+            if error.is_some() {
                 let a = ui.palette.breakpoint_error;
                 ui.get_mut(row_widget).style_adjustment.update(a);
             }
@@ -4194,6 +4269,29 @@ impl WindowContent for BreakpointsWindow {
                             }
                         }
                     }
+                    BreakpointOn::PointOfInterest(point) => {
+                        let mut found = false;
+                        for binary in debugger.symbols.iter() {
+                            let symbols = match &binary.symbols {
+                                Ok(s) if binary.is_mapped => s,
+                                _ => continue,
+                            };
+                            if let Some(static_addrs) = symbols.points_of_interest.get(point) {
+                                for &static_addr in static_addrs {
+                                    if let Some(line) = symbols.find_line(static_addr) {
+                                        let file = &symbols.files[line.file_idx().unwrap()];
+                                        state.should_scroll_source = Some((Some(SourceScrollTarget {path: file.path.to_owned(), version: file.version.clone(), line: line.line()}), false));
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                                if found {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    BreakpointOn::InitialExec => (),
                 }
             }
         }

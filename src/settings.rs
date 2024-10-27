@@ -3,7 +3,9 @@ use std::{collections::{HashMap, hash_map::Entry}, path::PathBuf, fmt, fmt::Writ
 
 pub struct Settings {
     pub tab_width: usize,
+    // TODO: Make these two special breakpoints (visible/editable in breakpoints window) instead of settings.
     pub stop_on_initial_exec: bool,
+    pub stop_on_main: bool,
     pub fps: f64,
     pub max_threads: usize,
     // We currently use one timer for a few periodic tasks:
@@ -30,6 +32,7 @@ impl Default for Settings {
     fn default() -> Self { Settings {
         tab_width: 2,
         stop_on_initial_exec: false,
+        stop_on_main: false,
         fps: 144.0,
         max_threads: 128,
         periodic_timer_ns: 250_000_000,

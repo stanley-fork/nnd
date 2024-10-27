@@ -14,8 +14,9 @@ sudo {0} -p pid   - attach to an existing process
 
 Additional arguments:
 --stdin/--stdout/--stderr path   - redirect stdin/stdout/stderr to file
---tty path   - equivalent to --stdin path --stdout path, see --help-tty
--s   - suspend the program right after starting it (after exec(), long before main())
+--tty path   - redirect both stdin and stdout to path, see --help-tty
+-s   - stop on main() (only applies to the first time the program starts; when starting it again from UI, press 'step' key instead of 'run' to stop on main())
+-ss  - stop early in process startup sequence (long before main(), but after loading dynamic libraries)
 -d path   - directory in which to look for source code; if specified multiple times, multiple directories will be searched; default: current directory
 --unstripped path   - path to executable from which to load debug symbols; useful if the running executable is stripped and you have an unstripped version on the side
 -m full|no-hover|disabled   - mouse mode; 'no-hover' to react only to clicking and dragging, 'disabled' to disable mouse altogether; default is 'full' (if it doesn't work, check if mouse reporting is enabled in the terminal application)
@@ -39,7 +40,7 @@ Limitations:
  * TUI only (no REPL, no GUI)
  * no remote debugging (but works fine over ssh)
  * single process (doesn't follow forks)
- * no rr or other 'big agenda' features
+ * no rr or other backwards stepping
 
 Properties:
  * Not based on gdb or lldb, implemented mostly from scratch.

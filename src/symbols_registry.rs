@@ -22,6 +22,11 @@ pub struct Binary {
     // Index in `priority_order`.
     pub priority_idx: usize,
 }
+impl Binary {
+    pub fn symbols_loaded(&self) -> bool {
+        !self.symbols.as_ref().is_err_and(|e| e.is_loading()) && !self.unwind.as_ref().is_err_and(|e| e.is_loading())
+    }
+}
 
 pub struct SymbolsRegistry {
     binaries: Vec<Option<(Binary, Arc<SymbolsLoadingStatus>)>>, // id -> binary
@@ -75,12 +80,17 @@ impl SymbolsRegistry {
         &mut self.binaries.last_mut().unwrap().as_mut().unwrap().0
     }
 
-    pub fn mark_all_as_unmapped(&mut self) {
+    pub fn mark_all_as_unmapped(&mut self) -> HashMap</*binary_id*/ usize, /*addr_map.diff*/ usize> {
+       let mut prev_mapped: HashMap<usize, usize> = HashMap::new();
         for (_, id) in &self.locator_to_id {
             let b = &mut self.binaries[*id].as_mut().unwrap().0;
-            b.is_mapped = false;
+            if b.is_mapped {
+                prev_mapped.insert(b.id, b.addr_map.diff);
+                b.is_mapped = false;
+            }
             b.addr_map = AddrMap::default();
         }
+        prev_mapped
     }
 
     pub fn update_priority_order(&mut self) {

@@ -117,13 +117,13 @@ impl ThreadInfo {
     }
 }
 
-pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) {
+pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) -> /*binaries_added*/ bool {
     if debugger.info.exe_inode == 0 {
         let path = format!("/proc/{}/exe", debugger.pid);
         let m = match fs::metadata(&path) {
             Err(e) => {
                 eprintln!("error: failed to read {}: {}", path, e);
-                return;
+                return false;
             }
             Ok(x) => x };
         debugger.info.exe_inode = m.ino();
@@ -136,11 +136,12 @@ pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) {
     let mut maps = match MemMapsInfo::read_proc_maps(debugger.pid) {
         Err(e) => {
             eprintln!("error: failed to read maps: {}", e);
-            return;
+            return false;
         }
         Ok(m) => m };
 
-    debugger.symbols.mark_all_as_unmapped();
+    let prev_mapped = debugger.symbols.mark_all_as_unmapped();
+
     for (idx, map) in maps.maps.iter_mut().enumerate() {
         let locator = match &map.binary_locator {
             None => continue,
@@ -174,6 +175,15 @@ pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) {
     debugger.symbols.update_priority_order();
 
     debugger.info.maps = maps;
+
+    // Check if any of the mapped binaries are new or changed address.
+    for b in debugger.symbols.iter() {
+        if b.is_mapped && prev_mapped.get(&b.id) != Some(&b.addr_map.diff) {
+            eprintln!("info: new binaries mapped");
+            return true;
+        }
+    }
+    false
 }
 
 // Must be called when the thread gets suspended (and not immediately resumed) - to assign registers, so we can unwind the stack.

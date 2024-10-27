@@ -22,7 +22,7 @@ pub enum ProcessState {
     Stepping,
 }
 impl ProcessState {
-    fn breakpoints_should_be_active(self) -> bool {
+    pub fn process_ready(self) -> bool {
         match self {
             Self::NoProcess | Self::Starting | Self::Exiting => false,
             Self::Running | Self::Suspended | Self::Stepping => true,
@@ -131,8 +131,19 @@ pub struct Debugger {
     // We're suspending all threads to do something with breakpoints. Once all threads are stopped, we do the thing and resume (if target_state says so).
     pub stopping_to_handle_breakpoints: bool,
 
+    // Whether we're keeping all threads suspended (despite target_state being Running or Stepping) until symbols are loaded.
+    // The value is an id of one of the binaries that are still loading (last time we checked).
+    // We do this if there are any active breakpoints or pending steps (e.g. step to start of main()) that require symbols.
+    // (Why not just always keep the process stopped until symbols are loaded, since the debugger can't do much without symbols loaded?
+    //  Because of this use case: start some long-running server, then go send requests to it right away. It's convenient to be able to
+    //  always start the server in the debugger, just in case (to be able to debug it if it crashes or if you later want to set a breakpoint).
+    //  If the debugger delays server startup by few seconds, that's a non-starter.)
+    pub stopped_until_symbols_are_loaded: Option<usize>,
+
     pub stepping: Option<StepState>,
-    pub initial_step: InitialStep,
+
+    // Start this step when we're ready: on PTRACE_EVENT_EXEC and/or after symbols are loaded.
+    pub pending_step: Option<(pid_t, BreakpointOn)>,
 
     pub breakpoint_locations: Vec<BreakpointLocation>, // sorted by address
     pub breakpoints: Pool<Breakpoint>,
@@ -154,14 +165,6 @@ pub enum StepKind {
     Out,
     // Run-to-cursor.
     Cursor,
-}
-
-// Where to stop a newly started process. E.g. if the user presses "step into" when the program is not running, we'll start the program and run to the start of function "main".
-pub enum InitialStep {
-    None,
-    Exec, // right after initial exec (PTRACE_EVENT_EXEC)
-    Main, // start of main function
-    Cursor(BreakpointOn), // when main thread hits a given instruction
 }
 
 #[derive(Debug)]
@@ -235,7 +238,7 @@ pub struct HardwareBreakpoint {
     pub addr: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LineBreakpoint {
     pub path: PathBuf,
     pub file_version: FileVersionInfo,
@@ -253,11 +256,13 @@ pub struct AddressBreakpoint {
     pub subfunction_level: u16,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum BreakpointOn {
     Line(LineBreakpoint),
     Address(AddressBreakpoint),
-    // Could add data breakpoints, function entry, syscall, signal, etc.
+    InitialExec, // right after initial exec (PTRACE_EVENT_EXEC)
+    PointOfInterest(PointOfInterest),
+    // Could add data breakpoints, syscall, signal, etc.
 }
 
 pub struct Breakpoint {
@@ -297,6 +302,11 @@ impl Breakpoint {
                 out.write_usize(b.addr)?;
                 out.write_u16(b.subfunction_level)?;
             }
+            BreakpointOn::InitialExec => out.write_u8(2)?,
+            BreakpointOn::PointOfInterest(point) => {
+                out.write_u8(3)?;
+                point.save_state(out)?;
+            }
         }
         if let Some((s, _, _)) = &self.condition {
             out.write_u8(1)?;
@@ -318,6 +328,8 @@ impl Breakpoint {
                 };
                 BreakpointOn::Address(AddressBreakpoint {function, addr: inp.read_usize()?, subfunction_level: inp.read_u16()?})
             }
+            2 => BreakpointOn::InitialExec,
+            3 => BreakpointOn::PointOfInterest(PointOfInterest::load_state(inp)?),
             x => return err!(Environment, "unexpected breakpoint type in save file: {}", x),
         };
         let condition = match inp.read_u8()? {
@@ -338,6 +350,18 @@ pub enum StopReason {
     Breakpoint(BreakpointId),
     Step,
     Signal(i32),
+    Exception,
+}
+impl StopReason {
+    // If different threads simultaneously stopped for different reasons, the ui should switch to the one with highest-priority reason.
+    pub fn priority(&self) -> isize /* >= 0 */ {
+        match self {
+            Self::Breakpoint(_) => 0,
+            Self::Step => 1,
+            Self::Exception => 2,
+            Self::Signal(_) => 3,
+        }
+    }
 }
 
 impl Thread {
@@ -348,7 +372,7 @@ impl Thread {
 
 impl Debugger {
     fn new(mode: RunMode, command_line: Vec<String>, context: Arc<Context>, symbols: SymbolsRegistry, breakpoints: Pool<Breakpoint>, persistent: PersistentState, my_resource_stats: ResourceStats, prof: Profiling) -> Self {
-        Debugger {mode, command_line, context, pid: 0, target_state: ProcessState::NoProcess, log: Log::new(), prof, threads: HashMap::new(), pending_wait_events: VecDeque::new(), next_thread_idx: 1, info: ProcessInfo::default(), my_resource_stats, symbols, memory: MemReader::invalid(), waiting_for_initial_sigstop: false, stepping: None, initial_step: InitialStep::None, breakpoint_locations: Vec::new(), breakpoints, stopping_to_handle_breakpoints: false, hardware_breakpoints: std::array::from_fn(|_| HardwareBreakpoint {active: false, thread_specific: None, addr: 0}), persistent}
+        Debugger {mode, command_line, context, pid: 0, target_state: ProcessState::NoProcess, log: Log::new(), prof, threads: HashMap::new(), pending_wait_events: VecDeque::new(), next_thread_idx: 1, info: ProcessInfo::default(), my_resource_stats, symbols, memory: MemReader::invalid(), waiting_for_initial_sigstop: false, stepping: None, pending_step: None, breakpoint_locations: Vec::new(), breakpoints, stopping_to_handle_breakpoints: false, stopped_until_symbols_are_loaded: None, hardware_breakpoints: std::array::from_fn(|_| HardwareBreakpoint {active: false, thread_specific: None, addr: 0}), persistent}
     }
 
     pub fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {
@@ -422,7 +446,7 @@ impl Debugger {
         Ok(r)
     }
 
-    pub fn start_child(&mut self, initial_step: InitialStep) -> Result<()> {
+    pub fn start_child(&mut self, initial_step: Option<BreakpointOn>) -> Result<()> {
         if self.mode != RunMode::Run { return err!(Usage, "can't start new process in attach mode"); }
         if self.target_state != ProcessState::NoProcess { return err!(Usage, "already debugging, can't start"); }
         eprintln!("info: starting child");
@@ -556,7 +580,7 @@ impl Debugger {
 
         self.pid = pid;
         self.target_state = ProcessState::Starting;
-        self.initial_step = initial_step;
+        self.pending_step = initial_step.map(|on| (pid, on));
         self.waiting_for_initial_sigstop = true;
         self.memory = MemReader::new(pid);
         let thread = Thread::new(self.next_thread_idx, pid, ThreadState::Running);
@@ -660,7 +684,7 @@ impl Debugger {
                     let mut force_resume = thread.exiting;
 
                     if signal == libc::SIGSTOP && self.waiting_for_initial_sigstop {
-                        // Ignore the initial SIGSTOP, it has served its purpose.
+                        // Ignore the initial SIGSTOP, it has served its purpose (ensuring that we PTRACE_SEIZE the child before it does execvp()).
                         // The `wstatus>>16` value in this case is inconsistent: sometimes it's 0, sometimes PTRACE_EVENT_STOP.
                         eprintln!("info: got initial SIGSTOP");
                         force_resume = true;
@@ -690,10 +714,10 @@ impl Debugger {
                                     // This is a point after dynamic libraries are loaded, but before main() or any static variable initialization.
                                     is_initial_exec = true;
                                     self.target_state = ProcessState::Suspended; // will resume below if needed
+                                } else {
+                                    // Here we're supposed to also handle the case when a multi-threaded process does an exec, and all its threads vanish.
+                                    // See "execve(2) under ptrace" section in `man ptrace`. This is currently not implemented.
                                 }
-
-                                // Here we're supposed to also handle the case when a multi-threaded process does an exec, and all its threads vanish.
-                                // See "execve(2) under ptrace" section in `man ptrace`. This is currently not implemented.
                             }
                             libc::PTRACE_EVENT_CLONE => {
                                 let new_tid;
@@ -794,19 +818,22 @@ impl Debugger {
         }
 
         // Don't load process information if any of:
-        //  * All we did was skip conditional breakpoints. This path must be kept fast, otherwise conditional breakpoints would be slow.
-        //  * The forked child process didn't do the initial exec() yet. In particular, don't kick off loading symbols because that would uselessly load symbols for the debugger itself.
         //  * There is no process.
+        //  * The forked child process didn't do the initial exec() yet. In particular, don't kick off loading symbols because that would uselessly load symbols for the debugger itself.
+        //  * All we did was skip conditional breakpoints. This path must be kept fast, otherwise conditional breakpoints will be slow.
         let mut drop_caches = false;
-        if refresh_info && (self.target_state == ProcessState::Suspended || self.target_state == ProcessState::Running || self.target_state == ProcessState::Stepping) {
-            // TODO: Instead of re-reading /proc/<pid>/maps after every event, detect dynamic library loads using r_debug protocol (is that what it's called?), and maybe also every second.
-            refresh_maps_and_binaries_info(self);
+        if refresh_info && self.target_state.process_ready() {
+            // Re-read /proc/<pid>/maps to see what dynamic libraries are loaded. Re-resolve breakpoints if there are any new ones.
+            // TODO: Also trigger this on dynamic library load, using r_debug rendezvoud thing (put breakpoint on _dl_debug_state?).
+            //       Once we have that, maybe don't refresh on any stop (but maybe refresh periodically to handle custom dynamic linkers).
+            drop_caches |= refresh_maps_and_binaries_info(self);
             drop_caches |= self.symbols.do_eviction();
 
             if is_initial_exec {
-                // The executable and the dynamic libraries should be mmapped by now (except the ones dlopen()ed at runtime, e.g. by custom dynamic linkers). Activate breakpoints.
-                self.activate_breakpoints(self.breakpoints.iter().map(|t| t.0).collect())?;
-                self.handle_initial_exec();
+                // The executable and the dynamic libraries should be mmapped by now (except the ones dlopen()ed at runtime, e.g. by custom dynamic linkers).
+                // Activate breakpoints, start initial step if requested (e.g. step to start of main()), stop right here if needed (if stop on exec was requested).
+                self.target_state = if self.pending_step.is_some() {ProcessState::Stepping} else {ProcessState::Running};
+                self.try_pending_step_and_activate_breakpoints()?;
             }
 
             // This looks O(n^2): any_thread_in_state iterates over all threads, and this happens after each thread stopping.
@@ -815,15 +842,12 @@ impl Debugger {
                 self.handle_breakpoints()?;
 
                 self.stopping_to_handle_breakpoints = false;
-                let tids_to_resume: Vec<pid_t> = self.threads.keys().filter(|tid| self.target_state_for_thread(**tid) == ThreadState::Running).copied().collect();
-                for t in tids_to_resume {
-                    // (We refreshed after suspending, so should refresh after resuming, even though the suspension was probably brief.
-                    //  Otherwise the UI will show the threads as suspended for a second after adding a breakpoint - confusing.
-                    //  Actually it's confusing anyway: this refresh will usually show the thread as R[unning], even if it's usually S[leeping].)
-                    let should_refresh_thread_info = true;
 
-                    self.resume_thread(t, should_refresh_thread_info)?;
-                }
+                // (We refreshed after suspending, so should refresh after resuming, even though the suspension was probably brief.
+                //  Otherwise the UI will show the threads as suspended for a second after adding a breakpoint - confusing.
+                //  Actually it's confusing anyway: this refresh will usually show the thread as R[unning], even if it's usually S[leeping].)
+                let should_refresh_thread_info = true;
+                self.resume_threads_if_needed(should_refresh_thread_info)?;
             }
         }
 
@@ -846,7 +870,7 @@ impl Debugger {
     }
 
     fn target_state_for_thread(&self, tid: pid_t) -> ThreadState {
-        if self.stopping_to_handle_breakpoints {
+        if self.stopping_to_handle_breakpoints || self.stopped_until_symbols_are_loaded.is_some() {
             return ThreadState::Suspended;
         }
         match self.target_state {
@@ -864,30 +888,29 @@ impl Debugger {
     fn cancel_stepping(&mut self) {
         if self.stepping.is_some() {
             eprintln!("info: cancel stepping");
-            self.remove_step_breakpoints();
+            for location in &mut self.breakpoint_locations {
+                location.breakpoints.retain(|b| match b {BreakpointRef::Step(_) => false, _ => true});
+            }        
             self.stepping = None;
         }
-    }
-
-    fn remove_step_breakpoints(&mut self) {
-        for location in &mut self.breakpoint_locations {
-            location.breakpoints.retain(|b| match b {BreakpointRef::Step(_) => false, _ => true});
-        }        
+        if self.pending_step.is_some() {
+            eprintln!("info: cancel pending step");
+            self.pending_step = None;
+        }
     }
 
     pub fn drop_caches(&mut self) -> Result<()> {
         eprintln!("info: drop caches");
-        refresh_maps_and_binaries_info(self);
-        for t in self.threads.values_mut() {
-            t.info.invalidate();
-            refresh_thread_info(self.pid, t, &mut self.prof.bucket, &self.context.settings);
+        if self.target_state.process_ready() {
+            refresh_maps_and_binaries_info(self);
+            for t in self.threads.values_mut() {
+                t.info.invalidate();
+                refresh_thread_info(self.pid, t, &mut self.prof.bucket, &self.context.settings);
+            }
+
+            self.try_pending_step_and_activate_breakpoints()?;
         }
 
-        // Retry resolving breakpoints into addresses after symbols are loaded. Particularly useful for breakpoints loaded from state file on startup.
-        if self.target_state.breakpoints_should_be_active() {
-            self.activate_breakpoints(self.breakpoints.iter().map(|t| t.0).collect())?;
-        }
-        // TODO: Also re-resolve breakpoints on dynamic library loads. Use "r_debug rendezvous struct" or something (put breakpoint on _dl_debug_state?). Use INTERP section in ELF to locate the dynamic linker.
         Ok(())
     }
 
@@ -897,14 +920,11 @@ impl Debugger {
             ProcessState::Stepping => self.cancel_stepping(),
             _ => return err!(Usage, "not suspended, can't resume") }
         eprintln!("info: resume");
-        
+
         self.target_state = ProcessState::Running;
-        let tids: Vec<pid_t> = self.threads.keys().copied().collect();
-        for tid in tids {
-            if self.target_state_for_thread(tid) == ThreadState::Running {
-                self.resume_thread(tid, true)?;
-            }
-        }
+
+        self.check_if_we_should_wait_for_symbols_to_load();
+        self.resume_threads_if_needed(/*refresh_info*/ true)?;
 
         Ok(())
     }
@@ -917,6 +937,7 @@ impl Debugger {
         self.cancel_stepping();
 
         self.target_state = ProcessState::Suspended;
+        self.stopped_until_symbols_are_loaded = None;
         self.ptrace_interrupt_all_running_threads()?;
         Ok(())
     }
@@ -948,50 +969,85 @@ impl Debugger {
         Ok(())
     }
 
-    fn handle_initial_exec(&mut self) {
-        let mut step_to: Option<BreakpointOn> = None;
-        match mem::replace(&mut self.initial_step, InitialStep::None) {
-            InitialStep::None => (),
-            InitialStep::Exec => return, // stay suspended
-            InitialStep::Cursor(on) => step_to = Some(on),
-            InitialStep::Main => {
-                let mut is_loading = false;
-                for binary in self.symbols.iter() {
-                    let symbols = match &binary.symbols {
-                        Ok(s) if binary.is_mapped => s,
-                        Err(e) if e.is_loading() => {
-                            is_loading = true;
-                            continue;
+    // Assigns stopped_until_symbols_are_loaded.
+    fn check_if_we_should_wait_for_symbols_to_load(&mut self) {
+        assert!(self.target_state.process_ready());
+        // Check if anything needs symbols.
+        if self.pending_step.is_none() {
+            // (Case that is not handled very correctly: conditional breakpoint in a binary that's already loaded, but the condition looks at variable higher up the stack that live in binary that's still loading.
+            //  We won't wait for symbols to load, and the condition evaluation may fail unnecessarily. Which is ok if condition evaluation error triggers a stop, not so ok if the condition ignores errors.
+            //  I guess the fix would be to just always wait for symbols if any breakpoints are active; anything more complex seems too error-prone and not worth it.)
+            if !self.breakpoints.iter().any(|(_, b)| b.enabled && b.addrs.as_ref().is_err_and(|e| e.is_loading())) {
+                // Symbols not needed.
+                self.stopped_until_symbols_are_loaded = None;
+                return;
+            }
+        }
+        if let &Some(binary_id) = &self.stopped_until_symbols_are_loaded {
+            if let Some(binary) = self.symbols.get(binary_id) {
+                if !binary.symbols_loaded() {
+                    return; // still loading the same binary as before
+                }
+            }
+        }
+        for binary in self.symbols.iter() {
+            if !binary.symbols_loaded() {
+                self.stopped_until_symbols_are_loaded = Some(binary.id);
+                return; // found a binary that's still loading
+            }
+        }
+        debug_assert!(false); // try_pending_step_and_activate_breakpoints() should've handled breakpoints and pending step
+        self.stopped_until_symbols_are_loaded = None;
+    }
+
+    // Try resolving breakpoints into addresses and starting the pending step if present.
+    // If this requires symbols to be loaded, and they're not loaded, sets stopped_until_symbols_are_loaded. (Then this is called again from drop_caches() when symbols are loaded.)
+    fn try_pending_step_and_activate_breakpoints(&mut self) -> Result<()> {
+        assert!(self.target_state.process_ready());
+
+        self.activate_breakpoints(self.breakpoints.iter().map(|t| t.0).collect())?;
+
+        if let &Some((tid, ref on)) = &self.pending_step {
+            assert_eq!(self.target_state, ProcessState::Stepping);
+            assert!(self.stepping.is_none());
+            if let &BreakpointOn::InitialExec = on {
+                self.target_state = ProcessState::Suspended;
+                self.pending_step = None;
+            } else {
+                let mut breakpoint = Breakpoint {on: on.clone(), condition: None, hits: 0, addrs: err!(NotCalculated, ""), enabled: true, active: false};
+                Self::determine_locations_for_breakpoint(&self.symbols, &mut breakpoint);
+                match breakpoint.addrs {
+                    Err(e) if e.is_loading() => (),
+                    Err(e) => {
+                        log!(self.log, "{}", e);
+                        self.target_state = ProcessState::Suspended;
+                        self.pending_step = None;
+                    }
+                    Ok(addrs) => {
+                        eprintln!("info: step to cursor thread {} cursor {:?}", tid, breakpoint.on);
+
+                        let step = StepState {tid, keep_other_threads_suspended: false, disable_breakpoints: true, internal_kind: StepKind::Cursor, by_instructions: false, addr_ranges: Vec::new(), cfa: 0, single_steps: false, stack_digest: Vec::new()};
+                        self.stepping = Some(step);
+                        self.pending_step = None;
+
+                        for (addr, subfunction_level) in addrs {
+                            self.add_breakpoint_location(BreakpointRef::Step(StepBreakpointType::Cursor(subfunction_level)), addr);
                         }
-                        _ => continue,
-                    };
-                    if let Some(static_addrs) = symbols.points_of_interest.get(&PointOfInterest::MainFunction) {
-                        let addr = binary.addr_map.static_to_dynamic(static_addrs[0]);
-                        step_to = Some(BreakpointOn::Address(AddressBreakpoint {function: None, addr, subfunction_level: u16::MAX}));
-                        break;
+                        self.arrange_handle_breakpoints()?;
                     }
-                }
-                if step_to.is_none() {
-                    if is_loading {
-                        log!(self.log, "symbols not loaded, stopping early");
-                    } else {
-                        log!(self.log, "main function not found");
-                    }
-                    // Stop on exec instead.
-                    return;
                 }
             }
         }
-        if let Some(step_to) = step_to {
-            match self.step_to_cursor(self.pid, step_to) {
-                Ok(()) => return,
-                Err(e) => log!(self.log, "{}", e), // unexpected
-            }
+
+        self.check_if_we_should_wait_for_symbols_to_load();
+
+        if self.stopped_until_symbols_are_loaded.is_some() {
+            self.ptrace_interrupt_all_running_threads()?;
+        } else {
+            self.resume_threads_if_needed(/*refresh_info*/ true)?;
         }
-        match self.resume() {
-            Ok(()) => (),
-            Err(e) => log!(self.log, "{}", e), // unexpected
-        }
+
+        Ok(())
     }
     
     fn make_instruction_decoder<'a>(&self, range: Range<usize>, buf: &'a mut Vec<u8>) -> Result<iced_x86::Decoder<'a>> {
@@ -1405,12 +1461,7 @@ impl Debugger {
                 self.resume_thread(tid, true)?;
             }
         } else {
-            let tids: Vec<pid_t> = self.threads.keys().copied().collect();
-            for t in tids {
-                if self.target_state_for_thread(t) == ThreadState::Running {
-                    self.resume_thread(t, true)?;
-                }
-            }
+            self.resume_threads_if_needed(/*refresh_info*/ true)?;
         }
 
         Ok(())
@@ -1419,40 +1470,20 @@ impl Debugger {
     pub fn step_to_cursor(&mut self, tid: pid_t, cursor: BreakpointOn) -> Result<()> {
         match self.target_state {
             ProcessState::Suspended | ProcessState::Running | ProcessState::Stepping => (),
-            ProcessState::NoProcess => return self.start_child(InitialStep::Cursor(cursor)),
+            ProcessState::NoProcess => return self.start_child(Some(cursor)),
             ProcessState::Starting | ProcessState::Exiting => return err!(Usage, "not ready"),
         }
         if self.threads.get(&tid).is_none() {
             return err!(Usage, "no thread");
         }
 
-        let mut breakpoint = Breakpoint {on: cursor, condition: None, hits: 0, addrs: err!(NotCalculated, ""), enabled: true, active: false};
-        Self::determine_locations_for_breakpoint(&self.symbols, &mut breakpoint);
-        let addrs = breakpoint.addrs?;
-
-        eprintln!("info: step to cursor thread {} cursor {:?}", tid, breakpoint.on);
-
         self.cancel_stepping();
-        assert!(self.stepping.is_none());
-        assert!(self.breakpoint_locations.iter().all(|loc| loc.breakpoints.iter().all(|b| match b { BreakpointRef::Step(_) => false, _ => true })));
 
-        let step = StepState {tid, keep_other_threads_suspended: false, disable_breakpoints: true, internal_kind: StepKind::Cursor, by_instructions: false, addr_ranges: Vec::new(), cfa: 0, single_steps: false, stack_digest: Vec::new()};
-        self.stepping = Some(step);
-        let was_running = self.target_state == ProcessState::Running;
-        self.target_state = ProcessState::Stepping;
+        self.pending_step = Some((tid, cursor));
+        self.try_pending_step_and_activate_breakpoints()?;
 
-        for (addr, subfunction_level) in addrs {
-            self.add_breakpoint_location(BreakpointRef::Step(StepBreakpointType::Cursor(subfunction_level)), addr);
-        }
-        self.arrange_handle_breakpoints()?;
-
-        if !was_running {
-            let tids: Vec<pid_t> = self.threads.keys().copied().collect();
-            for t in tids {
-                if self.target_state_for_thread(t) == ThreadState::Running {
-                    self.resume_thread(t, true)?;
-                }
-            }
+        if self.stopped_until_symbols_are_loaded.is_some() {
+            self.ptrace_interrupt_all_running_threads()?;
         }
 
         Ok(())
@@ -1467,6 +1498,14 @@ impl Debugger {
         None
     }
 
+    fn resume_threads_if_needed(&mut self, refresh_info: bool) -> Result<()> {
+        let tids_to_resume: Vec<pid_t> = self.threads.keys().filter(|tid| self.target_state_for_thread(**tid) == ThreadState::Running).copied().collect();
+        for t in tids_to_resume {
+            self.resume_thread(t, refresh_info)?;
+        }
+        Ok(())
+    }
+
     fn resume_thread(&mut self, tid: pid_t, refresh_info: bool) -> Result<()> {
         let thread = self.threads.get_mut(&tid).unwrap();
         if thread.state == ThreadState::Running {
@@ -1477,7 +1516,7 @@ impl Debugger {
                 Some(step) if step.tid == tid && step.single_steps => thread.single_stepping = true,
                 _ => () };
         }
-        let op = if thread.single_stepping { libc::PTRACE_SINGLESTEP } else { libc::PTRACE_CONT };
+        let op = if thread.single_stepping {libc::PTRACE_SINGLESTEP} else {libc::PTRACE_CONT};
         let sig = thread.pending_signal.take().unwrap_or(0);
         unsafe {ptrace(op, tid, 0, sig as u64, &mut self.prof.bucket)?};
         thread.state = ThreadState::Running;
@@ -1486,7 +1525,7 @@ impl Debugger {
         if refresh_info {
             refresh_thread_info(self.pid, thread, &mut self.prof.bucket, &self.context.settings);
         }
-        
+
         Ok(())
     }
 
@@ -1707,18 +1746,12 @@ impl Debugger {
     }
 
     pub fn add_breakpoint(&mut self, on: BreakpointOn) -> Result<BreakpointId> {
-        let mut breakpoint = Breakpoint {on, condition: None, hits: 0, addrs: err!(NotCalculated, ""), enabled: true, active: false};
-        if self.target_state.breakpoints_should_be_active() {
-            Self::determine_locations_for_breakpoint(&self.symbols, &mut breakpoint);
-            if let Err(e) = breakpoint.addrs {
-                return Err(e);
-            }
-            let id = self.breakpoints.add(breakpoint).0;
+        let breakpoint = Breakpoint {on, condition: None, hits: 0, addrs: err!(NotCalculated, ""), enabled: true, active: false};
+        let id = self.breakpoints.add(breakpoint).0;
+        if self.target_state.process_ready() {
             self.activate_breakpoints(vec![id])?;
-            Ok(id)
-        } else {
-            Ok(self.breakpoints.add(breakpoint).0)
         }
+        Ok(id)
     }
     pub fn remove_breakpoint(&mut self, id: BreakpointId) -> bool {
         if self.breakpoints.try_get(id).is_none() {
@@ -1739,7 +1772,7 @@ impl Debugger {
         b.enabled = enabled;
         if !enabled {
             self.deactivate_breakpoint(id);
-        } else if self.target_state.breakpoints_should_be_active() {
+        } else if self.target_state.process_ready() {
             self.activate_breakpoints(vec![id])?;
         }
         Ok(true)
@@ -1758,27 +1791,37 @@ impl Debugger {
     }
 
     fn activate_breakpoints(&mut self, ids: Vec<BreakpointId>) -> Result<()> {
-        assert!(self.target_state.breakpoints_should_be_active());
+        assert!(self.target_state.process_ready());
         let mut added_locations = false;
+        let mut wait_for_symbols = false;
         for id in ids {
             let b = self.breakpoints.get_mut(id);
             if !b.enabled || b.active {
                 continue;
             }
-            if b.addrs.is_err() {
+            if let Err(e) = &b.addrs {
                 Self::determine_locations_for_breakpoint(&self.symbols, b);
             }
-            if let Ok(addrs) = &b.addrs {
-                assert!(!addrs.is_empty());
-                added_locations = true;
-                b.active = true;
-                for (addr, subfunction_level) in addrs.clone() {
-                    self.add_breakpoint_location(BreakpointRef::Id {id, subfunction_level}, addr);
+            match &b.addrs {
+                Ok(addrs) => {
+                    assert!(!addrs.is_empty());
+                    added_locations = true;
+                    b.active = true;
+                    for (addr, subfunction_level) in addrs.clone() {
+                        self.add_breakpoint_location(BreakpointRef::Id {id, subfunction_level}, addr);
+                    }
                 }
+                Err(e) if e.is_loading() => wait_for_symbols = true,
+                Err(_) => (),
             }
         }
         if added_locations {
             self.arrange_handle_breakpoints()?;
+        }
+        if wait_for_symbols && self.stopped_until_symbols_are_loaded.is_none() {
+            self.check_if_we_should_wait_for_symbols_to_load();
+            assert!(self.stopped_until_symbols_are_loaded.is_some());
+            self.ptrace_interrupt_all_running_threads()?;
         }
         Ok(())
     }
@@ -1878,12 +1921,45 @@ impl Debugger {
             }
             BreakpointOn::Address(bp) => {
                 if let Some((locator, offset)) = &mut bp.function {
-                    if let Ok(a) = Self::resolve_function_breakpoint_location(symbols_registry, locator, *offset) {
-                        bp.addr = a;
+                    match Self::resolve_function_breakpoint_location(symbols_registry, locator, *offset) {
+                        Ok(a) => bp.addr = a,
+                        Err(e) if e.is_loading() => {
+                            breakpoint.addrs = Err(e); // we'll retry when loaded
+                            return;
+                        }
+                        Err(_) => (), // fall back to last known address (bp.addr)
                     }
                 }
                 breakpoint.addrs = Ok(vec![(bp.addr, bp.subfunction_level)]);
             }
+            BreakpointOn::PointOfInterest(point) => {
+                let mut loading = false;
+                let mut addrs: Vec<(usize, u16)> = Vec::new();
+                for binary in symbols_registry.iter() {
+                    let symbols = match &binary.symbols {
+                        Ok(s) if binary.is_mapped => s,
+                        Err(e) if e.is_loading() => {
+                            loading = true;
+                            continue;
+                        }
+                        _ => continue,
+                    };
+                    if let Some(static_addrs) = symbols.points_of_interest.get(point) {
+                        for &static_addr in static_addrs {
+                            let addr = binary.addr_map.static_to_dynamic(static_addr);
+                            addrs.push((addr, u16::MAX));
+                        }
+                    }
+                }
+                breakpoint.addrs = if !addrs.is_empty() {
+                    Ok(addrs)
+                } else if loading {
+                    err!(Loading, "symbols are not loaded yet")
+                } else {
+                    err!(NoFunction, "{} not found", point.name_for_ui())
+                };
+            }
+            BreakpointOn::InitialExec => breakpoint.addrs = err!(Internal, "unexpected InitialExec breakpoint"),
         }
     }
 
@@ -2171,8 +2247,8 @@ impl Debugger {
     }
     
     // Returns true if any breakpoint was actually hit, so we should switch to ProcessState::Suspended.
-    // May also set stopping_to_handle_breakpoints to true, in which case we should also stop all threads.
-    // Otherwise treat it as a spurious wakeup and continue (e.g. breakpoint is for a different thread or conditional and the condition is false, or something).
+    // May also set stopping_to_handle_breakpoints to true, in which case the caller should stop all threads.
+    // Otherwise treat it as a spurious wakeup and continue (e.g. breakpoint is for a different thread, or conditional breakpoint's condition evaluated to false, or something).
     fn handle_breakpoint_trap(&mut self, tid: pid_t, single_stepping: bool, ignore_next_hw_breakpoint_hit_at_addr: Option<usize>) -> Result<(/*hit*/ bool, Registers, Option<(Vec<usize>, bool, u16)>)> {
         let mut regs = ptrace_getregs(tid, &mut self.prof.bucket)?;
         let mut addr = regs.get_int(RegisterIdx::Rip).unwrap().0 as usize;
@@ -2219,7 +2295,7 @@ impl Debugger {
         let mut request_single_step = false;
         let mut stop_reasons: Vec<StopReason> = Vec::new();
         let mut stack_digest_to_select: Option<(Vec<usize>, bool, u16)> = None;
-        let mut hit_step_breakpoint = false;
+        let mut hit_step_breakpoint: Option<StepBreakpointType> = None;
 
         if let Some(idx) = self.find_breakpoint_location(addr) {
             let location = &mut self.breakpoint_locations[idx];
@@ -2241,7 +2317,7 @@ impl Debugger {
                         if tid == step.tid {
                             Self::handle_step_breakpoint_hit(step, *t, &mut request_single_step);
 
-                            hit_step_breakpoint = true;
+                            hit_step_breakpoint = Some(*t);
                             if let &StepBreakpointType::Cursor(subfunction_level) = t {
                                 if subfunction_level != u16::MAX {
                                     stack_digest_to_select = Some((Vec::new(), false, subfunction_level));
@@ -2264,6 +2340,9 @@ impl Debugger {
                                 // (It would be better for performance to also deactivate them as we go, then reactivate after the step completes.)
                                 continue;
                             }
+                        }
+                        if self.pending_step.is_some() {
+                            continue;
                         }
                         if self.target_state == ProcessState::Suspended {
                             // Solves this race condition:
@@ -2318,12 +2397,13 @@ impl Debugger {
         if let Some(step) = &self.stepping {
             if hit {
                 self.cancel_stepping();
-            } else if tid == step.tid && self.handle_step_stop(spurious_stop, hit_step_breakpoint, &regs) {
+            } else if tid == step.tid && self.handle_step_stop(spurious_stop, hit_step_breakpoint.is_some(), &regs) {
                 let step = self.stepping.as_mut().unwrap();
                 if step.internal_kind != StepKind::Cursor {
                     stack_digest_to_select = Some((mem::take(&mut step.stack_digest), step.internal_kind == StepKind::Into, u16::MAX));
                 }
-                stop_reasons.push(StopReason::Step);
+                let stop_reason = if hit_step_breakpoint.is_some_and(|t| t == StepBreakpointType::Catch) {StopReason::Exception} else {StopReason::Step};
+                stop_reasons.push(stop_reason);
                 self.cancel_stepping();
                 hit = true;
             }
