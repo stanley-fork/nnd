@@ -1976,7 +1976,7 @@ impl WindowContent for DisassemblyWindow {
         }
         ip_lines.sort_unstable_by_key(|k| (k.0, !k.1));
 
-        let mut address_breakpoints: Vec<(usize, /*enabled*/ bool, /*location_active*/ bool)> = Vec::new();
+        let mut address_breakpoints: Vec<(usize, /*enabled*/ bool, /*location_active*/ bool, /*conditional*/ bool)> = Vec::new();
         for (_, breakpoint) in debugger.breakpoints.iter() {
             match &breakpoint.on {
                 BreakpointOn::Address(bp) => {
@@ -1988,7 +1988,7 @@ impl WindowContent for DisassemblyWindow {
                         }
                     }
                     let addr = Self::fixup_breakpoint_address(bp, tab, &binary.addr_map);
-                    address_breakpoints.push((addr, breakpoint.enabled, location_active));
+                    address_breakpoints.push((addr, breakpoint.enabled, location_active, breakpoint.condition.is_some()));
                 }
                 _ => (),
             }
@@ -2019,23 +2019,24 @@ impl WindowContent for DisassemblyWindow {
                         let loc_idx = debugger.breakpoint_locations.partition_point(|loc| loc.addr < addr);
                         if loc_idx < debugger.breakpoint_locations.len() {
                             let loc = &debugger.breakpoint_locations[loc_idx];
-                            //asdqwe
-                            if loc.addr == addr && loc.breakpoints.iter().any(|b| match b { BreakpointRef::Id {..} => true, BreakpointRef::Step(_) => false }) {
-                                marker = if loc.active { "● " } else { "○ " }
+                            if loc.addr == addr {
+                                for b in &loc.breakpoints {
+                                    match b {
+                                        &BreakpointRef::Id {id, ..} => {
+                                            let conditional = debugger.breakpoints.get(id).condition.is_some();
+                                            (marker, style) = get_breakpoint_icon(/*enabled*/ true, /*active*/ true, /*secondary*/ true, conditional, &ui.palette);
+                                        }
+                                        BreakpointRef::Step(_) => (),
+                                    }
+                                }
                             }
                         }
 
-                        let bp_idx = address_breakpoints.partition_point(|(a, _, _)| *a < addr);
+                        let bp_idx = address_breakpoints.partition_point(|(a, _, _, _)| *a < addr);
                         if bp_idx < address_breakpoints.len() {
-                            let &(a, enabled, location_active) = &address_breakpoints[bp_idx];
+                            let &(a, enabled, location_active, conditional) = &address_breakpoints[bp_idx];
                             if a == addr {
-                                //asdqwe
-                                if !enabled {
-                                    marker = "○ ";
-                                } else {
-                                    style = ui.palette.breakpoint;
-                                    marker = if location_active {"● "} else {"○ "};
-                                }
+                                (marker, style) = get_breakpoint_icon(enabled, location_active, /*secondary*/ false, conditional, &ui.palette);
                             }
                         }
                     }
@@ -3886,15 +3887,17 @@ impl WindowContent for CodeWindow {
             has_locations: bool,
             active: bool,
             adjusted: bool,
+            conditional: bool,
         }
         let mut breakpoint_lines: Vec<BreakpointLine> = Vec::new();
         for (id, breakpoint) in debugger.breakpoints.iter() {
             match &breakpoint.on {
                 BreakpointOn::Line(bp) if bp.path == tab.path_in_symbols => {
-                    breakpoint_lines.push(BreakpointLine {line: bp.line, id, enabled: breakpoint.enabled, has_locations: false, active: breakpoint.active, adjusted: false});
+                    let conditional = breakpoint.condition.is_some();
+                    breakpoint_lines.push(BreakpointLine {line: bp.line, id, enabled: breakpoint.enabled, has_locations: false, active: breakpoint.active, adjusted: false, conditional});
                     if let Some(&adj) = bp.adjusted_line.as_ref() {
                         if adj != bp.line && breakpoint.enabled {
-                            breakpoint_lines.push(BreakpointLine {line: adj, id, enabled: breakpoint.enabled, has_locations: false, active: breakpoint.active, adjusted: true});
+                            breakpoint_lines.push(BreakpointLine {line: adj, id, enabled: breakpoint.enabled, has_locations: false, active: breakpoint.active, adjusted: true, conditional});
                         }
                     }
                 }
@@ -3935,15 +3938,8 @@ impl WindowContent for CodeWindow {
                 let idx = breakpoint_lines.partition_point(|t| t.line < i + 1);
                 if idx < breakpoint_lines.len() && breakpoint_lines[idx].line == i + 1 {
                     let l = &breakpoint_lines[idx];
-                    //asdqwe
-                    if !l.enabled {
-                        ui_write!(ui, secondary_breakpoint, "○ ");
-                    } else {
-                        let active = l.active && l.has_locations;
-                        let style = if l.adjusted {ui.palette.secondary_breakpoint} else {ui.palette.breakpoint};
-                        let s = if active { "● " } else { "○ " };
-                        styled_write!(ui.text, style, "{}", s);
-                    }
+                    let (marker, style) = get_breakpoint_icon(l.enabled, l.active, l.adjusted, l.conditional, &ui.palette);
+                    styled_write!(ui.text, style, "{}", marker);
                 } else {
                     ui_write!(ui, default, "  ");
                 }
@@ -4152,14 +4148,8 @@ impl WindowContent for BreakpointsWindow {
             table.text_cell(ui);
 
             ui_write!(ui, instruction_pointer, "{}", if is_hit {"⮕ "} else {"  "});
-            //asdqwe
-            if !b.enabled {
-                ui_writeln!(ui, secondary_breakpoint, "○ ");
-            } else if !b.active || locs_begin == locs_end {
-                ui_writeln!(ui, breakpoint, "○ ");
-            } else {
-                ui_writeln!(ui, breakpoint, "● ");
-            }
+            let (marker, style) = get_breakpoint_icon(b.enabled, b.active, /*secondary*/ false, b.condition.is_some(), &ui.palette);
+            styled_writeln!(ui.text, style, "{}", marker);
             with_parent!(ui, table.text_cell(ui), {
                 ui.cur_mut().flags.insert(WidgetFlags::HIGHLIGHT_ON_HOVER);
                 if ui.check_mouse(MouseActions::CLICK) {
