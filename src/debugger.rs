@@ -918,6 +918,7 @@ impl Debugger {
         match self.target_state {
             ProcessState::Suspended => (),
             ProcessState::Stepping => self.cancel_stepping(),
+            ProcessState::Running if self.stopped_until_symbols_are_loaded.is_some() => (),
             _ => return err!(Usage, "not suspended, can't resume") }
         eprintln!("info: resume");
 
