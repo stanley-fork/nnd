@@ -1481,6 +1481,7 @@ impl Debugger {
         self.cancel_stepping();
 
         self.pending_step = Some((tid, cursor));
+        self.target_state = ProcessState::Stepping;
         self.try_pending_step_and_activate_breakpoints()?;
 
         if self.stopped_until_symbols_are_loaded.is_some() {
