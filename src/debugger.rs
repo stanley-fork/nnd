@@ -2422,6 +2422,10 @@ impl Debugger {
         // All of this is slow.
         let bp = self.breakpoints.get(id);
         let expr = bp.condition.as_ref().unwrap().1.as_ref().unwrap();
+        if expr.is_trivial_false() {
+            // Fast path for profiling (to measure how slow is the expression evaluation vs everything else.
+            return Ok(false);
+        }
         let need_full_stack = does_expression_need_full_stack(expr);
         self.threads.get_mut(&tid).unwrap().info.regs = ptrace_getregs(tid, &mut self.prof.bucket)?;
         let stack = self.get_stack_trace(tid, /*partial*/ !need_full_stack);

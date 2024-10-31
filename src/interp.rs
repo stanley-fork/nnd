@@ -5,6 +5,14 @@ pub struct Expression {
     ast: Vec<ASTNode>,
     root: ASTIdx,
 }
+impl Expression {
+    pub fn is_trivial_false(&self) -> bool {
+        match &self.ast[self.root.0].a {
+            AST::Literal(LiteralValue::Basic(BasicValue::U(0))) => true,
+            _ => false,
+        }
+    }
+}
 
 pub fn parse_watch_expression(s: &str) -> Result<Expression> {
     let mut lex = Lexer {input: InputStream {input: s, pos: 0}, next_tokens: Vec::new(), previous_token_end: 0, previous_dot: false};

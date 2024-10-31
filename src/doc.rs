@@ -110,7 +110,7 @@ If you work at ClickHouse, report to #debugger channel in slack or DM Michael Ko
    (There is no plan to actually parse the template type names into their component parts; doing it correctly would be crazy complicated like everything else in C++.)
  * Can't assign to the debugged program's variables or registers
  * No data breakpoints, whole-file breakpoints, special breakpoints (signals, exceptions/panics).
- * Conditional breakpoints are not fast: a few thousand evaluations per second.
+ * Conditional breakpoints are not very fast: a few thousand evaluations per second.
  * Inside libraries that were dlopen()ed at runtime, breakpoints get disabled on program restart. Manually disable-enable the breakpoint after the dlopen() to reactivate it.
  * The disassembly window can only open functions that appear in .symtab or debug info. Can't disassemble arbitrary memory, e.g. JIT-generated code or code from binaries without .symtab or debug info.
  * The debugger gets noticeably slow when the program has > 1K threads, and unusably slow with 20K threads. Part of it is inevitable syscalls
