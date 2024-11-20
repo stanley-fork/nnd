@@ -1,10 +1,8 @@
-use crate::{*, error::{*, Result, Error}, util::*, registers::*, types::*, procfs::*, symbols_registry::*, process_info::*, unwind::*, symbols::*, arena::*, pretty::*, settings::*, common_ui::*};
+use crate::{*, error::{*, Result, Error}, util::*, registers::*, types::*, procfs::*, symbols_registry::*, process_info::*, unwind::*, symbols::*, arena::*, pretty::*, settings::*, common_ui::*, dwarf::*};
 use std::{fmt, fmt::Write, mem, collections::{HashMap, HashSet}, io::Write as ioWrite, borrow::Cow, ops::Range, path::Path};
-use gimli::{Operation, EndianSlice, LittleEndian, Expression, Encoding, EvaluationResult, ValueType, DieReference, DW_AT_location, Location, DebugInfoOffset};
+use gimli::{Operation, Expression, Encoding, EvaluationResult, ValueType, DieReference, DW_AT_location, Location, DebugInfoOffset, Reader};
 use bitflags::*;
 use rand::random;
-
-type SliceType = EndianSlice<'static, LittleEndian>;
 
 // Just a byte array that avoids heap allocation if length is <= 24 bytes.
 // Doesn't store an exact length. The length is usually determined by data type, stored separately.
@@ -265,7 +263,7 @@ impl AddrOrValueBlob {
     }
 }
 
-pub fn format_dwarf_expression<'a>(expr: Expression<EndianSlice<'a, LittleEndian>>, encoding: Encoding) -> Result<String> {
+pub fn format_dwarf_expression<'a>(expr: Expression<DwarfSlice>, encoding: Encoding) -> Result<String> {
     let mut res = String::new();
     let mut op_iter = expr.operations(encoding);
     while let Some(op) = op_iter.next()? {
@@ -1170,7 +1168,7 @@ pub struct DwarfEvalContext<'a> {
     pub local_variables: &'a [Variable],
 }
 
-pub fn eval_dwarf_expression(mut expression: Expression<SliceType>, context: &mut DwarfEvalContext) -> Result<(AddrOrValueBlob, /*dubious*/ bool)> {
+pub fn eval_dwarf_expression(mut expression: Expression<DwarfSlice>, context: &mut DwarfEvalContext) -> Result<(AddrOrValueBlob, /*dubious*/ bool)> {
     // Ignore [DW_OP_deref, DW_OP_stack_value] at the end of expression.
     // This is a workaround for what may be a quirk in LLVM: sometimes [DW_OP_deref, DW_OP_stack_value] is used for
     // variables whose type is a struct bigger than 8 bytes. Taken literally, these instructions say to read 8 bytes
@@ -1178,7 +1176,7 @@ pub fn eval_dwarf_expression(mut expression: Expression<SliceType>, context: &mu
     // points to the whole struct, not just its first 8 bytes, so we can report the address without dereferencing it.
     // (Maybe this will end up in gimli instead: https://github.com/gimli-rs/gimli/pull/738 )
     if expression.0.slice().len() >= 2 && expression.0.slice().ends_with(&[gimli::constants::DW_OP_deref.0, gimli::constants::DW_OP_stack_value.0]) {
-        expression = Expression(EndianSlice::new(&expression.0.slice()[..expression.0.slice().len() - 2], LittleEndian));
+        expression = Expression(DwarfSlice::new(&expression.0.slice()[..expression.0.slice().len() - 2]));
     }
 
     let mut eval = expression.evaluation(context.encoding);
@@ -1202,7 +1200,7 @@ pub fn eval_dwarf_expression(mut expression: Expression<SliceType>, context: &mu
                 context.memory.read(*address as usize, slice)?;
                 let val = match value_type {
                     ValueType::Generic => gimli::Value::Generic(u64::from_le_bytes(place)),
-                    _ => gimli::Value::parse(value_type, EndianSlice::new(slice, LittleEndian::default()))? };
+                    _ => gimli::Value::parse(value_type, gimli::EndianSlice::new(slice, gimli::LittleEndian::default()))? };
                 eval.resume_with_memory(val)
             }
             EvaluationResult::RequiresRegister {register, base_type} => {
@@ -1219,7 +1217,7 @@ pub fn eval_dwarf_expression(mut expression: Expression<SliceType>, context: &mu
                 dubious |= dub;
                 let val = match value_type {
                     ValueType::Generic => gimli::Value::Generic(reg_val),
-                    _ => gimli::Value::parse(value_type, EndianSlice::new(&reg_val.to_le_bytes(), LittleEndian::default()))? };
+                    _ => gimli::Value::parse(value_type, gimli::EndianSlice::new(&reg_val.to_le_bytes(), gimli::LittleEndian::default()))? };
                 eval.resume_with_register(val)
             }
             EvaluationResult::RequiresFrameBase => {
@@ -1255,7 +1253,7 @@ pub fn eval_dwarf_expression(mut expression: Expression<SliceType>, context: &mu
                 let slice = match attr {
                     // It seems weird to ignore missing attribute, but it's what the DWARF spec says:
                     // "If there is no such attribute, then there is no effect."
-                    None => EndianSlice::default(),
+                    None => DwarfSlice::default(),
                     Some(a) => match a.exprloc_value() {
                         // I guess it's in principle allowed to be a location list, in which we'll have to
                         // look up the current instruction pointer, but I hope compilers don't output that.

@@ -1887,7 +1887,7 @@ impl Debugger {
                     let mut subfuncs_and_addrs: Vec<(/*function_idx*/ usize, /*subfunction_idx*/ usize, /*addr*/ usize, u16)> = addrs.iter().map(|(line, level)| {
                         let addr = line.addr();
                         if let Ok((function, function_idx)) = symbols.addr_to_function(addr) {
-                            if let Some(sf) = symbols.containing_subfunction_at_level(addr, *level, function) {
+                            if let Some((sf, _)) = symbols.containing_subfunction_at_level(addr, *level, function) {
                                 return (function_idx, sf, addr, *level);
                             }
                         }

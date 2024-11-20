@@ -1,17 +1,16 @@
-use crate::{*, error::{*, Error, Result}, range_index::*, util::*, elf::*, procfs::*, registers::*, symbols::*, expr::*};
+use crate::{*, error::{*, Error, Result}, range_index::*, util::*, elf::*, procfs::*, registers::*, symbols::*, expr::*, dwarf::*};
 use gimli::*;
 use std::{sync::Arc, rc::Rc, mem, path::PathBuf, ops::Range};
 
-type SliceType = EndianSlice<'static, LittleEndian>;
 pub type UnwindScratchBuffer = UnwindContext<usize>;
 
 pub struct UnwindInfo {
     elf: Arc<ElfFile>,
 
     // .eh_frame - section with information needed for stack unwinding, e.g. where's the return address and saved registers (for different address ranges).
-    eh_frame: Option<UnwindSectionIndex<EhFrame<SliceType>>>,
+    eh_frame: Option<UnwindSectionIndex<EhFrame<DwarfSlice>>>,
     // .debug_frame - approximately the same as .eh_frame. But not exactly the same! And sometimes both are present. Why do people do that.
-    debug_frame: Option<UnwindSectionIndex<DebugFrame<SliceType>>>,
+    debug_frame: Option<UnwindSectionIndex<DebugFrame<DwarfSlice>>>,
 }
 
 #[derive(Clone)]
@@ -93,18 +92,18 @@ pub struct FileLineInfo {
 }
 
 
-struct UnwindSectionIndex<S: UnwindSection<SliceType>> {
+struct UnwindSectionIndex<S: UnwindSection<DwarfSlice>> {
     section: S,
     // CIEs in the section (you don't have to know what "CIE" means, it's just part of deserializing the stack unwinding information).
-    cies: Vec<CommonInformationEntry<SliceType>>,
+    cies: Vec<CommonInformationEntry<DwarfSlice>>,
     // Static address -> offset of FDE in the section (FDE is a unit of information in .eh_frame or .debug_frame, corresponding to a range of addresses).
     static_addr_to_fde: RangeIndex<usize>,
     static_base_addresses: BaseAddresses,
 }
 
-impl<S: UnwindSection<SliceType>> UnwindSectionIndex<S> {
+impl<S: UnwindSection<DwarfSlice>> UnwindSectionIndex<S> {
     fn load(data: &'static [u8], static_base_addresses: BaseAddresses, section: S) -> Result<Self> {
-        let mut cies: Vec<CommonInformationEntry<SliceType>> = Vec::new();
+        let mut cies: Vec<CommonInformationEntry<DwarfSlice>> = Vec::new();
         let mut fde_ranges: Vec<RangeIndexEntry<usize>> = Vec::new();
 
         let mut entries_iter = section.entries(&static_base_addresses);
@@ -121,7 +120,7 @@ impl<S: UnwindSection<SliceType>> UnwindSectionIndex<S> {
         Ok(Self {section, static_base_addresses, cies, static_addr_to_fde: RangeIndex::new(fde_ranges, "unwind")})
     }
 
-    fn find_fde_and_row<'a>(&self, static_pseudo_addr: usize, scratch: &'a mut UnwindScratchBuffer) -> Result<Option<(FrameDescriptionEntry<SliceType>, &'a UnwindTableRow<usize>, /*section*/ SliceType)>> {
+    fn find_fde_and_row<'a>(&self, static_pseudo_addr: usize, scratch: &'a mut UnwindScratchBuffer) -> Result<Option<(FrameDescriptionEntry<DwarfSlice>, &'a UnwindTableRow<usize>, /*section*/ DwarfSlice)>> {
         let fde_offset = match self.static_addr_to_fde.find(static_pseudo_addr) {
             None => return Ok(None),
             Some(o) => o.value,
@@ -136,7 +135,7 @@ impl<S: UnwindSection<SliceType>> UnwindSectionIndex<S> {
     }
 }
 
-fn find_cie_in(offset: u64, cies: &Vec<CommonInformationEntry<SliceType>>) -> gimli::read::Result<CommonInformationEntry<SliceType>> {
+fn find_cie_in(offset: u64, cies: &Vec<CommonInformationEntry<DwarfSlice>>) -> gimli::read::Result<CommonInformationEntry<DwarfSlice>> {
     let idx = cies.partition_point(|cie| cie.offset() < offset as usize);
     if idx < cies.len() && cies[idx].offset() == offset as usize {
         Ok(cies[idx].clone())
@@ -173,12 +172,12 @@ impl UnwindInfo {
         let mut res = Self {elf: elf.clone(), eh_frame: None, debug_frame: None};
 
         match load_section(".eh_frame") {
-            Ok((data, addr)) => res.eh_frame = Some(UnwindSectionIndex::load(data, static_base_addresses.clone().set_eh_frame(addr), EhFrame::new(data, LittleEndian))?),
+            Ok((data, addr)) => res.eh_frame = Some(UnwindSectionIndex::load(data, static_base_addresses.clone().set_eh_frame(addr), EhFrame::from(DwarfSlice::new(data)))?),
             Err(e) if e.is_no_section() => (),
             Err(e) => return Err(e),
         }
         match load_section(".debug_frame") {
-            Ok((data, addr)) => res.debug_frame = Some(UnwindSectionIndex::load(data, static_base_addresses, DebugFrame::new(data, LittleEndian))?),
+            Ok((data, addr)) => res.debug_frame = Some(UnwindSectionIndex::load(data, static_base_addresses, DebugFrame::from(DwarfSlice::new(data)))?),
             Err(e) if e.is_no_section() => (),
             Err(e) => return Err(e),
         }
@@ -189,7 +188,7 @@ impl UnwindInfo {
         Ok(res)
     }
 
-    pub fn find_row_and_eval_cfa<'a>(&self, memory: &mut CachedMemReader, addr_map: &AddrMap, scratch: &'a mut UnwindScratchBuffer, pseudo_addr: usize, regs: &Registers) -> Result<(FrameDescriptionEntry<SliceType>, &'a UnwindTableRow<usize>, /*cfa*/ usize, /*cfa_dubious*/ bool, /*section*/ SliceType)> {
+    pub fn find_row_and_eval_cfa<'a>(&self, memory: &mut CachedMemReader, addr_map: &AddrMap, scratch: &'a mut UnwindScratchBuffer, pseudo_addr: usize, regs: &Registers) -> Result<(FrameDescriptionEntry<DwarfSlice>, &'a UnwindTableRow<usize>, /*cfa*/ usize, /*cfa_dubious*/ bool, /*section*/ DwarfSlice)> {
         let static_pseudo_addr = addr_map.dynamic_to_static(pseudo_addr);
         let found = match &self.debug_frame {
             Some(section) => section.find_fde_and_row(static_pseudo_addr, scratch)?,
@@ -358,7 +357,7 @@ impl UnwindInfo {
     }
 }
 
-fn eval_dwarf_expression_as_u64(expression: Expression<SliceType>, encoding: Encoding, regs: &Registers, memory: &mut CachedMemReader, addr_map: &AddrMap, skip_final_dereference: bool) -> Result<(u64, /* dubious */ bool)> {
+fn eval_dwarf_expression_as_u64(expression: Expression<DwarfSlice>, encoding: Encoding, regs: &Registers, memory: &mut CachedMemReader, addr_map: &AddrMap, skip_final_dereference: bool) -> Result<(u64, /* dubious */ bool)> {
     let (val, dubious) = eval_dwarf_expression(expression, &mut DwarfEvalContext {encoding, memory, symbols: None, unit: None, addr_map, regs: Some(regs), frame_base: None, local_variables: &[]})?;
     let val = if skip_final_dereference {
         // I'm probably misunderstanding something, but the meaning of gimli::read::Location::Address seems to be different between CFA/frame-base vs registers/variables.
@@ -376,10 +375,10 @@ fn eval_dwarf_expression_as_u64(expression: Expression<SliceType>, encoding: Enc
 
 }
 
-fn eval_cfa_rule(rule: &CfaRule<usize>, encoding: Encoding, section: SliceType, registers: &Registers, memory: &mut CachedMemReader, addr_map: &AddrMap) -> Result<(u64, bool)> {
+fn eval_cfa_rule(rule: &CfaRule<usize>, encoding: Encoding, section: DwarfSlice, registers: &Registers, memory: &mut CachedMemReader, addr_map: &AddrMap) -> Result<(u64, bool)> {
     Ok(match rule {
         CfaRule::Expression(e) => {
-            let e = Expression(EndianSlice::new(&section.slice()[e.offset..e.offset+e.length], LittleEndian));
+            let e = Expression(DwarfSlice::new(&section.slice()[e.offset..e.offset+e.length]));
             eval_dwarf_expression_as_u64(e, encoding, registers, memory, addr_map, /*skip_final_dereference*/ true)?
         }
         CfaRule::RegisterAndOffset {register: reg, offset} => {
@@ -396,7 +395,7 @@ fn eval_cfa_rule(rule: &CfaRule<usize>, encoding: Encoding, section: SliceType, 
     })
 }
 
-fn eval_register_rule(reg: Option<RegisterIdx>, rule: &RegisterRule<usize>, encoding: Encoding, section: SliceType, registers: &Registers, memory: &mut CachedMemReader, addr_map: &AddrMap) -> Result<Option<(u64, bool)>> {
+fn eval_register_rule(reg: Option<RegisterIdx>, rule: &RegisterRule<usize>, encoding: Encoding, section: DwarfSlice, registers: &Registers, memory: &mut CachedMemReader, addr_map: &AddrMap) -> Result<Option<(u64, bool)>> {
     let (cfa, cfa_dubious) = registers.get_int(RegisterIdx::Cfa).unwrap();
     let val = match rule {
         RegisterRule::Undefined => return Ok(None),
@@ -420,12 +419,12 @@ fn eval_register_rule(reg: Option<RegisterIdx>, rule: &RegisterRule<usize>, enco
         RegisterRule::Offset(offset) => (memory.read_usize(cfa.wrapping_add(*offset as u64) as usize)? as u64, cfa_dubious),
         RegisterRule::ValOffset(offset) => (cfa.wrapping_add(*offset as u64), cfa_dubious),
         RegisterRule::Expression(e) => {
-            let e = Expression(EndianSlice::new(&section.slice()[e.offset..e.offset+e.length], LittleEndian));
+            let e = Expression(DwarfSlice::new(&section.slice()[e.offset..e.offset+e.length]));
             let (addr, dubious) = eval_dwarf_expression_as_u64(e, encoding, registers, memory, addr_map, /*skip_final_dereference*/ true)?;
             (memory.read_usize(addr as usize)? as u64, dubious)
         }
         RegisterRule::ValExpression(e) => {
-            let e = Expression(EndianSlice::new(&section.slice()[e.offset..e.offset+e.length], LittleEndian));
+            let e = Expression(DwarfSlice::new(&section.slice()[e.offset..e.offset+e.length]));
             eval_dwarf_expression_as_u64(e, encoding, registers, memory, addr_map, /*skip_final_dereference*/ false)?
         }
         RegisterRule::Architectural => return err!(Dwarf, "architectural register rule"),

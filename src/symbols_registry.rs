@@ -1,7 +1,6 @@
 use crate::{*, error::*, elf::*, symbols::*, procfs::*, util::*, unwind::*, log::*, context::*};
 use std::{fs::File, collections::{HashMap, HashSet, hash_map::Entry, VecDeque}, rc::Rc, sync::{Arc, Mutex, Condvar, Weak}, sync::atomic::{AtomicBool, AtomicUsize, Ordering}, thread::{self, JoinHandle}, mem, path::Path};
 use std::os::unix::fs::MetadataExt;
-use memmap2::Mmap;
 
 #[derive(Clone)]
 pub struct Binary {
@@ -225,8 +224,7 @@ fn load_elf(locator: &BinaryLocator, contents_maybe: Result<Vec<u8>>, custom_pat
             if metadata.ino() != locator.inode && custom_path.is_none() {
                 return err!(Usage, "binary changed");
             }
-            let mmap = unsafe { Mmap::map(&file)? };
-            ElfFile::from_mmap(locator.path.clone(), mmap)?
+            ElfFile::from_file(locator.path.clone(), &file, metadata.len())?
         }
         SpecialSegmentId::Vdso(_) => {
             ElfFile::from_contents(locator.path.clone(), contents_maybe?)?

@@ -1,7 +1,6 @@
 use std::{fs::{File}, mem};
 use std::io::{self, BufReader, SeekFrom, Seek, Read, BufRead};
 use std::collections::{HashMap, hash_map::Entry};
-use memmap2::Mmap;
 use crate::{*, error::*, log::*, util::*};
 
 pub struct ElfSection {
@@ -53,8 +52,10 @@ pub struct ElfFile {
     pub section_by_name: HashMap<String, usize>,
     pub text_section: Option<usize>,
 
+    // Slightly longer than the file because of padding.
     mmapped: Option<Mmap>,
     owned: Vec<u8>,
+    // Length equal to file size.
     data: &'static [u8],
 }
 
@@ -74,8 +75,10 @@ pub const SHN_UNDEF: u16 = 0;
 
 pub const ELFCOMPRESS_ZLIB: u32 = 1;
 
+pub const ELF_PAD_RIGHT: usize = 4096;
+
 impl ElfFile {
-    pub fn data<'a>(&'a self) -> &'a [u8] {
+    pub fn data(&self) -> &[u8] {
         self.data as _
     }
 
@@ -144,8 +147,8 @@ impl ElfFile {
         (0..self.sections.len()).map(|i| self.section_data(i).len()).sum()
     }
 
-    pub fn from_mmap(name: String, mmap: Mmap) -> Result<Self> {
-        open_elf(name, Some(mmap), Vec::new())
+    pub fn from_file(name: String, file: &File, file_len: u64) -> Result<Self> {
+        open_elf(name, Some((file, file_len as usize)), Vec::new())
     }
 
     pub fn from_contents(name: String, contents: Vec<u8>) -> Result<Self> {
@@ -168,13 +171,24 @@ impl ElfSection {
 // If there are compressed sections, decompresses them right here.
 // This is maybe not ideal: maybe we won't need all of them, and maybe decompression can be parallelized.
 // Hopefully this won't be a problem because the huge binaries usually have uncompressed debug symbols.
-fn open_elf(name: String, mmapped: Option<Mmap>, owned: Vec<u8>) -> Result<ElfFile> {
-    let data: &[u8] = if let Some(m) = &mmapped {
-        m
-    } else {
-        &owned
+fn open_elf(name: String, file: Option<(&File, /*file_len*/ usize)>, mut owned: Vec<u8>) -> Result<ElfFile> {
+    let len;
+    let mmapped = match file {
+        Some((f, file_len)) => {
+            len = file_len;
+            Some(Mmap::new(f, file_len, file_len + ELF_PAD_RIGHT)?)
+        }
+        None => {
+            len = owned.len();
+            owned.resize(len + ELF_PAD_RIGHT, 0u8);
+            None
+        }
     };
-    
+    let data: &[u8] = match &mmapped {
+        Some(m) => m.data(),
+        None => &owned[..len],
+    };
+
     let mut reader = io::Cursor::new(&data[..]);
 
     let magic = reader.read_u32()?;
@@ -261,6 +275,7 @@ fn open_elf(name: String, mmapped: Option<Mmap>, owned: Vec<u8>) -> Result<ElfFi
     }
 
     let data: &'static [u8] = unsafe {mem::transmute(data)};
+
     let mut elf = ElfFile {name, mmapped, owned, data, segments, sections, entry_point, section_by_offset: Vec::new(), section_by_name: HashMap::new(), text_section: None};
 
     for idx in 0..elf.sections.len() {

@@ -1,6 +1,6 @@
 use crate::{*, error::*, log::*};
 use libc::{pid_t, c_char, c_void};
-use std::{io, io::{Read, BufReader, BufRead, Write}, str::FromStr, ptr, mem, mem::ManuallyDrop, fmt, fmt::Write as fmtWrite, os::fd::RawFd, ffi::{CStr, OsString, CString}, os::unix::ffi::{OsStringExt, OsStrExt}, arch::asm, cell::UnsafeCell, sync::atomic::{AtomicBool, Ordering}, ops::{Deref, DerefMut, FnOnce}, fs::File, collections::{BinaryHeap, hash_map::DefaultHasher}, hash::{Hash, Hasher}, cmp::Ord, cmp, path::{Path, PathBuf}};
+use std::{io, io::{Read, BufReader, BufRead, Write}, str::FromStr, ptr, mem, mem::ManuallyDrop, fmt, fmt::Write as fmtWrite, os::fd::{RawFd, AsRawFd}, ffi::{CStr, OsString, CString}, os::unix::ffi::{OsStringExt, OsStrExt}, arch::asm, cell::UnsafeCell, sync::atomic::{AtomicBool, Ordering}, ops::{Deref, DerefMut, FnOnce}, fs::File, collections::{BinaryHeap, hash_map::DefaultHasher}, hash::{Hash, Hasher}, cmp::Ord, cmp, path::{Path, PathBuf}};
 
 pub fn tgkill(pid: pid_t, tid: pid_t, sig: i32) -> Result<i32> {
     //eprintln!("trace: tgkill({}, {}, {})", pid, tid, sig);
@@ -726,3 +726,31 @@ pub fn hexdump(s: &[u8], lim: usize) -> String {
     }
     r
 }
+
+pub struct Mmap {
+    ptr: *mut libc::c_void,
+    file_len: usize,
+    mapped_len: usize,
+}
+impl Mmap {
+    // If mapped_len > file_len, ensures the whole mapped_len range is readable (e.g. for simd padding).
+    pub fn new(file: &File, file_len: usize, mapped_len: usize) -> Result<Mmap> {
+        // First mmap() an anon region for file+padding, then mmap() the file at the same address (remapping the first ~file_len bytes to point to the file instead).
+        let anon_map = unsafe {libc::mmap(ptr::null_mut(), mapped_len, libc::PROT_READ, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)};
+        if anon_map == libc::MAP_FAILED { return errno_err!("anon mmap of size {} failed", mapped_len); }
+        let file_map = unsafe {libc::mmap(anon_map, file_len, libc::PROT_READ, libc::MAP_PRIVATE | libc::MAP_FIXED, file.as_raw_fd(), 0)};
+        if file_map == libc::MAP_FAILED { return errno_err!("failed to mmap file of size {}", file_len); }
+        assert_eq!(anon_map, file_map);
+
+        Ok(Mmap {ptr: file_map, file_len, mapped_len})
+    }
+
+    pub fn data(&self) -> &[u8] { unsafe {std::slice::from_raw_parts(self.ptr as *const u8, self.file_len)} }
+}
+impl Drop for Mmap {
+    fn drop(&mut self) {
+        unsafe {libc::munmap(self.ptr, self.mapped_len)};
+    }
+}
+unsafe impl Send for Mmap {}
+unsafe impl Sync for Mmap {}

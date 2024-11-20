@@ -2,7 +2,6 @@
 extern crate nnd;
 use nnd::{*, error::*, elf::*, log::*, symbols::*, types::*, arena::*, util::*};
 use std::{fs::{File}, io::{self, Write}, sync::Arc, mem, sync::atomic::{AtomicBool, Ordering}, cell::UnsafeCell, thread, thread::JoinHandle};
-use memmap2::Mmap;
 
 fn main() -> Result<()> {
     std::env::set_var("RUST_BACKTRACE", "1");
@@ -24,8 +23,7 @@ fn main() -> Result<()> {
     dbg!(mem::size_of::<FileInfo>());
 
     let file = File::open(&path)?;
-    let mmap = unsafe { Mmap::map(&file)? };
-    let elf = Arc::new(ElfFile::from_mmap(path.clone(), mmap)?);
+    let elf = Arc::new(ElfFile::from_file(path.clone(), &file, file.metadata()?.len())?);
     let symbols;
 
     {

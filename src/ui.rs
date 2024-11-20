@@ -1933,19 +1933,16 @@ impl WindowContent for DisassemblyWindow {
                 }
             }
 
-            let level = tab.selected_subfunction_level.min(disas_line.subfunction_level);
+            let selected_level = tab.selected_subfunction_level.min(disas_line.subfunction_level);
             if let &Some(mut sf_idx) = &disas_line.subfunction {
-                while symbols_shard.subfunctions[sf_idx].level > level.saturating_add(1) {
-                    sf_idx = symbols_shard.subfunctions[sf_idx].parent;
-                }
-                if symbols_shard.subfunctions[sf_idx].level == level.saturating_add(1) {
+                let mut level = disas_line.subfunction_level;
+                (sf_idx, level) = symbols.subfunction_ancestor_at_level(sf_idx, level, selected_level.saturating_add(1), function);
+                if level == selected_level.saturating_add(1) {
                     source_line_info = Some(symbols_shard.subfunctions[sf_idx].call_line.clone());
                 }
 
-                while symbols_shard.subfunctions[sf_idx].level > level {
-                    sf_idx = symbols_shard.subfunctions[sf_idx].parent;
-                }
-                if symbols_shard.subfunctions[sf_idx].level == level {
+                (sf_idx, level) = symbols.subfunction_ancestor_at_level(sf_idx, level, selected_level, function);
+                if level == selected_level {
                     selected_subfunction_idx = Some(sf_idx);
                 }
             }
@@ -2079,11 +2076,8 @@ impl WindowContent for DisassemblyWindow {
                     found = true;
 
                     let line_sf_at_cur_level = |line: usize| -> usize {
-                        let mut idx = disas.lines[line].subfunction.clone().unwrap();
-                        while symbols_shard.subfunctions[idx].level > level {
-                            idx = symbols_shard.subfunctions[idx].parent;
-                        }
-                        idx
+                        let l = &disas.lines[line];
+                        symbols.subfunction_ancestor_at_level(l.subfunction.clone().unwrap(), l.subfunction_level, level, function).0
                     };
 
                     let cur_sf = line_sf_at_cur_level(start);

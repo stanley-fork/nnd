@@ -9,6 +9,11 @@ investigate why exception-aware step-over doesn't work in clickhouse, at least s
 
 investigate why quitting is slow
 optimize simple things found by profiler (samply is nice)
+  attr_string
+  avoid allocations in finish_function
+  read_abbreviation (array indexing, of all things)
+  DebugAddr.get_address
+  Result::branch
 look at profiler on ch server (1500 threads)
 test with 10k threads
   fix O(n^2) stuff until syscalls are the slowest part
@@ -20,6 +25,9 @@ test with watches window filled with long arrays (I saw 50ms frames when there a
 
 do something for downcasts in conditional breakpoints (coalesce()? maybe()? ?()? ()?? checkbox to stop on error? 'is' operator? explicit checked downcast? also function to check field presense without evaluating it)
 edit breakpoint condition on click
+indicate when subfunction pc ranges are non-contiguous, maybe just add dim " [cont]" to callee name if it's not the first range
+support casting slices (e.g. from pretty printers) to slices of different type (especially string)
+allow casting n-byte arrays/structs to/from n-byte primitive types
 `in` operator, e.g. x in [1, 2, 3]
 scroll code to next breakpoint when deleting breakpoint in breakpoints window
 make '^' apply to expressions instead of variable names, e.g. ^(this.query_context)

@@ -2,7 +2,6 @@
 extern crate nnd;
 use nnd::{*, error::{*, Result, Error}, elf::*, log::*};
 use std::{fs::{File}, str, mem, collections::hash_map::DefaultHasher, hash::Hasher, fmt::Write as FmtWrite, io::{self, Write}, mem::drop, collections::HashMap};
-use memmap2::Mmap;
 use gimli::*;
 
 type SliceType = EndianSlice<'static, LittleEndian>;
@@ -17,8 +16,7 @@ fn main() -> Result<()> {
     let mut out = io::BufWriter::new(io::stdout());
 
     let file = File::open(&args[1])?;
-    let mmap = unsafe { Mmap::map(&file)? };
-    let elf = ElfFile::from_mmap(args[1].clone(), mmap)?;
+    let elf = ElfFile::from_file(args[1].clone(), &file, file.metadata()?.len())?;
 
     let load_section = |id: SectionId| -> std::result::Result<SliceType, Error> {
         match elf.section_by_name.get(id.name()) {

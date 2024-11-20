@@ -834,6 +834,7 @@ fn recognize_slice_or_vec(substruct: &mut ContainerSubstruct, val: &mut Cow<Valu
         // libstdc++ string: {string_length, dataplus, union {local_buf, allocated_capacity}}
         optional_field(find_int_field(&["local_buf"], &mut anon))?;
     }
+    optional_field(find_field(&["mprotected"], substruct))?;
     substruct.check_all_fields_used()?;
 
     let mut inner_size = (unsafe {&*inner_type}).calculate_size();
