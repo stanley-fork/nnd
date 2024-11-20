@@ -223,6 +223,7 @@ pub struct CompilationUnit {
 // The range tree is well-formed within each function (we do a pass to validate and fix up the ranges after parsing each function),
 // but nothing is guaranteed across functions.
 
+//asdqwe remove `parent` and `level`, merge with SubfunctionPcRange
 #[derive(Clone)]
 pub struct Subfunction {
     // Index in Symbols.functions. MAX if level == 0 or if DWARF had invalid reference.
@@ -1878,6 +1879,8 @@ struct DwarfLoader<'a> {
     // We don't pop from the Vec. Instead, entries are reused to avoid frequent allocations (of the Vec-s inside each entry).
     stack: Vec<LoaderStackEntry>,
     depth: usize,
+
+    temp: LoaderTempStorage,
 }
 
 // Start or end of a tentative SubfunctionPcRange.
@@ -1893,6 +1896,14 @@ struct VariantInfo {
     discriminant_die: DieOffset,
     field_flags: FieldFlags, // VARIANT, DEFAULT_VARIANT, or empty
     discr_value: usize,
+}
+
+#[derive(Default)]
+struct LoaderTempStorage {
+    // Used by finish_function().
+    list_heads: Vec<(/*subfunction_idx*/ usize, /*first_range_idx*/ usize)>,
+    stack: Vec<(/*subfunction_idx*/ usize, /*range_idx*/ usize, /*active*/ usize)>,
+    levels: Vec<Vec<SubfunctionPcRange>>,
 }
 
 struct LoaderStackEntry {
@@ -1929,7 +1940,7 @@ impl<'a> DwarfLoader<'a> {
     fn new(loader: &'a SymbolsLoader, shard: &'a mut SymbolsLoaderShard, unit_idx: usize) -> Result<Self> {
         let unit = &loader.sym.units[unit_idx];
         let section_slice = *loader.sym.dwarf.debug_info.reader();
-        Ok(Self {loader, section_slice, shard_idx: unit.shard_idx, shard, unit_idx, unit: &unit.unit, unit_language: LanguageFamily::Unknown, scope_name: String::new(), stack: Vec::new(), depth: 0})
+        Ok(Self {loader, section_slice, shard_idx: unit.shard_idx, shard, unit_idx, unit: &unit.unit, unit_language: LanguageFamily::Unknown, scope_name: String::new(), stack: Vec::new(), depth: 0, temp: LoaderTempStorage::default()})
     }
 
     fn push(&mut self, tag: DwTag) {
@@ -3152,9 +3163,10 @@ impl<'a> DwarfLoader<'a> {
         // Do a sweeping line (or whatever it's called) to turn arbitrary set of ranges into a well-formed tree of nested ranges,
         // and link ranges of each subfunction into a linked list.
         top.subfunction_events.sort_unstable_by_key(|e| (e.addr, e.sign, e.level as i32 * e.sign as i32));
-        let mut list_heads: Vec<(/*subfunction_idx*/ usize, /*first_range_idx*/ usize)> = Vec::new();
-        let mut stack: Vec<(/*subfunction_idx*/ usize, /*range_idx*/ usize, /*active*/ usize)> = Vec::new();
-        let mut levels: Vec<Vec<SubfunctionPcRange>> = Vec::new();
+        let temp = &mut self.temp;
+        temp.list_heads.clear();
+        temp.stack.clear();
+        let mut levels_len = 0usize; // effective length of temp.levels; we don't clear it to avoid reallocating inner Vec-s
         let mut last_closed: (usize, LineInfo) = (usize::MAX, LineInfo::invalid());
         for &SubfunctionEvent {addr, subfunction_idx, level, sign} in &top.subfunction_events {
             if addr > last_closed.0 {
@@ -3171,32 +3183,35 @@ impl<'a> DwarfLoader<'a> {
 
             let level = level as usize;
             if sign > 0 {
-                if level < stack.len() {
-                    if stack[level].0 == subfunction_idx {
-                        stack[level].2 += 1;
+                if level < temp.stack.len() {
+                    if temp.stack[level].0 == subfunction_idx {
+                        temp.stack[level].2 += 1;
                     } else {
                         if self.shard.warn.check(line!()) { eprintln!("warning: overlapping inline function ranges at address 0x{:x} @0x{:x}", addr, self.shard.sym.subfunctions[subfunction_idx].callee_idx); }
                     }
                     continue;
                 }
-                let start_level = stack.len();
-                stack.resize(level + 1, (0, 0, 0));
-                if level >= levels.len() {
-                    levels.resize_with(level + 1, || Vec::new());
+                let start_level = temp.stack.len();
+                temp.stack.resize(level + 1, (0, 0, 0));
+                if level >= levels_len {
+                    if levels_len == temp.levels.len() {
+                        temp.levels.resize_with(temp.levels.len() * 2 + 100, || Vec::new());
+                    }
+                    levels_len += 1;
                 }
 
                 // Open a range at current level and for all ancestors that don't have a range open.
-                stack.last_mut().unwrap().2 += 1;
+                temp.stack.last_mut().unwrap().2 += 1;
                 let mut cur_sf_idx = subfunction_idx;
                 for cur_level in (start_level..level+1).rev() {
                     let cur_sf = &mut self.shard.sym.subfunctions[cur_sf_idx];
                     assert!(cur_level == cur_sf.level as usize);
-                    let new_range_idx = levels[cur_level].len();
-                    stack[cur_level].0 = cur_sf_idx;
-                    stack[cur_level].1 = new_range_idx;
-                    levels[cur_level].push(SubfunctionPcRange {range: addr..addr, subfunction_idx: cur_sf_idx, prev_range_idx: cur_sf.last_range_idx});
+                    let new_range_idx = temp.levels[cur_level].len();
+                    temp.stack[cur_level].0 = cur_sf_idx;
+                    temp.stack[cur_level].1 = new_range_idx;
+                    temp.levels[cur_level].push(SubfunctionPcRange {range: addr..addr, subfunction_idx: cur_sf_idx, prev_range_idx: cur_sf.last_range_idx});
                     if cur_sf.last_range_idx == usize::MAX {
-                        list_heads.push((cur_sf_idx, new_range_idx));
+                        temp.list_heads.push((cur_sf_idx, new_range_idx));
                     }
                     cur_sf.last_range_idx = new_range_idx;
 
@@ -3207,27 +3222,27 @@ impl<'a> DwarfLoader<'a> {
                     cur_sf_idx = cur_sf.parent;
                 }
             } else {
-                if stack[level].0 == subfunction_idx {
-                    stack[level].2 -= 1;
+                if temp.stack[level].0 == subfunction_idx {
+                    temp.stack[level].2 -= 1;
                 }
-                while let Some(&(_, range_idx, active)) = stack.last() {
+                while let Some(&(_, range_idx, active)) = temp.stack.last() {
                     if active != 0 {
                         break;
                     }
-                    stack.pop();
-                    let range = &mut levels[stack.len()][range_idx];
+                    temp.stack.pop();
+                    let range = &mut temp.levels[temp.stack.len()][range_idx];
                     range.range.end = addr;
                     let sf = &self.shard.sym.subfunctions[range.subfunction_idx];
                     last_closed = (addr, sf.call_line.clone());
                 }
             }
         }
-        assert!(stack.is_empty());
+        assert!(temp.stack.is_empty());
 
         // Circularize the linked lists.
-        for (subfunction_idx, first_range_idx) in list_heads {
+        for &(subfunction_idx, first_range_idx) in &temp.list_heads {
             let sf = &mut self.shard.sym.subfunctions[subfunction_idx];
-            levels[sf.level as usize][first_range_idx].prev_range_idx = sf.last_range_idx;
+            temp.levels[sf.level as usize][first_range_idx].prev_range_idx = sf.last_range_idx;
         }
 
         // Concatenate the per-level range arrays into one array.
@@ -3235,12 +3250,14 @@ impl<'a> DwarfLoader<'a> {
             self.shard.sym.subfunction_levels.push(self.shard.sym.subfunction_pc_ranges.len());
         }
         let levels_start = self.shard.sym.subfunction_levels.len() - 1;
-        for level in 0..levels.len() {
-            self.shard.sym.subfunction_pc_ranges.append(&mut levels[level]);
+        for level in 0..levels_len {
+            self.shard.sym.subfunction_pc_ranges.append(&mut temp.levels[level]);
             self.shard.sym.subfunction_levels.push(self.shard.sym.subfunction_pc_ranges.len());
+
+            temp.levels[level].clear();
         }
         let level_idxs = levels_start..self.shard.sym.subfunction_levels.len();
-        assert!(level_idxs.len() == levels.len() + 1);
+        assert!(level_idxs.len() == levels_len + 1);
 
         self.shard.functions[top.function].subfunction_levels = level_idxs;
     }
