@@ -1,5 +1,5 @@
 use crate::{*, symbols::*, error::*, symbols_registry::*, util::*, procfs::*, settings::*, common_ui::*};
-use std::{fmt::Write, ops::Range};
+use std::{fmt::Write, ops::Range, collections::HashSet};
 use iced_x86::*;
 
 pub const MAX_X86_INSTRUCTION_BYTES: usize = 15;
@@ -172,7 +172,9 @@ pub fn disassemble_function(function_idx: usize, mut static_addr_ranges: Vec<Ran
     clean_up_ranges(&mut static_addr_ranges);
 
     let mut res = Disassembly {text: intro, lines: Vec::new(), error: None, max_abs_relative_addr: 0, indent_width: str_width(&palette.tree_indent.0), widest_line: 0, symbols_shard: None};
-    let mut subfunc_ranges: Vec<&[SubfunctionPcRange]> = Vec::new();
+    let mut subfunc_idxs: Vec<Range<usize>> = Vec::new();
+    let mut subfunctions: &[Subfunction] = &[];
+    let mut seen_subfunction_identities: HashSet<u32> = HashSet::new();
 
     while res.lines.len() < res.text.num_lines() {
         res.lines.push(DisassemblyLineInfo {kind: DisassemblyLineKind::Intro, static_addr: 0, ..Default::default()});
@@ -181,7 +183,8 @@ pub fn disassemble_function(function_idx: usize, mut static_addr_ranges: Vec<Ran
     if let Some(symbols) = &symbols {
         let function = &symbols.functions[function_idx];
         res.symbols_shard = Some(function.shard_idx());
-        subfunc_ranges = (1..function.num_levels()).map(|i| symbols.subfunction_ranges_at_level(i, function)).collect();
+        subfunc_idxs = (1..function.num_levels()).map(|i| symbols.subfunction_idxs_at_level(i, function)).collect();
+        subfunctions = &symbols.shards[function.shard_idx()].subfunctions;
     }
 
     for (addr_range_idx, static_addr_range) in static_addr_ranges.iter().enumerate() {
@@ -259,18 +262,17 @@ pub fn disassemble_function(function_idx: usize, mut static_addr_ranges: Vec<Ran
 
                 // Add inlined function calls information: function names, call line numbers, and indentation.
                 let function = &symbols.functions[function_idx];
-                for r in subfunc_ranges.iter_mut() {
-                    while !r.is_empty() && r[0].range.end <= static_addr {
-                        *r = &r[1..];
+                for r in subfunc_idxs.iter_mut() {
+                    while r.start < r.end && subfunctions[r.start].addr_range.end <= static_addr {
+                        r.start += 1;
                     }
-                    if r.is_empty() || r[0].range.start > static_addr {
+                    if r.start == r.end || subfunctions[r.start].addr_range.start > static_addr {
                         break;
                     }
-                    cur_subfunction = Some(r[0].subfunction_idx);
-                    let subfunction = &symbols.shards[function.shard_idx()].subfunctions[r[0].subfunction_idx];
+                    cur_subfunction = Some(r.start);
+                    let subfunction = &subfunctions[r.start];
                     subfunction_level += 1;
-                    assert!(subfunction.level == subfunction_level);
-                    if r[0].range.start > prev_static_addr {
+                    if subfunction.addr_range.start > prev_static_addr {
                         let callee_name = if subfunction.callee_idx == usize::MAX {
                             "?".to_string()
                         } else {
@@ -280,6 +282,11 @@ pub fn disassemble_function(function_idx: usize, mut static_addr_ranges: Vec<Ran
                         write_line_number(subfunction.call_line.clone(), DisassemblyLineKind::InlinedCallLineNumber, &mut res, subfunction_level, &mut cur_leaf_line, cur_subfunction.clone());
 
                         styled_write!(res.text, palette.default_dim, "{}", callee_name);
+
+                        if !seen_subfunction_identities.insert(subfunction.identity) {//asdqwe check if this is how insert() works
+                            // Indicate that the inlined function has multiple address ranges.
+                            styled_write!(res.text, palette.default_dim, " [cont]");//asdqwe test this, along with mouse hover on multi-range inlined functions
+                        }
                         res.text.close_line();
                         res.lines.push(DisassemblyLineInfo {kind: DisassemblyLineKind::InlinedFunctionName, static_addr, subfunction_level, leaf_line: cur_leaf_line.clone(), subfunction: cur_subfunction.clone(), ..Default::default()});
                     }

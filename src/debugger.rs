@@ -1208,28 +1208,32 @@ impl Debugger {
             if kind == StepKind::Out {
                 step.internal_kind = StepKind::Over;
                 let subfunction_idx = subframe.subfunction_idx.clone().unwrap();
-                for r in symbols.subfunction_ranges_at_level(frame.subframes.end - 1 - subframe_idx, function) {
-                    if r.subfunction_idx == subfunction_idx {
-                        static_addr_ranges.push(r.range.clone());
+                let subfunction_identity = subfunctions[subfunction_idx].identity;
+                for r in symbols.subfunctions_at_level(frame.subframes.end - 1 - subframe_idx, function) {
+                    if r.identity == subfunction_identity {
+                        static_addr_ranges.push(r.addr_range.clone());
                     }
                 }
                 assert!(!static_addr_ranges.is_empty());
             }
             if kind == StepKind::Over && frame.subframes.end - subframe_idx < function.num_levels() {
-                let subfunc_ranges = symbols.subfunction_ranges_at_level(frame.subframes.end - subframe_idx, function);
+                let subfuncs = symbols.subfunctions_at_level(frame.subframes.end - subframe_idx, function);
                 let parent_idx = subframe.subfunction_idx.clone().unwrap();
                 if let Some(start_line) = &subframe.line {
-                    for r in subfunc_ranges {
-                        let l = &subfunctions[r.subfunction_idx].call_line;
+                    // Step over all inlined function calls on this line/column.
+                    for s in subfuncs {
+                        let l = &s.call_line;
                         if l.file_idx() == start_line.line.file_idx() && l.line() == start_line.line.line() && (!use_line_number_with_column || l.column() == start_line.line.column()) {
-                            static_addr_ranges.push(r.range.clone());
+                            static_addr_ranges.push(s.addr_range.clone());
                         }
                     }
                 } else if subframe_idx > frame.subframes.start {
+                    // Step over one specific inlined function call.
                     let child_idx = stack.subframes[subframe_idx - 1].subfunction_idx.clone().unwrap();
-                    for r in subfunc_ranges {
-                        if r.subfunction_idx == child_idx {
-                            static_addr_ranges.push(r.range.clone());
+                    let child_identity = subfuncs[child_idx].identity;
+                    for s in subfuncs {
+                        if s.identity == child_identity {
+                            static_addr_ranges.push(s.addr_range.clone());
                         }
                     }
                 } else {
@@ -1710,13 +1714,14 @@ impl Debugger {
                         Err(e) => frame.frame_base = Err(e) }
 
                     for level in 1..function.num_levels() {
-                        let ranges = symbols.subfunction_ranges_at_level(level, function);
-                        let i = ranges.partition_point(|r| r.range.end <= static_addr);
-                        if i == ranges.len() || ranges[i].range.start > static_addr {
+                        let idxs = symbols.subfunction_idxs_at_level(level, function);
+                        let ranges = &symbols.shards[function.shard_idx()].subfunctions[idxs.clone()];
+                        let i = ranges.partition_point(|r| r.addr_range.end <= static_addr);
+                        if i == ranges.len() || ranges[i].addr_range.start > static_addr {
                             break;
                         }
-                        let subfunction_idx = ranges[i].subfunction_idx;
-                        let subfunction = &symbols.shards[function.shard_idx()].subfunctions[subfunction_idx];
+                        let subfunction_idx = idxs.start + i;
+                        let subfunction = &ranges[i];
 
                         if subfunction.call_line.file_idx().is_some() {
                             subframes.last_mut().unwrap().line = Some(make_file_line_info(subfunction.call_line.clone()));
@@ -1887,8 +1892,8 @@ impl Debugger {
                     let mut subfuncs_and_addrs: Vec<(/*function_idx*/ usize, /*subfunction_idx*/ usize, /*addr*/ usize, u16)> = addrs.iter().map(|(line, level)| {
                         let addr = line.addr();
                         if let Ok((function, function_idx)) = symbols.addr_to_function(addr) {
-                            if let Some((sf, _)) = symbols.containing_subfunction_at_level(addr, *level, function) {
-                                return (function_idx, sf, addr, *level);
+                            if let Some((sf, l)) = symbols.containing_subfunction_at_level(addr, *level, function) {
+                                return (function_idx, sf, addr, l);
                             }
                         }
                         (usize::MAX, addr, addr, *level)

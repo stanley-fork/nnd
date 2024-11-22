@@ -94,11 +94,9 @@ pub struct SymbolsShard {
 
     // Functions and inlined function calls.
     pub subfunctions: Vec<Subfunction>,
-    // Address ranges for them. Normally accessed through subfunction_levels.
-    pub subfunction_pc_ranges: Vec<SubfunctionPcRange>,
-    // Indices in subfunction_pc_ranges of boundaries between sorted runs of ranges corresponding to one function+level.
+    // Indices in `subfunctions` of boundaries between sorted runs of ranges corresponding to one function+level.
     // Normally accessed through FunctionInfo.subfunction_levels, which points to a slice of this array.
-    // With that slice in hand, subfunction_pc_ranges[slice[i]..slice[i+1]] are the sorted ranges at level i within the function.
+    // With that slice in hand, subfunctions[slice[i]..slice[i+1]] are the sorted ranges at level i within the function.
     // Length of the slice is number of levels + 1.
     pub subfunction_levels: Vec<usize>,
 
@@ -208,11 +206,10 @@ pub struct CompilationUnit {
 // That's why FunctionInfo doesn't contain the end of the range, and subfunctions (see below) may have
 // address ranges not fully consistent with their function's ranges (i.e. stick out or have gaps).
 //
-// Subfunction is a set of address ranges inside a function, corresponding either to the
-// whole function (level-0 subfunction) or to an inlined function call. Subfunctions of each function form a tree.
-// Subfunctions and their ranges are organized into "levels" by nesting depth. Ranges of each level live in their own sorted array slice.
-// Ranges of level i are in slice s.subfunction_pc_ranges[s.subfunction_levels[f.subfunction_levels.start + i]],
-// where s is SymbolsShard, and f is FunctionInfo.
+// Subfunction is an address range inside a function, corresponding either to the whole function (level-0 subfunction)
+// or to an inlined function call (or a part of an inlined function call, if the call consists of multiple ranges).
+// Subfunctions of each function form a tree, organized into "levels" by nesting depth. Subfunctions of each level live in their own sorted array slice.
+// Level i has subfunctions s.subfunctions[s.subfunction_levels[f.subfunction_levels.start + i]], where s is SymbolsShard, and f is FunctionInfo.
 // Subfunction ranges are always properly nested, ranges on each level don't overlap,
 // and the nesting of ranges matches the child-parent relationships in the subfunction tree:
 //
@@ -223,29 +220,24 @@ pub struct CompilationUnit {
 // The range tree is well-formed within each function (we do a pass to validate and fix up the ranges after parsing each function),
 // but nothing is guaranteed across functions.
 
-//asdqwe remove `parent` and `level`, merge with SubfunctionPcRange
 #[derive(Clone)]
 pub struct Subfunction {
     // Index in Symbols.functions. MAX if level == 0 or if DWARF had invalid reference.
     // (During symbols loading, this is a FunctionAddr instead.)
     pub callee_idx: usize,
-    pub parent: usize, // index in `subfunctions`, if level > 0
     local_variables: usize, // packed range of indices in `local_variables`
     // Location of the function definition (if level-0) or call site (if level > 0). Invalid if unknown.
     pub call_line: LineInfo,
-    pub last_range_idx: usize, // index in the function+level's slice of subfunction_pc_ranges; MAX means something was wrong in DWARF, and this subfunction should be ignored
-    pub level: u16,
+    pub addr_range: Range<usize>,
+    // Unique identifier of an inlined function call within the function. If an inlined function call consists of multiple address ranges,
+    // each range gets its own Subfunction, but their `identity`s are equal.
+    pub identity: u32,
 }
 impl Subfunction {
+    // Note: multiple Subfunction-s may point to the same variables (if they represent different address ranges of the same inlined function call).
     pub fn local_variables_range(&self) -> Range<usize> { let start = self.local_variables >> 24; Range {start, end: start + (self.local_variables & 0xffffff)} }
 
     pub fn pack_range(r: Range<usize>) -> usize { r.start << 24 | r.len() }
-}
-
-pub struct SubfunctionPcRange {
-    pub range: Range<usize>,
-    pub subfunction_idx: usize, // in `subfunctions`
-    pub prev_range_idx: usize, // idx in the function's slice of `subfunction_pc_ranges` of previous range with same subfunction_idx; circular linked list sorted by addr
 }
 
 bitflags! { pub struct FunctionFlags: u8 {
@@ -293,8 +285,8 @@ pub struct FunctionInfo {
     pub shard_idx: u16,
     pub flags: FunctionFlags,
     pub language: LanguageFamily,
-    // Range in SymbolsShard.subfunction_levels, which points to a series of slices in subfunction_pc_ranges,
-    // where i-th slice is the sorted sequence of ranges of subfunctions at level i.
+    // Range in SymbolsShard.subfunction_levels, which points to a series of slices in subfunctions,
+    // where i-th slice is the sorted sequence of subfunctions at level i.
     // Empty if the function has no machine code or comes from .symtab
     pub subfunction_levels: Range<usize>,
 }
@@ -685,18 +677,24 @@ impl Symbols {
         res.1
     }
 
-    pub fn subfunction_ranges_at_level<'a>(&'a self, level: usize, function: &FunctionInfo) -> &'a [SubfunctionPcRange] {
+    pub fn subfunction_idxs_at_level(&self, level: usize, function: &FunctionInfo) -> Range<usize> {
         let shard = &self.shards[function.shard_idx()];
         let levels = &shard.subfunction_levels[function.subfunction_levels.clone()];
         assert!(levels.len() > level + 1);
-        &shard.subfunction_pc_ranges[levels[level]..levels[level+1]]
+        levels[level]..levels[level+1]
+    }
+    
+    pub fn subfunctions_at_level<'a>(&'a self, level: usize, function: &FunctionInfo) -> &'a [Subfunction] {
+        &self.shards[function.shard_idx()].subfunctions[self.subfunction_idxs_at_level(level, function)]
     }
 
-    pub fn root_subfunction<'a>(&'a self, function: &FunctionInfo) -> Option<(&'a Subfunction, usize)> {
+    pub fn root_subfunction<'a>(&'a self, function: &FunctionInfo) -> Option<(&'a Subfunction, /*subfunction_idx*/ usize)> {
         if function.subfunction_levels.is_empty() {
             None
         } else {
-            let idx = self.subfunction_ranges_at_level(0, function)[0].subfunction_idx;
+            let idxs = self.subfunction_idxs_at_level(0, function);
+            assert!(!idxs.is_empty());
+            let idx = idxs.start;
             Some((&self.shards[function.shard_idx()].subfunctions[idx], idx))
         }
     }
@@ -705,32 +703,34 @@ impl Symbols {
         &self.shards[shard_idx].local_variables[subfunction.local_variables_range()]
     }
 
-    pub fn containing_subfunction_at_level(&self, addr: usize, level: u16, function: &FunctionInfo) -> Option<(/*sf_idx*/ usize, /*level*/u16)> {
+    pub fn containing_subfunction_at_level(&self, addr: usize, level: u16, function: &FunctionInfo) -> Option<(/*subfunction_idx*/ usize, /*level*/u16)> {
         let range = if level == u16::MAX {
             0..function.num_levels()
         } else {
             level as usize..level as usize + 1
         };
+        let shard = &self.shards[function.shard_idx()];
+        let levels = &shard.subfunction_levels[function.subfunction_levels.clone()];
+        assert!(levels.len() > level as usize + 1);
         let mut res = None;
         for level in range {
-            let ranges = self.subfunction_ranges_at_level(level, function);
-            let i = ranges.partition_point(|r| r.range.end <= addr);
-            if i == ranges.len() || ranges[i].range.start > addr  {
+            let idxs = levels[level]..levels[level+1];
+            let ranges = &shard.subfunctions[idxs.clone()];
+            let i = ranges.partition_point(|r| r.addr_range.end <= addr);
+            if i == ranges.len() || ranges[i].addr_range.start > addr  {
                 break;
             }
-            res = Some((ranges[i].subfunction_idx, level as u16));
+            res = Some((idxs.start + i, level as u16));
         }
         res
     }
 
-    pub fn subfunction_ancestor_at_level(&self, sf_idx: usize, from_level: u16, to_level: u16, function: &FunctionInfo) -> (/*sf_idx*/ usize, /*level*/ u16) {
+    pub fn subfunction_ancestor_at_level(&self, sf_idx: usize, from_level: u16, to_level: u16, function: &FunctionInfo) -> (/*subfunction_idx*/ usize, /*level*/ u16) {
         if from_level <= to_level {
             return (sf_idx, from_level);
         }
         let shard = &self.shards[function.shard_idx()];
-        let sf = &shard.subfunctions[sf_idx];
-        assert!(sf.last_range_idx != usize::MAX);
-        let addr = self.subfunction_ranges_at_level(from_level as usize, function)[sf.last_range_idx].range.start;
+        let addr = shard.subfunctions[sf_idx].addr_range.start;
         (self.containing_subfunction_at_level(addr, to_level, function).unwrap().0, to_level)
     }
 
@@ -1073,7 +1073,7 @@ impl SymbolsLoader {
 
         let (types_loader, types_shards) = TypesLoader::create(num_shards);
         let mut shards: Vec<SymbolsLoaderShard> = types_shards.into_iter().map(|types| SymbolsLoaderShard {
-            sym: SymbolsShard {addr_to_line: Vec::new(), line_to_addr: Vec::new(), types: Types::new(), misc_arena: Arena::new(), local_variables: Vec::new(), global_variables: Arena::new(), sorted_global_variable_names: StringTable::new(), subfunctions: Vec::new(), subfunction_pc_ranges: Vec::new(), subfunction_levels: Vec::new(), mangled_name_to_function: Vec::new()},
+            sym: SymbolsShard {addr_to_line: Vec::new(), line_to_addr: Vec::new(), types: Types::new(), misc_arena: Arena::new(), local_variables: Vec::new(), global_variables: Arena::new(), sorted_global_variable_names: StringTable::new(), subfunctions: Vec::new(), subfunction_levels: Vec::new(), mangled_name_to_function: Vec::new()},
             units: Vec::new(), symtab_ranges: Vec::new(), file_dedup: Vec::new(), file_used_lines: Vec::new(), types, base_types: Vec::new(), functions: Vec::new(), vtables: Vec::new(), points_of_interest: HashMap::new(),
             temp_global_var_arena: Arena::new(), max_function_end: 0, functions_before_dedup: 0, warn: Limiter::new()}).collect();
 
@@ -1324,7 +1324,6 @@ impl SymbolsLoader {
 
         shard.sym.local_variables.shrink_to_fit();
         shard.sym.subfunctions.shrink_to_fit();
-        shard.sym.subfunction_pc_ranges.shrink_to_fit();
         shard.sym.subfunction_levels.shrink_to_fit();
 
         Ok(())
@@ -1691,7 +1690,7 @@ impl SymbolsLoader {
 
     fn fixup_function_refs(&self, shard: &mut SymbolsLoaderShard) {
         for sf in &mut shard.sym.subfunctions {
-            if sf.level == 0 {
+            if sf.identity == 0 {
                 continue;
             }
             let die = sf.callee_idx;
@@ -1735,7 +1734,6 @@ impl SymbolsLoader {
             let fields_bytes = self.shards.iter().map(|s| unsafe {(*s.get()).sym.types.fields_arena.used()}).sum();
             let types_misc_bytes = self.shards.iter().map(|s| unsafe {(*s.get()).sym.types.misc_arena.used()}).sum();
             let subfunctions: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.subfunctions.len()}).sum();
-            let subfunction_pc_ranges: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.subfunction_pc_ranges.len()}).sum();
             let subfunction_levels: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.subfunction_levels.len()}).sum();
             let unresolved_vtables: usize = self.sym.vtables.iter().map(|v| v.type_.is_none() as usize).sum();
             let (mut field_used_bytes, mut nested_names) = (0usize, 0usize);
@@ -1772,7 +1770,7 @@ impl SymbolsLoader {
             eprintln!("info: loaded symbols for {} in {:.3}s (cpu: {:.3}s) in {} threads, process peak memory usage: {}, stats: {} units, {} files \
                        ({:.2}x dedup, {:.2}x unused, {} of paths, {} of remap), \
                        {} functions ({:.2}x dedup, {}, {} of names), {} in misc arena, \
-                       {} subfunctions ({:.2}x ranges, {} sf, {} ranges, {} levels), \
+                       {} subfunctions ({} sf, {} levels), \
                        {} lines ({}), {} local variables ({}), {} global variables ({}, names {}), \
                        {} types ({:.2}x dedup, {:.2}x offsets, {} names ({}), \
                        {} infos, {} fields ({:.2}% growth waste), {} nested names, {} misc, temp {} offset maps, temp {} dedup maps) \
@@ -1780,7 +1778,7 @@ impl SymbolsLoader {
                       self.sym.elf.name, total_wall_ns as f64 / 1e9, total_cpu_ns as f64 / 1e9, self.num_shards, peak_mem_str, PrettyCount(self.sym.units.len()), PrettyCount(self.sym.files.len()),
                       files_before_dedup as f64 / self.sym.files.len() as f64, self.sym.files.len() as f64 / self.sym.path_to_used_file.len() as f64, PrettySize(self.sym.file_paths.arena.used()), PrettySize(files_before_dedup * mem::size_of::<usize>()),
                       PrettyCount(self.sym.functions.len()), funcs_before_dedup as f64 / self.sym.functions.len() as f64, PrettySize(self.sym.functions.len() * mem::size_of::<FunctionInfo>()), PrettySize(function_names_len), PrettySize(misc_arena_size),
-                      PrettyCount(subfunctions), subfunction_pc_ranges as f64 / subfunctions as f64, PrettySize(subfunctions * mem::size_of::<Subfunction>()), PrettySize(subfunction_pc_ranges * mem::size_of::<SubfunctionPcRange>()), PrettySize(subfunction_levels * mem::size_of::<usize>()),
+                      PrettyCount(subfunctions), PrettySize(subfunctions * mem::size_of::<Subfunction>()), PrettySize(subfunction_levels * mem::size_of::<usize>()),
                       PrettyCount(lines), PrettySize(lines * mem::size_of::<LineInfo>() * 2), PrettyCount(local_variables), PrettySize(local_variables * mem::size_of::<Variable>()), PrettyCount(global_variables), PrettySize(global_variables * mem::size_of::<Variable>()), PrettySize(global_variable_name_bytes),
                       PrettyCount(final_types), self.types_before_dedup as f64 / final_types as f64, self.type_offsets as f64 / self.types_before_dedup as f64, PrettyCount(type_names), PrettySize(type_names_len),
                       PrettySize(type_infos_bytes), PrettySize(fields_bytes), fields_bytes as f64 / field_used_bytes as f64 * 100.0 - 100.0, PrettyCount(nested_names), PrettySize(types_misc_bytes), PrettySize(self.type_offset_maps_bytes), PrettySize(self.type_dedup_maps_bytes),
@@ -1843,7 +1841,7 @@ fn open_debuglink(elf: &ElfFile) -> Result<Option<ElfFile>> {
 // This is the slowest part of loading the debug symbols, so we should worry about speed the most here.
 struct DwarfLoader<'a> {
     // Example tree, in order of iteration:
-    //   root
+    //   compile_unit
     //     entry
     //     entry
     //       entry
@@ -1856,13 +1854,10 @@ struct DwarfLoader<'a> {
     //       null
     //     null
     //
-    // Notice that every nonempty list of children is terminated by a null entry, here represented as abbrev == None.
+    // Notice that every nonempty list of children (except the root compile_unit) is terminated by a null entry (in code represented as abbrev == None).
     // abbrev.has_children() tells whether current entry has children.
     // These two pieces of information are enough to keep track of depth.
     //
-    //asdqwe update this comment
-    // We use EntriesRaw instead of EntriesTree because the latter looks slow: if I'm reading it right, it'll parse each DIE as many times as its depth.
-    // EntriesCursor would probably be ok, but not much different from EntriesRaw.
     // When visiting each node, we *must* call cursor.read_abbreviation(), then read or skip all attributes using read_attribute() or skip_attributes().
     loader: &'a SymbolsLoader,
     section_slice: DwarfSlice,
@@ -1875,108 +1870,166 @@ struct DwarfLoader<'a> {
     // Scope name, like "std::vector<int>". We append to it when going into a namespace/class/function/etc, then un-append when leaving the subtree.
     scope_name: String,
 
-    // stack[depth] corresponds to current entry.
-    // We don't pop from the Vec. Instead, entries are reused to avoid frequent allocations (of the Vec-s inside each entry).
-    stack: Vec<LoaderStackEntry>,
-    depth: usize,
-
     temp: LoaderTempStorage,
+
+    // Main stack contains a sentinel root entry, then all DIEs on the path from the unit's root to the current DIE.
+    // When pushing to non-main stacks, make sure to set the corresponding flag in main_stack.top_mut().flags.
+    main_stack: FastStack<MainStackEntry, 0>,
+    scope_stack: FastStack<ScopeStackEntry, {StackFlags::HAS_SCOPE.bits()}>,
+    function_stack: FastStack<FunctionStackEntry, {StackFlags::HAS_FUNCTION.bits()}>,
+    subfunction_stack: FastStack<SubfunctionStackEntry, {StackFlags::HAS_SUBFUNCTION.bits()}>,
+    type_stack: FastStack<TypeStackEntry, {StackFlags::HAS_TYPE.bits()}>,
+    ranges_stack: FastStack<RangesStackEntry, {StackFlags::HAS_RANGES.bits()}>,
 }
 
-// Start or end of a tentative SubfunctionPcRange.
+// Start or end of a tentative Subfunction.
 struct SubfunctionEvent {
     addr: usize,
-    level: u16,
-    subfunction_idx: usize,
-    sign: i8, // +1 - range start, -1 - range end
-}
-
-#[derive(Clone, Copy)]
-struct VariantInfo {
-    discriminant_die: DieOffset,
-    field_flags: FieldFlags, // VARIANT, DEFAULT_VARIANT, or empty
-    discr_value: usize,
+    subfunction_idx: u32, // in FunctionStackEntry.`subfunctions`
+    // (level + 1) * sign, where sign is +1 if start of range, -1 if end of range.
+    // Has to be this way for sorting to work (packed into one number to make sorting faster):
+    // if multiple ranges start/end at the same address, first process the ends from deep to shallow, then process the starts from shallow to deep.
+    signed_level: i16,
 }
 
 #[derive(Default)]
 struct LoaderTempStorage {
-    // Used by finish_function().
-    list_heads: Vec<(/*subfunction_idx*/ usize, /*first_range_idx*/ usize)>,
-    stack: Vec<(/*subfunction_idx*/ usize, /*range_idx*/ usize, /*active*/ usize)>,
-    levels: Vec<Vec<SubfunctionPcRange>>,
+    // Used by finish_function(). Reused to avoid allocations (they showed up in profiling).
+    stack: Vec<(/*subfunction_idx*/ u32, /*range_idx*/ usize, /*active*/ usize)>,
+    levels: Vec<Vec<Subfunction>>,
 }
 
-struct LoaderStackEntry {
+// While DFSing the tree of DIEs we maintain a few stacks: main stack that has all DIEs we're currently inside of (pushed/popped very frequently, needs to be fast), and smaller stacks for specific kinds of DIEs, e.g. functions.
+
+// Stack entries often contain Vec-s, which we don't want to destroy/reallocate on every pop/push. So we have this wrapper that doesn't call destructors.
+#[derive(Default)]
+struct FastStack<T: Default, const FLAG: u16> {
+    s: Vec<T>,
+    len: usize,
+}
+impl<T: Default, const FLAG: u16> FastStack<T, FLAG> {
+    #[inline]
+    fn push_uninit(&mut self, flags: &mut StackFlags) -> &mut T {
+        if self.len == self.s.len() {
+            self.s.resize_with((self.len + 1) * 4, Default::default);
+        }
+        debug_assert!(!flags.contains(StackFlags::from_bits_truncate(FLAG)) || FLAG == 0);
+        flags.insert(StackFlags::from_bits_truncate(FLAG));
+        self.len += 1;
+        &mut self.s[self.len - 1]
+    }
+    fn pop(&mut self) -> &T { self.len -= 1; &self.s[self.len] }
+    fn pop_mut(&mut self) -> &mut T { self.len -= 1; &mut self.s[self.len] }
+    fn top(&self) -> &T { &self.s[self.len - 1] }
+    fn top_mut(&mut self) -> &mut T { &mut self.s[self.len - 1] }
+    fn top2(&self) -> &T { &self.s[self.len - 2] }
+    fn top2_mut(&mut self) -> &mut T { &mut self.s[self.len - 2] }
+}
+
+bitflags! { struct StackFlags: u16 {
+    // Which other stacks to pop when popping entry from the main stack.
+    const HAS_SCOPE = 0x1;
+    const HAS_FUNCTION = 0x2;
+    const HAS_SUBFUNCTION = 0x4;
+    const HAS_TYPE = 0x8;
+    const HAS_RANGES = 0x10;
+
+    // Whether discriminated union info in type_stack.top() needs to be updated when popping this entry from the main stack.
+    // (We don't have a whole separate stack for VariantInfo-s because they seem to never be nested.)
+    const HAS_VARIANT = 0x20;
+
+    const HAS_ANYTHING = 0x3f; // OR of all HAS_* bits
+
+    // Are we in a function scope, or type scope, or neither? E.g. if some types/functions are nested in one another, it'll describe the innermost one.
+    // These two flags are mutually exclusive.
+    //asdqwe set and unset all 3 of these where needed, check all tags
+    const IS_FUNCTION_SCOPE = 0x40;
+    const IS_TYPE_SCOPE = 0x80;
+    // Unset if we're in function/type scope, but we decided to discard that function/type (e.g. the function is unused or inline-only, or we failed to parse something).
+    // Used in combination with one of the IS_*_SCOPE flags above.
+    // If unset, there may be no corresponding type/function/subfunction in the corresponding other stack, so this flag must be checked before e.g. adding local variables to the stack entry.
+    const IS_VALID_SCOPE = 0x100;
+
+    const IS_ANY_SCOPE = 0x1c0; // OR of all IS_*_SCOPE bits
+}}
+
+#[derive(Clone, Copy)]
+struct MainStackEntry {
     tag: DwTag,
+    flags: StackFlags,
+}
+impl Default for MainStackEntry { fn default() -> Self { Self {tag: DW_TAG_null, flags: StackFlags::empty()} } }
+
+// Scope (namespace, struct, function, etc).
+#[derive(Default, Clone, Copy)]
+struct ScopeStackEntry {
+    // TODO: Support replacing the whole scope name instead of appending, in case of function with linkage_name and no name.
     scope_name_len: usize, // excluding current DIE
     // Indicates that we're not inside an anonymous namespace or function, so scope_name should be somewhat legit and can be used for deduplication.
     scope_name_is_linkable: bool,
+}
 
-    exact_type: *mut TypeInfo, // a real pointer (not DieOffset) to the type; non-null iff the *current* DIE is a type (struct/union/array/etc); not propagated to descendants, e.g. if there's a function inside the type, the type_ is unset inside the function
-    variant: Option<VariantInfo>, // if we're inside a discriminated union (e.g. Rust enum)
+// Function (DW_TAG_subprogram).
+#[derive(Default)]
+struct FunctionStackEntry {
+    // Index in `functions`.
+    function: usize,
+    subfunctions: Vec<(Subfunction, /*parent*/ u32)>, // inlined function calls in `function`; all have different identities, each may correspond to multiple address ranges (described by subfunction_events)
+    subfunction_events: Vec<SubfunctionEvent>,
+    ranges_stack_idx: usize, // where in ranges_stack are this function's address ranges
+}
+impl FunctionStackEntry { fn reset(&mut self, ranges_stack_idx: usize) { self.ranges_stack_idx = ranges_stack_idx; self.function = usize::MAX; self.subfunctions.clear(); self.subfunction_events.clear(); } }
+
+// Subfunction (function or inlined function call).
+#[derive(Default)]
+struct SubfunctionStackEntry {
+    // Index in FunctionStackEntry.subfunctions.
+    subfunction_idx: u32,
+    subfunction_level: u16,
+    local_variables: Vec<Variable>,
+}
+impl SubfunctionStackEntry { fn reset(&mut self, subfunction_idx: u32, subfunction_level: u16) { (self.subfunction_idx, self.subfunction_level) = (subfunction_idx, subfunction_level); self.local_variables.clear(); } }
+
+// Type (struct, enum, pointer, etc).
+struct TypeStackEntry {
+    //asdqwe remember to not propagate to descendants (check StackFlags): non-null iff the *current* DIE is a type (struct/union/array/etc); not propagated to descendants, e.g. if there's a function inside the type, the type_ is unset inside the function
+    type_: *mut TypeInfo, // a real pointer (not DieOffset) to the type
     nested_names: Vec<(&'static str, NestedName)>, // if exact_type is not null
 
-    // Address Range(s) of this unit/function/lexical-scope/inlined-function/etc. Used as the range for local variables (unless they have loclist ranges).
-    pc_ranges: Vec<gimli::Range>,
-    pc_ranges_depth: usize, // stack[pc_ranges_depth].pc_ranges is the actual value to use
-
-    // Index in `functions` if this DIE is a function, and we created a FunctionInfo for it (i.e. it either has address ranges or is inlined at least once). Otherwise MAX.
-    function: usize,
-    // If nonzero, stack[function_depth] is the innermost containing DIE that is a function, regardless of whether we created a FunctionInfo for it (to distinguish local from global variables correctly).
-    function_depth: usize,
-    subfunction_events: Vec<SubfunctionEvent>, // for current function
-
-    // Index in `subfunctions` if this DIE is a function or inlined function, and we created a Subfunction for it. Otherwise MAX.
-    subfunction: usize,
-    // If nonzero, stack[subfunction_depth] is the innermost containing DIE that is a function or inlined function call, regardless of whether we created FunctionInfo/Subfunction for it.
-    subfunction_depth: usize,
-    local_variables: Vec<Variable>, // for current subfunction
+    // Information about discriminated union (usually Rust enum).
+    discriminant_die: DieOffset, // from DW_TAG_variant_part
+    variant_field_flags: FieldFlags, // if we're inside DW_TAG_variant: VARIANT or DEFAULT_VARIANT; otherwise empty
+    discr_value: usize, // if we're inside DW_TAG_variant
 }
-impl Default for LoaderStackEntry { fn default() -> Self { Self {tag: DW_TAG_null, scope_name_len: 0, scope_name_is_linkable: true, exact_type: ptr::null_mut(), variant: None, nested_names: Vec::new(), pc_ranges: Vec::new(), pc_ranges_depth: 0, function: usize::MAX, function_depth: 0, subfunction_events: Vec::new(), subfunction: usize::MAX, subfunction_depth: 0, local_variables: Vec::new()} } }
+impl Default for TypeStackEntry { fn default() -> Self { Self {type_: ptr::null_mut(), nested_names: Vec::new(), discriminant_die: DebugInfoOffset(0), variant_field_flags: FieldFlags::empty(), discr_value: 0} } }
+impl TypeStackEntry { fn reset(&mut self, type_: *mut TypeInfo) { self.type_ = type_; self.nested_names.clear(); self.discriminant_die = DebugInfoOffset(0); self.variant_field_flags = FieldFlags::empty(); } }
 
-// The way tree traversal is currently implemented is kind of complicated and has a lot of boilerplate, in part because it's trying to be fast.
-// I wonder if there's a better way to organize this.
+// Something that has address ranges (unit, function, lexical scope, inlined function, etc).
+#[derive(Default)]
+struct RangesStackEntry {
+    // Current address range(s) to use for local variables (unless they have loclist ranges).
+    pc_ranges: Vec<gimli::Range>,
+}
+
 impl<'a> DwarfLoader<'a> {
     fn new(loader: &'a SymbolsLoader, shard: &'a mut SymbolsLoaderShard, unit_idx: usize) -> Result<Self> {
         let unit = &loader.sym.units[unit_idx];
         let section_slice = *loader.sym.dwarf.debug_info.reader();
-        Ok(Self {loader, section_slice, shard_idx: unit.shard_idx, shard, unit_idx, unit: &unit.unit, unit_language: LanguageFamily::Unknown, scope_name: String::new(), stack: Vec::new(), depth: 0, temp: LoaderTempStorage::default()})
-    }
-
-    fn push(&mut self, tag: DwTag) {
-        if self.depth + 1 == self.stack.len() {
-            self.stack.push(LoaderStackEntry::default());
-        }
-        self.depth += 1;
-        let (old, new) = self.stack.split_at_mut(self.depth);
-        let (old, new) = (&mut old[self.depth - 1], &mut new[0]);
-
-        new.tag = tag;
-        new.scope_name_len = self.scope_name.len();
-        
-        new.scope_name_is_linkable = old.scope_name_is_linkable;
-        new.pc_ranges_depth = old.pc_ranges_depth;
-        new.function_depth = old.function_depth;
-        new.subfunction_depth = old.subfunction_depth;
-
-        new.exact_type = ptr::null_mut();
-        new.variant = None;
-        new.nested_names.clear();
-        new.pc_ranges.clear();
-        new.function = usize::MAX;
-        new.subfunction_events.clear();
-        new.subfunction = usize::MAX;
-        new.local_variables.clear();
+        Ok(Self {loader, section_slice, shard_idx: unit.shard_idx, shard, unit_idx, unit: &unit.unit, unit_language: LanguageFamily::Unknown, scope_name: String::new(), temp: LoaderTempStorage::default(), main_stack: FastStack::default(), scope_stack: FastStack::default(), function_stack: FastStack::default(), subfunction_stack: FastStack::default(), type_stack: FastStack::default(), ranges_stack: FastStack::default()})
     }
 
     fn append_namespace_to_scope_name(&mut self, s: &str, linkable: bool) {
+        let top = self.main_stack.top_mut();
+        if top.flags.contains(StackFlags::HAS_SCOPE) {
+            self.scope_stack.top_mut().scope_name_is_linkable &= linkable;
+        } else {
+            let was_linkable = self.scope_stack.top().scope_name_is_linkable;
+            *self.scope_stack.push_uninit(&mut top.flags) = ScopeStackEntry {scope_name_len: self.scope_name.len(), scope_name_is_linkable: was_linkable && linkable};
+        }
         if !self.scope_name.is_empty() {
             self.scope_name.push_str("::");
         }
         self.scope_name.push_str(s);
-        if !linkable {
-            self.stack[self.depth].scope_name_is_linkable = false;
-        }
     }
 
     // Extracts DieOffset and transmutes it to *const TypeInfo.
@@ -1996,19 +2049,19 @@ impl<'a> DwarfLoader<'a> {
         Ok(Self::parse_type_ref_custom(attr, tag, self.unit, &mut self.shard.warn, &self.loader.types.builtin_types))
     }
 
-    fn parse_line_info(&mut self, file: Option<AttributeValue<DwarfSlice>>, line: Option<AttributeValue<DwarfSlice>>, column: Option<AttributeValue<DwarfSlice>>) -> LineInfo {
+    fn parse_line_info(shard: &mut SymbolsLoaderShard, loader: &SymbolsLoader, unit_idx: usize, file: Option<AttributeValue<DwarfSlice>>, line: Option<AttributeValue<DwarfSlice>>, column: Option<AttributeValue<DwarfSlice>>) -> LineInfo {
         let Some(file) = file else {return LineInfo::invalid()};
         let Some(idx) = file.udata_value() else {
-            if self.shard.warn.check(line!()) { eprintln!("warning: file attribute has unexpected form: {:?}", file); }
+            if shard.warn.check(line!()) { eprintln!("warning: file attribute has unexpected form: {:?}", file); }
             return LineInfo::invalid();
         };
-        let Some(&file) = self.loader.sym.units[self.unit_idx].file_idx_remap.get(idx as usize) else {return LineInfo::invalid()};
+        let Some(&file) = loader.sym.units[unit_idx].file_idx_remap.get(idx as usize) else {return LineInfo::invalid()};
 
         let line = match line {
             None => 0,
             Some(line) => match line.udata_value() {
                 None => {
-                    if self.shard.warn.check(line!()) { eprintln!("warning: line number has unexpected form: {:?}", line); }
+                    if shard.warn.check(line!()) { eprintln!("warning: line number has unexpected form: {:?}", line); }
                     0
                 }
                 Some(line) => line as usize } };
@@ -2016,7 +2069,7 @@ impl<'a> DwarfLoader<'a> {
             None => 0,
             Some(col) => match col.udata_value() {
                 None => {
-                    if self.shard.warn.check(line!()) { eprintln!("warning: column number has unexpected form: {:?}", col); }
+                    if shard.warn.check(line!()) { eprintln!("warning: column number has unexpected form: {:?}", col); }
                     0
                 }
                 Some(col) => col as usize } };
@@ -2024,7 +2077,7 @@ impl<'a> DwarfLoader<'a> {
         match LineInfo::new(0, Some(file), line, column, LineFlags::empty()) {
             Ok(x) => x,
             Err(e) => {
-                if self.shard.warn.check(line!()) { eprintln!("warning: {}", e); }
+                if shard.warn.check(line!()) { eprintln!("warning: {}", e); }
                 LineInfo::invalid()
             }
         }
@@ -2041,14 +2094,10 @@ impl<'a> DwarfLoader<'a> {
             }
         }
     }
-    
+
     fn add_variable_locations(&mut self, location_attr: &Option<AttributeValue<DwarfSlice>>, const_value_attr: &Option<AttributeValue<DwarfSlice>>, linkage_name: &Option<&'static str>, mut var: Variable, offset: DieOffset) -> Result<()> {
-        let top = &self.stack[self.depth];
-        // It's possible that the containing function has no ranges and was discarded.
-        // In this case we still have to interpret the variable as local rather than global.
-        // We still add them to the stack entry, then no one picks them up from there.
-        let subfunction_depth = top.subfunction_depth;
-        let parent_type = self.stack[self.depth - 1].exact_type;
+        let stack_flags = self.main_stack.top().flags;
+        let subfunction_top = self.subfunction_stack.top_mut();
         let mut custom_ranges = false;
         let mut is_global = false;
 
@@ -2059,23 +2108,27 @@ impl<'a> DwarfLoader<'a> {
             } else if let Some(loclist_offset) = Self::attr_locations_offset(&self.loader.sym.dwarf, self.unit, val)? {
                 let mut locs_iter = self.loader.sym.dwarf.locations(self.unit, loclist_offset)?;
                 // Different locations for different address ranges. Add multiple local variables.
-                // Or it's a static variable inside a function - then the range from location list is much longer
+                // Or it's a static variable inside a function - then the range from location list is much wider
                 // than the containing function (e.g. whole .text section).
                 custom_ranges = true;
-                let function_depth = top.function_depth;
                 while let Some(entry) = locs_iter.next()? {
                     var.location = PackedVariableLocation::expr(entry.data);
                     is_global = false;
-                    if subfunction_depth != 0 {
-                        // Guess whether it's a local or a static variable.
+                    if stack_flags.contains(StackFlags::IS_FUNCTION_SCOPE) {
+                        // We're inside a function. Guess whether it's a local or a static variable.
                         // (The `r.end + 1` is because I've seen ranges stick out like that in practice, idk why. Not sure if it was specifically variable vs function ranges, or some other kind of ranges of nested DIEs, I didn't check.)
-                        let is_local = var.flags().intersects(VariableFlags::FRAME_BASE | VariableFlags::PARAMETER)
-                            || self.stack[function_depth].pc_ranges.iter().any(|r| r.begin <= entry.range.begin && r.end + 1 >= entry.range.end);
-                        if is_local {
-                            self.stack[subfunction_depth].local_variables.push(var.with_range(entry.range));
-                        } else {
-                            // Probably a static variable inside a function. Add both local and global variable (if it's the last location list entry).
-                            self.stack[subfunction_depth].local_variables.push(var.with_range(entry.range));
+                        // TODO: This is sometimes not enough: I've seen local variables being detected as global. Maybe also look at the DWARF expression: if it uses general-purpose registers, it's probably a local variable.
+                        let mut is_local = var.flags().intersects(VariableFlags::FRAME_BASE | VariableFlags::PARAMETER);
+                        if !is_local && stack_flags.contains(StackFlags::IS_VALID_SCOPE) {
+                            let function_top = self.function_stack.top();
+                            let function_pc_ranges = &self.ranges_stack.s[function_top.ranges_stack_idx].pc_ranges;
+                            is_local = function_pc_ranges.iter().any(|r| r.begin <= entry.range.begin && r.end + 1 >= entry.range.end);
+                        }
+                        if stack_flags.contains(StackFlags::IS_VALID_SCOPE) {
+                            subfunction_top.local_variables.push(var.with_range(entry.range));
+                        }
+                        if !is_local {
+                            // Probably a static variable inside a function. Add both local variable (above) and global variable (if it's the last location list entry).
                             is_global = true;
                         }
                     } else {
@@ -2091,12 +2144,11 @@ impl<'a> DwarfLoader<'a> {
         }
 
         if !custom_ranges {
-            if subfunction_depth != 0 && parent_type == ptr::null_mut() {
-                let top = &self.stack[self.depth];
-                let ranges_depth = top.pc_ranges_depth;
-                for i in 0..self.stack[ranges_depth].pc_ranges.len() {
-                    let range = self.stack[ranges_depth].pc_ranges[i];
-                    self.stack[subfunction_depth].local_variables.push(var.with_range(range));
+            if stack_flags.contains(StackFlags::IS_FUNCTION_SCOPE) {
+                if stack_flags.contains(StackFlags::IS_VALID_SCOPE) {
+                    for range in &self.ranges_stack.top().pc_ranges {
+                        subfunction_top.local_variables.push(var.with_range(*range));
+                    }
                 }
             } else {
                 is_global = true;
@@ -2114,7 +2166,7 @@ impl<'a> DwarfLoader<'a> {
                     let options = cpp_demangle::DemangleOptions::new().recursion_limit(1000).no_return_type().no_params().hide_expression_literal_types();
                     if let Ok(r) = symbol.demangle(&options) {
                         var.set_name(self.shard.temp_global_var_arena.add_str(&r));
-                        if parent_type != ptr::null_mut() {
+                        if stack_flags.contains(StackFlags::IS_TYPE_SCOPE | StackFlags::IS_VALID_SCOPE) {
                             let i = r.rfind(':').map_or(0, |i| i + 1);
                             unqualified_name = self.shard.types.temp_types.misc_arena.add_str(&r[i..]);
                         }
@@ -2135,24 +2187,24 @@ impl<'a> DwarfLoader<'a> {
             let target_shard = hash % self.loader.shards.len();
             unsafe {(*(*self.loader.send_global_variable_names[self.shard_idx].get())[target_shard].get()).push(GlobalVariableNameMessage {name, ptr})};
 
-            if parent_type != ptr::null_mut() {
+            if stack_flags.contains(StackFlags::IS_TYPE_SCOPE | StackFlags::IS_VALID_SCOPE) {
                 // TODO: This doesn't cover the case when the declaration is separate from definition. The definition has location, the declaration has parent type, we have to somehow join the two.
-                self.stack[self.depth - 1].nested_names.push((unqualified_name, NestedName::Variable(ptr)));
+                self.type_stack.top_mut().nested_names.push((unqualified_name, NestedName::Variable(ptr)));
             }
         }
 
         Ok(())
     }
 
-    fn chase_origin_pointers(&mut self, mut attr_specification_or_origin: Option<AttributeValue<DwarfSlice>>, name: &mut Option<&'static str>, linkage_name: &mut Option<&'static str>, type_: &mut Option<*const TypeInfo>, mut decl: Option<&mut LineInfo>) -> Result<()> {
-        let mut cur_unit = self.unit;
+    fn chase_origin_pointers(shard: &mut SymbolsLoaderShard, loader: &SymbolsLoader, unit: &Unit<DwarfSlice>, unit_idx: usize, mut attr_specification_or_origin: Option<AttributeValue<DwarfSlice>>, name: &mut Option<&'static str>, linkage_name: &mut Option<&'static str>, type_: &mut Option<*const TypeInfo>, mut decl: Option<&mut LineInfo>) -> Result<()> {
+        let mut cur_unit = unit;
         while let Some(specification_or_origin) = attr_specification_or_origin {
             let (next_unit, next_offset) = match specification_or_origin {
                 AttributeValue::UnitRef(off) => (cur_unit, off),
                 AttributeValue::DebugInfoRef(off) => {
-                    let idx = self.loader.sym.units.partition_point(|u| u.offset <= off);
+                    let idx = loader.sym.units.partition_point(|u| u.offset <= off);
                     if idx == 0 { return err!(Dwarf, "specification/abstract_origin offset out of bounds"); }
-                    let u = &self.loader.sym.units[idx - 1];
+                    let u = &loader.sym.units[idx - 1];
                     let off = match off.to_unit_offset(&u.unit.header) {
                         None => return err!(Dwarf, "specification/abstract_origin entry offset out of unit bounds"),
                         Some(o) => o };
@@ -2163,17 +2215,17 @@ impl<'a> DwarfLoader<'a> {
             cur_unit = next_unit;
 
             let mut entries_iter = cur_unit.header.range_from(next_offset..)?;
-            let abbrev = match entries_iter.read_abbreviation(&self.unit.abbreviations)? {
+            let abbrev = match entries_iter.read_abbreviation(&unit.abbreviations)? {
                 None => return err!(Dwarf, "specification/abstract_origin points to null entry"),
                 Some(a) => a };
             attr_specification_or_origin = None;
-            let encoding = self.unit.encoding();
+            let encoding = unit.encoding();
             let (mut attr_file, mut attr_line, mut attr_column) = (None, None, None);
             for &attr in abbrev.attributes() {
                 match attr.name() {
-                    DW_AT_name => {name.get_or_insert(parse_attr_str(&self.loader.sym.dwarf, cur_unit, &Some(entries_iter.read_attribute(attr, encoding)?))?);}
-                    DW_AT_linkage_name => {linkage_name.get_or_insert(parse_attr_str(&self.loader.sym.dwarf, cur_unit, &Some(entries_iter.read_attribute(attr, encoding)?))?);}
-                    DW_AT_type => {type_.get_or_insert(Self::parse_type_ref_custom(entries_iter.read_attribute(attr, encoding)?, abbrev.tag(), cur_unit, &mut self.shard.warn, &self.loader.types.builtin_types));}
+                    DW_AT_name => {name.get_or_insert(parse_attr_str(&loader.sym.dwarf, cur_unit, &Some(entries_iter.read_attribute(attr, encoding)?))?);}
+                    DW_AT_linkage_name => {linkage_name.get_or_insert(parse_attr_str(&loader.sym.dwarf, cur_unit, &Some(entries_iter.read_attribute(attr, encoding)?))?);}
+                    DW_AT_type => {type_.get_or_insert(Self::parse_type_ref_custom(entries_iter.read_attribute(attr, encoding)?, abbrev.tag(), cur_unit, &mut shard.warn, &loader.types.builtin_types));}
                     DW_AT_specification => attr_specification_or_origin = Some(entries_iter.read_attribute(attr, encoding)?),
                     DW_AT_abstract_origin => attr_specification_or_origin = Some(entries_iter.read_attribute(attr, encoding)?),
                     DW_AT_decl_file => attr_file = Some(entries_iter.read_attribute(attr, encoding)?),
@@ -2184,20 +2236,28 @@ impl<'a> DwarfLoader<'a> {
             }
             if let Some(d) = &mut decl {
                 if **d == LineInfo::invalid() && attr_file.is_some() {
-                    **d = self.parse_line_info(attr_file, attr_line, attr_column);
+                    **d = Self::parse_line_info(shard, loader, unit_idx, attr_file, attr_line, attr_column);
                 }
             }
         }
         Ok(())
     }
-    
+
     fn load(&mut self) -> Result<()> {
         {
             let start_offset = self.unit.header.offset().as_debug_info_offset().unwrap();
             self.shard.types.set_unit(start_offset, DebugInfoOffset(start_offset.0 + self.unit.header.length_including_self()));
         }
 
-        self.stack.push(LoaderStackEntry::default());
+        // Fake sentinel values to avoid checking for empty stacks everywhere.
+        {
+            let mut _f = StackFlags::empty();
+            *self.main_stack.push_uninit(&mut _f) = MainStackEntry {tag: DW_TAG_null, flags: StackFlags::IS_VALID_SCOPE};
+            let f = &mut self.main_stack.top_mut().flags;
+            *self.scope_stack.push_uninit(f) = ScopeStackEntry {scope_name_len: 0, scope_name_is_linkable: true};
+            *self.ranges_stack.push_uninit(f) = RangesStackEntry::default();
+            *self.subfunction_stack.push_uninit(f) = SubfunctionStackEntry {subfunction_idx: u32::MAX, ..Default::default()};
+        }
 
         // Iterate over DIEs in depth-first order.
         let mut cursor = self.unit.header.range_from(UnitOffset(self.unit.header.header_size())..)?;
@@ -2209,45 +2269,44 @@ impl<'a> DwarfLoader<'a> {
             // Check if we're done.
             let offset = DebugInfoOffset(cursor.offset_from(&self.section_slice));
             if cursor.is_empty() {
-                if self.depth != 1 {
+                if self.main_stack.len != 2 { // expected stack contents: fake root, DW_TAG_compile_unit (which doesn't have a DW_TAG_null to terminator at the end, for some reason)
                     return err!(Dwarf, "tree ended early @0x{:x}", offset.0);
                 }
                 return Ok(());
             }
 
             // Pop from the stack if needed.
-            let finish_subtree = if !prev_has_children {
-                if self.depth < 1 {
+            if !prev_has_children {
+                if self.main_stack.len < 2 {
                     return err!(Dwarf, "tree underflow");
                 }
-                self.depth -= 1;
-                let top = &self.stack[self.depth + 1];
-                self.scope_name.truncate(top.scope_name_len);
+                let top = self.main_stack.pop();
 
                 if skip_subtree == usize::MAX {
-                    true
-                } else {
-                    if self.depth < skip_subtree {
-                        skip_subtree = usize::MAX;
+                    let flags = top.flags;
+                    if flags.intersects(StackFlags::HAS_ANYTHING) {
+                        if flags.contains(StackFlags::HAS_SCOPE) {
+                            let scope_top = self.scope_stack.pop();
+                            self.scope_name.truncate(scope_top.scope_name_len);
+                        }
+                        if flags.contains(StackFlags::HAS_RANGES) {
+                            self.ranges_stack.pop();
+                        }
+                        if flags.contains(StackFlags::HAS_SUBFUNCTION) {
+                            self.finish_subfunction();
+                        }
+                        if flags.contains(StackFlags::HAS_FUNCTION) {
+                            self.finish_function();
+                        }
+                        if flags.contains(StackFlags::HAS_TYPE) {
+                            self.finish_type();
+                        }
+                        if flags.contains(StackFlags::HAS_VARIANT) {
+                            self.type_stack.top_mut().variant_field_flags = FieldFlags::empty();
+                        }
                     }
-                    false
-                }
-            } else {
-                false
-            };
-
-            if finish_subtree {
-                let top = &mut self.stack[self.depth + 1];
-                if top.subfunction != usize::MAX {
-                    let start = self.shard.sym.local_variables.len();
-                    self.shard.sym.local_variables.append(&mut top.local_variables);
-                    let end = self.shard.sym.local_variables.len();
-                    self.shard.sym.subfunctions[top.subfunction].local_variables = Subfunction::pack_range(start..end);
-                }
-                match top.tag {
-                    DW_TAG_subprogram => self.finish_function(),
-                    DW_TAG_base_type | DW_TAG_unspecified_type | DW_TAG_structure_type | DW_TAG_class_type | DW_TAG_union_type | DW_TAG_enumeration_type | DW_TAG_pointer_type | DW_TAG_reference_type | DW_TAG_rvalue_reference_type | DW_TAG_array_type | DW_TAG_const_type | DW_TAG_restrict_type | DW_TAG_volatile_type | DW_TAG_atomic_type | DW_TAG_typedef => self.finish_type(),
-                    _ => (),
+                } else if self.main_stack.len < skip_subtree {
+                    skip_subtree = usize::MAX;
                 }
             }
 
@@ -2260,7 +2319,22 @@ impl<'a> DwarfLoader<'a> {
                 None => continue,
             };
 
-            self.push(abbrev.tag());
+            let inherited_flags = self.main_stack.top().flags & StackFlags::IS_ANY_SCOPE;
+            let mut _f = StackFlags::empty();
+            let top = self.main_stack.push_uninit(&mut _f);
+            *top = MainStackEntry {tag: abbrev.tag(), flags: inherited_flags};
+
+            /*asdqwe
+            new.exact_type = ptr::null_mut();
+            new.variant = None;
+            new.nested_names.clear();
+            new.pc_ranges.clear();
+            new.function = usize::MAX;
+            new.subfunctions.clear();
+            new.subfunction_events.clear();
+            new.subfunction_idx = u32::MAX;
+            new.subfunction_level = u16::MAX;
+            new.local_variables.clear();*/
 
             if skip_subtree != usize::MAX {
                 cursor.skip_attributes(abbrev.attributes(), encoding)?;
@@ -2295,8 +2369,9 @@ impl<'a> DwarfLoader<'a> {
                             _ => cursor.skip_attribute(attr, encoding)?,
                         }
                     }
-                    parse_attr_ranges(&self.loader.sym.dwarf, self.unit, &low_pc, &high_pc, &attr_ranges, offset, self.loader.sym.code_addr_range.start, &mut self.stack[self.depth].pc_ranges, &mut self.shard.warn)?;
-                    self.stack[self.depth].pc_ranges_depth = self.depth;
+                    let ranges_top = self.ranges_stack.push_uninit(&mut self.main_stack.top_mut().flags);
+                    parse_attr_ranges(&self.loader.sym.dwarf, self.unit, &low_pc, &high_pc, &attr_ranges, offset, self.loader.sym.code_addr_range.start, &mut ranges_top.pc_ranges, &mut self.shard.warn)?;
+                    self.main_stack.top_mut().flags.remove(StackFlags::IS_FUNCTION_SCOPE | StackFlags::IS_TYPE_SCOPE); // shouldn't do anything since this tag is always root, but just in case
                 }
 
                 // This tag means that the debug info is split into a separate file using DWARF's complicated mechanism for that.
@@ -2350,8 +2425,8 @@ impl<'a> DwarfLoader<'a> {
                     }
 
                     if attr_location.is_some() || attr_const_value.is_some() {
-                        let mut decl = self.parse_line_info(decl_file, decl_line, decl_column);
-                        self.chase_origin_pointers(attr_specification_or_origin, &mut name, &mut linkage_name, &mut type_, Some(&mut decl))?;
+                        let mut decl = Self::parse_line_info(&mut self.shard, &self.loader, self.unit_idx, decl_file, decl_line, decl_column);
+                        Self::chase_origin_pointers(&mut self.shard, &self.loader, self.unit, self.unit_idx, attr_specification_or_origin, &mut name, &mut linkage_name, &mut type_, Some(&mut decl))?;
                         let var_flags = if abbrev.tag() == DW_TAG_variable { VariableFlags::empty() } else { VariableFlags::PARAMETER };
                         let var = Variable::new(name.unwrap_or(""), type_.unwrap_or(self.loader.types.builtin_types.unknown), offset, decl, var_flags);
                         self.add_variable_locations(&attr_location, &attr_const_value, &linkage_name, var, offset)?;
@@ -2360,13 +2435,13 @@ impl<'a> DwarfLoader<'a> {
 
                 // Varargs.
                 DW_TAG_unspecified_parameters | DW_TAG_GNU_formal_parameter_pack => {
-                    skip_subtree = self.depth;
+                    skip_subtree = self.main_stack.len;
                     cursor.skip_attributes(abbrev.attributes(), encoding)?;
                 }
 
                 // Call sites (seem to be very incomplete, presumed useless).
                 DW_TAG_GNU_call_site | DW_TAG_call_site | DW_TAG_GNU_call_site_parameter | DW_TAG_call_site_parameter => {
-                    skip_subtree = self.depth;
+                    skip_subtree = self.main_stack.len;
                     cursor.skip_attributes(abbrev.attributes(), encoding)?;
                 }
 
@@ -2422,18 +2497,21 @@ impl<'a> DwarfLoader<'a> {
                             _ => cursor.skip_attribute(attr, encoding)?,
                         }
                     }
-                    let top = &mut self.stack[self.depth];
-                    parse_attr_ranges(&self.loader.sym.dwarf, self.unit, &low_pc, &high_pc, &attr_ranges, offset, self.loader.sym.code_addr_range.start, &mut top.pc_ranges, &mut self.shard.warn)?;
-                    top.function_depth = self.depth;
-                    top.pc_ranges_depth = self.depth;
-                    top.subfunction_depth = self.depth;
 
-                    if !top.pc_ranges.is_empty() || is_inlined {
+                    let ranges_stack_idx = self.ranges_stack.len;
+                    let ranges_top = self.ranges_stack.push_uninit(&mut self.main_stack.top_mut().flags);
+                    parse_attr_ranges(&self.loader.sym.dwarf, self.unit, &low_pc, &high_pc, &attr_ranges, offset, self.loader.sym.code_addr_range.start, &mut ranges_top.pc_ranges, &mut self.shard.warn)?;
+                    self.main_stack.top_mut().flags.remove(StackFlags::IS_ANY_SCOPE);
+                    self.main_stack.top_mut().flags.insert(StackFlags::IS_FUNCTION_SCOPE);
+
+                    if !ranges_top.pc_ranges.is_empty() || is_inlined {
+                        let function_top = self.function_stack.push_uninit(&mut self.main_stack.top_mut().flags);
+                        function_top.reset(ranges_stack_idx);
+
                         // Chase the specification/origin pointers to reach the function name (for function declarations and inlining stuff).
                         // Functions can be missing one of the two names (linkage name or regular name), but not both (in the binaries I looked at).
-                        let mut decl = self.parse_line_info(decl_file, decl_line, decl_column);
-                        self.chase_origin_pointers(attr_specification_or_origin, &mut name, &mut linkage_name, &mut type_, Some(&mut decl))?;
-                        let top = &mut self.stack[self.depth];
+                        let mut decl = Self::parse_line_info(&mut self.shard, &self.loader, self.unit_idx, decl_file, decl_line, decl_column);
+                        Self::chase_origin_pointers(&mut self.shard, &self.loader, self.unit, self.unit_idx, attr_specification_or_origin, &mut name, &mut linkage_name, &mut type_, Some(&mut decl))?;
 
                         let name_ref = if let Some(n) = linkage_name {
                             n
@@ -2463,36 +2541,37 @@ impl<'a> DwarfLoader<'a> {
                         // the transformations that the compiler did to arrive at these ranges.
                         // Do multi-ranges also appear on C++ coroutines or Rust async functions? No, they produce multiple functions instead.
 
-                        top.function = self.shard.functions.len();
+                        function_top.function = self.shard.functions.len();
                         let mut f = FunctionInfo {addr: FunctionAddr(0), prev_addr: FunctionAddr(0), die: offset, mangled_name: name_ref.as_ptr(), mangled_name_len: name_ref.len() as u32, shard_idx: self.shard_idx as u16, flags: FunctionFlags::empty(), language: self.unit_language, subfunction_levels: 0..0};
                         if is_inlined {
                             f.flags.insert(FunctionFlags::INLINED);
                         }
-                        if top.pc_ranges.is_empty() {
-                            // Inline-only function.
+                        if ranges_top.pc_ranges.is_empty() {
+                            // Inline-only function. Don't create a subfunction and don't add IS_VALID_SCOPE flag.
                             f.addr = FunctionAddr::inline(f.die);
                             f.prev_addr = f.addr;
                             self.shard.functions.push(f);
                         } else {
-                            top.pc_ranges.sort_unstable_by_key(|r| r.begin);
-                            let sf_idx = self.shard.sym.subfunctions.len();
-                            self.shard.sym.subfunctions.push(Subfunction {callee_idx: offset.0, parent: usize::MAX, local_variables: Subfunction::pack_range(0..0), call_line: decl, level: 0, last_range_idx: usize::MAX});
-                            top.subfunction = sf_idx;
-                            for (i, range) in top.pc_ranges.iter().enumerate() {
+                            self.main_stack.top_mut().flags.insert(StackFlags::IS_VALID_SCOPE);
+                            ranges_top.pc_ranges.sort_unstable_by_key(|r| r.begin);
+                            let sf_idx = 0u32;
+                            function_top.subfunctions.push((Subfunction {callee_idx: offset.0, local_variables: Subfunction::pack_range(0..0), call_line: decl, addr_range: 0..0, identity: sf_idx}, u32::MAX));
+                            self.subfunction_stack.push_uninit(&mut self.main_stack.top_mut().flags).reset(sf_idx, /*subfunction_level*/ 0);
+                            for (i, range) in ranges_top.pc_ranges.iter().enumerate() {
                                 let mut f = f.clone();
                                 f.addr = FunctionAddr::new(range.begin as usize);
-                                f.prev_addr = FunctionAddr::new(top.pc_ranges[(i + top.pc_ranges.len() - 1) % top.pc_ranges.len()].begin as usize);
+                                f.prev_addr = FunctionAddr::new(ranges_top.pc_ranges[(i + ranges_top.pc_ranges.len() - 1) % ranges_top.pc_ranges.len()].begin as usize);
                                 self.shard.functions.push(f);
 
-                                top.subfunction_events.push(SubfunctionEvent {addr: range.begin as usize, level: 0, subfunction_idx: sf_idx, sign: 1});
-                                top.subfunction_events.push(SubfunctionEvent {addr: range.end as usize, level: 0, subfunction_idx: sf_idx, sign: -1});
+                                function_top.subfunction_events.push(SubfunctionEvent {addr: range.begin as usize, subfunction_idx: sf_idx, signed_level: 1});
+                                function_top.subfunction_events.push(SubfunctionEvent {addr: range.end as usize, subfunction_idx: sf_idx, signed_level: -1});
 
                                 // Functions often overlap, especially with .symtab functions, idk why. So don't add function end markers.
                                 self.shard.max_function_end = self.shard.max_function_end.max(range.end as usize);
                             }
 
                             if is_main {
-                                self.shard.points_of_interest.entry(PointOfInterest::MainFunction).or_default().push(top.pc_ranges[0].begin as usize);
+                                self.shard.points_of_interest.entry(PointOfInterest::MainFunction).or_default().push(ranges_top.pc_ranges[0].begin as usize);
                             }
                         }
 
@@ -2511,7 +2590,7 @@ impl<'a> DwarfLoader<'a> {
                     self.append_namespace_to_scope_name("_", false);
                 }
 
-                DW_TAG_enumeration_type if self.stack[self.depth - 1].tag == DW_TAG_array_type => {
+                DW_TAG_enumeration_type if self.main_stack.top().tag == DW_TAG_array_type => {
                     // Haven't seen these in C++ or Rust.
                     if self.shard.warn.check(line!()) { eprintln!("warning: enum-valued array indices are not supported (have one @0x{:x})", offset.0); }
                     cursor.skip_attributes(abbrev.attributes(), encoding)?;
@@ -2555,7 +2634,7 @@ impl<'a> DwarfLoader<'a> {
                                 unqualified_name = parse_attr_str(&self.loader.sym.dwarf, self.unit, &Some(cursor.read_attribute(attr, encoding)?))?;
                                 self.append_namespace_to_scope_name(unqualified_name, true);
                                 info.name = self.shard.types.temp_types.unsorted_type_names.add_str(&self.scope_name, 0);
-                                if self.stack[self.depth].scope_name_is_linkable {
+                                if self.scope_stack.top().scope_name_is_linkable {
                                     info.flags.insert(TypeFlags::LINKABLE_NAME);
                                 }
                             }
@@ -2649,7 +2728,7 @@ impl<'a> DwarfLoader<'a> {
                     if info.name.is_empty() {
                         self.append_namespace_to_scope_name("_", false);
                     }
-                    info.line = self.parse_line_info(decl_file, decl_line, decl_column);
+                    info.line = Self::parse_line_info(&mut self.shard, &self.loader, self.unit_idx, decl_file, decl_line, decl_column);
 
                     if is_complex_float {
                         // Treat complex float as a struct rather than primitive type.
@@ -2716,6 +2795,7 @@ impl<'a> DwarfLoader<'a> {
                         self.shard.base_types.push((offset.0 as u64) << 8 | type_enum as u64);
                     }
 
+                    let prev_type_stack_len = self.type_stack.len;
                     let ti;
                     if is_alias {
                         ti = info.t.as_pointer().unwrap().type_;
@@ -2724,11 +2804,14 @@ impl<'a> DwarfLoader<'a> {
                         let t;
                         (t, ti) = self.shard.types.add_type(info);
                         assert!(t != ptr::null());
-                        self.stack[self.depth].exact_type = t as *mut TypeInfo;
+                        let top = self.main_stack.top_mut();
+                        self.type_stack.push_uninit(&mut top.flags).reset(t as *mut TypeInfo);
+                        top.flags.remove(StackFlags::IS_ANY_SCOPE);
+                        top.flags.insert(StackFlags::IS_TYPE_SCOPE | StackFlags::IS_VALID_SCOPE);
                     }
 
-                    if !unqualified_name.is_empty() && self.stack[self.depth - 1].exact_type != ptr::null_mut() {
-                        self.stack[self.depth - 1].nested_names.push((unqualified_name, NestedName::Type(ti)));
+                    if !unqualified_name.is_empty() && self.main_stack.top2().flags.contains(StackFlags::IS_TYPE_SCOPE | StackFlags::IS_VALID_SCOPE) {
+                        self.type_stack.s[prev_type_stack_len - 1].nested_names.push((unqualified_name, NestedName::Type(ti)));
                     }
                 }
 
@@ -2737,20 +2820,22 @@ impl<'a> DwarfLoader<'a> {
                     // Applicable attributes:
                     // Useful: DECL, name, artificial, bit_size, byte_size, data_bit_offset, data_member_location, external (seems undocumented), declaration, type, const_value
                     // Other: accessibility, mutable, visibility, virtuality
-                    let type_ = self.stack[self.depth - 1].exact_type;
-                    if type_ == ptr::null_mut() {
-                        if self.shard.warn.check(line!()) { eprintln!("warning: {} in {} is not supported", abbrev.tag(), self.stack[self.depth - 1].tag); }
+                    let top = self.main_stack.top();
+                    if !top.flags.contains(StackFlags::IS_TYPE_SCOPE | StackFlags::IS_VALID_SCOPE) {
+                        if !top.flags.contains(StackFlags::IS_TYPE_SCOPE) {
+                            if self.shard.warn.check(line!()) { eprintln!("warning: {} in {} is not supported", abbrev.tag(), self.main_stack.top2().tag); }
+                        }
                         cursor.skip_attributes(abbrev.attributes(), encoding)?;
                     } else {
+                        let type_top = self.type_stack.top_mut();
+                        let type_ = type_top.type_;
                         let mut attr_const_value = None;
                         let mut field = StructField {name: "", flags: FieldFlags::empty(), bit_offset: 0, bit_size: 0, type_: self.loader.types.builtin_types.unknown, discr_value: 0};
-                        if let Some(variant) = &self.stack[self.depth - 1].variant {
-                            if offset == variant.discriminant_die {
-                                field.flags.insert(FieldFlags::DISCRIMINANT);
-                            }
-                            field.flags.insert(variant.field_flags);
-                            field.discr_value = variant.discr_value;
+                        if offset == type_top.discriminant_die {
+                            field.flags.insert(FieldFlags::DISCRIMINANT);
                         }
+                        field.flags.insert(type_top.variant_field_flags);
+                        field.discr_value = type_top.discr_value;
                         if abbrev.tag() == DW_TAG_inheritance {
                             field.flags.insert(FieldFlags::INHERITANCE);
                             field.name = "#base";
@@ -2826,7 +2911,7 @@ impl<'a> DwarfLoader<'a> {
                             unsafe {
                                 match &mut (*type_).t {
                                     Type::Enum(e) => self.shard.types.temp_types.add_enumerand(e, Enumerand {value: enum_value, name: field.name, flags: EnumerandFlags::empty()}),
-                                    _ => if self.shard.warn.check(line!()) { eprintln!("warning: {} in {} is not supported", abbrev.tag(), self.stack[self.depth - 1].tag); }
+                                    _ => if self.shard.warn.check(line!()) { eprintln!("warning: {} in {} is not supported", abbrev.tag(), self.main_stack.top2().tag); }
                                 }
                             }
                         } else {
@@ -2839,7 +2924,7 @@ impl<'a> DwarfLoader<'a> {
                                     // Probably separate declaration and definition.
                                     //if self.shard.warn.check(line!()) { eprintln!("warning: static field with no DW_AT_const_value at @0x{:x}", offset.0); }
                                 } else {
-                                    let decl = self.parse_line_info(decl_file, decl_line, decl_column);
+                                    let decl = Self::parse_line_info(&mut self.shard, &self.loader, self.unit_idx, decl_file, decl_line, decl_column);
                                     let var = Variable::new(field.name, field.type_, offset, decl, VariableFlags::empty());
                                     self.add_variable_locations(&None, &attr_const_value, &None, var, offset)?;
                                 }
@@ -2848,10 +2933,87 @@ impl<'a> DwarfLoader<'a> {
                                 let t = unsafe {&mut *type_};
                                 match &mut t.t {
                                     Type::Struct(s) => self.shard.types.temp_types.add_field(s, field),
-                                    _ => if self.shard.warn.check(line!()) { eprintln!("warning: {} in {} is not supported", abbrev.tag(), self.stack[self.depth - 1].tag); }
+                                    _ => if self.shard.warn.check(line!()) { eprintln!("warning: {} in {} is not supported", abbrev.tag(), self.main_stack.top2().tag); }
                                 }
                             }
                         }
+                    }
+                }
+
+                DW_TAG_variant_part | DW_TAG_variant if !self.main_stack.top().flags.contains(StackFlags::IS_TYPE_SCOPE | StackFlags::IS_VALID_SCOPE) => {
+                    if !self.main_stack.top().flags.contains(StackFlags::IS_TYPE_SCOPE) {
+                        if self.shard.warn.check(line!()) { eprintln!("warning: {} in {} is not supported", abbrev.tag(), self.main_stack.top2().tag); }
+                    }
+                    cursor.skip_attributes(abbrev.attributes(), encoding)?;
+                }
+
+                // Rust enum.
+                // The tree usually looks like this:
+                //   structure_type
+                //     variant_part - with DW_AT_discr pointing to the discriminant member
+                //       member - discriminant
+                //       variant - with DW_AT_discr_value
+                //         member
+                //       variant
+                //         member
+                //       ...
+                DW_TAG_variant_part => {
+                    // Applicable attributes:
+                    // Useful: discr
+                    // Other: accessibility, declaration, type
+                    let mut discriminant_die: DieOffset = DebugInfoOffset(0);
+                    for &attr in abbrev.attributes() {
+                        match attr.name() {
+                            DW_AT_discr => match cursor.read_attribute(attr, encoding)? {
+                                AttributeValue::UnitRef(unit_offset) => discriminant_die = unit_offset.to_debug_info_offset(&self.unit.header).unwrap(),
+                                v => if self.shard.warn.check(line!()) { eprintln!("warning: {} has unexpected form: {:?}", attr.name(), v); }
+                            }
+                            _ => cursor.skip_attribute(attr, encoding)?,
+                        }
+                    }
+                    if discriminant_die.0 == 0 {
+                        // DW_AT_discr can be missing if there's only one reachable variant. Use nonzero value so that we can distinguish this from the whole DW_TAG_variant_part being missing.
+                        discriminant_die.0 = 1;
+                    }
+                    self.type_stack.top_mut().discriminant_die = discriminant_die;
+                }
+                DW_TAG_variant => {
+                    // Applicable attributes:
+                    // Useful: discr_value, discr_list
+                    // Other: accessibility, declaration
+                    let mut found_discr = false;
+                    let mut discr_value = 0usize;
+                    let mut error = false;
+                    for &attr in abbrev.attributes() {
+                        match attr.name() {
+                            DW_AT_discr_value => {
+                                let v = cursor.read_attribute(attr, encoding)?;
+                                if let Some(x) = v.udata_value().or_else(|| v.sdata_value().map(|x| x as u64)) {
+                                    found_discr = true;
+                                    discr_value = x as usize;
+                                } else {
+                                    error = true;
+                                    if self.shard.warn.check(line!()) { eprintln!("warning: {} has unexpected form: {:?}", attr.name(), v); }
+                                }
+                            }
+                            // (I looked at one Rust binary, and there were no disct_list-s, so not supporting it yet.)
+                            DW_AT_discr_list => {
+                                error = true;
+                                if self.shard.warn.check(line!()) { eprintln!("warning: DW_AT_discr_list is not supported"); }
+                            }
+                            _ => cursor.skip_attribute(attr, encoding)?,
+                        }
+                    }
+                    let type_top = self.type_stack.top_mut();
+                    if type_top.discriminant_die.0 == 0 {
+                        if self.shard.warn.check(line!()) { eprintln!("warning: variant is not inside variant_part @0x{:x}", offset.0); }
+                    } else if !type_top.variant_field_flags.is_empty() {
+                        if self.shard.warn.check(line!()) { eprintln!("warning: nested DW_TAG_variant-s @0x{:x}", offset.0); }
+                    } else if !error {
+                        type_top.variant_field_flags.insert(if found_discr {FieldFlags::VARIANT} else {FieldFlags::DEFAULT_VARIANT});
+                        type_top.discr_value = discr_value;
+                        // Clear variant_field_flags when leaving the DW_TAG_variant subtree.
+                        self.main_stack.top_mut().flags.insert(StackFlags::HAS_VARIANT);
                     }
                 }
 
@@ -2861,27 +3023,29 @@ impl<'a> DwarfLoader<'a> {
                     // Useful: count, byte_stride, bit_stride, byte_size, bit_size, lower_bound, upper_bound, type
                     // Other: alignment, data_location, declaration, threads_scaled
                     // Other: DECL, name, accessibility, allocated, associated, visibility
-                    let t = self.stack[self.depth - 1].exact_type;
-                    if t == ptr::null_mut() || unsafe {(*t).t.as_array_mut().is_none()} {
-                        if self.stack[self.depth - 1].tag != DW_TAG_array_type {
-                            if self.shard.warn.check(line!()) { eprintln!("warning: {} in {} is not supported", abbrev.tag(), self.stack[self.depth - 1].tag); }
-                        } else {
-                            // (Warning would already be printed when parsing the parent.)
-                        }
-                        cursor.skip_attributes(abbrev.attributes(), encoding)?;
+                    let array = if !self.main_stack.top().flags.contains(StackFlags::IS_TYPE_SCOPE | StackFlags::IS_VALID_SCOPE) {
+                        None
                     } else {
-                        let t = unsafe {&mut *t};
-                        let mut array = t.t.as_array_mut().unwrap();
+                        let t = self.type_stack.top().type_;
+                        unsafe {(*t).t.as_array_mut()}
+                    };
+                    if let Some(mut array) = array {
                         if !array.flags.contains(ArrayFlags::PARSED_SUBRANGE) {
                             array.flags.insert(ArrayFlags::PARSED_SUBRANGE);
                         } else {
                             // Turn multidimensional array into array of arrays.
+                            // Point the stack entry to the inner array (so that subsequent DW_TAG_subrange_type-s apply to inner rather than outer dimensions).
+                            // The outer array is still in `types`, but not in the stack, so finish_type() won't be called for it, which is ok.
+                            // (Note that pushing another type onto type_stack won't work because the repeated DW_TAG_subrange_type are not nested in each other, so the stack entry will be popped immediately.)
+                            let t = unsafe {&mut *self.type_stack.top().type_};
+                            array = t.t.as_array_mut().unwrap(); // avoid UB
                             let info = TypeInfo {die: offset, binary_id: t.binary_id, line: t.line, language: self.unit_language, t: Type::Array(ArrayType {flags: ArrayFlags::PARSED_SUBRANGE, type_: array.type_, stride: 0, len: 0}), ..TypeInfo::default()};
                             let (ptr, off) = self.shard.types.add_type(info);
                             assert!(ptr != ptr::null());
                             array.type_ = off;
-                            self.stack[self.depth - 1].exact_type = ptr as *mut TypeInfo;
-                            array = unsafe {(*self.stack[self.depth - 1].exact_type).t.as_array_mut().unwrap()};
+                            let ptr = ptr as *mut TypeInfo;
+                            self.type_stack.top_mut().type_ = ptr;
+                            array = unsafe {(*ptr).t.as_array_mut().unwrap()};
                         }
 
                         let mut lower_bound: u64 = 0;
@@ -2921,86 +3085,26 @@ impl<'a> DwarfLoader<'a> {
                                 array.flags.insert(ArrayFlags::LEN_KNOWN);
                             }
                         }
+                    } else {
+                        if self.main_stack.top2().tag != DW_TAG_array_type {
+                            if self.shard.warn.check(line!()) { eprintln!("warning: {} in {} is not supported", abbrev.tag(), self.main_stack.top2().tag); }
+                        } else {
+                            // (Warning would already be printed when parsing the parent.)
+                        }
+                        cursor.skip_attributes(abbrev.attributes(), encoding)?;
                     }
                 }
 
                 DW_TAG_generic_subrange => {
                     // Haven't seen these in C++ or Rust.
-                    if self.shard.warn.check(line!()) { eprintln!("warning: arrays with dynamic number of dimensions are not supported (got one @0x{:x}", offset.0); }
+                    if self.shard.warn.check(line!()) { eprintln!("warning: arrays with dynamic number of dimensions are not supported (got one @0x{:x})", offset.0); }
                     cursor.skip_attributes(abbrev.attributes(), encoding)?;
-                }
-
-                // Rust enum.
-                // The tree usually looks like this:
-                //   structure_type
-                //     variant_part - with DW_AT_discr pointing to the discriminant member
-                //       member - discriminant
-                //       variant - with DW_AT_discr_value
-                //         member
-                //       variant
-                //         member
-                //       ...
-                DW_TAG_variant_part => {
-                    // Applicable attributes:
-                    // Useful: discr
-                    // Other: accessibility, declaration, type
-                    let mut variant = VariantInfo {discriminant_die: DebugInfoOffset(0), field_flags: FieldFlags::empty(), discr_value: 0};
-                    for &attr in abbrev.attributes() {
-                        match attr.name() {
-                            DW_AT_discr => match cursor.read_attribute(attr, encoding)? {
-                                AttributeValue::UnitRef(unit_offset) => variant.discriminant_die = unit_offset.to_debug_info_offset(&self.unit.header).unwrap(),
-                                v => if self.shard.warn.check(line!()) { eprintln!("warning: {} has unexpected form: {:?}", attr.name(), v); }
-                            }
-                            _ => cursor.skip_attribute(attr, encoding)?,
-                        }
-                    }
-                    let t = self.stack[self.depth - 1].exact_type;
-                    self.stack[self.depth].exact_type = t;
-                    self.stack[self.depth].variant = Some(variant);
-                }
-                DW_TAG_variant => {
-                    // Applicable attributes:
-                    // Useful: discr_value, discr_list
-                    // Other: accessibility, declaration
-                    let mut variant = self.stack[self.depth - 1].variant.clone();
-                    let mut found_discr = false;
-                    if let Some(variant) = &mut variant {
-                        for &attr in abbrev.attributes() {
-                            match attr.name() {
-                                DW_AT_discr_value => {
-                                    found_discr = true;
-                                    let v = cursor.read_attribute(attr, encoding)?;
-                                    if let Some(x) = v.udata_value().or_else(|| v.sdata_value().map(|x| x as u64)) {
-                                        variant.discr_value = x as usize;
-                                        variant.field_flags.insert(FieldFlags::VARIANT);
-                                    } else {
-                                        if self.shard.warn.check(line!()) { eprintln!("warning: {} has unexpected form: {:?}", attr.name(), v); }
-                                    }
-                                }
-                                // (I looked at one Rust binary, and there were no disct_list-s, so not supporting it yet.)
-                                DW_AT_discr_list => {
-                                    found_discr = true;
-                                    if self.shard.warn.check(line!()) { eprintln!("warning: DW_AT_discr_list is not supported"); }
-                                }
-                                _ => cursor.skip_attribute(attr, encoding)?,
-                            }
-                        }
-                        if !found_discr {
-                            variant.field_flags.insert(FieldFlags::DEFAULT_VARIANT);
-                        }
-                    } else {
-                        if self.shard.warn.check(line!()) { eprintln!("warning: variant is not inside variant_part @0x{:x}", offset.0); }
-                        cursor.skip_attributes(abbrev.attributes(), encoding)?;
-                    }
-                    let t = self.stack[self.depth - 1].exact_type;
-                    self.stack[self.depth].exact_type = t;
-                    self.stack[self.depth].variant = variant;
                 }
 
                 // TODO: Function pointers and pointers to members.
                 DW_TAG_ptr_to_member_type | DW_TAG_subroutine_type => {
                     self.shard.types.add_type(TypeInfo {name: "<unsupported>", die: offset, binary_id: self.loader.binary_id, language: self.unit_language, flags: TypeFlags::UNSUPPORTED, ..TypeInfo::default()});
-                    skip_subtree = self.depth;
+                    skip_subtree = self.main_stack.len;
                     cursor.skip_attributes(abbrev.attributes(), encoding)?;
                 }
 
@@ -3018,13 +3122,15 @@ impl<'a> DwarfLoader<'a> {
                         }
                     }
                     if low_pc.is_some() || high_pc.is_some() || attr_ranges.is_some() {
-                        parse_attr_ranges(&self.loader.sym.dwarf, self.unit, &low_pc, &high_pc, &attr_ranges, offset, self.loader.sym.code_addr_range.start, &mut self.stack[self.depth].pc_ranges, &mut self.shard.warn)?;
-                        self.stack[self.depth].pc_ranges_depth = self.depth;
+                        let ranges_top = self.ranges_stack.push_uninit(&mut self.main_stack.top_mut().flags);
+                        parse_attr_ranges(&self.loader.sym.dwarf, self.unit, &low_pc, &high_pc, &attr_ranges, offset, self.loader.sym.code_addr_range.start, &mut ranges_top.pc_ranges, &mut self.shard.warn)?;
                     }
                 }
 
-                DW_TAG_inlined_subroutine if self.stack[self.depth].function_depth == 0 => {
-                    if self.shard.warn.check(line!()) { eprintln!("warning: unexpected inlined_subroutine not inside function @0x{:x}", offset.0); }
+                DW_TAG_inlined_subroutine if !self.main_stack.top().flags.contains(StackFlags::IS_FUNCTION_SCOPE | StackFlags::IS_VALID_SCOPE) => {
+                    if !self.main_stack.top().flags.contains(StackFlags::IS_FUNCTION_SCOPE) {
+                        if self.shard.warn.check(line!()) { eprintln!("warning: unexpected inlined_subroutine not inside function @0x{:x}", offset.0); }
+                    }
                     cursor.skip_attributes(abbrev.attributes(), encoding)?;
                 }
 
@@ -3048,58 +3154,60 @@ impl<'a> DwarfLoader<'a> {
                             _ => cursor.skip_attribute(attr, encoding)?,
                         }
                     }
-                    let top = &mut self.stack[self.depth];
-                    parse_attr_ranges(&self.loader.sym.dwarf, self.unit, &low_pc, &high_pc, &attr_ranges, offset, self.loader.sym.code_addr_range.start, &mut top.pc_ranges, &mut self.shard.warn)?;
-                    top.pc_ranges_depth = self.depth;
-                    let parent_depth = top.subfunction_depth;
-                    top.subfunction_depth = self.depth;
+                    let ranges_top = self.ranges_stack.push_uninit(&mut self.main_stack.top_mut().flags);
+                    parse_attr_ranges(&self.loader.sym.dwarf, self.unit, &low_pc, &high_pc, &attr_ranges, offset, self.loader.sym.code_addr_range.start, &mut ranges_top.pc_ranges, &mut self.shard.warn)?;
 
-                    let function_depth = top.function_depth;
-                    if self.stack[function_depth].subfunction != usize::MAX {
-                        assert!(parent_depth != 0);
-                        let call_line = self.parse_line_info(call_file, call_line, call_column);
-                        let callee_die = match abstract_origin {
-                            None => {
-                                if self.shard.warn.check(line!()) { eprintln!("warning: inlined_subroutine doesn't say which function was inlined (DW_AT_abstract_origin) @0x{:x}", offset.0); }
+                    let call_line = Self::parse_line_info(&mut self.shard, &self.loader, self.unit_idx, call_file, call_line, call_column);
+                    let callee_die = match abstract_origin {
+                        None => {
+                            if self.shard.warn.check(line!()) { eprintln!("warning: inlined_subroutine doesn't say which function was inlined (DW_AT_abstract_origin) @0x{:x}", offset.0); }
+                            DebugInfoOffset(usize::MAX)
+                        }
+                        Some(val) => match val {
+                            AttributeValue::UnitRef(off) => off.to_debug_info_offset(&self.unit.header).unwrap(),
+                            AttributeValue::DebugInfoRef(off) => off,
+                            _ => {
+                                if self.shard.warn.check(line!()) { eprintln!("warning: abstract origin has unexpected form: {:?}", val); }
                                 DebugInfoOffset(usize::MAX)
                             }
-                            Some(val) => match val {
-                                AttributeValue::UnitRef(off) => off.to_debug_info_offset(&self.unit.header).unwrap(),
-                                AttributeValue::DebugInfoRef(off) => off,
-                                _ => {
-                                    if self.shard.warn.check(line!()) { eprintln!("warning: abstract origin has unexpected form: {:?}", val); }
-                                    DebugInfoOffset(usize::MAX)
-                                }
-                            }
-                        };
+                        }
+                    };
 
-                        let parent_idx = self.stack[parent_depth].subfunction;
-                        assert!(parent_idx != usize::MAX);
-                        let level = self.shard.sym.subfunctions[parent_idx].level + 1;
-                        let sf_idx = self.shard.sym.subfunctions.len();
-                        self.shard.sym.subfunctions.push(Subfunction {callee_idx: callee_die.0, parent: parent_idx, local_variables: Subfunction::pack_range(0..0), call_line: call_line.clone(), level, last_range_idx: usize::MAX});
-                        self.stack[self.depth].subfunction = sf_idx;
-                        for i in 0..self.stack[self.depth].pc_ranges.len() {
-                            let range = self.stack[self.depth].pc_ranges[i].clone();
-                            self.stack[function_depth].subfunction_events.push(SubfunctionEvent {addr: range.begin as usize, level, subfunction_idx: sf_idx, sign: 1});
-                            self.stack[function_depth].subfunction_events.push(SubfunctionEvent {addr: range.end as usize, level, subfunction_idx: sf_idx, sign: -1});
+                    let f = self.function_stack.top_mut();
+                    let parent = self.subfunction_stack.top();
+                    let level = parent.subfunction_level + 1;
+                    let parent_idx = parent.subfunction_idx;
+
+                    if f.subfunctions.len() >= u32::MAX as usize - 1 {
+                        if self.shard.warn.check(line!()) { eprintln!("function @0x{:x} has more than {} inlined function calls; this is not supported", offset.0, u32::MAX-1); }
+                        self.main_stack.top_mut().flags.remove(StackFlags::IS_VALID_SCOPE);
+                    } else if level >= i16::MAX as u16 {
+                        if self.shard.warn.check(line!()) { eprintln!("warning: inlined functions nested > {} levels deep @0x{:x}; this is not supported", i16::MAX - 1, offset.0); }
+                        self.main_stack.top_mut().flags.remove(StackFlags::IS_VALID_SCOPE);
+                    } else {
+                        let sf_idx = f.subfunctions.len() as u32;
+                        f.subfunctions.push((Subfunction {callee_idx: callee_die.0, local_variables: Subfunction::pack_range(0..0), call_line: call_line.clone(), addr_range: 0..0, identity: sf_idx}, parent_idx));
+                        self.subfunction_stack.push_uninit(&mut self.main_stack.top_mut().flags).reset(sf_idx, level);
+                        for range in &self.ranges_stack.top().pc_ranges {
+                            f.subfunction_events.push(SubfunctionEvent {addr: range.begin as usize, subfunction_idx: sf_idx, signed_level: level as i16 + 1});
+                            f.subfunction_events.push(SubfunctionEvent {addr: range.end as usize, subfunction_idx: sf_idx, signed_level: -(level as i16 + 1)});
                         }
                     }
                 }
 
                 // Things we (hopefully) don't care about.
                 DW_TAG_label | DW_TAG_imported_declaration | DW_TAG_imported_module | DW_TAG_GNU_template_parameter_pack | DW_TAG_GNU_template_template_param => {
-                    skip_subtree = self.depth;
+                    skip_subtree = self.main_stack.len;
                     cursor.skip_attributes(abbrev.attributes(), encoding)?;
                 }
 
                 // Function template arguments.
-                DW_TAG_template_type_parameter if self.stack[self.depth - 1].exact_type == ptr::null_mut() => {
-                    skip_subtree = self.depth;
+                DW_TAG_template_type_parameter if !self.main_stack.top().flags.contains(StackFlags::IS_TYPE_SCOPE | StackFlags::IS_VALID_SCOPE) => {
+                    skip_subtree = self.main_stack.len;
                     cursor.skip_attributes(abbrev.attributes(), encoding)?;
                 }
 
-                // Treat struct template arguments as typedefs, as if e.g. vector<int> had a 'using T = int' inside it.
+                // Struct template arguments. Treat them as typedefs, as if e.g. vector<int> had a 'using T = int' inside it. Useful for pretty printers.
                 DW_TAG_template_type_parameter => {
                     // Applicable attributes:
                     // Useful: DECL, name, type
@@ -3114,7 +3222,7 @@ impl<'a> DwarfLoader<'a> {
                         }
                     }
                     if !name.is_empty() && type_ != ptr::null() {
-                        self.stack[self.depth - 1].nested_names.push((name, NestedName::Type(type_)));
+                        self.type_stack.top_mut().nested_names.push((name, NestedName::Type(type_)));
                     }
                 }
 
@@ -3142,7 +3250,7 @@ impl<'a> DwarfLoader<'a> {
                         // Not sure what this means, but it's possible.
                         //if self.shard.warn.check(line!()) { eprintln!("warning: DW_TAG_template_value_parameter without DW_AT_const_value or DW_AT_type @0x{:x}", offset.0); }
                     } else {
-                        let decl = self.parse_line_info(decl_file, decl_line, decl_column);
+                        let decl = Self::parse_line_info(&mut self.shard, &self.loader, self.unit_idx, decl_file, decl_line, decl_column);
                         let var = Variable::new(name, type_, offset, decl, VariableFlags::TEMPLATE_PARAMETER);
                         self.add_variable_locations(&None, &attr_const_value, &None, var, offset)?;
                     }
@@ -3153,124 +3261,119 @@ impl<'a> DwarfLoader<'a> {
         }
     }
 
+    fn finish_subfunction(&mut self) {
+        let top = self.subfunction_stack.pop_mut();
+        let start = self.shard.sym.local_variables.len();
+        self.shard.sym.local_variables.append(&mut top.local_variables);
+        let end = self.shard.sym.local_variables.len();
+        let subfunction_idx = top.subfunction_idx;
+        self.function_stack.top_mut().subfunctions[subfunction_idx as usize].0.local_variables = Subfunction::pack_range(start..end);
+    }
+    
     fn finish_function(&mut self) {
-        let top = &mut self.stack[self.depth + 1];
-        if top.subfunction == usize::MAX {
+        let top = self.function_stack.pop_mut();
+        if top.subfunction_events.is_empty() {
+            // Inline-only function.
             return;
         }
-        assert!(top.function != usize::MAX && !top.pc_ranges.is_empty());
 
-        // Do a sweeping line (or whatever it's called) to turn arbitrary set of ranges into a well-formed tree of nested ranges,
-        // and link ranges of each subfunction into a linked list.
-        top.subfunction_events.sort_unstable_by_key(|e| (e.addr, e.sign, e.level as i32 * e.sign as i32));
+        // Do a sweeping line to turn arbitrary set of ranges into a well-formed tree of nested ranges,
+        // (because who knows what garbage the debug info may contain in practice).
+        // Imagine a flame graph being scanned left to right by a vertical line. Each iteration of the loop corresponds to a left or right edge of a rectangle.
+        top.subfunction_events.sort_unstable_by_key(|e| (e.addr, e.signed_level));
         let temp = &mut self.temp;
-        temp.list_heads.clear();
+        // stack: Vec<(/*subfunction_idx*/ usize, /*range_idx*/ usize, /*active*/ usize)>,
         temp.stack.clear();
-        let mut levels_len = 0usize; // effective length of temp.levels; we don't clear it to avoid reallocating inner Vec-s
-        let mut last_closed: (usize, LineInfo) = (usize::MAX, LineInfo::invalid());
-        for &SubfunctionEvent {addr, subfunction_idx, level, sign} in &top.subfunction_events {
-            if addr > last_closed.0 {
-                if last_closed.1.file_idx().is_some() {
-                    // .debug_line often doesn't have a row at the end of inlined function. I.e. the first few instructions
-                    // after the inlined function still have the same line number as the insides of the inlined function, which makes things really confusing.
-                    // I'm not sure what's the intention there. I guess the debugger is supposed to realize that the instructions after an inlined function
-                    // have the same line number as the inlined function's call site? Let's interpret it that way and add LineInfo, with lower priority than the
-                    // LineInfo-s from .debug_line.
-                    self.shard.sym.addr_to_line.push(last_closed.1.clone().with_addr_and_flags(last_closed.0, LineFlags::INLINED_FUNCTION));
-                }
-                last_closed.0 = usize::MAX;
-            }
-
-            let level = level as usize;
-            if sign > 0 {
+        // (temp.levels[..num_levels] are cleared near the end of this function)
+        let mut num_levels = 0usize; // effective length of temp.levels; we don't clear it to avoid reallocating inner Vec-s
+        for event_idx in 0..top.subfunction_events.len() {
+            let &SubfunctionEvent {addr, subfunction_idx, signed_level} = &top.subfunction_events[event_idx];
+            let level = (signed_level.abs() - 1) as usize;
+            if signed_level > 0 { // start of a range
                 if level < temp.stack.len() {
-                    if temp.stack[level].0 == subfunction_idx {
-                        temp.stack[level].2 += 1;
-                    } else {
-                        if self.shard.warn.check(line!()) { eprintln!("warning: overlapping inline function ranges at address 0x{:x} @0x{:x}", addr, self.shard.sym.subfunctions[subfunction_idx].callee_idx); }
+                    if temp.stack[level].0 != subfunction_idx {
+                        if self.shard.warn.check(line!()) { eprintln!("warning: overlapping inlined function ranges at address 0x{:x} in function @0x{:x}", addr, self.shard.functions[top.function].die.0); }
+                        // Increment the counter anyway, because the corresponding closing event will decrement it.
+                        // (Alternatively, we could make a memo to ignore the corresponding close event. Note that making the increment+decrement
+                        //  conditional on just subfunction_idx would be incorrect: the subfunction idx in the stack may change between the start and end event.)
                     }
+                    temp.stack[level].2 += 1;
                     continue;
                 }
                 let start_level = temp.stack.len();
                 temp.stack.resize(level + 1, (0, 0, 0));
-                if level >= levels_len {
-                    if levels_len == temp.levels.len() {
-                        temp.levels.resize_with(temp.levels.len() * 2 + 100, || Vec::new());
+                if level >= num_levels {
+                    num_levels = level + 1;
+                    if num_levels > temp.levels.len() {
+                        temp.levels.resize_with(num_levels * 4, || Vec::new());
                     }
-                    levels_len += 1;
                 }
 
                 // Open a range at current level and for all ancestors that don't have a range open.
                 temp.stack.last_mut().unwrap().2 += 1;
                 let mut cur_sf_idx = subfunction_idx;
                 for cur_level in (start_level..level+1).rev() {
-                    let cur_sf = &mut self.shard.sym.subfunctions[cur_sf_idx];
-                    assert!(cur_level == cur_sf.level as usize);
+                    let &(ref cur_sf, parent) = &top.subfunctions[cur_sf_idx as usize];
                     let new_range_idx = temp.levels[cur_level].len();
                     temp.stack[cur_level].0 = cur_sf_idx;
                     temp.stack[cur_level].1 = new_range_idx;
-                    temp.levels[cur_level].push(SubfunctionPcRange {range: addr..addr, subfunction_idx: cur_sf_idx, prev_range_idx: cur_sf.last_range_idx});
-                    if cur_sf.last_range_idx == usize::MAX {
-                        temp.list_heads.push((cur_sf_idx, new_range_idx));
-                    }
-                    cur_sf.last_range_idx = new_range_idx;
+                    temp.levels[cur_level].push(Subfunction {addr_range: addr..addr, ..*cur_sf});
 
                     if cur_level > 0 && cur_sf.call_line.file_idx().is_some() {
                         self.shard.sym.line_to_addr.push((cur_sf.call_line.clone().with_addr_and_flags(addr, LineFlags::INLINED_FUNCTION | LineFlags::STATEMENT), cur_level as u16 - 1));
                     }
 
-                    cur_sf_idx = cur_sf.parent;
+                    cur_sf_idx = parent;
                 }
             } else {
-                if temp.stack[level].0 == subfunction_idx {
-                    temp.stack[level].2 -= 1;
-                }
-                while let Some(&(_, range_idx, active)) = temp.stack.last() {
+                temp.stack[level].2 -= 1;
+                let mut last_closed_sf = u32::MAX;
+                while let Some(&(subfunction_idx, range_idx, active)) = temp.stack.last() {
                     if active != 0 {
                         break;
                     }
                     temp.stack.pop();
                     let range = &mut temp.levels[temp.stack.len()][range_idx];
-                    range.range.end = addr;
-                    let sf = &self.shard.sym.subfunctions[range.subfunction_idx];
-                    last_closed = (addr, sf.call_line.clone());
+                    range.addr_range.end = addr;
+                    last_closed_sf = subfunction_idx;
+                }
+                if last_closed_sf != u32::MAX && event_idx + 1 < top.subfunction_events.len() && top.subfunction_events[event_idx + 1].addr > addr {
+                    let sf = &top.subfunctions[last_closed_sf as usize].0;
+                    if sf.call_line.file_idx().is_some() {
+                        // .debug_line often doesn't have a row at the end of inlined function. I.e. the first few instructions
+                        // after the inlined function still have the same line number as the insides of the inlined function, which makes things really confusing.
+                        // I'm not sure what's the intention there. I guess the debugger is supposed to realize that the instructions after an inlined function
+                        // have the same line number as the inlined function's call site? Let's interpret it that way and add LineInfo, with lower priority than the
+                        // LineInfo-s from .debug_line.
+                        self.shard.sym.addr_to_line.push(sf.call_line.clone().with_addr_and_flags(addr, LineFlags::INLINED_FUNCTION));
+                    }
                 }
             }
         }
         assert!(temp.stack.is_empty());
 
-        // Circularize the linked lists.
-        for &(subfunction_idx, first_range_idx) in &temp.list_heads {
-            let sf = &mut self.shard.sym.subfunctions[subfunction_idx];
-            temp.levels[sf.level as usize][first_range_idx].prev_range_idx = sf.last_range_idx;
-        }
-
         // Concatenate the per-level range arrays into one array.
-        if self.shard.sym.subfunction_levels.last() != Some(&self.shard.sym.subfunction_pc_ranges.len()) {
-            self.shard.sym.subfunction_levels.push(self.shard.sym.subfunction_pc_ranges.len());
+        if self.shard.sym.subfunction_levels.last() != Some(&self.shard.sym.subfunctions.len()) {
+            self.shard.sym.subfunction_levels.push(self.shard.sym.subfunctions.len());
         }
         let levels_start = self.shard.sym.subfunction_levels.len() - 1;
-        for level in 0..levels_len {
-            self.shard.sym.subfunction_pc_ranges.append(&mut temp.levels[level]);
-            self.shard.sym.subfunction_levels.push(self.shard.sym.subfunction_pc_ranges.len());
+        for level in 0..num_levels {
+            self.shard.sym.subfunctions.append(&mut temp.levels[level]);
+            self.shard.sym.subfunction_levels.push(self.shard.sym.subfunctions.len());
 
             temp.levels[level].clear();
         }
         let level_idxs = levels_start..self.shard.sym.subfunction_levels.len();
-        assert!(level_idxs.len() == levels_len + 1);
+        assert!(level_idxs.len() == num_levels + 1);
 
         self.shard.functions[top.function].subfunction_levels = level_idxs;
     }
 
     fn finish_type(&mut self) {
-        let top = &mut self.stack[self.depth + 1];
-        let t = top.exact_type;
-        if t == ptr::null_mut() {
-            return;
-        }
-        let t = unsafe {&mut *t};
-        if !top.nested_names.is_empty() {
-            t.nested_names = self.shard.types.temp_types.misc_arena.add_slice(&top.nested_names);
+        let type_top = self.type_stack.pop();
+        let t = unsafe {&mut *type_top.type_};
+        if !type_top.nested_names.is_empty() {
+            t.nested_names = self.shard.types.temp_types.misc_arena.add_slice(&type_top.nested_names);
         }
     }
 }

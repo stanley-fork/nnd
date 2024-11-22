@@ -1405,12 +1405,7 @@ impl LocationsWindow {
 
         let mut row_idx = 0;
         for level in 0..function.num_levels() {
-            let ranges = symbols.subfunction_ranges_at_level(level, function);
-            for (i, range) in ranges.iter().enumerate() {
-                if range.prev_range_idx < i {
-                    continue;
-                }
-                let sf = &symbols.shards[function.shard_idx()].subfunctions[range.subfunction_idx];
+            for sf in symbols.subfunctions_at_level(level, function) {
                 for v in symbols.local_variables_in_subfunction(sf, function.shard_idx()) {
                     if !v.range().contains(&static_addr) {
                         continue;
@@ -1890,7 +1885,7 @@ impl WindowContent for DisassemblyWindow {
         assert_eq!(disas.symbols_shard, Some(function.shard_idx()));
         let symbols_shard = &symbols.shards[function.shard_idx()];
 
-        let mut selected_subfunction_idx: Option<usize> = None;
+        let mut selected_subfunction_identity: Option<u32> = None;
         let mut source_line: Option<SourceScrollTarget> = None;
 
         if let Some(disas_line) = disas.lines.get(tab.area_state.cursor) {
@@ -1943,7 +1938,7 @@ impl WindowContent for DisassemblyWindow {
 
                 (sf_idx, level) = symbols.subfunction_ancestor_at_level(sf_idx, level, selected_level, function);
                 if level == selected_level {
-                    selected_subfunction_idx = Some(sf_idx);
+                    selected_subfunction_identity = Some(symbols_shard.subfunctions[sf_idx].identity);
                 }
             }
             if let Some(line) = source_line_info {
@@ -2086,7 +2081,7 @@ impl WindowContent for DisassemblyWindow {
                         end += 1;
                     }
 
-                    let is_selected = selected_subfunction_idx == Some(cur_sf);
+                    let is_selected = selected_subfunction_identity == Some(symbols.shards[function.shard_idx()].subfunctions[cur_sf].identity);
                     let (symbol, style) = if is_selected {&ui.palette.tree_indent_selected} else {&ui.palette.tree_indent};
                     for i in start..end {
                         let mut s = *style;
@@ -3621,7 +3616,7 @@ impl CodeWindow {
             // But suppose the line is in a function that is inlined at various call sites, and may also have its own machine code.
             // Which of those should we select? Always the non-inlined one? No. The user could be looking at an inlined site
             // (e.g. autoselected based on stack trace) - then jumping to a totally different function would be jarring.
-            // So I guess we should pick the address that's "closest" to the disassembly cursor, where "closest" means it's is in the
+            // So I guess we should pick the address that's "closest" to the disassembly window's cursor, where "closest" means it's is in the
             // same function and has the lowest lowest-common-ancestor in subfunction tree. That's what we do here.
             // This can still be pretty annoying though: if you randomly scroll back and forth in the source file, the disassembly will probably
             // jump to a different function at some point and will forget the relevant inlined site; maybe we should take stack trace into account too?
@@ -3636,9 +3631,9 @@ impl CodeWindow {
                 if function.num_levels() < 2 {
                     return true;
                 }
-                let ranges = symbols.subfunction_ranges_at_level(1, function);
-                let idx = ranges.partition_point(|r| r.range.end <= static_addr);
-                idx == ranges.len() || ranges[idx].range.start > static_addr
+                let ranges = symbols.subfunctions_at_level(1, function);
+                let idx = ranges.partition_point(|r| r.addr_range.end <= static_addr);
+                idx == ranges.len() || ranges[idx].addr_range.start > static_addr
             }).unwrap_or(0);
             let mut selected_idx: Option<usize> = None;
             if let Some((binary_id, selected_function_idx, selected_addr)) = &state.selected_addr {
@@ -3649,12 +3644,12 @@ impl CodeWindow {
                     let shard = &symbols.shards[function.shard_idx()];
                     let mut subfunction_ranges: Vec<Range<usize>> = Vec::new();
                     for level in 1..function.num_levels().max(1) {
-                        let pc_ranges = symbols.subfunction_ranges_at_level(level, function);
-                        let idx = pc_ranges.partition_point(|r| r.range.end <= selected_static_addr);
-                        if idx == pc_ranges.len() || pc_ranges[idx].range.start > selected_static_addr {
+                        let pc_ranges = symbols.subfunctions_at_level(level, function);
+                        let idx = pc_ranges.partition_point(|r| r.addr_range.end <= selected_static_addr);
+                        if idx == pc_ranges.len() || pc_ranges[idx].addr_range.start > selected_static_addr {
                             break;
                         }
-                        subfunction_ranges.push(pc_ranges[idx].range.clone());
+                        subfunction_ranges.push(pc_ranges[idx].addr_range.clone());
                     }
                     let mut closest = (0usize, 0usize);
                     for (idx, &(function_idx, _, static_addr)) in addrs.iter().enumerate() {

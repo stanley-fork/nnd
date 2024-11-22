@@ -8,7 +8,10 @@ fix incorrect column numbers with tab indentation (tabs should be counted as 1 c
 investigate why exception-aware step-over doesn't work in clickhouse, at least sometimes
 
 investigate why quitting is slow
-optimize simple things found by profiler (samply is nice)
+optimize symbols loading
+  test things
+  rewrite dwarf parser (declare struct layouts per tag, preprocess abbreviations, parse+resolve/convert attributes directly into the structs)
+  simple things found by profiler (samply is nice)
   attr_string
   avoid allocations in finish_function
   read_abbreviation (array indexing, of all things)
@@ -25,7 +28,6 @@ test with watches window filled with long arrays (I saw 50ms frames when there a
 
 do something for downcasts in conditional breakpoints (coalesce()? maybe()? ?()? ()?? checkbox to stop on error? 'is' operator? explicit checked downcast? also function to check field presense without evaluating it)
 edit breakpoint condition on click
-indicate when subfunction pc ranges are non-contiguous, maybe just add dim " [cont]" to callee name if it's not the first range
 support casting slices (e.g. from pretty printers) to slices of different type (especially string)
 allow casting n-byte arrays/structs to/from n-byte primitive types
 `in` operator, e.g. x in [1, 2, 3]
