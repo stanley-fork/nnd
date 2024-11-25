@@ -283,7 +283,7 @@ pub fn disassemble_function(function_idx: usize, mut static_addr_ranges: Vec<Ran
 
                         styled_write!(res.text, palette.default_dim, "{}", callee_name);
 
-                        if !seen_subfunction_identities.insert(subfunction.identity) {//asdqwe check if this is how insert() works
+                        if !seen_subfunction_identities.insert(subfunction.identity) {
                             // Indicate that the inlined function has multiple address ranges.
                             styled_write!(res.text, palette.default_dim, " [cont]");//asdqwe test this, along with mouse hover on multi-range inlined functions
                         }

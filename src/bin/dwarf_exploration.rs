@@ -1,7 +1,7 @@
 #![allow(non_upper_case_globals)]
 extern crate nnd;
 use nnd::{*, error::{*, Result, Error}, elf::*, log::*};
-use std::{fs::{File}, str, mem, collections::hash_map::DefaultHasher, hash::Hasher, fmt::Write as FmtWrite, io::{self, Write}, mem::drop, collections::HashMap};
+use std::{fs::{File}, str, mem, collections::hash_map::DefaultHasher, hash::{Hasher, Hash}, fmt::Write as FmtWrite, io::{self, Write}, mem::drop, collections::{HashMap, HashSet}};
 use gimli::*;
 
 type SliceType = EndianSlice<'static, LittleEndian>;
@@ -123,6 +123,11 @@ fn main() -> Result<()> {
     {
         let prof = ProfileScope::new(".debug_info pre-pass".to_string());
 
+        let (mut abbrev_count_total, mut abbrev_count_max, mut abbrev_attrs_total, mut abbrev_bytes_total, mut abbrev_nonconsecutive, mut abbrev_chasable) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+        let mut abbrev_set_hashes: HashSet<usize> = HashSet::new();
+        let mut abbrev_single_hashes: HashSet<usize> = HashSet::new();
+        let mut abbrev_offsets: HashSet<usize> = HashSet::new();
+
         // We have to iterate everything twice because dwarf sux.
         let mut units_iter = dwarf.units();
         while let Some(header) = units_iter.next()? {
@@ -143,12 +148,60 @@ fn main() -> Result<()> {
                 }
             }
 
+            if abbrev_offsets.insert(unit.header.debug_abbrev_offset().0) {
+                let abbrev = &unit.abbreviations;
+                let c = abbrev.vec.len() + abbrev.map.len();
+                abbrev_count_total += c;
+                if !abbrev.map.is_empty() {
+                    abbrev_nonconsecutive += 1;
+                }
+                abbrev_count_max = abbrev_count_max.max(c);
+                abbrev_bytes_total += c * mem::size_of::<Abbreviation>();
+                let mut set_hasher = DefaultHasher::new();
+                abbrev.vec.len().hash(&mut set_hasher);
+                abbrev.map.len().hash(&mut set_hasher);
+                for a in abbrev.vec.iter().chain(abbrev.map.values()) {
+                    let mut single_hasher = DefaultHasher::new();
+                    abbrev_attrs_total += a.attributes().len();
+                    abbrev_bytes_total += a.attributes().len() * mem::size_of::<AttributeSpecification>();
+                    a.attributes().len().hash(&mut single_hasher);
+                    a.code().hash(&mut single_hasher);
+                    a.tag().hash(&mut single_hasher);
+                    a.has_children().hash(&mut single_hasher);
+                    for attr in a.attributes() {
+                        attr.name().hash(&mut single_hasher);
+                        attr.form().hash(&mut single_hasher);
+                        attr.implicit_const_value().hash(&mut single_hasher);
+                    }
+                    let single_hash = single_hasher.finish() as usize;
+                    abbrev_single_hashes.insert(single_hash);
+                    single_hash.hash(&mut set_hasher);
+                    match a.tag() {
+                        DW_TAG_variable | DW_TAG_formal_parameter | DW_TAG_subprogram => abbrev_chasable += 1,
+                        _ => (),
+                    }
+                }
+                let set_hash = set_hasher.finish() as usize;
+                abbrev_set_hashes.insert(set_hash);
+            }
+
             units_vec.push(unit);
         }
 
         drop(prof);
         dbg!(units_vec.len());
         dbg!(line_programs.len());
+        dbg!(abbrev_count_total);
+        dbg!(abbrev_count_max);
+        dbg!(abbrev_attrs_total);
+        dbg!(abbrev_bytes_total);
+        dbg!(abbrev_nonconsecutive);
+        dbg!(abbrev_chasable);
+        dbg!(abbrev_offsets.len());
+        dbg!(abbrev_set_hashes.len());
+        dbg!(abbrev_single_hashes.len());
+        dbg!(mem::size_of::<Abbreviation>());
+        dbg!(mem::size_of::<AttributeSpecification>());
         eprintln!("-----");
     }
 

@@ -189,6 +189,7 @@ pub struct Symbols {
 pub struct CompilationUnit {
     pub offset: DieOffset,
     pub unit: Unit<DwarfSlice>,
+    pub abbreviations: AbbreviationSet,
 
     pub name: String,
     pub comp_dir: &'static str,
@@ -355,7 +356,7 @@ pub enum VariableLocation<'a> {
 #[derive(Clone, Copy)]
 pub enum PackedVariableLocation {
     ShortConst([u8; 12]),
-    LongConst {ptr: *const u8, len: u32}, // in the binary mmap, not necessarily longer than ShortConst limit
+    LongConst {ptr: *const u8, len: u32}, // in the binary mmap; not necessarily longer than ShortConst limit
     Expr {ptr: *const u8, len: u32},
     Unknown,
 }
@@ -704,14 +705,14 @@ impl Symbols {
     }
 
     pub fn containing_subfunction_at_level(&self, addr: usize, level: u16, function: &FunctionInfo) -> Option<(/*subfunction_idx*/ usize, /*level*/u16)> {
+        let shard = &self.shards[function.shard_idx()];
+        let levels = &shard.subfunction_levels[function.subfunction_levels.clone()];
         let range = if level == u16::MAX {
             0..function.num_levels()
         } else {
+            assert!(levels.len() > level as usize + 1);
             level as usize..level as usize + 1
         };
-        let shard = &self.shards[function.shard_idx()];
-        let levels = &shard.subfunction_levels[function.subfunction_levels.clone()];
-        assert!(levels.len() > level as usize + 1);
         let mut res = None;
         for level in range {
             let idxs = levels[level]..levels[level+1];
@@ -866,6 +867,7 @@ pub struct SymbolsLoader {
     shards: Vec<SyncUnsafeCell<CachePadded<SymbolsLoaderShard>>>,
     die_to_function_shards: Vec<SyncUnsafeCell<CachePadded<Vec<(DieOffset, usize)>>>>,
     types: TypesLoader,
+    abbreviations_shared: AbbreviationsSharedData,
     binary_id: usize,
 
     // Shuffling global variable names across threads for deduplication.
@@ -1003,11 +1005,6 @@ impl SymbolsLoader {
         }
 
         let mut dwarf = Dwarf::load(load_section)?;
-        *status.stage.lock().unwrap() = "loading abbreviations".to_string();
-        {
-            let _prof = ProfileScope::with_threshold(0.01, format!("loading abbreviations {}", elf.name));
-            dwarf.populate_abbreviations_cache(AbbreviationsCacheStrategy::All);
-        }
         *status.stage.lock().unwrap() = "listing units".to_string();
 
         if dwarf.debug_info.reader().is_empty() && warnings.is_empty() {
@@ -1083,39 +1080,58 @@ impl SymbolsLoader {
         let debug_info_section = dwarf.debug_info.reader().slice();
         let mut reported_progress_offset = 0usize;
 
+        let layouts = AllAttributeStructLayouts::new(
+            vec![
+                (DW_TAG_variable, VariableAttributes::layout()),
+                (DW_TAG_formal_parameter, VariableAttributes::layout()),
+
+                (DW_TAG_base_type, TypeAttributes::layout()),
+                (DW_TAG_unspecified_type, TypeAttributes::layout()),
+                (DW_TAG_structure_type, TypeAttributes::layout()),
+                (DW_TAG_class_type, TypeAttributes::layout()),
+                (DW_TAG_union_type, TypeAttributes::layout()),
+                (DW_TAG_enumeration_type, TypeAttributes::layout()),
+                (DW_TAG_pointer_type, TypeAttributes::layout()),
+                (DW_TAG_reference_type, TypeAttributes::layout()),
+                (DW_TAG_rvalue_reference_type, TypeAttributes::layout()),
+                (DW_TAG_array_type, TypeAttributes::layout()),
+                (DW_TAG_const_type, TypeAttributes::layout()),
+                (DW_TAG_restrict_type, TypeAttributes::layout()),
+                (DW_TAG_volatile_type, TypeAttributes::layout()),
+                (DW_TAG_atomic_type, TypeAttributes::layout()),
+                (DW_TAG_typedef, TypeAttributes::layout()),
+            ],
+            AttributeStructLayout::default(),
+            vec![DW_TAG_label, DW_TAG_variable, DW_TAG_formal_parameter, DW_TAG_subprogram, DW_TAG_inlined_subroutine]);
+
         let mut units: Vec<CompilationUnit> = Vec::new();
-        {
-            let _prof = ProfileScope::with_threshold(0.01, format!("listing units {}", elf.name));
-            let mut units_iter = dwarf.units();
-            while let Some(unit_header) = units_iter.next()? {
-                let unit = dwarf.unit(unit_header)?;
+        let (listed_units, abbreviations_shared) = list_units(&mut dwarf, &elf.name, layouts)?;
+        for (unit, abbreviations) in listed_units {
+            let offset = match unit.header.offset() {
+                UnitSectionOffset::DebugInfoOffset(o) => o,
+                _ => return err!(Internal, "unit offset has unexpected type"),
+            };
+            let name = match &unit.name {
+                Some(n) => str::from_utf8(n.slice())?.to_string(),
+                None => format!("[unit @0x{:x}]", offset.0) };
+            let comp_dir = match &unit.comp_dir {
+                Some(d) => str::from_utf8(d.slice())?,
+                None => "" };
 
-                let offset = match unit.header.offset() {
-                    UnitSectionOffset::DebugInfoOffset(o) => o,
-                    _ => return err!(Internal, "unit offset has unexpected type"),
-                };
-                let name = match &unit.name {
-                    Some(n) => str::from_utf8(n.slice())?.to_string(),
-                    None => format!("[unit @0x{:x}]", offset.0) };
-                let comp_dir = match &unit.comp_dir {
-                    Some(d) => str::from_utf8(d.slice())?,
-                    None => "" };
-
-                if offset.0 > round_robin_offset + unit_distribution_granularity {
-                    round_robin_offset = offset.0;
-                    round_robin_shard = (round_robin_shard + 1) % shards.len();
-                }
-                let shard_idx = round_robin_shard;
-                shards[shard_idx].units.push(units.len());
-
-                if offset.0 > reported_progress_offset + 10000000 {
-                    reported_progress_offset = offset.0;
-                    status.progress_ppm.store((offset.0 as f64 / debug_info_section.len() as f64 * progress_per_stage[0][1].0 * 1e6) as usize, Ordering::Relaxed);
-                }
-
-                // This is not necessarily a compilation unit (can be type unit), but we don't care, it's just a tree of DIEs either way.
-                units.push(CompilationUnit {offset, name, comp_dir, unit, shard_idx, file_idx_remap: Vec::new()});
+            if offset.0 > round_robin_offset + unit_distribution_granularity {
+                round_robin_offset = offset.0;
+                round_robin_shard = (round_robin_shard + 1) % shards.len();
             }
+            let shard_idx = round_robin_shard;
+            shards[shard_idx].units.push(units.len());
+
+            if offset.0 > reported_progress_offset + 10000000 {
+                reported_progress_offset = offset.0;
+                status.progress_ppm.store((offset.0 as f64 / debug_info_section.len() as f64 * progress_per_stage[0][1].0 * 1e6) as usize, Ordering::Relaxed);
+            }
+
+            // This is not necessarily a compilation unit (can be type unit), but we don't care, it's just a tree of DIEs either way.
+            units.push(CompilationUnit {offset, name, comp_dir, unit, abbreviations, shard_idx, file_idx_remap: Vec::new()});
         }
 
         for [_, symtab] in &strtab_symtab {
@@ -1137,7 +1153,7 @@ impl SymbolsLoader {
         Ok(SymbolsLoader {
             num_shards: shards.len(), binary_id, sym: Symbols {elf, additional_elves, warnings, notices, dwarf, units, files: Vec::new(), file_paths: StringTable::new(), path_to_used_file: HashMap::new(), functions: Vec::new(), shards: Vec::new(), builtin_types: BuiltinTypes::invalid(), base_types: Vec::new(), vtables: Vec::new(), points_of_interest: HashMap::new(), code_addr_range},
             shards: shards.into_iter().map(|s| SyncUnsafeCell::new(CachePadded::new(s))).collect(), die_to_function_shards: (0..num_shards).map(|_| SyncUnsafeCell::new(CachePadded::new(Vec::new()))).collect(), types: types_loader, send_global_variable_names, strtab_symtab, status, progress_per_stage,
-            prepare_time_per_stage_ns, run_time_per_stage_ns, shard_progress_ppm: (0..num_shards).map(|_| CachePadded::new(AtomicUsize::new(0))).collect(), stage: 0, types_before_dedup: 0, type_offsets: 0, type_offset_maps_bytes: 0, type_dedup_maps_bytes: 0})
+            abbreviations_shared, prepare_time_per_stage_ns, run_time_per_stage_ns, shard_progress_ppm: (0..num_shards).map(|_| CachePadded::new(AtomicUsize::new(0))).collect(), stage: 0, types_before_dedup: 0, type_offsets: 0, type_offset_maps_bytes: 0, type_dedup_maps_bytes: 0})
     }
 
     // The loading procedure alternates between single-threaded and multithreaded (sharded) parts. This is the single-threaded part, while run() is the multithreaded part.
@@ -1866,6 +1882,7 @@ struct DwarfLoader<'a> {
     unit_idx: usize,
     unit: &'a Unit<DwarfSlice>,
     unit_language: LanguageFamily,
+    abbreviations: &'a AbbreviationSet,
 
     // Scope name, like "std::vector<int>". We append to it when going into a namespace/class/function/etc, then un-append when leaving the subtree.
     scope_name: String,
@@ -1942,7 +1959,6 @@ bitflags! { struct StackFlags: u16 {
 
     // Are we in a function scope, or type scope, or neither? E.g. if some types/functions are nested in one another, it'll describe the innermost one.
     // These two flags are mutually exclusive.
-    //asdqwe set and unset all 3 of these where needed, check all tags
     const IS_FUNCTION_SCOPE = 0x40;
     const IS_TYPE_SCOPE = 0x80;
     // Unset if we're in function/type scope, but we decided to discard that function/type (e.g. the function is unused or inline-only, or we failed to parse something).
@@ -1992,7 +2008,6 @@ impl SubfunctionStackEntry { fn reset(&mut self, subfunction_idx: u32, subfuncti
 
 // Type (struct, enum, pointer, etc).
 struct TypeStackEntry {
-    //asdqwe remember to not propagate to descendants (check StackFlags): non-null iff the *current* DIE is a type (struct/union/array/etc); not propagated to descendants, e.g. if there's a function inside the type, the type_ is unset inside the function
     type_: *mut TypeInfo, // a real pointer (not DieOffset) to the type
     nested_names: Vec<(&'static str, NestedName)>, // if exact_type is not null
 
@@ -2011,11 +2026,36 @@ struct RangesStackEntry {
     pc_ranges: Vec<gimli::Range>,
 }
 
+dwarf_struct!{ VariableAttributes {
+    decl: DwarfCodeLocation, DW_AT_decl_file, CodeLocation;
+    specification_or_abstract_origin: DwarfReference, DW_AT_specification, SpecificationOrAbstractOrigin;
+    name: &'static str, DW_AT_name, String;
+    linkage_name: &'static str, DW_AT_linkage_name, String;
+    type_: /*DieOffset*/ usize, DW_AT_type, DebugInfoOffset;
+    location_expr: /*Expression*/ &'static [u8], DW_AT_location, Expression;
+    location_lists: /*LocationListsOffset*/ usize, DW_AT_location, LocationListsOffset;
+    const_value_usize: usize, DW_AT_const_value, MaybeSigned;
+    const_value_slice: &'static [u8], DW_AT_const_value, Slice;
+}}
+
+dwarf_struct!{ TypeAttributes {
+    decl: DwarfCodeLocation, DW_AT_decl_file, CodeLocation;
+    specification_or_abstract_origin: DwarfReference, DW_AT_specification, SpecificationOrAbstractOrigin;
+    name: &'static str, DW_AT_name, String;
+    type_: /*DieOffset*/ usize, DW_AT_type, DebugInfoOffset;
+    byte_size: usize, DW_AT_byte_size, Unsigned;
+    bit_size: usize, DW_AT_bit_size, Unsigned;
+    declaration: bool, DW_AT_declaration, Flag;
+    encoding: usize, DW_AT_encoding, Unsigned;
+    byte_stride: usize, DW_AT_byte_stride, Unsigned;
+    bit_stride: usize, DW_AT_bit_stride, Unsigned;
+}}
+
 impl<'a> DwarfLoader<'a> {
     fn new(loader: &'a SymbolsLoader, shard: &'a mut SymbolsLoaderShard, unit_idx: usize) -> Result<Self> {
         let unit = &loader.sym.units[unit_idx];
         let section_slice = *loader.sym.dwarf.debug_info.reader();
-        Ok(Self {loader, section_slice, shard_idx: unit.shard_idx, shard, unit_idx, unit: &unit.unit, unit_language: LanguageFamily::Unknown, scope_name: String::new(), temp: LoaderTempStorage::default(), main_stack: FastStack::default(), scope_stack: FastStack::default(), function_stack: FastStack::default(), subfunction_stack: FastStack::default(), type_stack: FastStack::default(), ranges_stack: FastStack::default()})
+        Ok(Self {loader, section_slice, shard_idx: unit.shard_idx, shard, unit_idx, unit: &unit.unit, abbreviations: &unit.abbreviations, unit_language: LanguageFamily::Unknown, scope_name: String::new(), temp: LoaderTempStorage::default(), main_stack: FastStack::default(), scope_stack: FastStack::default(), function_stack: FastStack::default(), subfunction_stack: FastStack::default(), type_stack: FastStack::default(), ranges_stack: FastStack::default()})
     }
 
     fn append_namespace_to_scope_name(&mut self, s: &str, linkable: bool) {
@@ -2196,7 +2236,7 @@ impl<'a> DwarfLoader<'a> {
         Ok(())
     }
 
-    fn chase_origin_pointers(shard: &mut SymbolsLoaderShard, loader: &SymbolsLoader, unit: &Unit<DwarfSlice>, unit_idx: usize, mut attr_specification_or_origin: Option<AttributeValue<DwarfSlice>>, name: &mut Option<&'static str>, linkage_name: &mut Option<&'static str>, type_: &mut Option<*const TypeInfo>, mut decl: Option<&mut LineInfo>) -> Result<()> {
+    fn chase_origin_pointers(shard: &mut SymbolsLoaderShard, loader: &SymbolsLoader, unit: &Unit<DwarfSlice>, unit_idx: usize, abbreviations: &AbbreviationSet, mut attr_specification_or_origin: Option<AttributeValue<DwarfSlice>>, name: &mut Option<&'static str>, linkage_name: &mut Option<&'static str>, type_: &mut Option<*const TypeInfo>, mut decl: Option<&mut LineInfo>) -> Result<()> {
         let mut cur_unit = unit;
         while let Some(specification_or_origin) = attr_specification_or_origin {
             let (next_unit, next_offset) = match specification_or_origin {
@@ -2215,17 +2255,17 @@ impl<'a> DwarfLoader<'a> {
             cur_unit = next_unit;
 
             let mut entries_iter = cur_unit.header.range_from(next_offset..)?;
-            let abbrev = match entries_iter.read_abbreviation(&unit.abbreviations)? {
+            let abbrev = match entries_iter.read_abbreviation(abbreviations)? {
                 None => return err!(Dwarf, "specification/abstract_origin points to null entry"),
                 Some(a) => a };
             attr_specification_or_origin = None;
             let encoding = unit.encoding();
             let (mut attr_file, mut attr_line, mut attr_column) = (None, None, None);
-            for &attr in abbrev.attributes() {
+            for &attr in &abbrev.attributes {
                 match attr.name() {
                     DW_AT_name => {name.get_or_insert(parse_attr_str(&loader.sym.dwarf, cur_unit, &Some(entries_iter.read_attribute(attr, encoding)?))?);}
                     DW_AT_linkage_name => {linkage_name.get_or_insert(parse_attr_str(&loader.sym.dwarf, cur_unit, &Some(entries_iter.read_attribute(attr, encoding)?))?);}
-                    DW_AT_type => {type_.get_or_insert(Self::parse_type_ref_custom(entries_iter.read_attribute(attr, encoding)?, abbrev.tag(), cur_unit, &mut shard.warn, &loader.types.builtin_types));}
+                    DW_AT_type => {type_.get_or_insert(Self::parse_type_ref_custom(entries_iter.read_attribute(attr, encoding)?, abbrev.tag, cur_unit, &mut shard.warn, &loader.types.builtin_types));}
                     DW_AT_specification => attr_specification_or_origin = Some(entries_iter.read_attribute(attr, encoding)?),
                     DW_AT_abstract_origin => attr_specification_or_origin = Some(entries_iter.read_attribute(attr, encoding)?),
                     DW_AT_decl_file => attr_file = Some(entries_iter.read_attribute(attr, encoding)?),
@@ -2260,15 +2300,15 @@ impl<'a> DwarfLoader<'a> {
         }
 
         // Iterate over DIEs in depth-first order.
-        let mut cursor = self.unit.header.range_from(UnitOffset(self.unit.header.header_size())..)?;
-        let abbreviations: &Abbreviations = &self.unit.abbreviations;
+        let mut cursor = SliceReader::new(self.unit.header.range_from(UnitOffset(self.unit.header.header_size())..)?);
+        let attribute_context = AttributeContext {unit: self.unit, dwarf: &self.loader.sym.dwarf, shared: &self.loader.abbreviations_shared};
         let encoding = self.unit.encoding();
         let mut prev_has_children = true;
         let mut skip_subtree = usize::MAX;
         loop {
             // Check if we're done.
-            let offset = DebugInfoOffset(cursor.offset_from(&self.section_slice));
-            if cursor.is_empty() {
+            let offset = DebugInfoOffset(cursor.slice.offset_from(&self.section_slice));
+            if cursor.slice.is_empty() {
                 if self.main_stack.len != 2 { // expected stack contents: fake root, DW_TAG_compile_unit (which doesn't have a DW_TAG_null to terminator at the end, for some reason)
                     return err!(Dwarf, "tree ended early @0x{:x}", offset.0);
                 }
@@ -2311,8 +2351,8 @@ impl<'a> DwarfLoader<'a> {
             }
 
             // Read next DIE.
-            let abbrev = cursor.read_abbreviation(abbreviations)?;
-            prev_has_children = abbrev.is_some_and(|e| e.has_children());
+            let abbrev = cursor.slice.read_abbreviation(self.abbreviations)?;
+            prev_has_children = abbrev.is_some_and(|e| e.has_children);
 
             let abbrev = match abbrev {
                 Some(a) => a,
@@ -2323,18 +2363,6 @@ impl<'a> DwarfLoader<'a> {
             let mut _f = StackFlags::empty();
             let top = self.main_stack.push_uninit(&mut _f);
             *top = MainStackEntry {tag: abbrev.tag(), flags: inherited_flags};
-
-            /*asdqwe
-            new.exact_type = ptr::null_mut();
-            new.variant = None;
-            new.nested_names.clear();
-            new.pc_ranges.clear();
-            new.function = usize::MAX;
-            new.subfunctions.clear();
-            new.subfunction_events.clear();
-            new.subfunction_idx = u32::MAX;
-            new.subfunction_level = u16::MAX;
-            new.local_variables.clear();*/
 
             if skip_subtree != usize::MAX {
                 cursor.skip_attributes(abbrev.attributes(), encoding)?;
@@ -2426,7 +2454,7 @@ impl<'a> DwarfLoader<'a> {
 
                     if attr_location.is_some() || attr_const_value.is_some() {
                         let mut decl = Self::parse_line_info(&mut self.shard, &self.loader, self.unit_idx, decl_file, decl_line, decl_column);
-                        Self::chase_origin_pointers(&mut self.shard, &self.loader, self.unit, self.unit_idx, attr_specification_or_origin, &mut name, &mut linkage_name, &mut type_, Some(&mut decl))?;
+                        Self::chase_origin_pointers(&mut self.shard, &self.loader, self.unit, self.unit_idx, self.abbreviations, attr_specification_or_origin, &mut name, &mut linkage_name, &mut type_, Some(&mut decl))?;
                         let var_flags = if abbrev.tag() == DW_TAG_variable { VariableFlags::empty() } else { VariableFlags::PARAMETER };
                         let var = Variable::new(name.unwrap_or(""), type_.unwrap_or(self.loader.types.builtin_types.unknown), offset, decl, var_flags);
                         self.add_variable_locations(&attr_location, &attr_const_value, &linkage_name, var, offset)?;
@@ -2511,7 +2539,7 @@ impl<'a> DwarfLoader<'a> {
                         // Chase the specification/origin pointers to reach the function name (for function declarations and inlining stuff).
                         // Functions can be missing one of the two names (linkage name or regular name), but not both (in the binaries I looked at).
                         let mut decl = Self::parse_line_info(&mut self.shard, &self.loader, self.unit_idx, decl_file, decl_line, decl_column);
-                        Self::chase_origin_pointers(&mut self.shard, &self.loader, self.unit, self.unit_idx, attr_specification_or_origin, &mut name, &mut linkage_name, &mut type_, Some(&mut decl))?;
+                        Self::chase_origin_pointers(&mut self.shard, &self.loader, self.unit, self.unit_idx, self.abbreviations, attr_specification_or_origin, &mut name, &mut linkage_name, &mut type_, Some(&mut decl))?;
 
                         let name_ref = if let Some(n) = linkage_name {
                             n
@@ -2606,6 +2634,8 @@ impl<'a> DwarfLoader<'a> {
                     // Other: data_bit_offset, data_location
                     // Other: binary_scale, decimal_scale, decimal_sign, digit_count, picture_string, small
                     // Other: allocated, associated, enum_class, accessibility, visibility, start_scope, export_symbols, endianity, calling_convention, address_class
+                    let mut attrs = TypeAttributes::default();
+                    unsafe {cursor.read_attributes(abbrev, /*secondary*/ false, attribute_context, &raw mut attrs)}?;
                     let mut is_alias = false;
                     let t = match abbrev.tag() {
                         DW_TAG_base_type => Type::Primitive(PrimitiveFlags::empty()),

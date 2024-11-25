@@ -269,7 +269,7 @@ impl Drop for INotifyFD {
 macro_rules! offsetof {
     ($t:ty, $f:ident $(. $p:ident)*) => (
         // Maybe this is UB, idk. Still seems better than pulling a whole crate for this.
-        unsafe {mem::transmute::<_, usize>(&mem::transmute::<_, &$t>(8usize).$f$(.$p)*) - 8}
+        unsafe {std::mem::transmute::<_, usize>(&std::mem::transmute::<_, &$t>(8usize).$f$(.$p)*) - 8}
     )
 }
 
