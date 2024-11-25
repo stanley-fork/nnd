@@ -280,10 +280,10 @@ pub fn format_dwarf_expression<'a>(expr: Expression<DwarfSlice>, encoding: Encod
             Operation::RegisterOffset {register, offset, base_type} => {
                 if let Some(r) = RegisterIdx::from_dwarf(register) { write!(res, "{}", r) } else { write!(res, "register({})", register.0) }?;
                 if offset != 0 {
-                    write!(res, "{:+}", offset)?;
+                    write!(res, "{}0x{:x}", if offset < 0 {"-"} else {"+"}, offset.abs())?;
                 }
                 if base_type.0 != 0 {
-                    write!(res, "(type@u+{:x})", base_type.0)?;
+                    write!(res, "(type@u+0x{:x})", base_type.0)?;
                 }
             }
             Operation::FrameOffset {offset} => {

@@ -1082,26 +1082,21 @@ impl SymbolsLoader {
 
         let layouts = AllAttributeStructLayouts::new(
             vec![
-                (DW_TAG_variable, VariableAttributes::layout()),
-                (DW_TAG_formal_parameter, VariableAttributes::layout()),
-
-                (DW_TAG_base_type, TypeAttributes::layout()),
-                (DW_TAG_unspecified_type, TypeAttributes::layout()),
-                (DW_TAG_structure_type, TypeAttributes::layout()),
-                (DW_TAG_class_type, TypeAttributes::layout()),
-                (DW_TAG_union_type, TypeAttributes::layout()),
-                (DW_TAG_enumeration_type, TypeAttributes::layout()),
-                (DW_TAG_pointer_type, TypeAttributes::layout()),
-                (DW_TAG_reference_type, TypeAttributes::layout()),
-                (DW_TAG_rvalue_reference_type, TypeAttributes::layout()),
-                (DW_TAG_array_type, TypeAttributes::layout()),
-                (DW_TAG_const_type, TypeAttributes::layout()),
-                (DW_TAG_restrict_type, TypeAttributes::layout()),
-                (DW_TAG_volatile_type, TypeAttributes::layout()),
-                (DW_TAG_atomic_type, TypeAttributes::layout()),
-                (DW_TAG_typedef, TypeAttributes::layout()),
+                (vec![DW_TAG_compile_unit, DW_TAG_partial_unit, DW_TAG_type_unit], UnitAttributes::layout()),
+                (vec![DW_TAG_namespace], NamespaceAttributes::layout()),
+                (vec![DW_TAG_variable, DW_TAG_formal_parameter], VariableAttributes::layout()),
+                (vec![DW_TAG_subprogram], SubprogramAttributes::layout()),
+                (vec![DW_TAG_base_type, DW_TAG_unspecified_type, DW_TAG_structure_type, DW_TAG_class_type, DW_TAG_union_type, DW_TAG_enumeration_type, DW_TAG_pointer_type, DW_TAG_reference_type, DW_TAG_rvalue_reference_type, DW_TAG_array_type, DW_TAG_const_type, DW_TAG_restrict_type, DW_TAG_volatile_type, DW_TAG_atomic_type, DW_TAG_typedef], TypeAttributes::layout()),
+                (vec![DW_TAG_inheritance, DW_TAG_member, DW_TAG_enumerator], FieldAttributes::layout()),
+                (vec![DW_TAG_variant_part], VariantPartAttributes::layout()),
+                (vec![DW_TAG_variant], VariantAttributes::layout()),
+                (vec![DW_TAG_subrange_type], SubrangeTypeAttributes::layout()),
+                (vec![DW_TAG_lexical_block], LexicalBlockAttributes::layout()),
+                (vec![DW_TAG_inlined_subroutine], InlinedSubroutineAttributes::layout()),
+                (vec![DW_TAG_template_type_parameter], TemplateTypeParameterAttributes::layout()),
+                (vec![DW_TAG_template_value_parameter], TemplateValueParameterAttributes::layout()),
             ],
-            AttributeStructLayout::default(),
+            CommonAttributes::layout(),
             vec![DW_TAG_label, DW_TAG_variable, DW_TAG_formal_parameter, DW_TAG_subprogram, DW_TAG_inlined_subroutine]);
 
         let mut units: Vec<CompilationUnit> = Vec::new();
@@ -2026,16 +2021,52 @@ struct RangesStackEntry {
     pc_ranges: Vec<gimli::Range>,
 }
 
-dwarf_struct!{ VariableAttributes {
+
+dwarf_struct!{ CommonAttributes {
+    // Keep these fields in sync with VariableAttributes and SubprogramAttributes, so that field numbers can be passed to chase_origin_pointers() without conversion.
     decl: DwarfCodeLocation, DW_AT_decl_file, CodeLocation;
     specification_or_abstract_origin: DwarfReference, DW_AT_specification, SpecificationOrAbstractOrigin;
     name: &'static str, DW_AT_name, String;
     linkage_name: &'static str, DW_AT_linkage_name, String;
     type_: /*DieOffset*/ usize, DW_AT_type, DebugInfoOffset;
+}}
+
+dwarf_struct!{ UnitAttributes {
+    ranges: DwarfRanges, DW_AT_ranges, Ranges;
+    language: usize, DW_AT_language, Unsigned;
+}}
+
+dwarf_struct!{ NamespaceAttributes {
+    name: &'static str, DW_AT_name, String;
+}}
+
+dwarf_struct!{ VariableAttributes {
+    // These fields must be identical to CommonAttributes, in the same order, and at the start.
+    decl: DwarfCodeLocation, DW_AT_decl_file, CodeLocation;
+    specification_or_abstract_origin: DwarfReference, DW_AT_specification, SpecificationOrAbstractOrigin;
+    name: &'static str, DW_AT_name, String;
+    linkage_name: &'static str, DW_AT_linkage_name, String;
+    type_: /*DieOffset*/ usize, DW_AT_type, DebugInfoOffset;
+
     location_expr: /*Expression*/ &'static [u8], DW_AT_location, Expression;
     location_lists: /*LocationListsOffset*/ usize, DW_AT_location, LocationListsOffset;
     const_value_usize: usize, DW_AT_const_value, MaybeSigned;
     const_value_slice: &'static [u8], DW_AT_const_value, Slice;
+}}
+
+dwarf_struct!{ SubprogramAttributes {
+    // These fields must be identical to CommonAttributes, in the same order, and at the start.
+    decl: DwarfCodeLocation, DW_AT_decl_file, CodeLocation;
+    specification_or_abstract_origin: DwarfReference, DW_AT_specification, SpecificationOrAbstractOrigin;
+    name: &'static str, DW_AT_name, String;
+    linkage_name: &'static str, DW_AT_linkage_name, String;
+    type_: /*DieOffset*/ usize, DW_AT_type, DebugInfoOffset;
+
+    ranges: DwarfRanges, DW_AT_ranges, Ranges;
+    frame_base_expr: /*Expression*/ &'static [u8], DW_AT_frame_base, Expression;
+    frame_base_lists: /*LocationListsOffset*/ usize, DW_AT_frame_base, LocationListsOffset;
+    main_suborogram: bool, DW_AT_main_subprogram, Flag;
+    inline: usize, DW_AT_inline, Unsigned;
 }}
 
 dwarf_struct!{ TypeAttributes {
@@ -2043,6 +2074,7 @@ dwarf_struct!{ TypeAttributes {
     specification_or_abstract_origin: DwarfReference, DW_AT_specification, SpecificationOrAbstractOrigin;
     name: &'static str, DW_AT_name, String;
     type_: /*DieOffset*/ usize, DW_AT_type, DebugInfoOffset;
+    // byte_size/bit_size may in theory be exprloc, presumably for some kind of dynamically-sized types, but I haven't seen that in practice.
     byte_size: usize, DW_AT_byte_size, Unsigned;
     bit_size: usize, DW_AT_bit_size, Unsigned;
     declaration: bool, DW_AT_declaration, Flag;
@@ -2050,6 +2082,62 @@ dwarf_struct!{ TypeAttributes {
     byte_stride: usize, DW_AT_byte_stride, Unsigned;
     bit_stride: usize, DW_AT_bit_stride, Unsigned;
 }}
+
+dwarf_struct!{ FieldAttributes {
+    decl: DwarfCodeLocation, DW_AT_decl_file, CodeLocation;
+    name: &'static str, DW_AT_name, String;
+    type_: /*DieOffset*/ usize, DW_AT_type, DebugInfoOffset;
+    byte_size: usize, DW_AT_byte_size, Unsigned;
+    bit_size: usize, DW_AT_bit_size, Unsigned;
+    bit_offset: usize, DW_AT_bit_offset, Unsigned;
+    // This can be exprloc in case of virtual inheritance. Not supported yet.
+    data_member_location: usize, DW_AT_data_member_location, Unsigned;
+    const_value_usize: usize, DW_AT_const_value, MaybeSigned;
+    const_value_slice: &'static [u8], DW_AT_const_value, Slice;
+    external: bool, DW_AT_external, Flag;
+    artificial: bool, DW_AT_artificial, Flag;
+}}
+
+dwarf_struct!{ VariantPartAttributes {
+    discr: usize, DW_AT_discr, DebugInfoOffset;
+}}
+
+dwarf_struct!{ VariantAttributes {
+    discr_value: usize, DW_AT_discr_value, MaybeSigned;
+    discr_list: &'static [u8], DW_AT_discr_list, Slice;
+}}
+
+dwarf_struct!{ SubrangeTypeAttributes {
+    byte_stride: usize, DW_AT_byte_stride, Unsigned;
+    bit_stride: usize, DW_AT_bit_stride, Unsigned;
+    count: usize, DW_AT_count, Unsigned;
+    lower_bound: usize, DW_AT_lower_bound, MaybeSigned;
+    upper_bound: usize, DW_AT_upper_bound, MaybeSigned;
+}}
+
+dwarf_struct!{ LexicalBlockAttributes {
+    ranges: DwarfRanges, DW_AT_ranges, Ranges;
+}}
+
+dwarf_struct!{ InlinedSubroutineAttributes {
+    specification_or_abstract_origin: DwarfReference, DW_AT_specification, SpecificationOrAbstractOrigin;
+    ranges: DwarfRanges, DW_AT_ranges, Ranges;
+    call: DwarfCodeLocation, DW_AT_call_file, CodeLocation;
+}}
+
+dwarf_struct!{ TemplateTypeParameterAttributes {
+    name: &'static str, DW_AT_name, String;
+    type_: /*DieOffset*/ usize, DW_AT_type, DebugInfoOffset;
+}}
+
+dwarf_struct!{ TemplateValueParameterAttributes {
+    decl: DwarfCodeLocation, DW_AT_decl_file, CodeLocation;
+    name: &'static str, DW_AT_name, String;
+    type_: /*DieOffset*/ usize, DW_AT_type, DebugInfoOffset;
+    const_value_usize: usize, DW_AT_const_value, MaybeSigned;
+    const_value_slice: &'static [u8], DW_AT_const_value, Slice;
+}}
+
 
 impl<'a> DwarfLoader<'a> {
     fn new(loader: &'a SymbolsLoader, shard: &'a mut SymbolsLoaderShard, unit_idx: usize) -> Result<Self> {
@@ -2089,7 +2177,7 @@ impl<'a> DwarfLoader<'a> {
         Ok(Self::parse_type_ref_custom(attr, tag, self.unit, &mut self.shard.warn, &self.loader.types.builtin_types))
     }
 
-    fn parse_line_info(shard: &mut SymbolsLoaderShard, loader: &SymbolsLoader, unit_idx: usize, file: Option<AttributeValue<DwarfSlice>>, line: Option<AttributeValue<DwarfSlice>>, column: Option<AttributeValue<DwarfSlice>>) -> LineInfo {
+    fn parse_line_info0(shard: &mut SymbolsLoaderShard, loader: &SymbolsLoader, unit_idx: usize, file: Option<AttributeValue<DwarfSlice>>, line: Option<AttributeValue<DwarfSlice>>, column: Option<AttributeValue<DwarfSlice>>) -> LineInfo {
         let Some(file) = file else {return LineInfo::invalid()};
         let Some(idx) = file.udata_value() else {
             if shard.warn.check(line!()) { eprintln!("warning: file attribute has unexpected form: {:?}", file); }
@@ -2115,6 +2203,17 @@ impl<'a> DwarfLoader<'a> {
                 Some(col) => col as usize } };
 
         match LineInfo::new(0, Some(file), line, column, LineFlags::empty()) {
+            Ok(x) => x,
+            Err(e) => {
+                if shard.warn.check(line!()) { eprintln!("warning: {}", e); }
+                LineInfo::invalid()
+            }
+        }
+    }
+
+    fn parse_line_info(shard: &mut SymbolsLoaderShard, loader: &SymbolsLoader, unit_idx: usize, loc: &DwarfCodeLocation) -> LineInfo {
+        let Some(&file) = loader.sym.units[unit_idx].file_idx_remap.get(loc.file) else {return LineInfo::invalid()};
+        match LineInfo::new(0, Some(file), loc.line, loc.column, LineFlags::empty()) {
             Ok(x) => x,
             Err(e) => {
                 if shard.warn.check(line!()) { eprintln!("warning: {}", e); }
@@ -2276,7 +2375,7 @@ impl<'a> DwarfLoader<'a> {
             }
             if let Some(d) = &mut decl {
                 if **d == LineInfo::invalid() && attr_file.is_some() {
-                    **d = Self::parse_line_info(shard, loader, unit_idx, attr_file, attr_line, attr_column);
+                    **d = Self::parse_line_info0(shard, loader, unit_idx, attr_file, attr_line, attr_column);
                 }
             }
         }
@@ -2365,7 +2464,7 @@ impl<'a> DwarfLoader<'a> {
             *top = MainStackEntry {tag: abbrev.tag(), flags: inherited_flags};
 
             if skip_subtree != usize::MAX {
-                cursor.skip_attributes(abbrev.attributes(), encoding)?;
+                cursor.skip_attributes(abbrev, &attribute_context)?;
                 continue;
             }
 
@@ -2453,7 +2552,7 @@ impl<'a> DwarfLoader<'a> {
                     }
 
                     if attr_location.is_some() || attr_const_value.is_some() {
-                        let mut decl = Self::parse_line_info(&mut self.shard, &self.loader, self.unit_idx, decl_file, decl_line, decl_column);
+                        let mut decl = Self::parse_line_info0(&mut self.shard, &self.loader, self.unit_idx, decl_file, decl_line, decl_column);
                         Self::chase_origin_pointers(&mut self.shard, &self.loader, self.unit, self.unit_idx, self.abbreviations, attr_specification_or_origin, &mut name, &mut linkage_name, &mut type_, Some(&mut decl))?;
                         let var_flags = if abbrev.tag() == DW_TAG_variable { VariableFlags::empty() } else { VariableFlags::PARAMETER };
                         let var = Variable::new(name.unwrap_or(""), type_.unwrap_or(self.loader.types.builtin_types.unknown), offset, decl, var_flags);
@@ -2464,13 +2563,13 @@ impl<'a> DwarfLoader<'a> {
                 // Varargs.
                 DW_TAG_unspecified_parameters | DW_TAG_GNU_formal_parameter_pack => {
                     skip_subtree = self.main_stack.len;
-                    cursor.skip_attributes(abbrev.attributes(), encoding)?;
+                    cursor.skip_attributes(abbrev, &attribute_context)?;
                 }
 
                 // Call sites (seem to be very incomplete, presumed useless).
                 DW_TAG_GNU_call_site | DW_TAG_call_site | DW_TAG_GNU_call_site_parameter | DW_TAG_call_site_parameter => {
                     skip_subtree = self.main_stack.len;
-                    cursor.skip_attributes(abbrev.attributes(), encoding)?;
+                    cursor.skip_attributes(abbrev, &attribute_context)?;
                 }
 
                 // Functions.
@@ -2538,7 +2637,7 @@ impl<'a> DwarfLoader<'a> {
 
                         // Chase the specification/origin pointers to reach the function name (for function declarations and inlining stuff).
                         // Functions can be missing one of the two names (linkage name or regular name), but not both (in the binaries I looked at).
-                        let mut decl = Self::parse_line_info(&mut self.shard, &self.loader, self.unit_idx, decl_file, decl_line, decl_column);
+                        let mut decl = Self::parse_line_info0(&mut self.shard, &self.loader, self.unit_idx, decl_file, decl_line, decl_column);
                         Self::chase_origin_pointers(&mut self.shard, &self.loader, self.unit, self.unit_idx, self.abbreviations, attr_specification_or_origin, &mut name, &mut linkage_name, &mut type_, Some(&mut decl))?;
 
                         let name_ref = if let Some(n) = linkage_name {
@@ -2621,7 +2720,7 @@ impl<'a> DwarfLoader<'a> {
                 DW_TAG_enumeration_type if self.main_stack.top().tag == DW_TAG_array_type => {
                     // Haven't seen these in C++ or Rust.
                     if self.shard.warn.check(line!()) { eprintln!("warning: enum-valued array indices are not supported (have one @0x{:x})", offset.0); }
-                    cursor.skip_attributes(abbrev.attributes(), encoding)?;
+                    cursor.skip_attributes(abbrev, &attribute_context)?;
                 }
 
                 // Types.
@@ -2635,7 +2734,7 @@ impl<'a> DwarfLoader<'a> {
                     // Other: binary_scale, decimal_scale, decimal_sign, digit_count, picture_string, small
                     // Other: allocated, associated, enum_class, accessibility, visibility, start_scope, export_symbols, endianity, calling_convention, address_class
                     let mut attrs = TypeAttributes::default();
-                    unsafe {cursor.read_attributes(abbrev, /*secondary*/ false, attribute_context, &raw mut attrs)}?;
+                    unsafe {cursor.read_attributes(abbrev, /*which_layout*/ 0, &attribute_context, &raw mut attrs as *mut u8)}?;
                     let mut is_alias = false;
                     let t = match abbrev.tag() {
                         DW_TAG_base_type => Type::Primitive(PrimitiveFlags::empty()),
@@ -2651,114 +2750,100 @@ impl<'a> DwarfLoader<'a> {
                         }
                         _ => panic!("huh?") };
                     let mut info = TypeInfo {die: offset, binary_id: self.loader.binary_id, line: LineInfo::invalid(), t, language: self.unit_language, ..Default::default()};
-                    let mut saw_type = false;
                     let mut is_complex_float = false;
-                    let mut unqualified_name: &'static str = "";
-                    let (mut decl_file, mut decl_line, mut decl_column) = (None, None, None);
-                    for &attr in abbrev.attributes() {
-                        match attr.name() {
-                            DW_AT_decl_file => decl_file = Some(cursor.read_attribute(attr, encoding)?),
-                            DW_AT_decl_line => decl_line = Some(cursor.read_attribute(attr, encoding)?),
-                            DW_AT_decl_column => decl_column = Some(cursor.read_attribute(attr, encoding)?),
-                            DW_AT_name => {
-                                unqualified_name = parse_attr_str(&self.loader.sym.dwarf, self.unit, &Some(cursor.read_attribute(attr, encoding)?))?;
-                                self.append_namespace_to_scope_name(unqualified_name, true);
-                                info.name = self.shard.types.temp_types.unsorted_type_names.add_str(&self.scope_name, 0);
-                                if self.scope_stack.top().scope_name_is_linkable {
-                                    info.flags.insert(TypeFlags::LINKABLE_NAME);
-                                }
-                            }
-                            DW_AT_byte_size | DW_AT_bit_size => {
-                                let val = cursor.read_attribute(attr, encoding)?;
-                                let mut s = match val.udata_value() {
-                                    Some(x) => x as usize,
-                                    None => {
-                                        // Exprloc is possible here, presumably for some kind of weird dynamicaly-sized types. I haven't seen that in practice.
-                                        if self.shard.warn.check(line!()) { eprintln!("warning: {} has unexpected form: {:?}", attr.name(), val) };
-                                        info.flags.insert(TypeFlags::UNSUPPORTED);
-                                        0
-                                    }
-                                };
-                                if attr.name() == DW_AT_bit_size {
-                                    if s & 7 != 0 {
-                                        if self.shard.warn.check(line!()) { eprintln!("warning: {} = {} on {} is not supported", attr.name(), s, abbrev.tag()); }
-                                        info.flags.insert(TypeFlags::UNSUPPORTED);
-                                    }
-                                    s = (s+7)/8;
-                                }
-                                info.size = s;
-                                info.flags.insert(TypeFlags::SIZE_KNOWN);
-                            }
-                            DW_AT_declaration => {
-                                cursor.read_attribute(attr, encoding)?;
-                                info.flags.insert(TypeFlags::DECLARATION);
-                            }
-                            DW_AT_specification | DW_AT_abstract_origin => {
-                                if self.shard.warn.check(line!()) { eprintln!("warning: {} on {} is not supported", attr.name(), abbrev.tag()); }
-                                cursor.read_attribute(attr, encoding)?;
-                            }
-                            DW_AT_type => {
-                                saw_type = true;
-                                let type_ = self.parse_type_ref(cursor.read_attribute(attr, encoding)?, abbrev.tag())?;
-                                match &mut info.t {
-                                    Type::Enum(e) => e.type_ = type_,
-                                    Type::Pointer(p) => p.type_ = type_,
-                                    Type::Array(a) => a.type_ = type_,
-                                    _ => if self.shard.warn.check(line!()) { eprintln!("warning: {} on {} is not supported", attr.name(), abbrev.tag()); }
-                                }
-                            }
-                            DW_AT_encoding => {
-                                let val = cursor.read_attribute(attr, encoding)?;
-                                match &mut info.t {
-                                    Type::Primitive(p) => {
-                                        match val.u8_value() {
-                                            Some(e) => match DwAte(e) {
-                                                // Why did DW eat all these things? Stop it, DW! Bad dog!
-                                                DW_ATE_address => (),
-                                                DW_ATE_boolean => p.insert(PrimitiveFlags::BOOL),
-                                                DW_ATE_imaginary_float | DW_ATE_float => p.insert(PrimitiveFlags::FLOAT),
-                                                DW_ATE_signed => p.insert(PrimitiveFlags::SIGNED),
-                                                DW_ATE_signed_char => p.insert(PrimitiveFlags::SIGNED | PrimitiveFlags::CHAR | if self.unit_language.presumably_cpp() {PrimitiveFlags::AMBIGUOUS_CHAR} else {PrimitiveFlags::empty()}),
-                                                DW_ATE_unsigned => (),
-                                                DW_ATE_unsigned_char => p.insert(PrimitiveFlags::CHAR),
-                                                DW_ATE_UTF | DW_ATE_UCS | DW_ATE_ASCII => p.insert(PrimitiveFlags::CHAR | if self.unit_language.presumably_cpp() {PrimitiveFlags::AMBIGUOUS_CHAR} else {PrimitiveFlags::empty()}),
-                                                DW_ATE_complex_float => is_complex_float = true,
-                                                //DW_ATE_packed_decimal | DW_ATE_numeric_string | DW_ATE_edited | DW_ATE_signed_fixed | DW_ATE_unsigned_fixed | DW_ATE_decimal_float
-                                                _ => {
-                                                    if self.shard.warn.check(line!()) { eprintln!("warning: {} = {} on {} is not supported", attr.name(), e, abbrev.tag()); }
-                                                    info.flags.insert(TypeFlags::UNSUPPORTED);
-                                                }
-                                            }
-                                            None => if self.shard.warn.check(line!()) { eprintln!("warning: unexpected {} form: {:?}", attr.name(), val); }
-                                        }
-                                    }
-                                    // The spec doesn't seem to allow DW_AT_encoding on DW_TAG_enumeration_type, but it appears in most Linux standard libraries, e.g. libc.so.6
-                                    // In those cases, both DW_AT_encoding and DW_AT_type are present, and the former matches the encoding inside the type pointed to by the latter.
-                                    // So we just ignore it.
-                                    Type::Enum(_) => (),
-                                    _ => {
-                                        if self.shard.warn.check(line!()) { eprintln!("warning: {} on {} is not supported", attr.name(), abbrev.tag()); }
-                                        info.flags.insert(TypeFlags::UNSUPPORTED)
-                                    }
-                                }
-                            }
-                            DW_AT_bit_stride | DW_AT_byte_stride => if let Some(s) = parse_attr_stride(attr.name(), cursor.read_attribute(attr, encoding)?, offset, &mut self.shard.warn) {
-                                match &mut info.t {
-                                    Type::Array(a) => a.stride = s,
-                                    _ => if self.shard.warn.check(line!()) { eprintln!("warning: {} on {} is not supported", attr.name(), abbrev.tag()); }
-                                }
-                            }
-                            DW_AT_ordering | DW_AT_rank => {
-                                if self.shard.warn.check(line!()) { eprintln!("warning: {} on {} is not supported", attr.name(), abbrev.tag()); }
-                                cursor.skip_attribute(attr, encoding)?;
-                            }
-                            _ => cursor.skip_attribute(attr, encoding)?,
+
+                    if attrs.fields & TypeAttributes::decl != 0 {
+                        info.line = Self::parse_line_info(&mut self.shard, &self.loader, self.unit_idx, &attrs.decl);
+                    }
+
+                    if attrs.name.is_empty() {
+                        self.append_namespace_to_scope_name("_", false);
+                    } else {
+                        self.append_namespace_to_scope_name(attrs.name, true);
+                        info.name = self.shard.types.temp_types.unsorted_type_names.add_str(&self.scope_name, 0);
+                        if self.scope_stack.top().scope_name_is_linkable {
+                            info.flags.insert(TypeFlags::LINKABLE_NAME);
                         }
                     }
-                    if info.name.is_empty() {
-                        self.append_namespace_to_scope_name("_", false);
+
+                    if attrs.fields & TypeAttributes::byte_size != 0 {
+                        info.size = attrs.byte_size;
+                        info.flags.insert(TypeFlags::SIZE_KNOWN);
+                    } else if attrs.fields & TypeAttributes::bit_size != 0 {
+                        if attrs.bit_size & 7 != 0 {
+                            if self.shard.warn.check(line!()) { eprintln!("warning: DW_AT_bit_size = {} on {} is not supported", attrs.bit_size, abbrev.tag()); }
+                            info.flags.insert(TypeFlags::UNSUPPORTED);
+                        }
                     }
-                    info.line = Self::parse_line_info(&mut self.shard, &self.loader, self.unit_idx, decl_file, decl_line, decl_column);
+
+                    if attrs.fields & (TypeAttributes::byte_stride | TypeAttributes::bit_stride) != 0 { 
+                        match &mut info.t {
+                            Type::Array(a) => {
+                                if attrs.fields & TypeAttributes::byte_stride != 0 {
+                                    a.stride = attrs.byte_stride;
+                                } else if attrs.bit_stride % 8 != 0 {
+                                    if self.shard.warn.check(line!()) { eprintln!("warning: bit-packed arrays are not supported (have DW_AT_bit_stride @0x{:x})", offset.0); }
+                                } else {
+                                    a.stride = attrs.bit_stride / 8;
+                                }
+                            }
+                            _ => if self.shard.warn.check(line!()) { eprintln!("warning: DW_AT_{{byte,bit}}_stride on {} is not supported", abbrev.tag()); }
+                        }
+                    }
+                
+                    if attrs.declaration {
+                        info.flags.insert(TypeFlags::DECLARATION);
+                    }
+
+                    if attrs.fields & DwarfReference::HAS_SPECIFICATION_OR_ABSTRACT_ORIGIN != 0 {
+                        if self.shard.warn.check(line!()) { eprintln!("warning: DW_AT_specification/DW_AT_abstract_origin on {} is not supported", abbrev.tag()); }
+                    }
+
+                    if attrs.fields & TypeAttributes::type_ != 0 {
+                        let type_ = attrs.type_ as *const TypeInfo;
+                        match &mut info.t {
+                            Type::Enum(e) => e.type_ = type_,
+                            Type::Pointer(p) => p.type_ = type_,
+                            Type::Array(a) => a.type_ = type_,
+                            _ => if self.shard.warn.check(line!()) { eprintln!("warning: DW_AT_type on {} is not supported", abbrev.tag()); }
+                        }
+                    } else {
+                        match &mut info.t {
+                            // Pointer without DW_AT_type is a void*
+                            Type::Pointer(p) => p.type_ = self.loader.types.builtin_types.void, // (this will apply to typedefs too, seems ok)
+                            _ => (),
+                        }
+                    }
+
+                    if attrs.fields & TypeAttributes::encoding != 0 {
+                        match &mut info.t {
+                            Type::Primitive(p) => match DwAte(attrs.encoding as u8) {
+                                // Why did DW eat all these things? Stop it, DW! Bad dog!
+                                DW_ATE_address => (),
+                                DW_ATE_boolean => p.insert(PrimitiveFlags::BOOL),
+                                DW_ATE_imaginary_float | DW_ATE_float => p.insert(PrimitiveFlags::FLOAT),
+                                DW_ATE_signed => p.insert(PrimitiveFlags::SIGNED),
+                                DW_ATE_signed_char => p.insert(PrimitiveFlags::SIGNED | PrimitiveFlags::CHAR | if self.unit_language.presumably_cpp() {PrimitiveFlags::AMBIGUOUS_CHAR} else {PrimitiveFlags::empty()}),
+                                DW_ATE_unsigned => (),
+                                DW_ATE_unsigned_char => p.insert(PrimitiveFlags::CHAR),
+                                DW_ATE_UTF | DW_ATE_UCS | DW_ATE_ASCII => p.insert(PrimitiveFlags::CHAR | if self.unit_language.presumably_cpp() {PrimitiveFlags::AMBIGUOUS_CHAR} else {PrimitiveFlags::empty()}),
+                                DW_ATE_complex_float => is_complex_float = true,
+                                //DW_ATE_packed_decimal | DW_ATE_numeric_string | DW_ATE_edited | DW_ATE_signed_fixed | DW_ATE_unsigned_fixed | DW_ATE_decimal_float
+                                _ => {
+                                    if self.shard.warn.check(line!()) { eprintln!("warning: DW_AT_encoding = {} on {} is not supported", DwAte(attrs.encoding as u8), abbrev.tag()); }
+                                    info.flags.insert(TypeFlags::UNSUPPORTED);
+                                }
+                            }
+                            // The spec doesn't seem to allow DW_AT_encoding on DW_TAG_enumeration_type, but it appears in most Linux standard libraries, e.g. libc.so.6
+                            // In those cases, both DW_AT_encoding and DW_AT_type are present, and the former matches the encoding inside the type pointed to by the latter.
+                            // So we just ignore it.
+                            Type::Enum(_) => (),
+                            _ => {
+                                if self.shard.warn.check(line!()) { eprintln!("warning: DW_AT_encoding on {} is not supported", abbrev.tag()); }
+                                info.flags.insert(TypeFlags::UNSUPPORTED)
+                            }
+                        }
+                    }
 
                     if is_complex_float {
                         // Treat complex float as a struct rather than primitive type.
@@ -2786,13 +2871,6 @@ impl<'a> DwarfLoader<'a> {
                         info.t = Type::Struct(struct_type);
                     }
 
-                    if !saw_type {
-                        // Pointer without DW_AT_type is a void*
-                        match &mut info.t {
-                            Type::Pointer(p) => p.type_ = self.loader.types.builtin_types.void, // (this will apply to typedefs too, seems ok)
-                            _ => (),
-                        }
-                    }
                     if !info.flags.contains(TypeFlags::SIZE_KNOWN) {
                         match &info.t {
                             Type::Primitive(_) | Type::Pointer(_) => {
@@ -2840,8 +2918,8 @@ impl<'a> DwarfLoader<'a> {
                         top.flags.insert(StackFlags::IS_TYPE_SCOPE | StackFlags::IS_VALID_SCOPE);
                     }
 
-                    if !unqualified_name.is_empty() && self.main_stack.top2().flags.contains(StackFlags::IS_TYPE_SCOPE | StackFlags::IS_VALID_SCOPE) {
-                        self.type_stack.s[prev_type_stack_len - 1].nested_names.push((unqualified_name, NestedName::Type(ti)));
+                    if !attrs.name.is_empty() && self.main_stack.top2().flags.contains(StackFlags::IS_TYPE_SCOPE | StackFlags::IS_VALID_SCOPE) {
+                        self.type_stack.s[prev_type_stack_len - 1].nested_names.push((attrs.name, NestedName::Type(ti)));
                     }
                 }
 
@@ -2855,7 +2933,7 @@ impl<'a> DwarfLoader<'a> {
                         if !top.flags.contains(StackFlags::IS_TYPE_SCOPE) {
                             if self.shard.warn.check(line!()) { eprintln!("warning: {} in {} is not supported", abbrev.tag(), self.main_stack.top2().tag); }
                         }
-                        cursor.skip_attributes(abbrev.attributes(), encoding)?;
+                        cursor.skip_attributes(abbrev, &attribute_context)?;
                     } else {
                         let type_top = self.type_stack.top_mut();
                         let type_ = type_top.type_;
@@ -2954,7 +3032,7 @@ impl<'a> DwarfLoader<'a> {
                                     // Probably separate declaration and definition.
                                     //if self.shard.warn.check(line!()) { eprintln!("warning: static field with no DW_AT_const_value at @0x{:x}", offset.0); }
                                 } else {
-                                    let decl = Self::parse_line_info(&mut self.shard, &self.loader, self.unit_idx, decl_file, decl_line, decl_column);
+                                    let decl = Self::parse_line_info0(&mut self.shard, &self.loader, self.unit_idx, decl_file, decl_line, decl_column);
                                     let var = Variable::new(field.name, field.type_, offset, decl, VariableFlags::empty());
                                     self.add_variable_locations(&None, &attr_const_value, &None, var, offset)?;
                                 }
@@ -2974,7 +3052,7 @@ impl<'a> DwarfLoader<'a> {
                     if !self.main_stack.top().flags.contains(StackFlags::IS_TYPE_SCOPE) {
                         if self.shard.warn.check(line!()) { eprintln!("warning: {} in {} is not supported", abbrev.tag(), self.main_stack.top2().tag); }
                     }
-                    cursor.skip_attributes(abbrev.attributes(), encoding)?;
+                    cursor.skip_attributes(abbrev, &attribute_context)?;
                 }
 
                 // Rust enum.
@@ -3121,21 +3199,21 @@ impl<'a> DwarfLoader<'a> {
                         } else {
                             // (Warning would already be printed when parsing the parent.)
                         }
-                        cursor.skip_attributes(abbrev.attributes(), encoding)?;
+                        cursor.skip_attributes(abbrev, &attribute_context)?;
                     }
                 }
 
                 DW_TAG_generic_subrange => {
                     // Haven't seen these in C++ or Rust.
                     if self.shard.warn.check(line!()) { eprintln!("warning: arrays with dynamic number of dimensions are not supported (got one @0x{:x})", offset.0); }
-                    cursor.skip_attributes(abbrev.attributes(), encoding)?;
+                    cursor.skip_attributes(abbrev, &attribute_context)?;
                 }
 
                 // TODO: Function pointers and pointers to members.
                 DW_TAG_ptr_to_member_type | DW_TAG_subroutine_type => {
                     self.shard.types.add_type(TypeInfo {name: "<unsupported>", die: offset, binary_id: self.loader.binary_id, language: self.unit_language, flags: TypeFlags::UNSUPPORTED, ..TypeInfo::default()});
                     skip_subtree = self.main_stack.len;
-                    cursor.skip_attributes(abbrev.attributes(), encoding)?;
+                    cursor.skip_attributes(abbrev, &attribute_context)?;
                 }
 
                 // Lexical block, just provides address ranges for the variables it contains.
@@ -3161,7 +3239,7 @@ impl<'a> DwarfLoader<'a> {
                     if !self.main_stack.top().flags.contains(StackFlags::IS_FUNCTION_SCOPE) {
                         if self.shard.warn.check(line!()) { eprintln!("warning: unexpected inlined_subroutine not inside function @0x{:x}", offset.0); }
                     }
-                    cursor.skip_attributes(abbrev.attributes(), encoding)?;
+                    cursor.skip_attributes(abbrev, &attribute_context)?;
                 }
 
                 // Inlined functions.
@@ -3187,7 +3265,7 @@ impl<'a> DwarfLoader<'a> {
                     let ranges_top = self.ranges_stack.push_uninit(&mut self.main_stack.top_mut().flags);
                     parse_attr_ranges(&self.loader.sym.dwarf, self.unit, &low_pc, &high_pc, &attr_ranges, offset, self.loader.sym.code_addr_range.start, &mut ranges_top.pc_ranges, &mut self.shard.warn)?;
 
-                    let call_line = Self::parse_line_info(&mut self.shard, &self.loader, self.unit_idx, call_file, call_line, call_column);
+                    let call_line = Self::parse_line_info0(&mut self.shard, &self.loader, self.unit_idx, call_file, call_line, call_column);
                     let callee_die = match abstract_origin {
                         None => {
                             if self.shard.warn.check(line!()) { eprintln!("warning: inlined_subroutine doesn't say which function was inlined (DW_AT_abstract_origin) @0x{:x}", offset.0); }
@@ -3228,13 +3306,13 @@ impl<'a> DwarfLoader<'a> {
                 // Things we (hopefully) don't care about.
                 DW_TAG_label | DW_TAG_imported_declaration | DW_TAG_imported_module | DW_TAG_GNU_template_parameter_pack | DW_TAG_GNU_template_template_param => {
                     skip_subtree = self.main_stack.len;
-                    cursor.skip_attributes(abbrev.attributes(), encoding)?;
+                    cursor.skip_attributes(abbrev, &attribute_context)?;
                 }
 
                 // Function template arguments.
                 DW_TAG_template_type_parameter if !self.main_stack.top().flags.contains(StackFlags::IS_TYPE_SCOPE | StackFlags::IS_VALID_SCOPE) => {
                     skip_subtree = self.main_stack.len;
-                    cursor.skip_attributes(abbrev.attributes(), encoding)?;
+                    cursor.skip_attributes(abbrev, &attribute_context)?;
                 }
 
                 // Struct template arguments. Treat them as typedefs, as if e.g. vector<int> had a 'using T = int' inside it. Useful for pretty printers.
@@ -3280,13 +3358,13 @@ impl<'a> DwarfLoader<'a> {
                         // Not sure what this means, but it's possible.
                         //if self.shard.warn.check(line!()) { eprintln!("warning: DW_TAG_template_value_parameter without DW_AT_const_value or DW_AT_type @0x{:x}", offset.0); }
                     } else {
-                        let decl = Self::parse_line_info(&mut self.shard, &self.loader, self.unit_idx, decl_file, decl_line, decl_column);
+                        let decl = Self::parse_line_info0(&mut self.shard, &self.loader, self.unit_idx, decl_file, decl_line, decl_column);
                         let var = Variable::new(name, type_, offset, decl, VariableFlags::TEMPLATE_PARAMETER);
                         self.add_variable_locations(&None, &attr_const_value, &None, var, offset)?;
                     }
                 }
 
-                _ => cursor.skip_attributes(abbrev.attributes(), encoding)?,
+                _ => cursor.skip_attributes(abbrev, &attribute_context)?,
             }
         }
     }

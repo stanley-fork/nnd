@@ -34,14 +34,14 @@ impl SliceReader {
     pub fn skip_attribute(&mut self, spec: AttributeSpecification, encoding: Encoding) -> gimli::Result<()> {
         self.slice.skip_attribute(spec, encoding)
     }
-    pub fn skip_attributes(&mut self, specs: &[AttributeSpecification], encoding: Encoding) -> gimli::Result<()> {
-        self.slice.skip_attributes(specs, encoding)
+
+    pub fn skip_attributes(&mut self, abbreviation: &Abbreviation, context: &AttributeContext) -> Result<()> {
+        unsafe {self.read_attributes(abbreviation, /*which_layout*/ 2, context, ptr::null_mut())}
     }
 
-    pub unsafe fn read_attributes(&mut self, abbreviation: &Abbreviation, secondary: bool, context: &AttributeContext, out: *mut u8) -> Result<()> {
-        let actions = &abbreviation.actions[secondary as usize];
-        let flags_ptr = out.add(actions.flags_offset as usize) as *mut u32;
-        *flags_ptr = actions.flags_value;
+    pub unsafe fn read_attributes(&mut self, abbreviation: &Abbreviation, which_layout: usize, context: &AttributeContext, out: *mut u8) -> Result<()> {
+        let actions = &abbreviation.actions[which_layout];
+        let mut flags = actions.flags_value;
         for mut action in actions.actions.iter().copied() {
             if action.form == DW_FORM_indirect {
                 let mut form = action.form;
@@ -56,10 +56,8 @@ impl SliceReader {
                 // Do the checks+dispatch that we normally do when preprocessing abbreviations.
                 let layout_idx = action.param >> 16;
                 let name = DwAt((action.param & 0xffff) as u16);
-                let mut flags = *flags_ptr;
                 let layout = &context.shared.layouts.layouts[layout_idx].1;
                 action = prepare_attribute_action(AttributeSpecification {name, form, implicit_const_value}, layout, context.unit.header.encoding(), &context.shared.warnings, &mut flags)?;
-                *flags_ptr = flags;
             }
 
             let out_field = out.add(action.field_offset as usize);
@@ -211,6 +209,13 @@ impl SliceReader {
             }
         }
 
+        if flags != 0 {
+            let flags_ptr = out.add(actions.flags_offset as usize) as *mut u32;
+            *flags_ptr = flags;
+        } else {
+            // (If it's a skip-all layout, `out` is a null pointer, don't dereference it.)
+        }
+
         Ok(())
     }
 }
@@ -238,7 +243,8 @@ pub struct Abbreviation {
 
     // 0 - normal tag-specific struct layout.
     // 1 - common struct layout for chasing abstract_origin/specification pointers without looking at the tag.
-    actions: [AbbreviationActions; 2],
+    // 2 - skip
+    actions: [AbbreviationActions; 3],
 }
 impl Abbreviation {
     // TODO: Remove these.
@@ -293,7 +299,7 @@ struct AbbreviationActions {
     actions: Vec<AttributeAction>, // TODO: try replacing this with Range<u32> of indices into a shared array
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct AttributeStructLayout {
     pub flags_offset: u32,
     pub fields: Vec<(/*offset*/ u32, DwAt, AttributeType)>,
@@ -347,23 +353,33 @@ pub struct AllAttributeStructLayouts {
     num_primary_layouts: usize, // layouts[0..num_primary_layouts] correspond to tags and are sorted by tag
     secondary_layout_idx: usize, // layouts[secondary_layout_idx] is the alternative layout to use for all tags in secondary_tags
     unit_layout_idx: usize, // layouts[unit_layout_idx] is the alternative layout to use for DW_TAG_compile_unit
+    empty_layout_idx: usize, // layout[empty_layout_idx] is a skip-all-attributes layout that can be used with null pointer as target struct
     secondary_tags: Vec<DwTag>,
 }
 impl AllAttributeStructLayouts {
-    pub fn new(mut layouts: Vec<(DwTag, AttributeStructLayout)>, secondary_layout: AttributeStructLayout, mut secondary_tags: Vec<DwTag>) -> Self {
+    pub fn new(layout_groups: Vec<(Vec<DwTag>, AttributeStructLayout)>, secondary_layout: AttributeStructLayout, mut secondary_tags: Vec<DwTag>) -> Self {
+        let mut layouts: Vec<(DwTag, AttributeStructLayout)> = Vec::new();
+        for (tags, layout) in layout_groups {
+            for tag in tags {
+                layouts.push((tag, layout.clone()));
+            }
+        }
+
         layouts.sort_unstable_by_key(|(t, _)| *t);
         let num_primary_layouts = layouts.len();
         let secondary_layout_idx = layouts.len();
         layouts.push((DW_TAG_null, secondary_layout));
         let unit_layout_idx = layouts.len();
         layouts.push((DW_TAG_null, UnitPrepassAttributes::layout()));
+        let empty_layout_idx = layouts.len();
+        layouts.push((DW_TAG_null, AttributeStructLayout::default()));
         for (_, l) in &mut layouts {
             l.preprocess();
         }
         secondary_tags.sort_unstable();
-        Self {layouts, num_primary_layouts, secondary_layout_idx, unit_layout_idx, secondary_tags}
+        Self {layouts, num_primary_layouts, secondary_layout_idx, unit_layout_idx, empty_layout_idx, secondary_tags}
     }
-    
+
     fn find(&self, tag: DwTag) -> Option<usize> {
         let i = self.layouts[..self.num_primary_layouts].partition_point(|(t, _)| *t < tag);
         if i < self.num_primary_layouts && self.layouts[i].0 == tag {
@@ -574,35 +590,35 @@ macro_rules! dwarf_struct {
 // Covers 3 attributes (even though only one is explicitly given to dwarf_struct!()): DW_AT_ranges, DW_AT_low_pc, DW_AT_high_pc.
 #[derive(Default)]
 pub struct DwarfRanges {
-    ranges: usize, // offset in .debug_ranges or .debug_rnglists
-    low_pc: usize,
-    high_pc: usize,
+    pub ranges: usize, // offset in .debug_ranges or .debug_rnglists
+    pub low_pc: usize,
+    pub high_pc: usize,
 }
 impl DwarfRanges {
     // These bits would be set in the parent struct's `fields` bitmask.
     // (Make sure to not clash with the bit in DwarfReference. Also keep it in sync with the assert in AttributeStructLayout.preprocess())
-    const RANGES: u32 = 1 << 26;
-    const LOW_PC: u32 = 1 << 27;
-    const HIGH_PC: u32 = 1 << 28;
+    pub const RANGES: u32 = 1 << 26;
+    pub const LOW_PC: u32 = 1 << 27;
+    pub const HIGH_PC: u32 = 1 << 28;
     // Set if the DW_AT_high_pc had data form (i.e. it needs to be added to low_pc), unset if address form.
-    const HIGH_PC_IS_RELATIVE: u32 = 1 << 29;
+    pub const HIGH_PC_IS_RELATIVE: u32 = 1 << 29;
 }
 
 #[derive(Default, Clone, Copy)]
 pub struct DwarfReference {
-    offset: usize,
+    pub offset: usize,
 }
 impl DwarfReference {
     // (Keep these from clashing with bits in DwarfRanges and in sync with assert in preprocess().)
-    const HAS_SPECIFICATION_OR_ABSTRACT_ORIGIN: u32 = 1 << 30;
-    const GLOBAL: u32 = 1 << 31;
+    pub const HAS_SPECIFICATION_OR_ABSTRACT_ORIGIN: u32 = 1 << 30;
+    pub const GLOBAL: u32 = 1 << 31;
 }
 
 #[derive(Default)]
 pub struct DwarfCodeLocation {
-    file: usize,
-    line: usize,
-    column: usize,
+    pub file: usize,
+    pub line: usize,
+    pub column: usize,
 }
 
 dwarf_struct!{ UnitPrepassAttributes {
@@ -635,7 +651,7 @@ pub fn list_units(dwarf: &mut Dwarf<DwarfSlice>, binary_name: &str, layouts: All
                 off_end += 1;
             }
 
-            let mut vec = vec![Abbreviation {code: 0, tag: DW_TAG_null, has_children: false, attributes: Vec::new(), actions: [Default::default(), Default::default()]}];
+            let mut vec = vec![Abbreviation {code: 0, tag: DW_TAG_null, has_children: false, attributes: Vec::new(), actions: [Default::default(), Default::default(), Default::default()]}];
             let (mut consecutive, mut sorted) = (true, true);
             let mut prev_code = 0;
 
@@ -675,13 +691,14 @@ pub fn list_units(dwarf: &mut Dwarf<DwarfSlice>, binary_name: &str, layouts: All
                     attributes.push(AttributeSpecification {name: DwAt(name), form: DwForm(form), implicit_const_value});
                 }
 
-                let mut actions = [AbbreviationActions::default(), AbbreviationActions::default()];
+                let mut actions = [AbbreviationActions::default(), AbbreviationActions::default(), AbbreviationActions::default()];
                 if let Some(layout_idx) = shared.layouts.find(tag) {
                     actions[0] = prepare_abbreviation_actions(&attributes, layout_idx, encoding, &mut shared)?;
                 }
                 if let Some(layout_idx) = shared.layouts.find_secondary(tag) {
                     actions[1] = prepare_abbreviation_actions(&attributes, layout_idx, encoding, &mut shared)?;
                 }
+                actions[2] = prepare_abbreviation_actions(&attributes, shared.layouts.empty_layout_idx, encoding, &mut shared)?;
 
                 vec.push(Abbreviation {code, tag, has_children: has_children != 0, attributes, actions});
 
