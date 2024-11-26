@@ -119,6 +119,14 @@ fn main() {
             settings.periodic_timer_ns = (seconds * 1e9) as usize;
         } else if let Some(_) = parse_arg(&mut args, "--verbose", "", true) {
             settings.trace_logging = true;
+        } else if let Some(v) = parse_arg(&mut args, "--max-threads", "", false) {
+            settings.max_threads = match usize::from_str(&v) {
+                Err(_) => {
+                    eprintln!("invalid --max-threads (expected nonnegative integer): {}", v);
+                    process::exit(1);
+                }
+                Ok(x) => x,
+            };
         } else if print_help_chapter(&args[0], &all_args[0]) {
             process::exit(0);
         } else {

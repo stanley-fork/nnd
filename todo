@@ -15,6 +15,7 @@ optimize symbols loading
     declare struct layouts per tag
     preprocess abbreviations
     parse+resolve/convert attributes directly into the structs
+    fix warning about unsupported forms, especially implicit_const on flags
     remove gimli::Unit, get the basic info ourselves
     compare two error checking approaches
     try caching chase results (71M chases, 15M unique results, 205M total DIEs)
@@ -33,6 +34,7 @@ test with 10k threads
   maybe avoid duplicate POKEUSER calls for debug registers if the thread already had them assigned
 test with watches window filled with long arrays (I saw 50ms frames when there are ~5 of them; maybe just decrease length limit)
 
+update Vec pretty printer - the inner pointer is u8 now
 do something for downcasts in conditional breakpoints (coalesce()? maybe()? ?()? ()?? checkbox to stop on error? 'is' operator? explicit checked downcast? also function to check field presense without evaluating it)
 edit breakpoint condition on click
 support casting slices (e.g. from pretty printers) to slices of different type (especially string)

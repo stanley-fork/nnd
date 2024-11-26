@@ -285,7 +285,7 @@ pub fn disassemble_function(function_idx: usize, mut static_addr_ranges: Vec<Ran
 
                         if !seen_subfunction_identities.insert(subfunction.identity) {
                             // Indicate that the inlined function has multiple address ranges.
-                            styled_write!(res.text, palette.default_dim, " [cont]");//asdqwe test this, along with mouse hover on multi-range inlined functions
+                            styled_write!(res.text, palette.default_dim, " [cont]");
                         }
                         res.text.close_line();
                         res.lines.push(DisassemblyLineInfo {kind: DisassemblyLineKind::InlinedFunctionName, static_addr, subfunction_level, leaf_line: cur_leaf_line.clone(), subfunction: cur_subfunction.clone(), ..Default::default()});

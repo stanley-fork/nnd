@@ -9,7 +9,6 @@ opt-level = 1
 
 [profile.release]
 panic = 'abort'
-debug = true #asdqwe
 
 [profile.dbgo]
 inherits = "release"

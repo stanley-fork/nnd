@@ -701,7 +701,7 @@ fn one_container_name_looks_like_string(s: &str) -> bool {
     let end = s.find('<').unwrap_or(s.len());
     let s = &s[..end];
     // Hope no one will have a struct called "NotString".
-    s.find("str").is_some() || s.find("Str").is_some()
+    s.find("str").is_some() || s.find("Str").is_some() || s.find("Path").is_some()
 }
 
 fn container_name_looks_like_string(t: *const TypeInfo, additional_names: &[&str]) -> bool {
@@ -870,7 +870,14 @@ fn recognize_slice_or_vec(substruct: &mut ContainerSubstruct, val: &mut Cow<Valu
     };
 
     // Guess whether this is a string.
-    let is_string = inner_size == 1 && container_name_looks_like_string(val.type_, additional_names);
+    let is_string = inner_size <= 1 && container_name_looks_like_string(val.type_, additional_names);
+
+    // Rust &Path (or &OsStr) is weird: it's {data_ptr: *Path, length: usize}, where Path is a struct with DW_AT_byte_size = 0, but one field of size 1 byte (in 100 wrappers);
+    // I guess philosophically this Path is supposed to be a dynamically-sized struct, but there doesn't seem to be anything in the debug info to indicate that or to
+    // distinguish it from a size 0 struct (except maybe the mismatch between the declared size and the size of the field).
+    if is_string && inner_size == 0 {
+        inner_type = state.builtin_types.char8;
+    }
 
     // Return a slice.
     make_slice(val, start, len, inner_type, is_string, state);
@@ -889,11 +896,19 @@ fn recognize_rust_vec(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, 
     let head_field = optional_field(find_int_field(&["head"], substruct))?;
     substruct.check_all_fields_used()?;
 
+    let mut inner_size = (unsafe {&*inner_type}).calculate_size();
+    if inner_size == 1 {
+        // Newer versions of Rust have u8 pointer regardless of the actual element type.
+        if let Some(t) = optional_field(find_nested_type("T", val.type_))? {
+            inner_type = t;
+            inner_size = (unsafe {&*inner_type}).calculate_size();
+        }
+    }
+
     let len = val.val.bit_range(len_field, &mut context.memory)?;
     let ptr = val.val.bit_range(ptr_field, &mut context.memory)?;
     let cap = val.val.bit_range(cap_field, &mut context.memory)?;
 
-    let inner_size = (unsafe {&*inner_type}).calculate_size();
     if let Some(f) = head_field {
         // VecDeque.
         let head = val.val.bit_range(f, &mut context.memory)?;

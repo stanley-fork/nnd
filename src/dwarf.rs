@@ -15,31 +15,86 @@ use std::{str, borrow::Cow, fmt, sync::Mutex, collections::HashSet, mem, ptr};
 // We currently don't support .debug_types section. If we were to support it, we would pack section id and offset into one 8-byte value and use that as DieOffset (just like UnitSectionOffset, but 8 bytes instead of 16).
 pub type DieOffset = DebugInfoOffset<usize>;
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub struct DwarfSlice {
-    pub slice: &'static [u8], // opt out of the borrow checker for this, for now
+    // If the slice is nonempty, it's guaranteed to be padded on the right by at least one extra page of readable memory (see Mmap::new()).
+    p: *const u8,
+    n: usize,
+}
+unsafe impl Send for DwarfSlice {}
+unsafe impl Sync for DwarfSlice {}
+impl Default for DwarfSlice { fn default() -> Self { Self {p: ptr::null(), n: 0} } }
+impl fmt::Debug for DwarfSlice { fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> std::result::Result<(), fmt::Error> { write!(fmt, "DwarfSlice of length {}", self.n) } }
+impl DwarfSlice {
+    pub fn new(slice: &'static [u8]) -> DwarfSlice { DwarfSlice {p: slice.as_ptr(), n: slice.len()} }
+    pub fn slice(&self) -> &'static [u8] {unsafe {std::slice::from_raw_parts(self.p, self.n)}}
+    pub fn as_ptr(&self) -> *const u8 {self.p}
+
+    #[inline]
+    pub fn read_bytes(&mut self, len: usize) -> gimli::Result<&'static [u8]> {
+        if len > self.n {
+            Err(gimli::Error::UnexpectedEof(self.offset_id()))
+        } else {
+            let r = unsafe {std::slice::from_raw_parts(self.p, len)};
+            self.p = unsafe {self.p.add(len)};
+            self.n -= len;
+            Ok(r)
+        }
+    }
+
+    pub fn read_u24(&mut self) -> gimli::Result<u32> {
+        let mut a = [0u8; 4];
+        a[..3].copy_from_slice(self.read_bytes(3)?);
+        Ok(u32::from_le_bytes(a))
+    }
+
+    // Functions replacing gimli EntriesRaw.
+
+    pub fn read_abbreviation<'ab>(&mut self, abbreviations: &'ab AbbreviationSet) -> Result<Option<&'ab Abbreviation>> {
+        let code = self.read_uleb128()? as usize;
+        if code == 0 {
+            return Ok(None);
+        }
+        Ok(Some(abbreviations.get(code)?))
+    }
 }
 
 pub struct SliceReader {
     pub slice: DwarfSlice, // TODO: after all gimli parsing code is replaced, unwrap this to &'static [u8]
-    // TODO: pub unexpected_eof: bool, add it to check(), audit everything
+    pub unexpected_eof: bool, // TODO: try to use signed len trick instead (set length to -1 on unexpected eof, do signed check on reads), after unwrapping `slice` so we can leave the len in gimli slices unsigned
 }
 impl SliceReader {
-    pub fn new(slice: DwarfSlice) -> Self { Self {slice} }
-    pub fn check(&self) -> Result<()> { Ok(()) } //if self.unexpected_eof {err!(Dwarf, "unexpected end of section")} else {Ok(())} }
+    pub fn new(slice: DwarfSlice) -> Self { Self {slice, unexpected_eof: false} }
+    pub fn check(&self) -> Result<()> { if self.unexpected_eof {err!(Dwarf, "unexpected end of section")} else {Ok(())} }
 
-    pub fn read_attribute(&mut self, spec: AttributeSpecification, encoding: Encoding) -> gimli::Result<AttributeValue<DwarfSlice>> {
-        self.slice.read_attribute(spec, encoding)
-    }
-    pub fn skip_attribute(&mut self, spec: AttributeSpecification, encoding: Encoding) -> gimli::Result<()> {
-        self.slice.skip_attribute(spec, encoding)
-    }
+    #[inline]
+    unsafe fn read_bytes_unchecked(&mut self, len: usize) -> &'static [u8] { let r = std::slice::from_raw_parts(self.slice.p, len); self.slice.p = self.slice.p.add(len); self.slice.n -= len; r }
+    #[inline]
+    unsafe fn advance_unchecked(&mut self, len: usize) -> *const u8 { let p = self.slice.p; self.slice.p = self.slice.p.add(len); self.slice.n -= len; p }
+
+    // Byte reading functions that try to be faster by avoiding Result<>. Instead, you may parse a bunch of values, then call check() to check that there was no unexpected end of data.
+    // Also call check() if any other parsing error occurred, because that error may've been caused by reaching eof and getting unexpected zeroes from these functions.
+    pub fn read_u8_or_zero(&mut self) -> u8 { unsafe { if self.slice.n == 0 {self.unexpected_eof = true; 0} else {*self.advance_unchecked(1)} } }
+    pub fn read_u16_or_zero(&mut self) -> u16 { unsafe { if self.slice.n < 2 {self.unexpected_eof = true; self.slice.n = 0; 0} else {ptr::read_unaligned(self.advance_unchecked(2) as *const u16)} } }
+    pub fn read_u24_or_zero(&mut self) -> u32 { unsafe { if self.slice.n < 3 {self.unexpected_eof = true; self.slice.n = 0; 0} else {ptr::read_unaligned(self.advance_unchecked(3) as *const u32) & 0xffffff} } } // relying on padding
+    pub fn read_u32_or_zero(&mut self) -> u32 { unsafe { if self.slice.n < 4 {self.unexpected_eof = true; self.slice.n = 0; 0} else {ptr::read_unaligned(self.advance_unchecked(4) as *const u32)} } }
+    pub fn read_u64_or_zero(&mut self) -> u64 { unsafe { if self.slice.n < 8 {self.unexpected_eof = true; self.slice.n = 0; 0} else {ptr::read_unaligned(self.advance_unchecked(8) as *const u64)} } }
+    pub fn read_bytes_or_empty(&mut self, len: usize) -> &'static [u8] { unsafe { if self.slice.n < len {self.unexpected_eof = true; self.slice.n = 0; &[]} else {std::slice::from_raw_parts(self.advance_unchecked(len), len)} } }
 
     pub fn skip_attributes(&mut self, abbreviation: &Abbreviation, context: &AttributeContext) -> Result<()> {
         unsafe {self.read_attributes(abbreviation, /*which_layout*/ 2, context, ptr::null_mut())}
     }
 
     pub unsafe fn read_attributes(&mut self, abbreviation: &Abbreviation, which_layout: usize, context: &AttributeContext, out: *mut u8) -> Result<()> {
+        let r = self.read_attributes_impl(abbreviation, which_layout, context, out);
+        if self.unexpected_eof {
+            err!(Dwarf, "unexpected end of section when parsing attributes")
+        } else {
+            r
+        }
+    }
+
+    pub unsafe fn read_attributes_impl(&mut self, abbreviation: &Abbreviation, which_layout: usize, context: &AttributeContext, out: *mut u8) -> Result<()> {
         let actions = &abbreviation.actions[which_layout];
         let mut flags = actions.flags_value;
         for mut action in actions.actions.iter().copied() {
@@ -62,7 +117,6 @@ impl SliceReader {
 
             let out_field = out.add(action.field_offset as usize);
             // I guess this is not UB? I just want to emit a `mov` instruction, is it too much to ask.
-            //asdqwe check that this compiles to a simple mov and is inlined
             let set_usize = |x: usize| ptr::copy_nonoverlapping(&x as *const usize as *const u8, out_field, 8);
             let set_slice = |x: &'static [u8], check_utf8: bool| {
                 if check_utf8 && std::str::from_utf8(x).is_err() {
@@ -76,8 +130,9 @@ impl SliceReader {
 
             let set_strx = |index: usize, context: &AttributeContext| -> Result<()> {
                 let offset = context.dwarf.string_offset(context.unit, DebugStrOffsetsIndex(index))?;
+                // TODO: Replace all occurrences of `string(` in this file with a faster SIMD null-terminated string implementation. Same for read_null_terminated_slice().
                 let s = context.dwarf.string(offset)?;
-                set_slice(s.slice, action.param != 0);
+                set_slice(s.slice(), action.param != 0);
                 Ok(())
             };
             let set_addrx = |index: usize, context: &AttributeContext| -> Result<()> {
@@ -94,57 +149,57 @@ impl SliceReader {
             };
 
             match action.form {
-                DW_FORM_addr => set_usize(if context.unit.header.encoding().address_size == 8 {self.slice.read_u64()? as usize} else {self.slice.read_u32()? as usize}),
+                DW_FORM_addr => set_usize(if context.unit.header.encoding().address_size == 8 {self.read_u64_or_zero() as usize} else {self.read_u32_or_zero() as usize}),
 
                 DW_FORM_block1 => {
-                    let len = self.slice.read_u8()? as usize;
-                    set_slice(self.slice.read_bytes(len)?, false);
+                    let len = self.read_u8_or_zero() as usize;
+                    set_slice(self.read_bytes_or_empty(len), false);
                 }
                 DW_FORM_block2 => {
-                    let len = self.slice.read_u16()? as usize;
-                    set_slice(self.slice.read_bytes(len)?, false);
+                    let len = self.read_u16_or_zero() as usize;
+                    set_slice(self.read_bytes_or_empty(len), false);
                 }
                 DW_FORM_block4 => {
-                    let len = self.slice.read_u32()? as usize;
-                    set_slice(self.slice.read_bytes(len)?, false);
+                    let len = self.read_u32_or_zero() as usize;
+                    set_slice(self.read_bytes_or_empty(len), false);
                 }
                 DW_FORM_block | DW_FORM_exprloc => {
                     let len = self.slice.read_uleb128()? as usize;
-                    set_slice(self.slice.read_bytes(len)?, false);
+                    set_slice(self.read_bytes_or_empty(len), false);
                 }
-                DW_FORM_data16 => set_slice(self.slice.read_bytes(16)?, false),
+                DW_FORM_data16 => set_slice(self.read_bytes_or_empty(16), false),
 
-                DW_FORM_data1 => set_usize(self.slice.read_u8()? as usize),
-                DW_FORM_data2 => set_usize(self.slice.read_u16()? as usize),
-                DW_FORM_data4 => set_usize(self.slice.read_u32()? as usize),
-                DW_FORM_data8 => set_usize(self.slice.read_u64()? as usize),
+                DW_FORM_data1 => set_usize(self.read_u8_or_zero() as usize),
+                DW_FORM_data2 => set_usize(self.read_u16_or_zero() as usize),
+                DW_FORM_data4 => set_usize(self.read_u32_or_zero() as usize),
+                DW_FORM_data8 => set_usize(self.read_u64_or_zero() as usize),
                 DW_FORM_sdata => set_usize(self.slice.read_sleb128()? as usize),
                 DW_FORM_udata => set_usize(self.slice.read_uleb128()? as usize),
 
-                DW_FORM_string => set_slice(self.slice.read_null_terminated_slice()?.slice, action.param != 0),
+                DW_FORM_string => set_slice(self.slice.read_null_terminated_slice()?.slice(), action.param != 0),
                 DW_FORM_strp => {
                     let offset = self.slice.read_offset(context.unit.header.encoding().format)?;
                     let s = context.dwarf.string(DebugStrOffset(offset))?;
-                    set_slice(s.slice, action.param != 0);
+                    set_slice(s.slice(), action.param != 0);
                 }
                 DW_FORM_strp_sup => {
                     let offset = self.slice.read_offset(context.unit.header.encoding().format)?;
                     let s = context.dwarf.sup_string(DebugStrOffset(offset))?;
-                    set_slice(s.slice, action.param != 0);
+                    set_slice(s.slice(), action.param != 0);
                 }
                 DW_FORM_line_strp => {
                     let offset = self.slice.read_offset(context.unit.header.encoding().format)?;
                     let s = context.dwarf.line_string(DebugLineStrOffset(offset))?;
-                    set_slice(s.slice, action.param != 0);
+                    set_slice(s.slice(), action.param != 0);
                 }
                 DW_FORM_strx => set_strx(self.slice.read_uleb128()? as usize, context)?,
-                DW_FORM_strx1 => set_strx(self.slice.read_u8()? as usize, context)?,
-                DW_FORM_strx2 => set_strx(self.slice.read_u16()? as usize, context)?,
-                DW_FORM_strx3 => set_strx(self.slice.read_u24()? as usize, context)?,
-                DW_FORM_strx4 => set_strx(self.slice.read_u32()? as usize, context)?,
+                DW_FORM_strx1 => set_strx(self.read_u8_or_zero() as usize, context)?,
+                DW_FORM_strx2 => set_strx(self.read_u16_or_zero() as usize, context)?,
+                DW_FORM_strx3 => set_strx(self.read_u24_or_zero() as usize, context)?,
+                DW_FORM_strx4 => set_strx(self.read_u32_or_zero() as usize, context)?,
 
                 DW_FORM_flag => {
-                    let v = self.slice.read_u8()?;
+                    let v = self.read_u8_or_zero();
                     if v > 1 {
                         return err!(Dwarf, "invalid flag value: {}", v);
                     }
@@ -152,19 +207,19 @@ impl SliceReader {
                 }
                 DW_FORM_flag_present => (),
 
-                DW_FORM_ref1 => set_unit_offset(self.slice.read_u8()? as usize, context),
-                DW_FORM_ref2 => set_unit_offset(self.slice.read_u16()? as usize, context),
-                DW_FORM_ref4 => set_unit_offset(self.slice.read_u32()? as usize, context),
-                DW_FORM_ref8 => set_unit_offset(self.slice.read_u64()? as usize, context),
+                DW_FORM_ref1 => set_unit_offset(self.read_u8_or_zero() as usize, context),
+                DW_FORM_ref2 => set_unit_offset(self.read_u16_or_zero() as usize, context),
+                DW_FORM_ref4 => set_unit_offset(self.read_u32_or_zero() as usize, context),
+                DW_FORM_ref8 => set_unit_offset(self.read_u64_or_zero() as usize, context),
                 DW_FORM_ref_udata => set_unit_offset(self.slice.read_uleb128()? as usize, context),
 
                 DW_FORM_ref_addr | DW_FORM_sec_offset => set_usize(self.slice.read_offset(context.unit.header.encoding().format)?),
 
                 DW_FORM_addrx => set_addrx(self.slice.read_uleb128()? as usize, context)?,
-                DW_FORM_addrx1 => set_addrx(self.slice.read_u8()? as usize, context)?,
-                DW_FORM_addrx2 => set_addrx(self.slice.read_u16()? as usize, context)?,
-                DW_FORM_addrx3 => set_addrx(self.slice.read_u24()? as usize, context)?,
-                DW_FORM_addrx4 => set_addrx(self.slice.read_u32()? as usize, context)?,
+                DW_FORM_addrx1 => set_addrx(self.read_u8_or_zero() as usize, context)?,
+                DW_FORM_addrx2 => set_addrx(self.read_u16_or_zero() as usize, context)?,
+                DW_FORM_addrx3 => set_addrx(self.read_u24_or_zero() as usize, context)?,
+                DW_FORM_addrx4 => set_addrx(self.read_u32_or_zero() as usize, context)?,
 
                 DW_FORM_implicit_const => set_usize(action.param),
 
@@ -186,15 +241,15 @@ impl SliceReader {
                     self.slice.skip(len)?;
                 }
                 DW_EXTRA_FORM_skip_block1 => {
-                    let len = self.slice.read_u8()? as usize;
+                    let len = self.read_u8_or_zero() as usize;
                     self.slice.skip(len)?;
                 }
                 DW_EXTRA_FORM_skip_block2 => {
-                    let len = self.slice.read_u16()? as usize;
+                    let len = self.read_u16_or_zero() as usize;
                     self.slice.skip(len)?;
                 }
                 DW_EXTRA_FORM_skip_block4 => {
-                    let len = self.slice.read_u32()? as usize;
+                    let len = self.read_u32_or_zero() as usize;
                     self.slice.skip(len)?;
                 }
                 DW_EXTRA_FORM_skip_string => {self.slice.read_null_terminated_slice()?;}
@@ -226,13 +281,6 @@ pub struct AttributeSpecification {
     pub form: DwForm,
     pub implicit_const_value: usize,
 }
-impl AttributeSpecification {
-    // TODO: Remove these.
-    #[inline]
-    pub fn name(&self) -> DwAt { self.name }
-    #[inline]
-    pub fn form(&self) -> DwForm { self.form }
-}
 
 #[derive(Clone)]
 pub struct Abbreviation {
@@ -247,11 +295,8 @@ pub struct Abbreviation {
     actions: [AbbreviationActions; 3],
 }
 impl Abbreviation {
-    // TODO: Remove these.
     #[inline]
     pub fn tag(&self) -> DwTag { self.tag }
-    #[inline]
-    pub fn attributes(&self) -> &[AttributeSpecification] { &self.attributes }
 }
 
 #[derive(Clone)]
@@ -417,11 +462,17 @@ pub struct AbbreviationsSharedData {
     warnings: FormWarningLimiter,
 }
 
+#[derive(Clone)]
 pub struct AttributeContext<'a> {
     // TODO: Try inlining frequently accessed fields of these structs here for speed.
     pub unit: &'a Unit<DwarfSlice>,
     pub dwarf: &'a Dwarf<DwarfSlice>,
     pub shared: &'a AbbreviationsSharedData,
+}
+impl<'a> AttributeContext<'a> {
+    pub fn switch_unit(&mut self, unit: &'a Unit<DwarfSlice>) {
+        self.unit = unit;
+    }
 }
 
 // What to do with an attribute: which forms to expect, what output type to produce, what conversions to apply.
@@ -511,7 +562,6 @@ macro_rules! dwarf_field_mask_constants {
 }
 
 // Example usage:
-//asdqwe change to different example since ranges stuff got special-cased
 //
 // dwarf_struct!{ MyStruct {
 //     range_lists: RangeListsOffset, DW_AT_ranges, RangeLists;
@@ -614,7 +664,7 @@ impl DwarfReference {
     pub const GLOBAL: u32 = 1 << 31;
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 pub struct DwarfCodeLocation {
     pub file: usize,
     pub line: usize,
@@ -668,7 +718,7 @@ pub fn list_units(dwarf: &mut Dwarf<DwarfSlice>, binary_name: &str, layouts: All
                     return err!(Dwarf, "abbreviation has tag 0");
                 }
                 let tag = DwTag(tag);
-                let has_children = reader.slice.read_u8()?;
+                let has_children = reader.read_u8_or_zero();
                 if has_children > 1 {
                     return err!(Dwarf, "invalid has_children value in abbreviation");
                 }
@@ -761,21 +811,21 @@ impl gimli::Reader for DwarfSlice {
     fn endian(&self) -> Self::Endian {LittleEndian::default()}
 
     // Boring adapters.
-    fn len(&self) -> usize {self.slice.len()}
-    fn empty(&mut self) {self.slice = &self.slice[..0]}
-    fn truncate(&mut self, len: usize) -> gimli::Result<()> {if len > self.slice.len() {Err(gimli::Error::UnexpectedEof(self.offset_id()))} else {self.slice = &self.slice[..len]; Ok(())}}
-    fn offset_id(&self) -> ReaderOffsetId {ReaderOffsetId(self.slice.as_ptr() as u64)}
-    fn lookup_offset_id(&self, id: ReaderOffsetId) -> Option<usize> {let ptr = self.slice.as_ptr() as u64; if id.0 >= ptr && id.0 <= ptr + self.slice.len() as u64 {Some((id.0 - ptr) as usize)} else {None}}
+    fn len(&self) -> usize {self.n}
+    fn empty(&mut self) {self.n = 0;}
+    fn truncate(&mut self, len: usize) -> gimli::Result<()> {if len > self.n {Err(gimli::Error::UnexpectedEof(self.offset_id()))} else {self.n = len; Ok(())}}
+    fn offset_id(&self) -> ReaderOffsetId {ReaderOffsetId(self.p as u64)}
+    fn lookup_offset_id(&self, id: ReaderOffsetId) -> Option<usize> {let ptr = self.p as u64; if id.0 >= ptr && id.0 <= ptr + self.n as u64 {Some((id.0 - ptr) as usize)} else {None}}
     fn skip(&mut self, len: usize) -> gimli::Result<()> {self.read_bytes(len)?; Ok(())}
     fn split(&mut self, len: usize) -> gimli::Result<Self> {Ok(Self::new(self.read_bytes(len)?))}
-    fn to_slice(&self) -> gimli::Result<Cow<'_, [u8]>> {Ok(self.slice.into())}
-    fn to_string_lossy(&self) -> gimli::Result<Cow<'_, str>> {Ok(String::from_utf8_lossy(self.slice))}
-    fn to_string(&self) -> gimli::Result<Cow<'_, str>> {match str::from_utf8(self.slice) {Ok(s) => Ok(s.into()), _ => Err(gimli::Error::BadUtf8)}} // unused, no need to optimize
+    fn to_slice(&self) -> gimli::Result<Cow<'_, [u8]>> {Ok(self.slice().into())}
+    fn to_string_lossy(&self) -> gimli::Result<Cow<'_, str>> {Ok(String::from_utf8_lossy(self.slice()))}
+    fn to_string(&self) -> gimli::Result<Cow<'_, str>> {match str::from_utf8(self.slice()) {Ok(s) => Ok(s.into()), _ => Err(gimli::Error::BadUtf8)}} // unused, no need to optimize
     fn read_slice(&mut self, buf: &mut [u8]) -> gimli::Result<()> {buf.copy_from_slice(self.read_bytes(buf.len())?); Ok(())}
     fn offset_from(&self, base: &Self) -> usize {
-        let base_ptr = base.slice.as_ptr() as usize;
-        let ptr = self.slice.as_ptr() as usize;
-        debug_assert!(ptr >= base_ptr && ptr <= base_ptr + base.slice.len());
+        let base_ptr = base.p as usize;
+        let ptr = self.p as usize;
+        debug_assert!(ptr >= base_ptr && ptr <= base_ptr + base.n);
         ptr - base_ptr
     }
 
@@ -783,8 +833,8 @@ impl gimli::Reader for DwarfSlice {
 
     fn find(&self, byte: u8) -> gimli::Result<usize> {
         // TODO: Make this fast with simd.
-        for i in 0..self.slice.len() {
-            if self.slice[i] == byte {
+        for i in 0..self.n {
+            if unsafe {*self.p.add(i)} == byte {
                 return Ok(i);
             }
         }
@@ -814,11 +864,12 @@ impl gimli::Reader for DwarfSlice {
         let mut r = 0u64;
         let mut shift = 0u32;
         loop {
-            if self.slice.is_empty() {
+            if self.n == 0 {
                 return Err(gimli::Error::UnexpectedEof(self.offset_id()));
             }
-            let b = self.slice[0];
-            self.slice = &self.slice[1..];
+            let b = unsafe {*self.p};
+            self.p = unsafe {self.p.add(1)};
+            self.n -= 1;
             if shift == 63 && b > 1 {
                 return Err(gimli::Error::BadUnsignedLeb128);
             }
@@ -841,150 +892,6 @@ impl gimli::Reader for DwarfSlice {
 
     // TODO: fn read_uleb128_u16(&mut self) -> gimli::Result<u16>
     // TODO: fn read_sleb128(&mut self) -> gimli::Result<i64>
-}
-
-impl fmt::Debug for DwarfSlice {
-    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> std::result::Result<(), fmt::Error> {
-        write!(fmt, "DwarfSlice of length {}", self.slice.len())
-    }
-}
-
-impl DwarfSlice {
-    pub fn new(slice: &'static [u8]) -> DwarfSlice {
-        DwarfSlice {slice}
-    }
-
-    pub fn slice(&self) -> &'static [u8] {self.slice}
-
-    pub fn as_ptr(&self) -> *const u8 {self.slice.as_ptr()}
-
-    #[inline]
-    pub fn read_bytes(&mut self, len: usize) -> gimli::Result<&'static [u8]> {
-        if len > self.slice.len() {
-            Err(gimli::Error::UnexpectedEof(self.offset_id()))
-        } else {
-            let r = &self.slice[..len];
-            self.slice = &self.slice[len..];
-            Ok(r)
-        }
-    }
-
-    pub fn read_u24(&mut self) -> gimli::Result<u32> {
-        let mut a = [0u8; 4];
-        a[..3].copy_from_slice(self.read_bytes(3)?);
-        Ok(u32::from_le_bytes(a))
-    }
-
-    // Functions replacing gimli EntriesRaw.
-
-    pub fn read_abbreviation<'ab>(&mut self, abbreviations: &'ab AbbreviationSet) -> Result<Option<&'ab Abbreviation>> {
-        let code = self.read_uleb128()? as usize;
-        if code == 0 {
-            return Ok(None);
-        }
-        Ok(Some(abbreviations.get(code)?))
-    }
-
-    #[inline]
-    fn chase_attribute_form(&mut self, mut form: DwForm) -> gimli::Result<DwForm> {
-        while form == constants::DW_FORM_indirect {
-            form = constants::DwForm(self.read_uleb128_u16()?);
-        }
-        Ok(form)
-    }        
-
-    // Doesn't do the conversions that gimli Attribute::value() does, so the caller needs to recognize some more forms sometimes.
-    // Specifically, it should use offset_value() instead of expecting things like AttributeValue::RangeListsRef (idk why they exist,
-    // attribute name already uniquely determines which section the offset points to; I guess it's just a paranoid redundant check to make bugs less likely?
-    // doesn't seem worth the extra code and the overhead).
-    pub fn read_attribute(&mut self, spec: AttributeSpecification, encoding: Encoding) -> gimli::Result<AttributeValue<DwarfSlice>> {
-        let form = self.chase_attribute_form(spec.form())?;
-        Ok(match form {
-            constants::DW_FORM_addr => AttributeValue::Addr(self.read_address(encoding.address_size)?),
-            constants::DW_FORM_block1 => AttributeValue::Block({let n = self.read_u8()? as usize; self.split(n)?}),
-            constants::DW_FORM_block2 => AttributeValue::Block({let n = self.read_u16()? as usize; self.split(n)?}),
-            constants::DW_FORM_block4 => AttributeValue::Block({let n = self.read_u32()? as usize; self.split(n)?}),
-            constants::DW_FORM_block => AttributeValue::Block({let n = self.read_uleb128()? as usize; self.split(n)?}),
-            constants::DW_FORM_data1 => AttributeValue::Data1(self.read_u8()?),
-            constants::DW_FORM_data2 => AttributeValue::Data2(self.read_u16()?),
-            // Note: this is missing logic for DWARF 2/3, see allow_section_offset() in gimli.
-            constants::DW_FORM_data4 => AttributeValue::Data4(self.read_u32()?),
-            constants::DW_FORM_data8 => AttributeValue::Data8(self.read_u64()?),
-            constants::DW_FORM_data16 => AttributeValue::Block(self.split(16)?),
-            constants::DW_FORM_udata => AttributeValue::Udata(self.read_uleb128()?),
-            constants::DW_FORM_sdata => AttributeValue::Sdata(self.read_sleb128()?),
-            constants::DW_FORM_exprloc => AttributeValue::Exprloc(Expression({let n = self.read_uleb128()? as usize; self.split(n)?})),
-            constants::DW_FORM_flag => AttributeValue::Flag(self.read_u8()? != 0),
-            constants::DW_FORM_flag_present => AttributeValue::Flag(true),
-            constants::DW_FORM_sec_offset => AttributeValue::SecOffset(self.read_offset(encoding.format)?),
-            constants::DW_FORM_ref1 => AttributeValue::UnitRef(UnitOffset(self.read_u8()? as usize)),
-            constants::DW_FORM_ref2 => AttributeValue::UnitRef(UnitOffset(self.read_u16()? as usize)),
-            constants::DW_FORM_ref4 => AttributeValue::UnitRef(UnitOffset(self.read_u32()? as usize)),
-            constants::DW_FORM_ref8 => AttributeValue::UnitRef(UnitOffset(self.read_u64()? as usize)),
-            constants::DW_FORM_ref_udata => AttributeValue::UnitRef(UnitOffset(self.read_uleb128()? as usize)),
-            // Note: this is missing logic for DWARF 2, see this case in parse_attribute() in gimli.
-            constants::DW_FORM_ref_addr => AttributeValue::DebugInfoRef(DebugInfoOffset(self.read_offset(encoding.format)?)),
-            constants::DW_FORM_ref_sig8 => AttributeValue::DebugTypesRef(DebugTypeSignature(self.read_u64()?)),
-            constants::DW_FORM_ref_sup4 => AttributeValue::DebugInfoRefSup(DebugInfoOffset(self.read_u32()? as usize)),
-            constants::DW_FORM_ref_sup8 => AttributeValue::DebugInfoRefSup(DebugInfoOffset(self.read_u64()? as usize)),
-            constants::DW_FORM_GNU_ref_alt => AttributeValue::DebugInfoRefSup(DebugInfoOffset(self.read_offset(encoding.format)?)),
-            constants::DW_FORM_string => AttributeValue::String(self.read_null_terminated_slice()?),
-            constants::DW_FORM_strp => AttributeValue::DebugStrRef(DebugStrOffset(self.read_offset(encoding.format)?)),
-            constants::DW_FORM_strp_sup | constants::DW_FORM_GNU_strp_alt => AttributeValue::DebugStrRefSup(DebugStrOffset(self.read_offset(encoding.format)?)),
-            constants::DW_FORM_line_strp => AttributeValue::DebugLineStrRef(DebugLineStrOffset(self.read_offset(encoding.format)?)),
-            constants::DW_FORM_implicit_const => AttributeValue::Sdata(spec.implicit_const_value as i64),
-            constants::DW_FORM_strx | constants::DW_FORM_GNU_str_index => AttributeValue::DebugStrOffsetsIndex(DebugStrOffsetsIndex(self.read_uleb128()? as usize)),
-            constants::DW_FORM_strx1 => AttributeValue::DebugStrOffsetsIndex(DebugStrOffsetsIndex(self.read_u8()? as usize)),
-            constants::DW_FORM_strx2 => AttributeValue::DebugStrOffsetsIndex(DebugStrOffsetsIndex(self.read_u16()? as usize)),
-            constants::DW_FORM_strx3 => AttributeValue::DebugStrOffsetsIndex(DebugStrOffsetsIndex(self.read_u32()? as usize)),
-            constants::DW_FORM_strx4 => AttributeValue::DebugStrOffsetsIndex(DebugStrOffsetsIndex(self.read_u64()? as usize)),
-            constants::DW_FORM_addrx | constants::DW_FORM_GNU_addr_index => AttributeValue::DebugAddrIndex(DebugAddrIndex(self.read_uleb128()? as usize)),
-            constants::DW_FORM_addrx1 => AttributeValue::DebugAddrIndex(DebugAddrIndex(self.read_u8()? as usize)),
-            constants::DW_FORM_addrx2 => AttributeValue::DebugAddrIndex(DebugAddrIndex(self.read_u16()? as usize)),
-            constants::DW_FORM_addrx3 => AttributeValue::DebugAddrIndex(DebugAddrIndex(self.read_u24()? as usize)),
-            constants::DW_FORM_addrx4 => AttributeValue::DebugAddrIndex(DebugAddrIndex(self.read_u32()? as usize)),
-            constants::DW_FORM_loclistx => AttributeValue::DebugLocListsIndex(DebugLocListsIndex(self.read_uleb128()? as usize)),
-            constants::DW_FORM_rnglistx => AttributeValue::DebugRngListsIndex(DebugRngListsIndex(self.read_uleb128()? as usize)),
-            _ => return Err(gimli::Error::UnknownForm(form)),
-        })
-    }
-
-    pub fn skip_attribute(&mut self, spec: AttributeSpecification, encoding: Encoding) -> gimli::Result<()> {
-        let form = self.chase_attribute_form(spec.form())?;
-        let bytes: usize = match form {
-            constants::DW_FORM_addr => encoding.address_size as usize,
-            constants::DW_FORM_implicit_const | constants::DW_FORM_flag_present => 0,
-            constants::DW_FORM_data1 | constants::DW_FORM_flag | constants::DW_FORM_strx1 | constants::DW_FORM_ref1 | constants::DW_FORM_addrx1 => 1,
-            constants::DW_FORM_data2 | constants::DW_FORM_ref2 | constants::DW_FORM_addrx2 | constants::DW_FORM_strx2 => 2,
-            constants::DW_FORM_addrx3 | constants::DW_FORM_strx3 => 3,
-            constants::DW_FORM_data4 | constants::DW_FORM_ref_sup4 | constants::DW_FORM_ref4 | constants::DW_FORM_strx4 | constants::DW_FORM_addrx4 => 4,
-            constants::DW_FORM_data8 | constants::DW_FORM_ref8 | constants::DW_FORM_ref_sig8 | constants::DW_FORM_ref_sup8 => 8,
-            constants::DW_FORM_data16 => 16,
-            constants::DW_FORM_sec_offset | constants::DW_FORM_GNU_ref_alt | constants::DW_FORM_strp | constants::DW_FORM_strp_sup | constants::DW_FORM_GNU_strp_alt | constants::DW_FORM_line_strp => encoding.format.word_size() as usize,
-
-            constants::DW_FORM_ref_addr => if encoding.version == 2 {encoding.address_size as usize} else {encoding.format.word_size() as usize},
-
-            constants::DW_FORM_block1 => self.read_u8()? as usize,
-            constants::DW_FORM_block2 => self.read_u16()? as usize,
-            constants::DW_FORM_block4 => self.read_u32()? as usize,
-            constants::DW_FORM_block | constants::DW_FORM_exprloc => self.read_uleb128()? as usize,
-            constants::DW_FORM_string => self.find(0)? + 1,
-            constants::DW_FORM_udata | constants::DW_FORM_sdata | constants::DW_FORM_ref_udata | constants::DW_FORM_strx | constants::DW_FORM_GNU_str_index | constants::DW_FORM_addrx | constants::DW_FORM_GNU_addr_index | constants::DW_FORM_loclistx | constants::DW_FORM_rnglistx => {
-                self.skip_leb128()?;
-                0
-            }
-            _ => return Err(gimli::Error::UnknownForm(form)),
-        };
-        self.read_bytes(bytes)?;
-        Ok(())
-    }
-
-    pub fn skip_attributes(&mut self, specs: &[AttributeSpecification], encoding: Encoding) -> gimli::Result<()> {
-        for &spec in specs {
-            self.skip_attribute(spec, encoding)?;
-        }
-        Ok(())
-    }
 }
 
 
@@ -1045,71 +952,6 @@ const DW_EXTRA_FORM_skip_block2: DwForm = DwForm(0xfe04);
 const DW_EXTRA_FORM_skip_block4: DwForm = DwForm(0xfe05);
 const DW_EXTRA_FORM_skip_string: DwForm = DwForm(0xfe06);
 
-
-/*asdqwe
-DW_AT_type, DW_AT_specification, DW_AT_abstract_origin;
-UnitRef, DebugInfoRef;
-
-DW_AT_decl_file, DW_AT_decl_line, DW_AT_decl_column, DW_AT_call_file, DW_AT_call_line, DW_AT_call_column;
-udata_value();
-
-DW_AT_ranges;
-RangeListsRef(offset) => dwarf.ranges_offset_from_raw(unit, offset);
-DebugRngListsIndex(index) => dwarf.ranges_offset(unit, index)?;
-
-DW_AT_low_pc;
-attr_address()
-    Addr(addr) => addr
-    DebugAddrIndex(index) => dwarf.address(unit, index);
-
-DW_AT_high_pc;
-attr_address() or udata_value();
-
-DW_AT_language;
-u16_value();
-
-DW_AT_const_value;
-udata_value()/sdata_value() => usize;
-Block => &'static [u8];
-string_value() => &'static [u8];
-
-DW_AT_location, DW_AT_frame_base;
-exprloc_value(),
-LocationListsRef(offset) => offset,
-DebugLocListsIndex(index) => dwarf.locations_offset(unit, index)?,
-Some(offset) = attr.offset_value() => LocationListsOffset(offset);
-
-DW_AT_main_subprogramm, DW_AT_declaration, DW_AT_external, DW_AT_artificial;
-flag;
-
-DW_AT_inline;
-u8_value();
-
-DW_AT_byte_size, DW_AT_bit_size;
-udata_value();
-
-DW_AT_encoding;
-u8_value();
-
-DW_AT_bit_stride, DW_AT_byte_stride;
-sdata_value(), otherwise "warning: arrays with dynamic stride are not supported ({:?} @0x{:x})";
-
-DW_AT_ordering, DW_AT_rank, DW_AT_discr_list;
-"warning: {} on {} is not supported";
-
-DW_AT_data_bit_offset, DW_AT_data_member_location;
-udata_value();
-exprloc_value() not supported;
-
-DW_AT_discr;
-UnitRef;
-
-DW_AT_discr_value;
-udata_value()/sdata_value();
-
-DW_AT_count, DW_AT_lower_bound, DW_AT_upper_bound;
-udata_value()/sdata_value(), ignore otherwise (exprloc?);
-*/
 
 fn prepare_attribute_action(attr: AttributeSpecification, layout: &AttributeStructLayout, encoding: Encoding, warnings: &FormWarningLimiter, flags: &mut u32) -> Result<AttributeAction> {
     assert!(attr.form != DW_FORM_indirect);
