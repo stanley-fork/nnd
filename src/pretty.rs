@@ -899,6 +899,7 @@ fn recognize_rust_vec(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, 
     let mut inner_size = (unsafe {&*inner_type}).calculate_size();
     if inner_size == 1 {
         // Newer versions of Rust have u8 pointer regardless of the actual element type.
+        //asdqwe there's something broken when the vec was unwrapped from a single-field struct; we probably look at typedefs of the wrapper instead of the vec; check other find_nested_* calls too
         if let Some(t) = optional_field(find_nested_type("T", val.type_))? {
             inner_type = t;
             inner_size = (unsafe {&*inner_type}).calculate_size();

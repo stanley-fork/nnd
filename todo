@@ -40,6 +40,7 @@ edit breakpoint condition on click
 support casting slices (e.g. from pretty printers) to slices of different type (especially string)
 allow casting n-byte arrays/structs to/from n-byte primitive types
 `in` operator, e.g. x in [1, 2, 3]
+make names in MetaType etc unexpandable as array
 scroll code to next breakpoint when deleting breakpoint in breakpoints window
 make '^' apply to expressions instead of variable names, e.g. ^(this.query_context)
 allow adding unconditional breakpoint on the same line as conditional one, somehow
@@ -70,6 +71,7 @@ find function by address (like addr2line)
 use actual function name instead of "_" in namespace path, or do something else to make function-static variables usable
 show number of function inlined sites in disassembly window, allow setting breakpoint on it, allow opening inline-only functions
 show stop reason in status window, next to "suspended"
+follow forks, maybe even support multiple processes
 allow cast `foo as typeof(bar)`, also `foo as typeof(bar)::T`
 show argument values in stack trace
 detect dynamic library loads using r_debug thing

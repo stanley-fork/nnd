@@ -2022,7 +2022,7 @@ struct SubfunctionStackEntry {
     subfunction_level: u16,
     local_variables: Vec<Variable>,
 }
-impl SubfunctionStackEntry { fn reset(&mut self, subfunction_idx: u32, subfunction_level: u16) { (self.subfunction_idx, self.subfunction_level) = (subfunction_idx, subfunction_level); self.local_variables.clear(); } }
+impl SubfunctionStackEntry { #[inline] fn reset(&mut self, subfunction_idx: u32, subfunction_level: u16) { (self.subfunction_idx, self.subfunction_level) = (subfunction_idx, subfunction_level); self.local_variables.clear(); } }
 
 // Type (struct, enum, pointer, etc).
 struct TypeStackEntry {
@@ -2327,8 +2327,8 @@ impl<'a> DwarfLoader<'a> {
             };
 
             let mut attrs = CommonAttributes::default();
-            let mut cursor = SliceReader::new(attribute_context.unit.header.range_from(next_offset..)?);
-            let Some(abbrev) = cursor.slice.read_abbreviation(abbreviations)? else {return err!(Dwarf, "specification/abstract_origin points to null entry")};
+            let mut cursor = SliceReader::new(attribute_context.unit.header.range_from(next_offset..)?.slice());
+            let Some(abbrev) = cursor.read_abbreviation(abbreviations)? else {return err!(Dwarf, "specification/abstract_origin points to null entry")};
             unsafe {cursor.read_attributes(abbrev, /*which_layout*/ 1, &attribute_context, &raw mut attrs as *mut u8)?};
 
             let added_fields = attrs.fields & !*fields;
@@ -2361,15 +2361,15 @@ impl<'a> DwarfLoader<'a> {
         }
 
         // Iterate over DIEs in depth-first order.
-        let mut cursor = SliceReader::new(self.unit.header.range_from(UnitOffset(self.unit.header.header_size())..)?);
+        let mut cursor = SliceReader::new(self.unit.header.range_from(UnitOffset(self.unit.header.header_size())..)?.slice());
         let attribute_context = AttributeContext {unit: self.unit, dwarf: &self.loader.sym.dwarf, shared: &self.loader.abbreviations_shared};
         let encoding = self.unit.encoding();
         let mut prev_has_children = true;
         let mut skip_subtree = usize::MAX;
         loop {
             // Check if we're done.
-            let offset = DebugInfoOffset(cursor.slice.offset_from(&self.section_slice));
-            if cursor.slice.is_empty() {
+            let offset = DebugInfoOffset(cursor.offset_from(self.section_slice.slice()));
+            if cursor.is_empty() {
                 if self.main_stack.len != 2 { // expected stack contents: fake root, DW_TAG_compile_unit (which doesn't have a DW_TAG_null to terminator at the end, for some reason)
                     return err!(Dwarf, "tree ended early @0x{:x}", offset.0);
                 }
@@ -2412,7 +2412,7 @@ impl<'a> DwarfLoader<'a> {
             }
 
             // Read next DIE.
-            let abbrev = cursor.slice.read_abbreviation(self.abbreviations)?;
+            let abbrev = cursor.read_abbreviation(self.abbreviations)?;
             prev_has_children = abbrev.is_some_and(|e| e.has_children);
 
             let abbrev = match abbrev {

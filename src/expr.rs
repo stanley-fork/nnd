@@ -736,7 +736,7 @@ fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut Form
                     } else if let Some(c) = char::from_u32(x as u32) {
                         styled_write!(state.out, state.palette.value, "{} '{}'", c as u32, c);
                     } else {
-                        styled_write!(state.out, state.palette.error, "<bad char: {}>", x);
+                        styled_write!(state.out, state.palette.value, "{}", x);
                     }
                 } else if p.contains(PrimitiveFlags::BOOL) && !as_number {
                     match x {
