@@ -1390,13 +1390,13 @@ pub mod tests {
             };
             if slice_len < len {
                 assert!(reader.unexpected_eof);
-                assert_eq!(reader.slice.n, 0);
+                assert_eq!(reader.n, 0);
                 assert_eq!(res, 0);
             } else {
                 assert!(!reader.unexpected_eof);
-                let read_bytes = reader.slice.p as usize - slice_ptr as usize;
+                let read_bytes = reader.p as usize - slice_ptr as usize;
                 assert_eq!(read_bytes, len);
-                assert_eq!(reader.slice.n, slice_len - read_bytes);
+                assert_eq!(reader.n, slice_len - read_bytes);
                 assert_eq!(res, num);
             }
         }

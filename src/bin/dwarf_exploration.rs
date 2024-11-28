@@ -1,7 +1,7 @@
 #![allow(non_upper_case_globals)]
 extern crate nnd;
 use nnd::{*, error::{*, Result, Error}, elf::*, log::*};
-use std::{fs::{File}, str, mem, collections::hash_map::DefaultHasher, hash::{Hasher, Hash}, fmt::Write as FmtWrite, io::{self, Write}, mem::drop, collections::{HashMap, HashSet}};
+use std::{fs::{File}, str, mem, collections::hash_map::DefaultHasher, hash::{Hasher}, fmt::Write as FmtWrite, io::{self, Write}, mem::drop, collections::{HashMap}};
 use gimli::*;
 
 type SliceType = EndianSlice<'static, LittleEndian>;
@@ -123,10 +123,11 @@ fn main() -> Result<()> {
     {
         let prof = ProfileScope::new(".debug_info pre-pass".to_string());
 
+        /* // For abbreviation stats, make fields `vec` and `map` public in struct Abbreviations in gimli code.
         let (mut abbrev_count_total, mut abbrev_count_max, mut abbrev_attrs_total, mut abbrev_bytes_total, mut abbrev_nonconsecutive, mut abbrev_chasable) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
         let mut abbrev_set_hashes: HashSet<usize> = HashSet::new();
         let mut abbrev_single_hashes: HashSet<usize> = HashSet::new();
-        let mut abbrev_offsets: HashSet<usize> = HashSet::new();
+        let mut abbrev_offsets: HashSet<usize> = HashSet::new();*/
 
         // We have to iterate everything twice because dwarf sux.
         let mut units_iter = dwarf.units();
@@ -148,15 +149,16 @@ fn main() -> Result<()> {
                 }
             }
 
+            /*
             if abbrev_offsets.insert(unit.header.debug_abbrev_offset().0) {
                 let abbrev = &unit.abbreviations;
-                let c = abbrev.vec.len() + abbrev.map.len();
-                abbrev_count_total += c;
+                //let c = abbrev.vec.len() + abbrev.map.len();
+                //abbrev_count_total += c;
                 if !abbrev.map.is_empty() {
                     abbrev_nonconsecutive += 1;
                 }
-                abbrev_count_max = abbrev_count_max.max(c);
-                abbrev_bytes_total += c * mem::size_of::<Abbreviation>();
+                //abbrev_count_max = abbrev_count_max.max(c);
+                //abbrev_bytes_total += c * mem::size_of::<Abbreviation>();
                 let mut set_hasher = DefaultHasher::new();
                 abbrev.vec.len().hash(&mut set_hasher);
                 abbrev.map.len().hash(&mut set_hasher);
@@ -183,14 +185,14 @@ fn main() -> Result<()> {
                 }
                 let set_hash = set_hasher.finish() as usize;
                 abbrev_set_hashes.insert(set_hash);
-            }
+            }*/
 
             units_vec.push(unit);
         }
 
         drop(prof);
         dbg!(units_vec.len());
-        dbg!(line_programs.len());
+        dbg!(line_programs.len());/*
         dbg!(abbrev_count_total);
         dbg!(abbrev_count_max);
         dbg!(abbrev_attrs_total);
@@ -199,7 +201,7 @@ fn main() -> Result<()> {
         dbg!(abbrev_chasable);
         dbg!(abbrev_offsets.len());
         dbg!(abbrev_set_hashes.len());
-        dbg!(abbrev_single_hashes.len());
+        dbg!(abbrev_single_hashes.len());*/
         dbg!(mem::size_of::<Abbreviation>());
         dbg!(mem::size_of::<AttributeSpecification>());
         eprintln!("-----");
