@@ -8,6 +8,7 @@ fix incorrect column numbers with tab indentation (tabs should be counted as 1 c
 investigate why exception-aware step-over doesn't work in clickhouse, at least sometimes
 
 investigate why quitting is slow
+investigate why some types (e.g. arrow::Schema) fail to match declaration to definition, and variables end up shown as empty structs
 optimize symbols loading
   test things
   rewrite dwarf parser

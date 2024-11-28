@@ -56,7 +56,7 @@ impl DwarfSlice {
 pub struct SliceReader {
     p: *const u8,
     n: usize,
-    unexpected_eof: bool, // TODO: try to use signed len trick instead (set length to -1 on unexpected eof, do signed check on reads)
+    unexpected_eof: bool,
 }
 impl SliceReader {
     pub fn new(slice: &'static [u8]) -> Self { Self {p: slice.as_ptr(), n: slice.len(), unexpected_eof: false} }
@@ -365,6 +365,7 @@ impl SliceReader {
                     }
                     *(out_field as *mut bool) = v != 0;
                 }
+                DW_FORM_flag_present => *(out_field as *mut bool) = true,
 
                 DW_FORM_ref1 => set_unit_offset(self.read_u8_or_zero() as usize, context),
                 DW_FORM_ref2 => set_unit_offset(self.read_u16_or_zero() as usize, context),
@@ -412,7 +413,6 @@ impl SliceReader {
                 DW_EXTRA_FORM_skip_string => {self.read_null_terminated_slice_or_empty();}
 
                 // These are unexpected here because prepare_attribute_action() converts them to other forms.
-                // DW_FORM_flag_present => ,
                 // DW_FORM_ref_addr | DW_FORM_sec_offset => ,
 
                 // These are not supported:
@@ -1296,9 +1296,6 @@ fn prepare_abbreviation_actions(attributes: &[AttributeSpecification], layout_id
         }
 
         let action = prepare_attribute_action(*attr, layout, encoding, &shared.warnings, &mut flags_value)?;
-        if action.form == DW_FORM_flag_present {
-            continue;
-        }
         if action.form == DW_EXTRA_FORM_skip_bytes {
             if action.param == 0 {
                 continue;

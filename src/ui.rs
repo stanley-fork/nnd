@@ -3949,6 +3949,7 @@ impl WindowContent for CodeWindow {
                 if column_number != 0 {
                     adjustments.push((column_number-1..column_number, ui.palette.code_instruction_pointer_column));
                 }
+                adjustments.sort_unstable_by_key(|(r, _)| r.start);
 
                 let l = ui.text.import_line_with_adjustments(&file.text, i, &adjustments);
 
