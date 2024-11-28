@@ -41,15 +41,14 @@ pub fn prettify_value(val: &mut Cow<Value>, warning: &mut Option<Error>, state: 
         }
     }
 
-    let mut fields = Cow::Borrowed(struct_.fields());
-    let mut additional_names: Vec<&'static str> = Vec::new();
-    unravel_struct(&mut fields, Some(&mut additional_names));
+    let mut substruct = Substruct::new(struct_, type_);
+    unravel_struct(&mut substruct);
 
-    if resolve_discriminated_union(&val.val, &mut fields, warning, context)? {
+    if resolve_discriminated_union(&val.val, &mut substruct, warning, context)? {
         allow_full_unwrap = false;
     }
 
-    match recognize_containers(val, &mut fields, &additional_names, warning, state, context) {
+    match recognize_containers(val, &mut substruct, warning, state, context) {
         Ok(()) => return Ok(()),
         Err(e) if !e.is_not_container() && !e.is_no_field() => *warning = Some(e),
         _ => (),
@@ -64,15 +63,15 @@ pub fn prettify_value(val: &mut Cow<Value>, warning: &mut Option<Error>, state: 
         let t = unsafe {&*ptr};
         t.t.as_pointer().is_some_and(|p| p.type_ == inner)
     };
-    if allow_full_unwrap && fields.len() == 1 && !is_pointer_to(fields[0].type_, type_) {
-        let field_val = get_struct_field(&val.val, &fields[0], &mut context.memory)?;
-        let new_val = Value {val: field_val, type_: fields[0].type_, flags: val.flags};
+    if allow_full_unwrap && substruct.fields.len() == 1 && !is_pointer_to(substruct.fields[0].type_, type_) {
+        let field_val = get_struct_field(&val.val, &substruct.fields[0], &mut context.memory)?;
+        let new_val = Value {val: field_val, type_: substruct.fields[0].type_, flags: val.flags};
         *val = Cow::Owned(new_val);
         return Ok(());
     }
 
     // If we altered the set of fields, create a new struct type.
-    if let Cow::Owned(fields) = fields {
+    if let Cow::Owned(fields) = substruct.fields {
         let val = val.to_mut();
         assert!(type_ as *const TypeInfo == val.type_);
         let mut new_type = type_.clone();
@@ -273,11 +272,11 @@ pub fn reflect_meta_value(val: &Value, state: &mut EvalState, context: &mut Eval
 
 fn is_field_uninformative(mut f: &StructField) -> bool {
     for step in 0..100 {
-        let size = f.calculate_bit_size();
-        if size == 0 {
+        let bit_size = f.calculate_bit_size();
+        if bit_size == 0 {
             return true;
         }
-        if size != 8 {
+        if bit_size != 8 {
             return false;
         }
 
@@ -302,22 +301,22 @@ fn is_field_uninformative(mut f: &StructField) -> bool {
 //    Very common for various wrappers in C++ and Rust.
 //  * Inline fields from base structs, as if they're this struct's fields.
 //  * Repeat to convergence.
-// This undoes a lot of cruft in standard libraries and makes watch values much more readable.
+// This undoes a lot of cruft in standard libraries and makes values in the watches window much more readable.
 // This is a shallow operation: it changes the set of fields, but doesn't change the types inside those fields.
 // When formatting a value, we apply prettification for each tree node, so end up with a deeply prettified tree.
-// When unwrapping single-field structs, the names of removed structs are added to additional_names; they're useful for container detection,
+// When unwrapping single-field structs, the names and nested_names of removed structs are added to additional_names and nested_names; they're useful for container detection,
 // e.g. if the user has struct Foo {s: String}, and we inline the String, the container detection needs to know that there was a struct named "String" in there,
 // to distinguish between string and array of u8.
 // Returns the new set of fields if any changes were made, None otherwise.
-fn unravel_struct(fields: &mut Cow<[StructField]>, mut additional_names: Option<&mut Vec<&'static str>>) {
+fn unravel_struct(substruct: &mut Substruct) {
     let (mut has_inheritance, mut empty_fields) = (false, 0usize);
-    for f in fields.iter() {
+    for f in substruct.fields.iter() {
         has_inheritance |= f.flags.contains(FieldFlags::INHERITANCE);
         if is_field_uninformative(f) {
             empty_fields += 1;
         }
     }
-    if !has_inheritance && empty_fields == 0 && fields.len() != 1 {
+    if !has_inheritance && empty_fields == 0 && substruct.fields.len() != 1 {
         // Fast path.
         return;
     }
@@ -328,14 +327,14 @@ fn unravel_struct(fields: &mut Cow<[StructField]>, mut additional_names: Option<
 
         // Remove uninformative fields.
         let mut changed = false;
-        for f in fields.iter() {
+        for f in substruct.fields.iter() {
             if is_field_uninformative(f) {
                 changed = true;
             } else {
                 temp_fields.push(f.clone());
             }
         }
-        let mut res = match fields {
+        let mut res = match &mut substruct.fields {
             Cow::Borrowed(_) => Vec::new(),
             Cow::Owned(v) => { // reuse memory
                 v.clear();
@@ -358,10 +357,15 @@ fn unravel_struct(fields: &mut Cow<[StructField]>, mut additional_names: Option<
                     }
                     inlined = true;
                     changed = true;
-                    if unwrap && !field_type.name.is_empty() {
-                        if let Some(v) = &mut additional_names {
-                            v.push(field_type.name);
+                    if !field_type.nested_names.is_empty() {
+                        if substruct.nested_names.is_empty() {
+                            substruct.nested_names = Cow::Borrowed(field_type.nested_names);
+                        } else {
+                            substruct.nested_names.to_mut().extend_from_slice(field_type.nested_names);
                         }
+                    }
+                    if !field_type.name.is_empty() {
+                        substruct.additional_names.push(field_type.name);
                     }
                 }
             }
@@ -370,7 +374,7 @@ fn unravel_struct(fields: &mut Cow<[StructField]>, mut additional_names: Option<
             }
         }
 
-        *fields = Cow::Owned(res);
+        substruct.fields = Cow::Owned(res);
 
         if !changed {
             break;
@@ -432,9 +436,9 @@ fn downcast_to_concrete_type(val: &mut Cow<Value>, vtable_ptr_field_offset: usiz
 }
 
 // Removes fields representing inactive variants. If nothing looks broken, removes discriminant too.
-fn resolve_discriminated_union(val: &AddrOrValueBlob, fields: &mut Cow<[StructField]>, warning: &mut Option<Error>, context: &mut EvalContext) -> Result<bool> {
+fn resolve_discriminated_union(val: &AddrOrValueBlob, substruct: &mut Substruct, warning: &mut Option<Error>, context: &mut EvalContext) -> Result<bool> {
     let mut discriminant: Option<usize> = None;
-    for field in fields.iter() {
+    for field in substruct.fields.iter() {
         if field.flags.contains(FieldFlags::DISCRIMINANT) {
             if discriminant.is_some() {
                 *warning = Some(error!(Dwarf, "multiple discriminants"));
@@ -473,7 +477,7 @@ fn resolve_discriminated_union(val: &AddrOrValueBlob, fields: &mut Cow<[StructFi
         Some(x) => x };
 
     let (mut found, mut has_default, mut has_nonvariant) = (false, false, false);
-    fields.to_mut().retain(|f| {
+    substruct.fields.to_mut().retain(|f| {
         if f.flags.contains(FieldFlags::DEFAULT_VARIANT) {
             has_default = true;
         } else if f.flags.contains(FieldFlags::VARIANT) {
@@ -495,22 +499,29 @@ fn resolve_discriminated_union(val: &AddrOrValueBlob, fields: &mut Cow<[StructFi
         if found {
             delete_if.insert(FieldFlags::DEFAULT_VARIANT);
         }
-        fields.to_mut().retain(|f| !f.flags.intersects(delete_if));
+        substruct.fields.to_mut().retain(|f| !f.flags.intersects(delete_if));
     }
     Ok(true)
 }
 
 
-// Container stuff.
-// Throughout these functions, error NoField means "this container wasn't recognized, but we should try others", while NotContainer means "stop all container recognition".
-
-struct ContainerSubstruct<'a> {
+// Struct that was transformed in some way, e.g. we may have inlined some fields of fields
+// (e.g. if the struct had only one field, which is a struct, we can unwrap it, i.e. the the inner struct's fields and put them in the outer struct).
+// Or this may represent part of the original struct (e.g. its struct field) at offset `bit_offset` within the original struct.
+struct Substruct<'a> {
     type_: *const TypeInfo,
+    // When we unwrap a struct, we keep the outer struct and discard the inner one. The fields, nested names (typedefs and constants), and the name of the inner struct get added to these arrays.
+    // Useful if e.g. we unwrapped a struct containing a vector, and the pretty-printer needs to find `value_type` typedef in the vector.
     fields: Cow<'a, [StructField]>,
-    bit_offset: usize,
-    used_fields_mask: usize,
+    nested_names: Cow<'a, [(&'static str, NestedName)]>,
+    additional_names: Vec<&'static str>,
+
+    bit_offset: usize, // if this represents part of a bigger struct, at this offset
+    used_fields_mask: usize, // which of the `fields` were recognized by container recognizer, to check that there are no unexpected fields
 }
-impl ContainerSubstruct<'_> {
+impl<'a> Substruct<'a> {
+    fn new(s: &'a StructType, type_: *const TypeInfo) -> Self { Self {type_, fields: Cow::Borrowed(s.fields()), nested_names: Cow::Borrowed(unsafe {(*type_).nested_names}), additional_names: Vec::new(), bit_offset: 0, used_fields_mask: 0} }
+
     fn check_all_fields_used(&self) -> Result<()> {
         if self.used_fields_mask != (!0usize >> (64-self.fields.len().min(64) as u32)) {
             err!(NotContainer, "")
@@ -523,7 +534,10 @@ impl ContainerSubstruct<'_> {
     }
 }
 
-fn find_field(names: &[&str], substruct: &mut ContainerSubstruct) -> Result<StructField> {
+// Container stuff.
+// Throughout these functions, error NoField means "this container wasn't recognized, but we should try others", while NotContainer means "stop all container recognition".
+
+fn find_field(names: &[&str], substruct: &mut Substruct) -> Result<StructField> {
     for (i, f) in substruct.fields.iter().enumerate() {
         let name = trim_field_name(f.name);
         if names.iter().position(|n| *n == name).is_some() {
@@ -537,17 +551,17 @@ fn find_field(names: &[&str], substruct: &mut ContainerSubstruct) -> Result<Stru
 }
 
 // Container begin/end/size/capacity fields are often wrapped in more structs. Peel them.
-fn unravel_container_field(field: &StructField, substruct: &mut ContainerSubstruct, primitive: bool) -> Result<(&'static TypeInfo, Range<usize>)> {
+fn unravel_container_field(field: &StructField, substruct: &mut Substruct, primitive: bool) -> Result<(&'static TypeInfo, Range<usize>)> {
     let mut t = unsafe {&*field.type_};
     let mut bit_offset = substruct.bit_offset + field.bit_offset;
     let mut bit_size = if field.flags.contains(FieldFlags::SIZE_KNOWN) {field.bit_size} else {t.calculate_size()*8};
     if let Type::Struct(s) = &t.t {
-        let mut fields = Cow::Borrowed(s.fields());
-        unravel_struct(&mut fields, None);
-        if fields.len() != 1 {
+        let mut ss = Substruct::new(s, t);
+        unravel_struct(&mut ss);
+        if ss.fields.len() != 1 {
             return err!(NoField, "");
         }
-        let field = &fields[0];
+        let field = &ss.fields[0];
         t = unsafe {&*field.type_};
         bit_offset += field.bit_offset;
         bit_size = if field.flags.contains(FieldFlags::SIZE_KNOWN) {field.bit_size} else {t.calculate_size()*8};
@@ -563,19 +577,19 @@ fn unravel_container_field(field: &StructField, substruct: &mut ContainerSubstru
     Ok((t, bit_offset..bit_offset+bit_size))
 }
 
-fn container_aux_struct(type_: *const TypeInfo) -> Result<ContainerSubstruct<'static>> {
+fn container_aux_struct(type_: *const TypeInfo) -> Result<Substruct<'static>> {
     let t = unsafe {&*type_};
     match &t.t {
         Type::Struct(s) => {
-            let mut fields = Cow::Borrowed(s.fields());
-            unravel_struct(&mut fields, None);
-            Ok(ContainerSubstruct {type_, fields, bit_offset: 0, used_fields_mask: 0})
+            let mut ss = Substruct::new(s, t);
+            unravel_struct(&mut ss);
+            Ok(ss)
         }
         _ => err!(NoField, ""),
     }
 }
 
-fn find_struct_field<'a>(names: &[&str], substruct: &mut ContainerSubstruct<'a>) -> Result<ContainerSubstruct<'a>> {
+fn find_struct_field<'a>(names: &[&str], substruct: &mut Substruct<'a>) -> Result<Substruct<'a>> {
     let f = find_field(names, substruct)?;
     let t = unsafe {&*f.type_};
     match &t.t {
@@ -583,14 +597,15 @@ fn find_struct_field<'a>(names: &[&str], substruct: &mut ContainerSubstruct<'a>)
             if f.flags.contains(FieldFlags::SIZE_KNOWN) && f.bit_size != t.size * 8 {
                 return err!(NotContainer, "");
             }
-            let mut fields = Cow::Borrowed(s.fields());
-            unravel_struct(&mut fields, None);
-            Ok(ContainerSubstruct {type_: f.type_, fields, bit_offset: substruct.bit_offset + f.bit_offset, used_fields_mask: 0})
+            let mut ss = Substruct::new(s, t);
+            unravel_struct(&mut ss);
+            ss.bit_offset = substruct.bit_offset + f.bit_offset;
+            Ok(ss)
         }
         _ => err!(NoField, ""),
     }
 }
-fn find_int_field(names: &[&str], substruct: &mut ContainerSubstruct) -> Result<Range<usize>> {
+fn find_int_field(names: &[&str], substruct: &mut Substruct) -> Result<Range<usize>> {
     let f = find_field(names, substruct)?;
     let (t, r) = unravel_container_field(&f, substruct, true)?;
     match &t.t {
@@ -606,7 +621,7 @@ fn find_int_field(names: &[&str], substruct: &mut ContainerSubstruct) -> Result<
         _ => err!(NoField, ""),
     }
 }
-fn find_pointer_field(names: &[&str], substruct: &mut ContainerSubstruct, inner_type: &mut *const TypeInfo) -> Result<Range<usize>> {
+fn find_pointer_field(names: &[&str], substruct: &mut Substruct, inner_type: &mut *const TypeInfo) -> Result<Range<usize>> {
     let f = find_field(names, substruct)?;
     let (t, r) = unravel_container_field(&f, substruct, true)?;
     match &t.t {
@@ -620,7 +635,7 @@ fn find_pointer_field(names: &[&str], substruct: &mut ContainerSubstruct, inner_
         _ => err!(NoField, ""),
     }
 }
-fn find_array_field(names: &[&str], substruct: &mut ContainerSubstruct, inner_type: &mut *const TypeInfo) -> Result<(Range<usize>, usize)> {
+fn find_array_field(names: &[&str], substruct: &mut Substruct, inner_type: &mut *const TypeInfo) -> Result<(Range<usize>, usize)> {
     let f = find_field(names, substruct)?;
     let (t, r) = unravel_container_field(&f, substruct, false)?;
     match &t.t {
@@ -649,12 +664,11 @@ fn find_array_field(names: &[&str], substruct: &mut ContainerSubstruct, inner_ty
     }
 }
 
-fn find_nested_type(name: &str, type_: *const TypeInfo) -> Result<*const TypeInfo> {
-    let t = unsafe {&*type_};
-    for (nn, n) in t.nested_names {
-        if *nn == name {
+fn find_nested_type(name: &str, nested_names: &[(&'static str, NestedName)]) -> Result<*const TypeInfo> {
+    for &(nn, n) in nested_names {
+        if nn == name {
             match n {
-                NestedName::Type(t) => return Ok(*t),
+                NestedName::Type(t) => return Ok(t),
                 _ => (),
             }
         }
@@ -662,13 +676,12 @@ fn find_nested_type(name: &str, type_: *const TypeInfo) -> Result<*const TypeInf
     err!(NoField, "")
 }
 
-fn find_nested_usize_constant(name: &str, type_: *const TypeInfo) -> Result<usize> {
-    let t = unsafe {&*type_};
-    for (nn, n) in t.nested_names {
-        if *nn == name {
+fn find_nested_usize_constant(name: &str, nested_names: &[(&'static str, NestedName)]) -> Result<usize> {
+    for &(nn, n) in nested_names {
+        if nn == name {
             match n {
                 NestedName::Variable(v) => {
-                    let v = unsafe {&**v};
+                    let v = unsafe {&*v};
                     let val = match v.location.unpack() {
                         VariableLocation::Const(x) => x,
                         _ => return err!(NotContainer, ""),
@@ -704,11 +717,11 @@ fn one_container_name_looks_like_string(s: &str) -> bool {
     s.find("str").is_some() || s.find("Str").is_some() || s.find("Path").is_some()
 }
 
-fn container_name_looks_like_string(t: *const TypeInfo, additional_names: &[&str]) -> bool {
-    if one_container_name_looks_like_string(unsafe {(*t).name}) {
+fn container_name_looks_like_string(substruct: &Substruct) -> bool {
+    if one_container_name_looks_like_string(unsafe {(*substruct.type_).name}) {
         return true;
     }
-    additional_names.iter().any(|s| one_container_name_looks_like_string(*s))
+    substruct.additional_names.iter().any(|s| one_container_name_looks_like_string(*s))
 }
 
 fn trim_field_name(mut name: &str) -> &str {
@@ -731,7 +744,7 @@ fn trim_field_name(mut name: &str) -> &str {
 // Returns Ok if the whole Value was replaced and doesn't need any further transformations.
 // Returns NotContainer error if the value wasn't replaced (but `fields` may have been mutated, e.g. removing refcount field from shared_ptr).
 // Returns other errors if we should fail the whole prettification (e.g. failed to read the struct from memory).
-fn recognize_containers(val: &mut Cow<Value>, fields: &mut Cow<[StructField]>, additional_names: &[&str], warning: &mut Option<Error>, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
+fn recognize_containers(val: &mut Cow<Value>, substruct: &mut Substruct, warning: &mut Option<Error>, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
     let t = unsafe {&*val.type_};
     let language = match t.language {
         LanguageFamily::Internal => return err!(NotContainer, ""),
@@ -743,55 +756,53 @@ fn recognize_containers(val: &mut Cow<Value>, fields: &mut Cow<[StructField]>, a
     // This way we're not too sensitive to small changes in implementation, and sometimes recognize custom containers along the way.
     // This may have some false positives, but that's not catastrophic, the user can always use .#r to see raw struct.
 
-    match recognize_shared_ptr(fields) {
+    match recognize_shared_ptr(substruct) {
         Ok(()) => return Ok(()),
         Err(e) if e.is_no_field() => (),
         Err(e) => return Err(e),
     }
 
-    let mut substruct = ContainerSubstruct {type_: val.type_, fields: fields.clone(), bit_offset: 0, used_fields_mask: 0};
-
-    match recognize_slice_or_vec(&mut substruct, val, additional_names, warning, state, context) {
+    match recognize_slice_or_vec(substruct, val, warning, state, context) {
         Ok(()) => return Ok(()),
         Err(e) if e.is_no_field() => substruct.clear_used(),
         Err(e) => return Err(e),
     }
-    match recognize_rust_vec(&mut substruct, val, additional_names, state, context) {
+    match recognize_rust_vec(substruct, val, state, context) {
         Ok(()) => return Ok(()),
         Err(e) if e.is_no_field() => substruct.clear_used(),
         Err(e) => return Err(e),
     }
-    match recognize_libcpp_string(&mut substruct, val, state, context) {
+    match recognize_libcpp_string(substruct, val, state, context) {
         Ok(()) => return Ok(()),
         Err(e) if e.is_no_field() => substruct.clear_used(),
         Err(e) => return Err(e),
     }
-    match recognize_absl_inlined_vector(&mut substruct, val, state, context) {
+    match recognize_absl_inlined_vector(substruct, val, state, context) {
         Ok(()) => return Ok(()),
         Err(e) if e.is_no_field() => substruct.clear_used(),
         Err(e) => return Err(e),
     }
-    match recognize_cpp_list(&mut substruct, val, state, context) {
+    match recognize_cpp_list(substruct, val, state, context) {
         Ok(()) => return Ok(()),
         Err(e) if e.is_no_field() => substruct.clear_used(),
         Err(e) => return Err(e),
     }
-    match recognize_rust_hash_table(&mut substruct, val, state, context) {
+    match recognize_rust_hash_table(substruct, val, state, context) {
         Ok(()) => return Ok(()),
         Err(e) if e.is_no_field() => substruct.clear_used(),
         Err(e) => return Err(e),
     }
-    match recognize_libstdcpp_deque(&mut substruct, val, state, context) {
+    match recognize_libstdcpp_deque(substruct, val, state, context) {
         Ok(()) => return Ok(()),
         Err(e) if e.is_no_field() => substruct.clear_used(),
         Err(e) => return Err(e),
     }
-    match recognize_libcpp_deque(&mut substruct, val, state, context) {
+    match recognize_libcpp_deque(substruct, val, state, context) {
         Ok(()) => return Ok(()),
         Err(e) if e.is_no_field() => substruct.clear_used(),
         Err(e) => return Err(e),
     }
-    match recognize_cpp_map(&mut substruct, val, state, context) {
+    match recognize_cpp_map(substruct, val, state, context) {
         Ok(()) => return Ok(()),
         Err(e) if e.is_no_field() => substruct.clear_used(),
         Err(e) => return Err(e),
@@ -819,7 +830,7 @@ fn make_array_of_references(val: &mut Cow<Value>, data: Vec<u8>, inner_type: *co
 
 // Slice or vector.
 // Something like: {start: *T, len: usize} or {begin: *T, end: *T, end_of_storage: *T}, or {buf: {ptr: *T, cap: usize}, len: usize}.
-fn recognize_slice_or_vec(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, additional_names: &[&str], warning: &mut Option<Error>, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
+fn recognize_slice_or_vec(substruct: &mut Substruct, val: &mut Cow<Value>, warning: &mut Option<Error>, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
     // Find field offsets.
     // (We first analyze the fields, then look at data. Not necessarily the simplest way to do this right now, but a sort of rehearsal of compiling to bytecode.)
     let mut inner_type: *const TypeInfo = ptr::null();
@@ -841,7 +852,7 @@ fn recognize_slice_or_vec(substruct: &mut ContainerSubstruct, val: &mut Cow<Valu
 
     // If start/end are char*, and there's typedef value_type, cast the pointers to it. This covers clickhouse PODArray in particular.
     if inner_size == 1 {
-        if let Some(t) = optional_field(find_nested_type("value_type", val.type_))? {
+        if let Some(t) = optional_field(find_nested_type("value_type", &substruct.nested_names))? {
             inner_type = t;
             inner_size = (unsafe {&*inner_type}).calculate_size();
         }
@@ -870,7 +881,7 @@ fn recognize_slice_or_vec(substruct: &mut ContainerSubstruct, val: &mut Cow<Valu
     };
 
     // Guess whether this is a string.
-    let is_string = inner_size <= 1 && container_name_looks_like_string(val.type_, additional_names);
+    let is_string = inner_size <= 1 && container_name_looks_like_string(substruct);
 
     // Rust &Path (or &OsStr) is weird: it's {data_ptr: *Path, length: usize}, where Path is a struct with DW_AT_byte_size = 0, but one field of size 1 byte (in 100 wrappers);
     // I guess philosophically this Path is supposed to be a dynamically-sized struct, but there doesn't seem to be anything in the debug info to indicate that or to
@@ -886,7 +897,7 @@ fn recognize_slice_or_vec(substruct: &mut ContainerSubstruct, val: &mut Cow<Valu
 
 // {len, buf: {ptr, cap}}
 // Or VecDeque: {head, len, buf: {ptr, cap}}
-fn recognize_rust_vec(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, additional_names: &[&str], state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
+fn recognize_rust_vec(substruct: &mut Substruct, val: &mut Cow<Value>, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
     let mut buf = find_struct_field(&["buf"], substruct)?;
     let mut inner_type: *const TypeInfo = ptr::null();
     let ptr_field = find_pointer_field(&["ptr"], &mut buf, &mut inner_type)?;
@@ -900,7 +911,7 @@ fn recognize_rust_vec(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, 
     if inner_size == 1 {
         // Newer versions of Rust have u8 pointer regardless of the actual element type.
         //asdqwe there's something broken when the vec was unwrapped from a single-field struct; we probably look at typedefs of the wrapper instead of the vec; check other find_nested_* calls too
-        if let Some(t) = optional_field(find_nested_type("T", val.type_))? {
+        if let Some(t) = optional_field(find_nested_type("T", &substruct.nested_names))? {
             inner_type = t;
             inner_size = (unsafe {&*inner_type}).calculate_size();
         }
@@ -922,20 +933,20 @@ fn recognize_rust_vec(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, 
         let new_val = builder.finish("VecDeque", val.flags, &mut state.types);
         *val = Cow::Owned(new_val);
     } else {
-        let is_string = inner_size == 1 && container_name_looks_like_string(val.type_, additional_names);
+        let is_string = inner_size == 1 && container_name_looks_like_string(substruct);
         make_slice(val, ptr, len, inner_type, is_string, state);
     }
     Ok(())
 }
 
 // shared_ptr: {ptr, refcount} - just remove refcount, so that field unwrapping turns this into plain pointer
-fn recognize_shared_ptr(fields: &mut Cow<[StructField]>) -> Result<()> {
-    if fields.len() != 2 {
+fn recognize_shared_ptr(substruct: &mut Substruct) -> Result<()> {
+    if substruct.fields.len() != 2 {
         return err!(NoField, "");
     }
     let mut refcount_idx: Option<usize> = None;
     let mut found_ptr = false;
-    for (i, f) in fields.iter().enumerate() {
+    for (i, f) in substruct.fields.iter().enumerate() {
         match trim_field_name(f.name) {
             "cntrl" | "refcount" => refcount_idx = Some(i),
             "ptr" => found_ptr = true,
@@ -944,7 +955,7 @@ fn recognize_shared_ptr(fields: &mut Cow<[StructField]>) -> Result<()> {
     }
     if let Some(i) = refcount_idx {
         if found_ptr {
-            fields.to_mut().remove(i);
+            substruct.fields.to_mut().remove(i);
             return err!(NotContainer, ""); // didn't replace the value
         }
     }
@@ -959,7 +970,7 @@ fn recognize_shared_ptr(fields: &mut Cow<[StructField]>) -> Result<()> {
 // }
 // (actual capacity is `cap * 2`, where 2 is `__endian_factor`)
 // (ifdef _LIBCPP_ABI_ALTERNATE_STRING_LAYOUT then the fields are shuffled around a little)
-fn recognize_libcpp_string(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
+fn recognize_libcpp_string(substruct: &mut Substruct, val: &mut Cow<Value>, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
     let mut s = find_struct_field(&["s"], substruct)?;
     let mut l = find_struct_field(&["l"], substruct)?;
     let _ = optional_field(find_field(&["r"], substruct))?;
@@ -1046,7 +1057,7 @@ fn make_array_or_slice(val: &mut Cow<Value>, byte_offset: usize, len: usize, inn
 // absl::InlinedVector: {metadata_: usize, data_: union {allocated: {allocated_data: *T, allocated_capacity: usize}, inlined: {inlined_data: [i8; cap]}}}
 // metadata_ & 1 - is_allocated
 // metadata_ >> 1 - len
-fn recognize_absl_inlined_vector(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
+fn recognize_absl_inlined_vector(substruct: &mut Substruct, val: &mut Cow<Value>, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
     let metadata_field = find_int_field(&["metadata"], substruct)?;
     let mut data = find_struct_field(&["data"], substruct)?;
     substruct.check_all_fields_used()?;
@@ -1082,9 +1093,9 @@ fn recognize_absl_inlined_vector(substruct: &mut ContainerSubstruct, val: &mut C
 // libstdc++ unordered_map: {..., _M_before_begin: node}, node: {_M_nxt: *node}
 // In all cases the value is right after the node struct (I wish it was just a field, then pretty printer wouldn't be needed).
 // Doesn't cover libc++ forward_list: it has values as field of node struct, so it's ok without pretty printer.
-fn recognize_cpp_list(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
+fn recognize_cpp_list(substruct: &mut Substruct, val: &mut Cow<Value>, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
     let size_field = optional_field(find_int_field(&["size_alloc", "size", "element_count", "p2"], substruct))?;
-    let value_type = find_nested_type("value_type", val.type_)?;
+    let value_type = find_nested_type("value_type", &substruct.nested_names)?;
     let mut node_type: *const TypeInfo = ptr::null();
     let first_node_field;
     let mut allow_extra_fields = false;
@@ -1144,9 +1155,9 @@ fn recognize_cpp_list(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, 
     Ok(())
 }
 
-fn recognize_rust_hash_table(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
+fn recognize_rust_hash_table(substruct: &mut Substruct, val: &mut Cow<Value>, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
     let mut table = find_struct_field(&["table"], substruct)?;
-    let bucket_type = find_nested_type("T", table.type_)?;
+    let bucket_type = find_nested_type("T", &substruct.nested_names)?;
     let bucket_mask_field = find_int_field(&["bucket_mask"], &mut table)?;
     let mut ctrl_type: *const TypeInfo = ptr::null();
     let ctrl_field = find_pointer_field(&["ctrl"], &mut table, &mut ctrl_type)?;
@@ -1187,11 +1198,11 @@ fn recognize_rust_hash_table(substruct: &mut ContainerSubstruct, val: &mut Cow<V
     Ok(())
 }
 
-fn recognize_libstdcpp_deque(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
+fn recognize_libstdcpp_deque(substruct: &mut Substruct, val: &mut Cow<Value>, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
     find_field(&["map"], substruct)?;
     let mut start = find_struct_field(&["start"], substruct)?;
     let mut finish = find_struct_field(&["finish"], substruct)?;
-    let mut value_type = find_nested_type("value_type", val.type_)?;
+    let mut value_type = find_nested_type("value_type", &substruct.nested_names)?;
     let start_cur_field = find_pointer_field(&["cur"], &mut start, &mut value_type)?;
     let start_first_field = find_pointer_field(&["first"], &mut start, &mut value_type)?;
     let start_last_field = find_pointer_field(&["last"], &mut start, &mut value_type)?;
@@ -1264,14 +1275,14 @@ fn recognize_libstdcpp_deque(substruct: &mut ContainerSubstruct, val: &mut Cow<V
     Ok(())
 }
 
-fn recognize_libcpp_deque(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
+fn recognize_libcpp_deque(substruct: &mut Substruct, val: &mut Cow<Value>, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
     let mut type_ = val.type_;
     // std::stack and std::queue are pointless trivial wrappers around std::deque. Unwrap.
-    if let Some(t) = optional_field(find_nested_type("container_type", type_))? {
+    if let Some(t) = optional_field(find_nested_type("container_type", &substruct.nested_names))? {
         type_ = t;
     }
 
-    let value_type = find_nested_type("value_type", type_)?;
+    let value_type = find_nested_type("value_type", unsafe {(*type_).nested_names})?;
     let mut map = find_struct_field(&["map"], substruct)?;
     let start_field = find_int_field(&["start"], substruct)?;
     let size_field = find_int_field(&["size"], substruct)?;
@@ -1284,8 +1295,8 @@ fn recognize_libcpp_deque(substruct: &mut ContainerSubstruct, val: &mut Cow<Valu
     find_pointer_field(&["end_cap"], &mut map, &mut value_ptr_type)?;
     map.check_all_fields_used()?;
 
-    let iterator_type = find_nested_type("iterator", type_)?;
-    let block_size = find_nested_usize_constant("_BS", iterator_type)?;
+    let iterator_type = find_nested_type("iterator", unsafe {(*type_).nested_names})?;
+    let block_size = find_nested_usize_constant("_BS", unsafe {(*iterator_type).nested_names})?;
     if block_size == 0 {
         return err!(NotContainer, "");
     }
@@ -1320,8 +1331,8 @@ fn recognize_libcpp_deque(substruct: &mut ContainerSubstruct, val: &mut Cow<Valu
     Ok(())
 }
 
-fn recognize_cpp_map(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
-    let value_type = find_nested_type("value_type", val.type_)?;
+fn recognize_cpp_map(substruct: &mut Substruct, val: &mut Cow<Value>, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
+    let value_type = find_nested_type("value_type", &substruct.nested_names)?;
     let root_field;
     let mut node_type: *const TypeInfo = ptr::null();
     let mut custom_value_offset: Option<usize> = None;
@@ -1342,8 +1353,8 @@ fn recognize_cpp_map(substruct: &mut ContainerSubstruct, val: &mut Cow<Value>, s
         // The base node struct is 3 pointers + 1 byte (color) + 7 bytes of padding = 32 bytes.
         // If the value type is small, it may be packed into that padding, so the actual offset is not always 32. Find it.
         // (This problem only came up in libc++ trees, not in libstdc++ trees (because it aligns value to 8 bytes for some reason), and not in linked lists (because the base node struct has no padding).)
-        let tree = find_nested_type("__base", val.type_)?;
-        let np = find_nested_type("__node_pointer", tree)?;
+        let tree = find_nested_type("__base", &substruct.nested_names)?;
+        let np = find_nested_type("__node_pointer", unsafe {(*tree).nested_names})?;
         let n = match unsafe {&(*np).t} {
             Type::Pointer(p) => p.type_,
             _ => return err!(NoField, ""),
