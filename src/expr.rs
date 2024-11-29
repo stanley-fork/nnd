@@ -1159,7 +1159,7 @@ pub struct DwarfEvalContext<'a> {
 
     // Unit.
     pub encoding: Encoding,
-    pub unit: Option<&'a CompilationUnit>,
+    pub unit: Option<&'a DwarfUnit>,
 
     // Stack frame. Not required for global variables.
     pub regs: Option<&'a Registers>,

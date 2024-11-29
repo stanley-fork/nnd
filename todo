@@ -9,22 +9,13 @@ investigate why exception-aware step-over doesn't work in clickhouse, at least s
 
 investigate why quitting is slow
 optimize symbols loading
-  test things
-  rewrite dwarf parser
-    use custom abbreviations
-    declare struct layouts per tag
-    preprocess abbreviations
-    parse+resolve/convert attributes directly into the structs
-    fix warning about unsupported forms, especially implicit_const on flags
-    remove gimli::Unit, get the basic info ourselves
-    compare two error checking approaches
-    try caching chase results (71M chases, 15M unique results, 205M total DIEs)
-    test with dwarf 4
+  profile attribute loading
+  madvise
+  fix warning about unsupported forms, especially implicit_const on flags
+  try caching chase results (71M chases, 15M unique results, 205M total DIEs)
+  test with dwarf 4
+  replace strlen inside .debug_str etc lookups
   simple things found by profiler (samply is nice)
-  attr_string
-  read_abbreviation (array indexing, of all things)
-  DebugAddr.get_address
-  Result::branch
 look at profiler on ch server (1500 threads)
 test with 10k threads
   fix O(n^2) stuff until syscalls are the slowest part

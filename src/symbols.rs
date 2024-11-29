@@ -151,7 +151,7 @@ pub struct Symbols {
 
     // Units in .debug_info, sorted by DieOffset (not to be confused with address).
     // Expect tens of thousands of these.
-    pub units: Vec<CompilationUnit>,
+    pub units: Vec<DwarfUnit>,
 
     // Indexes to map addresses (in debuggee's virtual address space) to stuff.
     // Keep in mind that these assume segment addresses as defined in ELF file, which are different from addresses at runtime.
@@ -184,19 +184,6 @@ pub struct Symbols {
 
     // Addresses of things like main() and __cxa_throw().
     pub points_of_interest: HashMap<PointOfInterest, Vec<usize>>,
-}
-
-pub struct CompilationUnit {
-    pub offset: DieOffset,
-    pub unit: Unit<DwarfSlice>,
-    pub abbreviations: AbbreviationSet,
-
-    pub name: String,
-    pub comp_dir: &'static str,
-
-    pub shard_idx: usize,
-
-    pub file_idx_remap: Vec<usize>, // DWARF file index -> index in Symbols.files
 }
 
 // Data structures for functions and inlined function calls.
@@ -611,7 +598,7 @@ unsafe impl Send for VTableInfo {}
 unsafe impl Sync for VTableInfo {}
 
 impl Symbols {
-    pub fn find_unit(&self, offset: DieOffset) -> Result<&CompilationUnit> {
+    pub fn find_unit(&self, offset: DieOffset) -> Result<&DwarfUnit> {
         let idx = self.units.partition_point(|u| u.offset <= offset);
         if idx == 0 { return err!(Internal, "entry offset out of bounds"); }
         Ok(&self.units[idx - 1])
@@ -1089,7 +1076,6 @@ impl SymbolsLoader {
 
         let layouts = AllAttributeStructLayouts::new(
             vec![
-                (vec![DW_TAG_compile_unit, DW_TAG_partial_unit, DW_TAG_type_unit], UnitAttributes::layout()),
                 (vec![DW_TAG_namespace], NamespaceAttributes::layout()),
                 (vec![DW_TAG_variable, DW_TAG_formal_parameter], VariableAttributes::layout()),
                 (vec![DW_TAG_subprogram], SubprogramAttributes::layout()),
@@ -1106,34 +1092,19 @@ impl SymbolsLoader {
             CommonAttributes::layout(),
             vec![DW_TAG_label, DW_TAG_variable, DW_TAG_formal_parameter, DW_TAG_subprogram, DW_TAG_inlined_subroutine]);
 
-        let mut units: Vec<CompilationUnit> = Vec::new();
-        let (listed_units, abbreviations_shared) = list_units(&mut dwarf, &elf.name, layouts)?;
-        for (unit, abbreviations) in listed_units {
-            let offset = match unit.header.offset() {
-                UnitSectionOffset::DebugInfoOffset(o) => o,
-                _ => return err!(Internal, "unit offset has unexpected type"),
-            };
-            let name = match &unit.name {
-                Some(n) => str::from_utf8(n.slice())?.to_string(),
-                None => format!("[unit @0x{:x}]", offset.0) };
-            let comp_dir = match &unit.comp_dir {
-                Some(d) => str::from_utf8(d.slice())?,
-                None => "" };
-
-            if offset.0 > round_robin_offset + unit_distribution_granularity {
-                round_robin_offset = offset.0;
+        let (mut units, abbreviations_shared) = list_units(&mut dwarf, &elf.name, layouts)?;
+        for (i, unit) in units.iter_mut().enumerate() {
+            if unit.offset.0 > round_robin_offset + unit_distribution_granularity {
+                round_robin_offset = unit.offset.0;
                 round_robin_shard = (round_robin_shard + 1) % shards.len();
             }
-            let shard_idx = round_robin_shard;
-            shards[shard_idx].units.push(units.len());
+            unit.shard_idx = round_robin_shard;
+            shards[unit.shard_idx].units.push(i);
 
-            if offset.0 > reported_progress_offset + 10000000 {
-                reported_progress_offset = offset.0;
-                status.progress_ppm.store((offset.0 as f64 / debug_info_section.len() as f64 * progress_per_stage[0][1].0 * 1e6) as usize, Ordering::Relaxed);
+            if unit.offset.0 > reported_progress_offset + 10000000 {
+                reported_progress_offset = unit.offset.0;
+                status.progress_ppm.store((unit.offset.0 as f64 / debug_info_section.len() as f64 * progress_per_stage[0][1].0 * 1e6) as usize, Ordering::Relaxed);
             }
-
-            // This is not necessarily a compilation unit (can be type unit), but we don't care, it's just a tree of DIEs either way.
-            units.push(CompilationUnit {offset, name, comp_dir, unit, abbreviations, shard_idx, file_idx_remap: Vec::new()});
         }
 
         for [_, symtab] in &strtab_symtab {
@@ -1924,10 +1895,7 @@ struct DwarfLoader<'a> {
     section_slice: DwarfSlice,
     shard_idx: usize,
     shard: &'a mut SymbolsLoaderShard,
-    unit_idx: usize,
-    unit: &'a Unit<DwarfSlice>,
-    unit_language: LanguageFamily,
-    abbreviations: &'a AbbreviationSet,
+    unit: &'a DwarfUnit,
 
     // Scope name, like "std::vector<int>". We append to it when going into a namespace/class/function/etc, then un-append when leaving the subtree.
     scope_name: String,
@@ -2081,11 +2049,6 @@ dwarf_struct!{ CommonAttributes {
     type_: /*DieOffset*/ usize, DW_AT_type, DebugInfoOffset;
 }}
 
-dwarf_struct!{ UnitAttributes {
-    ranges: DwarfRanges, DW_AT_ranges, Ranges;
-    language: usize, DW_AT_language, Unsigned;
-}}
-
 dwarf_struct!{ NamespaceAttributes {
     name: &'static str, DW_AT_name, String;
 }}
@@ -2203,7 +2166,7 @@ impl<'a> DwarfLoader<'a> {
     fn new(loader: &'a SymbolsLoader, shard: &'a mut SymbolsLoaderShard, unit_idx: usize) -> Result<Self> {
         let unit = &loader.sym.units[unit_idx];
         let section_slice = *loader.sym.dwarf.debug_info.reader();
-        Ok(Self {loader, section_slice, shard_idx: unit.shard_idx, shard, unit_idx, unit: &unit.unit, abbreviations: &unit.abbreviations, unit_language: LanguageFamily::Unknown, scope_name: String::new(), temp: LoaderTempStorage::default(), main_stack: FastStack::default(), scope_stack: FastStack::default(), function_stack: FastStack::default(), subfunction_stack: FastStack::default(), type_stack: FastStack::default(), ranges_stack: FastStack::default()})
+        Ok(Self {loader, section_slice, shard_idx: unit.shard_idx, shard, unit, scope_name: String::new(), temp: LoaderTempStorage::default(), main_stack: FastStack::default(), scope_stack: FastStack::default(), function_stack: FastStack::default(), subfunction_stack: FastStack::default(), type_stack: FastStack::default(), ranges_stack: FastStack::default()})
     }
 
     fn append_namespace_to_scope_name(&mut self, s: &str, linkable: bool) {
@@ -2220,8 +2183,8 @@ impl<'a> DwarfLoader<'a> {
         self.scope_name.push_str(s);
     }
 
-    fn parse_line_info(shard: &mut SymbolsLoaderShard, loader: &SymbolsLoader, unit_idx: usize, loc: &DwarfCodeLocation) -> LineInfo {
-        let Some(&file) = loader.sym.units[unit_idx].file_idx_remap.get(loc.file) else {return LineInfo::invalid()};
+    fn parse_line_info(shard: &mut SymbolsLoaderShard, loader: &SymbolsLoader, unit: &DwarfUnit, loc: &DwarfCodeLocation) -> LineInfo {
+        let Some(&file) = unit.file_idx_remap.get(loc.file) else {return LineInfo::invalid()};
         match LineInfo::new(0, Some(file), loc.line, loc.column, LineFlags::empty()) {
             Ok(x) => x,
             Err(e) => {
@@ -2255,7 +2218,7 @@ impl<'a> DwarfLoader<'a> {
                 // Different locations for different address ranges. Add multiple local variables.
                 // Or it's a static variable inside a function - then the range from location list is much wider
                 // than the containing function (e.g. whole .text section).
-                let mut locs_iter = self.loader.sym.dwarf.locations(self.unit, LocationListsOffset(off))?;
+                let mut locs_iter = self.loader.sym.dwarf.locations(&self.unit.unit, LocationListsOffset(off))?;
                 custom_ranges = true;
                 while let Some(entry) = locs_iter.next()? {
                     var.location = PackedVariableLocation::expr(entry.data);
@@ -2304,7 +2267,7 @@ impl<'a> DwarfLoader<'a> {
             let mut unqualified_name = unsafe {var.name()};
             let mut demangled = false;
             // If name is missing, use demangled linkage_name.
-            if unqualified_name.is_empty() && !linkage_name.is_empty() && self.unit_language.presumably_cpp() {
+            if unqualified_name.is_empty() && !linkage_name.is_empty() && self.unit.language.presumably_cpp() {
                 if let Ok(symbol) = cpp_demangle::BorrowedSymbol::new_with_options(linkage_name.as_bytes(), &cpp_demangle::ParseOptions::default().recursion_limit(1000)) {
                     let options = cpp_demangle::DemangleOptions::new().recursion_limit(1000).no_return_type().no_params().hide_expression_literal_types();
                     if let Ok(r) = symbol.demangle(&options) {
@@ -2340,13 +2303,13 @@ impl<'a> DwarfLoader<'a> {
     }
 
     // `fields` must use the same field numbering as CommonAttributes.
-    fn chase_origin_pointers(shard: &mut SymbolsLoaderShard, loader: &SymbolsLoader, initial_attribute_context: &AttributeContext, abbreviations: &AbbreviationSet, mut specification_or_origin: DwarfReference, name: &mut &'static str, linkage_name: &mut &'static str, type_: &mut usize, decl: &mut DwarfCodeLocation, fields: &mut u32) -> Result<()> {
+    fn chase_origin_pointers(shard: &mut SymbolsLoaderShard, loader: &SymbolsLoader, initial_attribute_context: &AttributeContext, mut specification_or_origin: DwarfReference, name: &mut &'static str, linkage_name: &mut &'static str, type_: &mut usize, decl: &mut DwarfCodeLocation, fields: &mut u32) -> Result<()> {
         let mut attribute_context = Cow::Borrowed(initial_attribute_context);
         while *fields & DwarfReference::HAS_SPECIFICATION_OR_ABSTRACT_ORIGIN != 0 {
             let next_offset = if *fields & DwarfReference::GLOBAL != 0 {
                 let unit_idx = loader.sym.units.partition_point(|u| u.offset.0 <= specification_or_origin.offset);
-                let u = &loader.sym.units[unit_idx.saturating_sub(1)].unit;
-                let Some(off) = DebugInfoOffset(specification_or_origin.offset).to_unit_offset(&u.header) else {return err!(Dwarf, "specification/abstract_origin entry offset out of unit bounds")};
+                let u = &loader.sym.units[unit_idx.saturating_sub(1)];
+                let Some(off) = DebugInfoOffset(specification_or_origin.offset).to_unit_offset(&u.unit.header) else {return err!(Dwarf, "specification/abstract_origin entry offset out of unit bounds")};
                 attribute_context.to_mut().switch_unit(u);
                 off
             } else {
@@ -2354,8 +2317,8 @@ impl<'a> DwarfLoader<'a> {
             };
 
             let mut attrs = CommonAttributes::default();
-            let mut cursor = SliceReader::new(attribute_context.unit.header.range_from(next_offset..)?.slice());
-            let Some(abbrev) = cursor.read_abbreviation(abbreviations)? else {return err!(Dwarf, "specification/abstract_origin points to null entry")};
+            let mut cursor = SliceReader::new(attribute_context.unit.unit.header.range_from(next_offset..)?.slice());
+            let Some(abbrev) = cursor.read_abbreviation(&attribute_context)? else {return err!(Dwarf, "specification/abstract_origin points to null entry")};
             unsafe {cursor.read_attributes(abbrev, /*which_layout*/ 1, &attribute_context, &raw mut attrs as *mut u8)?};
 
             let added_fields = attrs.fields & !*fields;
@@ -2373,8 +2336,8 @@ impl<'a> DwarfLoader<'a> {
 
     fn load(&mut self) -> Result<()> {
         {
-            let start_offset = self.unit.header.offset().as_debug_info_offset().unwrap();
-            self.shard.types.set_unit(start_offset, DebugInfoOffset(start_offset.0 + self.unit.header.length_including_self()));
+            let start_offset = self.unit.unit.header.offset().as_debug_info_offset().unwrap();
+            self.shard.types.set_unit(start_offset, DebugInfoOffset(start_offset.0 + self.unit.unit.header.length_including_self()));
         }
 
         // Fake sentinel values to avoid checking for empty stacks everywhere.
@@ -2388,9 +2351,9 @@ impl<'a> DwarfLoader<'a> {
         }
 
         // Iterate over DIEs in depth-first order.
-        let mut cursor = SliceReader::new(self.unit.header.range_from(UnitOffset(self.unit.header.header_size())..)?.slice());
+        let mut cursor = SliceReader::new(self.unit.unit.header.range_from(UnitOffset(self.unit.unit.header.header_size())..)?.slice());
         let attribute_context = AttributeContext {unit: self.unit, dwarf: &self.loader.sym.dwarf, shared: &self.loader.abbreviations_shared};
-        let encoding = self.unit.encoding();
+        let encoding = self.unit.unit.encoding();
         let mut prev_has_children = true;
         let mut skip_subtree = usize::MAX;
         loop {
@@ -2439,7 +2402,7 @@ impl<'a> DwarfLoader<'a> {
             }
 
             // Read next DIE.
-            let abbrev = cursor.read_abbreviation(self.abbreviations)?;
+            let abbrev = cursor.read_abbreviation(&attribute_context)?;
             prev_has_children = abbrev.is_some_and(|e| e.has_children);
 
             let abbrev = match abbrev {
@@ -2460,19 +2423,9 @@ impl<'a> DwarfLoader<'a> {
             // Each case here has to read/skip all attributes from `cursor`.
             match abbrev.tag() {
                 DW_TAG_compile_unit | DW_TAG_partial_unit | DW_TAG_type_unit => {
-                    let mut attrs = UnitAttributes::default();
-                    unsafe {cursor.read_attributes(abbrev, /*which_layout*/ 0, &attribute_context, &raw mut attrs as *mut u8)}?;
-                    if attrs.fields & UnitAttributes::language != 0 {
-                        let lang = constants::DwLang(attrs.language as u16);
-                        self.unit_language = match lang {
-                            // Unfortunately the C_plus_plus_* constants are not consecutive and don't follow any predictable pattern, so we'll have to update this list every few years as new C++ versions are added to DWARF.
-                            DW_LANG_C | DW_LANG_C11 | DW_LANG_C17 | DW_LANG_C89 | DW_LANG_C99 | DW_LANG_C_plus_plus | DW_LANG_C_plus_plus_03 | DW_LANG_C_plus_plus_11 | DW_LANG_C_plus_plus_14 | DW_LANG_C_plus_plus_17 | DW_LANG_C_plus_plus_20 => LanguageFamily::Cpp,
-                            DW_LANG_Rust => LanguageFamily::Rust,
-                            _ => LanguageFamily::Other,
-                        };
-                    }
+                    cursor.skip_attributes(abbrev, &attribute_context)?;
                     let ranges_top = self.ranges_stack.push_uninit(&mut self.main_stack.top_mut().flags);
-                    parse_dwarf_ranges(&self.loader.sym.dwarf, self.unit, &attrs.ranges, attrs.fields, offset, self.loader.sym.code_addr_range.start, &mut ranges_top.pc_ranges, &mut self.shard.warn)?;
+                    parse_dwarf_ranges(&self.loader.sym.dwarf, &self.unit.unit, &self.unit.ranges, self.unit.fields, offset, self.loader.sym.code_addr_range.start, &mut ranges_top.pc_ranges, &mut self.shard.warn)?;
                     self.main_stack.top_mut().flags.remove(StackFlags::IS_FUNCTION_SCOPE | StackFlags::IS_TYPE_SCOPE); // this shouldn't do anything since this tag is always root, but just in case
                 }
 
@@ -2501,8 +2454,8 @@ impl<'a> DwarfLoader<'a> {
                     const _: () = assert!(VariableAttributes::name == CommonAttributes::name && VariableAttributes::linkage_name == CommonAttributes::linkage_name && VariableAttributes::decl == CommonAttributes::decl && VariableAttributes::type_ == CommonAttributes::type_);
                     unsafe {cursor.read_attributes(abbrev, /*which_layout*/ 0, &attribute_context, &raw mut attrs as *mut u8)}?;
                     if attrs.fields & (VariableAttributes::location_expr | VariableAttributes::location_list | VariableAttributes::const_value_usize | VariableAttributes::const_value_slice) != 0 {
-                        Self::chase_origin_pointers(&mut self.shard, &self.loader, &attribute_context, self.abbreviations, attrs.specification_or_abstract_origin, &mut attrs.name, &mut attrs.linkage_name, &mut attrs.type_, &mut attrs.decl, &mut attrs.fields)?;
-                        let decl = if attrs.fields & VariableAttributes::decl != 0 {Self::parse_line_info(&mut self.shard, &self.loader, self.unit_idx, &attrs.decl)} else {LineInfo::invalid()};
+                        Self::chase_origin_pointers(&mut self.shard, &self.loader, &attribute_context, attrs.specification_or_abstract_origin, &mut attrs.name, &mut attrs.linkage_name, &mut attrs.type_, &mut attrs.decl, &mut attrs.fields)?;
+                        let decl = if attrs.fields & VariableAttributes::decl != 0 {Self::parse_line_info(&mut self.shard, &self.loader, self.unit, &attrs.decl)} else {LineInfo::invalid()};
                         let var_flags = if abbrev.tag() == DW_TAG_variable { VariableFlags::empty() } else { VariableFlags::PARAMETER };
                         let type_ = if attrs.fields & VariableAttributes::type_ != 0 {attrs.type_ as *const TypeInfo} else {self.loader.types.builtin_types.unknown};
                         let var = Variable::new(attrs.name, type_, offset, decl, var_flags);
@@ -2551,7 +2504,7 @@ impl<'a> DwarfLoader<'a> {
 
                     let ranges_stack_idx = self.ranges_stack.len;
                     let ranges_top = self.ranges_stack.push_uninit(&mut self.main_stack.top_mut().flags);
-                    parse_dwarf_ranges(&self.loader.sym.dwarf, self.unit, &attrs.ranges, attrs.fields, offset, self.loader.sym.code_addr_range.start, &mut ranges_top.pc_ranges, &mut self.shard.warn)?;
+                    parse_dwarf_ranges(&self.loader.sym.dwarf, &self.unit.unit, &attrs.ranges, attrs.fields, offset, self.loader.sym.code_addr_range.start, &mut ranges_top.pc_ranges, &mut self.shard.warn)?;
                     self.main_stack.top_mut().flags.remove(StackFlags::IS_ANY_SCOPE);
                     self.main_stack.top_mut().flags.insert(StackFlags::IS_FUNCTION_SCOPE);
 
@@ -2561,8 +2514,8 @@ impl<'a> DwarfLoader<'a> {
 
                         // Chase the specification/origin pointers to reach the function name (for function declarations and inlining stuff).
                         // Functions can be missing one of the two names (linkage name or regular name), but not both (in the binaries I looked at).
-                        Self::chase_origin_pointers(&mut self.shard, &self.loader, &attribute_context, self.abbreviations, attrs.specification_or_abstract_origin, &mut attrs.name, &mut attrs.linkage_name, &mut attrs.type_, &mut attrs.decl, &mut attrs.fields)?;
-                        let decl = if attrs.fields & VariableAttributes::decl != 0 {Self::parse_line_info(&mut self.shard, &self.loader, self.unit_idx, &attrs.decl)} else {LineInfo::invalid()};
+                        Self::chase_origin_pointers(&mut self.shard, &self.loader, &attribute_context, attrs.specification_or_abstract_origin, &mut attrs.name, &mut attrs.linkage_name, &mut attrs.type_, &mut attrs.decl, &mut attrs.fields)?;
+                        let decl = if attrs.fields & VariableAttributes::decl != 0 {Self::parse_line_info(&mut self.shard, &self.loader, self.unit, &attrs.decl)} else {LineInfo::invalid()};
 
                         let name_ref = if !attrs.linkage_name.is_empty() {
                             // Don't demangle it here because demangling is very slow for some reason.
@@ -2594,7 +2547,7 @@ impl<'a> DwarfLoader<'a> {
                         // Do multi-ranges also appear on C++ coroutines or Rust async functions? No, they produce multiple functions instead.
 
                         function_top.function = self.shard.functions.len();
-                        let mut f = FunctionInfo {addr: FunctionAddr(0), prev_addr: FunctionAddr(0), die: offset, mangled_name: name_ref.as_ptr(), mangled_name_len: name_ref.len() as u32, shard_idx: self.shard_idx as u16, flags: FunctionFlags::empty(), language: self.unit_language, subfunction_levels: 0..0};
+                        let mut f = FunctionInfo {addr: FunctionAddr(0), prev_addr: FunctionAddr(0), die: offset, mangled_name: name_ref.as_ptr(), mangled_name_len: name_ref.len() as u32, shard_idx: self.shard_idx as u16, flags: FunctionFlags::empty(), language: self.unit.language, subfunction_levels: 0..0};
                         if is_inlined {
                             f.flags.insert(FunctionFlags::INLINED);
                         }
@@ -2681,11 +2634,11 @@ impl<'a> DwarfLoader<'a> {
                             Type::Pointer(PointerType {flags: PointerFlags::empty(), type_: self.loader.types.builtin_types.unknown})
                         }
                         _ => panic!("huh?") };
-                    let mut info = TypeInfo {die: offset, binary_id: self.loader.binary_id, line: LineInfo::invalid(), t, language: self.unit_language, ..Default::default()};
+                    let mut info = TypeInfo {die: offset, binary_id: self.loader.binary_id, line: LineInfo::invalid(), t, language: self.unit.language, ..Default::default()};
                     let mut is_complex_float = false;
 
                     if attrs.fields & TypeAttributes::decl != 0 {
-                        info.line = Self::parse_line_info(&mut self.shard, &self.loader, self.unit_idx, &attrs.decl);
+                        info.line = Self::parse_line_info(&mut self.shard, &self.loader, self.unit, &attrs.decl);
                     }
 
                     if attrs.name.is_empty() {
@@ -2755,10 +2708,10 @@ impl<'a> DwarfLoader<'a> {
                                 DW_ATE_boolean => p.insert(PrimitiveFlags::BOOL),
                                 DW_ATE_imaginary_float | DW_ATE_float => p.insert(PrimitiveFlags::FLOAT),
                                 DW_ATE_signed => p.insert(PrimitiveFlags::SIGNED),
-                                DW_ATE_signed_char => p.insert(PrimitiveFlags::SIGNED | PrimitiveFlags::CHAR | if self.unit_language.presumably_cpp() {PrimitiveFlags::AMBIGUOUS_CHAR} else {PrimitiveFlags::empty()}),
+                                DW_ATE_signed_char => p.insert(PrimitiveFlags::SIGNED | PrimitiveFlags::CHAR | if self.unit.language.presumably_cpp() {PrimitiveFlags::AMBIGUOUS_CHAR} else {PrimitiveFlags::empty()}),
                                 DW_ATE_unsigned => (),
                                 DW_ATE_unsigned_char => p.insert(PrimitiveFlags::CHAR),
-                                DW_ATE_UTF | DW_ATE_UCS | DW_ATE_ASCII => p.insert(PrimitiveFlags::CHAR | if self.unit_language.presumably_cpp() {PrimitiveFlags::AMBIGUOUS_CHAR} else {PrimitiveFlags::empty()}),
+                                DW_ATE_UTF | DW_ATE_UCS | DW_ATE_ASCII => p.insert(PrimitiveFlags::CHAR | if self.unit.language.presumably_cpp() {PrimitiveFlags::AMBIGUOUS_CHAR} else {PrimitiveFlags::empty()}),
                                 DW_ATE_complex_float => is_complex_float = true,
                                 //DW_ATE_packed_decimal | DW_ATE_numeric_string | DW_ATE_edited | DW_ATE_signed_fixed | DW_ATE_unsigned_fixed | DW_ATE_decimal_float
                                 _ => {
@@ -2923,7 +2876,7 @@ impl<'a> DwarfLoader<'a> {
                                     } else {
                                         DwarfVariableLocation::ConstSlice(attrs.const_value_slice)
                                     };
-                                    let decl = Self::parse_line_info(&mut self.shard, &self.loader, self.unit_idx, &attrs.decl);
+                                    let decl = Self::parse_line_info(&mut self.shard, &self.loader, self.unit, &attrs.decl);
                                     let var = Variable::new(field.name, field.type_, offset, decl, VariableFlags::empty());
                                     self.add_variable_locations(loc, /*linkage_name*/ "", var, offset)?;
                                 } else {
@@ -3017,7 +2970,7 @@ impl<'a> DwarfLoader<'a> {
                             // (Note that pushing another type onto type_stack won't work because the repeated DW_TAG_subrange_type are not nested in each other, so the stack entry will be popped immediately.)
                             let t = unsafe {&mut *self.type_stack.top().type_};
                             array = t.t.as_array_mut().unwrap(); // avoid UB
-                            let info = TypeInfo {die: offset, binary_id: t.binary_id, line: t.line, language: self.unit_language, t: Type::Array(ArrayType {flags: ArrayFlags::PARSED_SUBRANGE, type_: array.type_, stride: 0, len: 0}), ..TypeInfo::default()};
+                            let info = TypeInfo {die: offset, binary_id: t.binary_id, line: t.line, language: self.unit.language, t: Type::Array(ArrayType {flags: ArrayFlags::PARSED_SUBRANGE, type_: array.type_, stride: 0, len: 0}), ..TypeInfo::default()};
                             let (ptr, off) = self.shard.types.add_type(info);
                             assert!(ptr != ptr::null());
                             array.type_ = off;
@@ -3068,7 +3021,7 @@ impl<'a> DwarfLoader<'a> {
 
                 // TODO: Function pointers and pointers to members.
                 DW_TAG_ptr_to_member_type | DW_TAG_subroutine_type => {
-                    self.shard.types.add_type(TypeInfo {name: "<unsupported>", die: offset, binary_id: self.loader.binary_id, language: self.unit_language, flags: TypeFlags::UNSUPPORTED, ..TypeInfo::default()});
+                    self.shard.types.add_type(TypeInfo {name: "<unsupported>", die: offset, binary_id: self.loader.binary_id, language: self.unit.language, flags: TypeFlags::UNSUPPORTED, ..TypeInfo::default()});
                     skip_subtree = self.main_stack.len;
                     cursor.skip_attributes(abbrev, &attribute_context)?;
                 }
@@ -3079,7 +3032,7 @@ impl<'a> DwarfLoader<'a> {
                     unsafe {cursor.read_attributes(abbrev, /*which_layout*/ 0, &attribute_context, &raw mut attrs as *mut u8)}?;
                     if attrs.fields & (DwarfRanges::RANGES | DwarfRanges::LOW_PC) != 0 {
                         let ranges_top = self.ranges_stack.push_uninit(&mut self.main_stack.top_mut().flags);
-                        parse_dwarf_ranges(&self.loader.sym.dwarf, self.unit, &attrs.ranges, attrs.fields, offset, self.loader.sym.code_addr_range.start, &mut ranges_top.pc_ranges, &mut self.shard.warn)?;
+                        parse_dwarf_ranges(&self.loader.sym.dwarf, &self.unit.unit, &attrs.ranges, attrs.fields, offset, self.loader.sym.code_addr_range.start, &mut ranges_top.pc_ranges, &mut self.shard.warn)?;
                     }
                 }
 
@@ -3098,9 +3051,9 @@ impl<'a> DwarfLoader<'a> {
                     let mut attrs = InlinedSubroutineAttributes::default();
                     unsafe {cursor.read_attributes(abbrev, /*which_layout*/ 0, &attribute_context, &raw mut attrs as *mut u8)}?;
                     let ranges_top = self.ranges_stack.push_uninit(&mut self.main_stack.top_mut().flags);
-                    parse_dwarf_ranges(&self.loader.sym.dwarf, self.unit, &attrs.ranges, attrs.fields, offset, self.loader.sym.code_addr_range.start, &mut ranges_top.pc_ranges, &mut self.shard.warn)?;
+                    parse_dwarf_ranges(&self.loader.sym.dwarf, &self.unit.unit, &attrs.ranges, attrs.fields, offset, self.loader.sym.code_addr_range.start, &mut ranges_top.pc_ranges, &mut self.shard.warn)?;
 
-                    let mut call_line = Self::parse_line_info(&mut self.shard, &self.loader, self.unit_idx, &attrs.call);
+                    let mut call_line = Self::parse_line_info(&mut self.shard, &self.loader, self.unit, &attrs.call);
                     let callee_die = if attrs.fields & InlinedSubroutineAttributes::abstract_origin != 0 {
                         DebugInfoOffset(attrs.abstract_origin)
                     } else {
@@ -3200,7 +3153,7 @@ impl<'a> DwarfLoader<'a> {
                         // Missing value or type. Not sure what this means, but it's possible.
                         //if self.shard.warn.check(line!()) { eprintln!("warning: DW_TAG_template_value_parameter without DW_AT_const_value or DW_AT_type @0x{:x}", offset.0); }
                     } else {
-                        let decl = Self::parse_line_info(&mut self.shard, &self.loader, self.unit_idx, &attrs.decl);
+                        let decl = Self::parse_line_info(&mut self.shard, &self.loader, self.unit, &attrs.decl);
                         let var = Variable::new(attrs.name, attrs.type_ as *const TypeInfo, offset, decl, VariableFlags::TEMPLATE_PARAMETER);
                         let loc = if attrs.fields & FieldAttributes::const_value_usize != 0 {
                             DwarfVariableLocation::ConstUsize(attrs.const_value_usize)

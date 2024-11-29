@@ -1,6 +1,6 @@
 use crate::{*, error::{*, Result, Error}, log::*, util::*, types::LanguageFamily};
 use gimli::{*, constants::DwForm};
-use std::{str, borrow::Cow, fmt, sync::Mutex, collections::HashSet, mem, ptr};
+use std::{str, borrow::Cow, fmt, sync::{Mutex, Arc}, collections::HashSet, mem, ptr};
 use std::arch::x86_64::*;
 use rand::random;
 
@@ -53,6 +53,7 @@ impl DwarfSlice {
     }
 }
 
+#[derive(Clone)]
 pub struct SliceReader {
     p: *const u8,
     n: usize,
@@ -216,13 +217,13 @@ impl SliceReader {
         }
     }
 
-    pub fn read_abbreviation<'ab>(&mut self, abbreviations: &'ab AbbreviationSet) -> Result<Option<&'ab Abbreviation>> {
+    pub fn read_abbreviation<'ab>(&mut self, context: &AttributeContext<'ab>) -> Result<Option<&'ab Abbreviation>> {
         let code = self.read_uleb128_or_zero();
         if code == 0 {
             self.check()?;
             return Ok(None);
         }
-        Ok(Some(abbreviations.get(code)?))
+        Ok(Some(context.unit.abbreviation_set.get(code)?))
     }
 
     pub fn skip_attributes(&mut self, abbreviation: &Abbreviation, context: &AttributeContext) -> Result<()> {
@@ -257,7 +258,7 @@ impl SliceReader {
                 let layout_idx = action.param >> 16;
                 let name = DwAt((action.param & 0xffff) as u16);
                 let layout = &context.shared.layouts.layouts[layout_idx].1;
-                action = prepare_attribute_action(AttributeSpecification {name, form, implicit_const_value}, layout, context.unit.header.encoding(), &context.shared.warnings, &mut flags)?;
+                action = prepare_attribute_action(AttributeSpecification {name, form, implicit_const_value}, layout, context.unit.unit.header.encoding(), &context.shared.warnings, &mut flags)?;
             }
 
             let out_field = out.add(action.field_offset as usize);
@@ -274,27 +275,27 @@ impl SliceReader {
             };
 
             let set_strx = |index: usize, context: &AttributeContext| -> Result<()> {
-                let offset = context.dwarf.string_offset(context.unit, DebugStrOffsetsIndex(index))?;
+                let offset = context.dwarf.string_offset(&context.unit.unit, DebugStrOffsetsIndex(index))?;
                 // TODO: Replace all occurrences of `string(` in this file with a faster SIMD null-terminated string implementation.
                 let s = context.dwarf.string(offset)?;
                 set_slice(s.slice(), action.param != 0);
                 Ok(())
             };
             let set_addrx = |index: usize, context: &AttributeContext| -> Result<()> {
-                let addr = context.dwarf.address(context.unit, DebugAddrIndex(index))? as usize;
+                let addr = context.dwarf.address(&context.unit.unit, DebugAddrIndex(index))? as usize;
                 set_usize(addr);
                 Ok(())
             };
             let set_unit_offset = |mut offset: usize, context: &AttributeContext| {
                 if action.param != 0 {
                     // Convert to global offset.
-                    offset = UnitOffset(offset).to_debug_info_offset(&context.unit.header).unwrap().0; // (panics if `unit` is a type unit instead of compile unit)
+                    offset = UnitOffset(offset).to_debug_info_offset(&context.unit.unit.header).unwrap().0; // (panics if `unit` is a type unit instead of compile unit)
                 }
                 set_usize(offset);
             };
 
             match action.form {
-                DW_FORM_addr => set_usize(if context.unit.header.encoding().address_size == 8 {self.read_u64_or_zero() as usize} else {self.read_u32_or_zero() as usize}),
+                DW_FORM_addr => set_usize(if context.unit.unit.header.encoding().address_size == 8 {self.read_u64_or_zero() as usize} else {self.read_u32_or_zero() as usize}),
 
                 DW_FORM_block1 => {
                     let len = self.read_u8_or_zero() as usize;
@@ -383,12 +384,12 @@ impl SliceReader {
 
                 DW_FORM_loclistx => {
                     let index = self.read_uleb128_or_zero();
-                    let offset = context.dwarf.locations_offset(context.unit, DebugLocListsIndex(index))?.0;
+                    let offset = context.dwarf.locations_offset(&context.unit.unit, DebugLocListsIndex(index))?.0;
                     set_usize(offset);
                 }
                 DW_FORM_rnglistx => {
                     let index = self.read_uleb128_or_zero();
-                    let offset = context.dwarf.ranges_offset(context.unit, DebugRngListsIndex(index))?.0;
+                    let offset = context.dwarf.ranges_offset(&context.unit.unit, DebugRngListsIndex(index))?.0;
                     set_usize(offset);
                 }
 
@@ -570,8 +571,15 @@ impl AllAttributeStructLayouts {
                 layouts.push((tag, layout.clone()));
             }
         }
+        layouts.push((DW_TAG_compile_unit, UnitLateAttributes::layout()));
 
         layouts.sort_unstable_by_key(|(t, _)| *t);
+        for i in 0..layouts.len()-1 {
+            if layouts[i].0 == layouts[i+1].0 {
+                panic!("multiple struct layouts for tag {}", layouts[i].0);
+            }
+        }
+
         let num_primary_layouts = layouts.len();
         let secondary_layout_idx = layouts.len();
         layouts.push((DW_TAG_null, secondary_layout));
@@ -626,12 +634,12 @@ pub struct AbbreviationsSharedData {
 #[derive(Clone)]
 pub struct AttributeContext<'a> {
     // TODO: Try inlining frequently accessed fields of these structs here for speed.
-    pub unit: &'a Unit<DwarfSlice>,
+    pub unit: &'a DwarfUnit,
     pub dwarf: &'a Dwarf<DwarfSlice>,
     pub shared: &'a AbbreviationsSharedData,
 }
 impl<'a> AttributeContext<'a> {
-    pub fn switch_unit(&mut self, unit: &'a Unit<DwarfSlice>) {
+    pub fn switch_unit(&mut self, unit: &'a DwarfUnit) {
         self.unit = unit;
     }
 }
@@ -832,16 +840,17 @@ pub struct DwarfCodeLocation {
     pub column: usize,
 }
 
-//asdqwe
 pub struct DwarfUnit {
     pub offset: DieOffset,
     pub unit: Unit<DwarfSlice>,
-    pub abbreviations: AbbreviationSet,
+    pub abbreviation_set: AbbreviationSet,
 
-    pub name: String,
+    pub name: &'static str,
     pub comp_dir: &'static str,
-    pub ranges: DwarfRanges,
     pub language: LanguageFamily,
+
+    pub ranges: DwarfRanges,
+    pub fields: u32, // for `ranges`
 
     // These are used by Symbols.
     pub shard_idx: usize,
@@ -850,7 +859,6 @@ pub struct DwarfUnit {
 
 dwarf_struct!{ UnitEarlyAttributes {
     // Be careful to not include any attributes that may require knowing unit's section offsets. E.g. name, comp_dir, low_pc can't be here.
-    stmt_list: usize, DW_AT_stmt_list, SectionOffset;
     str_offsets_base: usize, DW_AT_str_offsets_base, SectionOffset;
     addr_base: usize, DW_AT_addr_base, SectionOffset;
     loclists_base: usize, DW_AT_loclists_base, SectionOffset;
@@ -862,9 +870,10 @@ dwarf_struct!{ UnitLateAttributes {
     comp_dir: &'static str, DW_AT_comp_dir, String;
     ranges: DwarfRanges, DW_AT_ranges, Ranges;
     language: usize, DW_AT_language, Unsigned;
+    stmt_list: usize, DW_AT_stmt_list, SectionOffset; // (this could be in UnitEarlyAttributes, but more convenient here)
 }}
 
-pub fn list_units(dwarf: &mut Dwarf<DwarfSlice>, binary_name: &str, layouts: AllAttributeStructLayouts) -> Result<(Vec<(Unit<DwarfSlice>, AbbreviationSet)>, AbbreviationsSharedData)> {
+pub fn list_units(dwarf: &mut Dwarf<DwarfSlice>, binary_name: &str, layouts: AllAttributeStructLayouts) -> Result<(Vec<DwarfUnit>, AbbreviationsSharedData)> {
     let mut shared = AbbreviationsSharedData {layouts, warnings: FormWarningLimiter::default()};
 
     let mut unit_headers: Vec<(UnitHeader<DwarfSlice>, AbbreviationSet)> = Vec::new();
@@ -980,16 +989,71 @@ pub fn list_units(dwarf: &mut Dwarf<DwarfSlice>, binary_name: &str, layouts: All
             eprintln!("info: not all abbreviation codes are consecutive ({})", binary_name)
         }
     }
-    {
-        let _prof = ProfileScope::with_threshold(0.01, format!("loading gimli abbreviations ({})", binary_name));
-        dwarf.populate_abbreviations_cache(AbbreviationsCacheStrategy::All);
-    }
-    let mut units: Vec<(Unit<DwarfSlice>, AbbreviationSet)> = Vec::with_capacity(unit_headers.len());
+    let mut units: Vec<DwarfUnit> = Vec::with_capacity(unit_headers.len());
     {
         let _prof = ProfileScope::with_threshold(0.01, format!("preparing units ({})", binary_name));
-        for (header, set) in unit_headers {
-            let unit = dwarf.unit(header)?;
-            units.push((unit, set));
+        for (header, abbreviation_set) in unit_headers {
+            let offset = match header.offset() {
+                UnitSectionOffset::DebugInfoOffset(o) => o,
+                _ => return err!(Internal, "unit offset has unexpected type"),
+            };
+            let mut unit = DwarfUnit {
+                offset,
+                unit: Unit {
+                    header,
+                    // We don't use these, have our own implementation.
+                    abbreviations: Arc::new(Abbreviations::default()), name: None, comp_dir: None,
+                    // We'll assign these below.
+                    low_pc: 0, str_offsets_base: DebugStrOffsetsBase(0), addr_base: DebugAddrBase(0), loclists_base: DebugLocListsBase(0),
+                    rnglists_base: DebugRngListsBase(0), line_program: None,
+                    dwo_id: None, // not supported
+                },
+                abbreviation_set,
+                name: "", comp_dir: "", ranges: DwarfRanges::default(), fields: 0, language: LanguageFamily::Unknown, shard_idx: 0, file_idx_remap: Vec::new(),
+            };
+            let attribute_context = AttributeContext {unit: &unit, dwarf, shared: &shared};
+
+            let initial_cursor = SliceReader::new(header.range_from(UnitOffset(unit.unit.header.header_size())..)?.slice());
+
+            // Have to read attributes twice: first to get base section offsets, then other attributes (which may need section offsets to interpret).
+            // (We could be slightly more efficient and remember uninterpreted attributes instead of re-parsing them from bytes,
+            //  but it probably doesn't matter because there are only tens of thousands of units.)
+
+            let mut cursor = initial_cursor.clone();
+            let Some(abbrev) = cursor.read_abbreviation(&attribute_context)? else { return err!(Dwarf, "unit missing root DIE") };
+            if abbrev.tag != DW_TAG_compile_unit { return err!(Dwarf, "unexpected unit root DIE tag: {}", abbrev.tag) }
+            let mut attrs = UnitEarlyAttributes::default();
+            unsafe {cursor.read_attributes(&abbrev, /*which_layout*/ 1, &attribute_context, &raw mut attrs as *mut u8)?};
+
+            unit.unit.str_offsets_base = DebugStrOffsetsBase(attrs.str_offsets_base);
+            unit.unit.addr_base = DebugAddrBase(attrs.addr_base);
+            unit.unit.loclists_base = DebugLocListsBase(attrs.loclists_base);
+            unit.unit.rnglists_base = DebugRngListsBase(attrs.rnglists_base);
+
+            let attribute_context = AttributeContext {unit: &unit, dwarf, shared: &shared};
+            let mut cursor = initial_cursor.clone();
+            let Some(abbrev) = cursor.read_abbreviation(&attribute_context)? else { return err!(Sanity, "file changed") }; // re-lookup because of borrow checker
+            if abbrev.tag != DW_TAG_compile_unit { return err!(Sanity, "file changed") }
+            let mut attrs = UnitLateAttributes::default();
+            unsafe {cursor.read_attributes(&abbrev, /*which_layout*/ 0, &attribute_context, &raw mut attrs as *mut u8)?};
+
+            if attrs.fields & UnitLateAttributes::stmt_list != 0 {
+                unit.unit.line_program = Some(dwarf.debug_line.program(DebugLineOffset(attrs.stmt_list), unit.unit.header.address_size(), Some(DwarfSlice::new(attrs.comp_dir.as_bytes())), Some(DwarfSlice::new(attrs.name.as_bytes())))?);
+            }
+            unit.unit.low_pc = attrs.ranges.low_pc as u64;
+
+            unit.name = attrs.name;
+            unit.comp_dir = attrs.comp_dir;
+            unit.ranges = attrs.ranges;
+            unit.fields = attrs.fields;
+            unit.language = match DwLang(attrs.language as u16) {
+                // Unfortunately the C_plus_plus_* constants don't follow any predictable pattern, so we'll have to update this list every few years as new C++ versions are added to DWARF.
+                DW_LANG_C | DW_LANG_C11 | DW_LANG_C17 | DW_LANG_C89 | DW_LANG_C99 | DW_LANG_C_plus_plus | DW_LANG_C_plus_plus_03 | DW_LANG_C_plus_plus_11 | DW_LANG_C_plus_plus_14 | DW_LANG_C_plus_plus_17 | DW_LANG_C_plus_plus_20 => LanguageFamily::Cpp,
+                DW_LANG_Rust => LanguageFamily::Rust,
+                _ => LanguageFamily::Other,
+            };
+
+            units.push(unit);
         }
     }
 

@@ -224,6 +224,7 @@ fn load_elf(locator: &BinaryLocator, contents_maybe: Result<Vec<u8>>, custom_pat
             if metadata.ino() != locator.inode && custom_path.is_none() {
                 return err!(Usage, "binary changed");
             }
+            // TODO: Try madvise()ing the big sections: MADV_WILLNEED all .debug_* sections et al, MADV_SEQUENTIAL the .debug_info, MADV_RANDOM .debug_str, MADV_DONTNEED .debug_info after loading.
             ElfFile::from_file(locator.path.clone(), &file, metadata.len())?
         }
         SpecialSegmentId::Vdso(_) => {
