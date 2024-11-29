@@ -8,7 +8,6 @@ fix incorrect column numbers with tab indentation (tabs should be counted as 1 c
 investigate why exception-aware step-over doesn't work in clickhouse, at least sometimes
 
 investigate why quitting is slow
-investigate why some types (e.g. arrow::Schema) fail to match declaration to definition, and variables end up shown as empty structs
 optimize symbols loading
   test things
   rewrite dwarf parser
@@ -66,7 +65,7 @@ allow expressions (especially conditions) to have multiple statements separated 
 floating point and simd registers
 some kind of non-stop mode to prevent clickhouse server from losing keeper connection when stepping through the code
 allow navigating from source to variables (especially global) and types declared there
-allow to put breakpoint on a whole file
+allow to put breakpoint on a whole file (by adding breakpoint on the first line, since there's never any real code on first line in practice; have a new icon for it; internally use line 0 to cover the garbage LineInfo-s with line 0; or maybe put breakpoint only on function entry points instead of everything)
 function pointers and field pointers
 find function by address (like addr2line)
 use actual function name instead of "_" in namespace path, or do something else to make function-static variables usable

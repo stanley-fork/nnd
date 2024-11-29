@@ -1,4 +1,4 @@
-use crate::{*, error::{*, Result, Error}, log::*, util::*};
+use crate::{*, error::{*, Result, Error}, log::*, util::*, types::LanguageFamily};
 use gimli::{*, constants::DwForm};
 use std::{str, borrow::Cow, fmt, sync::Mutex, collections::HashSet, mem, ptr};
 use std::arch::x86_64::*;
@@ -576,7 +576,7 @@ impl AllAttributeStructLayouts {
         let secondary_layout_idx = layouts.len();
         layouts.push((DW_TAG_null, secondary_layout));
         let unit_layout_idx = layouts.len();
-        layouts.push((DW_TAG_null, UnitPrepassAttributes::layout()));
+        layouts.push((DW_TAG_null, UnitEarlyAttributes::layout()));
         let empty_layout_idx = layouts.len();
         layouts.push((DW_TAG_null, AttributeStructLayout::default()));
         for (_, l) in &mut layouts {
@@ -832,9 +832,36 @@ pub struct DwarfCodeLocation {
     pub column: usize,
 }
 
-dwarf_struct!{ UnitPrepassAttributes {
+//asdqwe
+pub struct DwarfUnit {
+    pub offset: DieOffset,
+    pub unit: Unit<DwarfSlice>,
+    pub abbreviations: AbbreviationSet,
+
+    pub name: String,
+    pub comp_dir: &'static str,
+    pub ranges: DwarfRanges,
+    pub language: LanguageFamily,
+
+    // These are used by Symbols.
+    pub shard_idx: usize,
+    pub file_idx_remap: Vec<usize>, // DWARF file index -> index in Symbols.files
+}
+
+dwarf_struct!{ UnitEarlyAttributes {
+    // Be careful to not include any attributes that may require knowing unit's section offsets. E.g. name, comp_dir, low_pc can't be here.
+    stmt_list: usize, DW_AT_stmt_list, SectionOffset;
+    str_offsets_base: usize, DW_AT_str_offsets_base, SectionOffset;
+    addr_base: usize, DW_AT_addr_base, SectionOffset;
+    loclists_base: usize, DW_AT_loclists_base, SectionOffset;
     rnglists_base: usize, DW_AT_rnglists_base, SectionOffset;
-    // TODO: All the other section offsets, etc. (Probably can't have name and ranges here because it may need section offset.)
+}}
+
+dwarf_struct!{ UnitLateAttributes {
+    name: &'static str, DW_AT_name, String;
+    comp_dir: &'static str, DW_AT_comp_dir, String;
+    ranges: DwarfRanges, DW_AT_ranges, Ranges;
+    language: usize, DW_AT_language, Unsigned;
 }}
 
 pub fn list_units(dwarf: &mut Dwarf<DwarfSlice>, binary_name: &str, layouts: AllAttributeStructLayouts) -> Result<(Vec<(Unit<DwarfSlice>, AbbreviationSet)>, AbbreviationsSharedData)> {

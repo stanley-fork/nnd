@@ -768,7 +768,7 @@ impl Symbols {
                 *s = &s[1..];
             }
         }
-        AddrToLineIter {prev_addr: usize::MAX, iter: MergeIterator::new(sources, |line| cmp::Reverse(line.addr_filenone_linebad_inlined()))}
+        AddrToLineIter {prev_addr: usize::MAX, iter: MergeIterator::new(sources, |line| /*it's a max-heap*/ cmp::Reverse(line.addr_filenone_linebad_inlined()))}
     }
 
     // The file_idx() in the returned LineInfo is never None (instead, the whole LineInfo is None).
@@ -852,6 +852,9 @@ impl<K: Ord, F: FnMut(&LineInfo) -> K> Iterator for AddrToLineIter<'_, K, F> {
     
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(line) = self.iter.next() {
+            // This deduplication logic is less sophisticated than what we do in parse_debug_line() and sort_addr_to_line().
+            // But this should be more than enough because usually all debug info for each function's address range is within one unit,
+            // so all jank fixup happens during loading, before we get here.
             if line.addr() != self.prev_addr {
                 self.prev_addr = line.addr();
                 return Some(line.clone());
@@ -926,6 +929,7 @@ struct SymbolsLoaderShard {
 
     functions: Vec<FunctionInfo>,
     max_function_end: usize,
+    subfunctions_need_fixup: Vec<usize>,
 
     vtables: Vec<VTableInfo>,
     points_of_interest: HashMap<PointOfInterest, Vec<usize>>,
@@ -1074,7 +1078,7 @@ impl SymbolsLoader {
         let (types_loader, types_shards) = TypesLoader::create(num_shards);
         let mut shards: Vec<SymbolsLoaderShard> = types_shards.into_iter().map(|types| SymbolsLoaderShard {
             sym: SymbolsShard {addr_to_line: Vec::new(), line_to_addr: Vec::new(), types: Types::new(), misc_arena: Arena::new(), local_variables: Vec::new(), global_variables: Arena::new(), sorted_global_variable_names: StringTable::new(), subfunctions: Vec::new(), subfunction_levels: Vec::new(), mangled_name_to_function: Vec::new()},
-            units: Vec::new(), symtab_ranges: Vec::new(), file_dedup: Vec::new(), file_used_lines: Vec::new(), types, base_types: Vec::new(), functions: Vec::new(), vtables: Vec::new(), points_of_interest: HashMap::new(),
+            units: Vec::new(), symtab_ranges: Vec::new(), file_dedup: Vec::new(), file_used_lines: Vec::new(), types, base_types: Vec::new(), functions: Vec::new(), subfunctions_need_fixup: Vec::new(), vtables: Vec::new(), points_of_interest: HashMap::new(),
             temp_global_var_arena: Arena::new(), max_function_end: 0, functions_before_dedup: 0, warn: Limiter::new()}).collect();
 
         let mut round_robin_shard = 0usize;
@@ -1214,6 +1218,7 @@ impl SymbolsLoader {
                 self.sort_functions(shard);
                 self.parse_debug_line(shard)?;
                 self.sort_addr_to_line(shard);
+                self.fixup_subfunction_call_lines(shard); // must be after sort_addr_to_line()
                 self.sort_line_to_addr(shard);
             }
             3 => {
@@ -1352,7 +1357,6 @@ impl SymbolsLoader {
 
             let mut rows_iter = program.clone().rows();
             let mut skip_current_sequence = false;
-            let mut last_line_to_addr_stmt: Option<usize> = None;
             while let Some((header, row)) = rows_iter.next_row()? {
                 if row.address() == 0 {
                     // Binaries often have lots (like 70%) of sequences that start at zero address, presumably because a relocation was lost at some point during compilation.
@@ -1364,7 +1368,6 @@ impl SymbolsLoader {
                 }
 
                 if !skip_current_sequence {
-                    let mut is_stmt = false;
                     let info = if row.end_sequence() {
                         LineInfo::new(row.address() as usize, None, 0, 0, LineFlags::empty())?
                     } else {
@@ -1374,17 +1377,18 @@ impl SymbolsLoader {
                             ColumnType::LeftEdge => 0,
                             ColumnType::Column(c) => u64::from(c) as usize,
                         };
-                        is_stmt = row.is_stmt() && file.is_some();
+                        let is_stmt = row.is_stmt() && file.is_some();
                         LineInfo::new(row.address() as usize, file, line, column, if is_stmt {LineFlags::STATEMENT} else {LineFlags::empty()})?
                     };
 
-                    let (mut skip_line_to_addr, mut skip_addr_to_line) = (false, false);
+                    let mut skip = false;
                     if let Some(prev) = shard.sym.addr_to_line.last() {
                         if info.line() == 0 && info.file_idx().is_some() && prev.file_idx() == info.file_idx() && prev.line() != 0 {
                             // Often there's a zero line number out of nowhere, surrounded by good line numbers with same file.
                             // Idk what this means or whether it's intended. Let's pretend it's not there.
-                            skip_line_to_addr = true;
-                            skip_addr_to_line = true;
+                            // We also do a similar thing in sort_addr_to_line() and fixup_subfunction_call_lines().
+                            // (Why do it here? To avoid needing stable sort in sort_addr_to_line().)
+                            skip = true;
                         } else if prev.addr() == row.address() as usize {
                             // Two consecutive rows have the same address. We have to be very careful here, otherwise breakpoints get super janky.
                             // This took a few attempts to get right (the the reasoning was forgotten and I broke it again, so I'm documenting it better now).
@@ -1402,36 +1406,41 @@ impl SymbolsLoader {
                             // Line 176 is call site of an inlined function. Line 25 is inside the inlined function.
                             // Additionally, there's a DW_TAG_inlined_subroutine that starts at the same address.
                             // Notice that:
-                            //  * We must not put the first two rows (lines 175-176) to line_to_addr with STATEMENT flag.
-                            //    If we do, setting a breakpoint on line 176 would be broken: the breakpoint will have subfunction_level = u16::MAX,
+                            //  * We must not add rows 1-2 (lines 175-176) to line_to_addr with STATEMENT flag.
+                            //    Otherwise setting a breakpoint on line 176 would be broken: the breakpoint will have subfunction_level = u16::MAX,
                             //    so when it's hit we'll select the inner subframe of the stack trace, which is inside the inlined function on line 26 instead of 176.
                             //    (The breakpoint instead should be set using the LineInfo produced by DW_TAG_inlined_subroutine, which has subfunction_level = 0.)
+                            //  * We must add at most one of the rows 3-4 (lines 25-26) to line_to_addr. If we add both, they'll be highlighted in the source code, as if there are two places control can stop;
+                            //    then the user may do a step and expect to get from one highlighted line/column to the other, and be confused when it skips way ahead instead.
+                            //    This is particularly bad when one of the columns is a function call and another is a parameter of the function call; if stopped on the parameter, typically
+                            //    you'd do a step-over-column to get to the function call, then do step-into to step into the call; but here the step-over-column would step over the whole call - very annoying.
                             //  * We must put at least one row with line 26 into line_to_addr with STATEMENT flag, so that breakpoint can be set on it.
-                            //  * For the first 3 lines, it's ok to discard them completely or to put then in line_to_addr without STATEMENT flag (for highlighting in the source code).
                             //
-                            // The logic we ended up with is:
-                            //  * in addr_to_line keep only the last of the consecutive rows with the same address (even if it's not a statement),
-                            //  * in line_to_addr keep all rows, but set the STATEMENT flag only for the last row with is_stmt == true.
+                            // The logic we ended up with is: keep only one of the consecutive rows with the same address; if any rows have is_stmt == true, keep the last of them, otherwise keep the last.
 
-                            skip_addr_to_line = true;
-                            *shard.sym.addr_to_line.last_mut().unwrap() = info;
-                            if info.file_idx().is_some() && is_stmt {
-                                if let &Some(i) = &last_line_to_addr_stmt {
-                                    let p = &mut shard.sym.line_to_addr[i].0;
-                                    if p.addr() == row.address() as usize {
-                                        p.unset_flag(LineFlags::STATEMENT);
-                                    }
+                            skip = true;
+                            if prev.file_idx().is_none() {
+                                // End of sequence... sike, a new sequence starts at the same address. Drop the end-of-sequence marker.
+                                shard.sym.addr_to_line.pop();
+                            } else {
+                                assert!(shard.sym.line_to_addr.last().is_some_and(|(p, _)| p.addr() == row.address() as usize));
+                                if info.file_idx().is_none() {
+                                    // `prev` covers an address range of length 0. We're not interested in that.
+                                    shard.sym.line_to_addr.pop();
+                                    *shard.sym.addr_to_line.last_mut().unwrap() = info;
+                                } else if info.flags().contains(LineFlags::STATEMENT) >= prev.flags().contains(LineFlags::STATEMENT) {
+                                    *shard.sym.line_to_addr.last_mut().unwrap() = (info, u16::MAX);
+                                    *shard.sym.addr_to_line.last_mut().unwrap() = info;
+                                } else {
+                                    // `prev` is a statement, and `info` is not. Keep `prev`.
                                 }
                             }
                         }
                     }
-                    if !skip_line_to_addr && info.file_idx().is_some() {
-                        if is_stmt {
-                            last_line_to_addr_stmt = Some(shard.sym.line_to_addr.len());
+                    if !skip {
+                        if info.file_idx().is_some() {
+                            shard.sym.line_to_addr.push((info.clone(), u16::MAX));
                         }
-                        shard.sym.line_to_addr.push((info.clone(), u16::MAX));
-                    }
-                    if !skip_addr_to_line {
                         shard.sym.addr_to_line.push(info);
                     }
                 }
@@ -1515,6 +1524,23 @@ impl SymbolsLoader {
             match shard.file_used_lines.last_mut() {
                 Some(x) if x.0 == idx => x.1 += 1,
                 _ => shard.file_used_lines.push((idx, 1)),
+            }
+        }
+    }
+
+    fn fixup_subfunction_call_lines(&self, shard: &mut SymbolsLoaderShard) {
+        // Sometimes DW_TAG_inlined_subroutine has DW_AT_call_line == 0. Idk whether this is intended and what it's supposed to mean.
+        // In the cases I've seen, there was a good line number (line of the inlined call) in .debug_line for a slightly lower address. Let's use that.
+        // There are few such subfunctions, so performance is not very important here.
+        for &sf_idx in &shard.subfunctions_need_fixup {
+            let sf = &mut shard.sym.subfunctions[sf_idx];
+            assert!(sf.call_line.file_idx().is_some() && sf.call_line.line() == 0);
+            let i = shard.sym.addr_to_line.partition_point(|l| l.addr() <= sf.addr_range.start);
+            if i > 0 {
+                let info = shard.sym.addr_to_line[i - 1];
+                if info.file_idx() == sf.call_line.file_idx() && info.line() != 0 {
+                    sf.call_line = info;
+                }
             }
         }
     }
@@ -1747,6 +1773,7 @@ impl SymbolsLoader {
         let total_wall_ns = prepare_ns + self.run_time_per_stage_ns.iter().map(|v| v.iter().map(|t| t.load(Ordering::Relaxed)).max().unwrap()).sum::<usize>();
         if total_wall_ns > 500_000_000 {
             let funcs_before_dedup: usize = self.shards.iter().map(|s| unsafe {(*s.get()).functions_before_dedup}).sum();
+            let subfunctions_needed_fixup: usize = self.shards.iter().map(|s| unsafe {(*s.get()).subfunctions_need_fixup.len()}).sum();
             let misc_arena_size: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.misc_arena.capacity()}).sum();
             let lines: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.addr_to_line.len()}).sum();
             let local_variables: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.local_variables.len()}).sum();
@@ -1806,7 +1833,7 @@ impl SymbolsLoader {
             eprintln!("info: loaded symbols for {} in {:.3}s (cpu: {:.3}s) in {} threads, process peak memory usage: {}, stats: {} units, {} files \
                        ({:.2}x dedup, {:.2}x unused, {} of paths, {} of remap), \
                        {} functions ({:.2}x dedup, {}, {} of names), {} in misc arena, \
-                       {} subfunctions ({} sf, {} levels), \
+                       {} subfunctions ({} sf, {} levels, {} fixed up), \
                        {} lines ({}), {} local variables ({}), {} global variables ({}, names {}), \
                        {} types ({:.2}x dedup, {:.2}x offsets, {} names ({}), \
                        {} infos, {} fields ({:.2}% growth waste), {} nested names, {} misc, temp {} offset maps, temp {} dedup maps) \
@@ -1814,7 +1841,7 @@ impl SymbolsLoader {
                       self.sym.elf.name, total_wall_ns as f64 / 1e9, total_cpu_ns as f64 / 1e9, self.num_shards, peak_mem_str, PrettyCount(self.sym.units.len()), PrettyCount(self.sym.files.len()),
                       files_before_dedup as f64 / self.sym.files.len() as f64, self.sym.files.len() as f64 / self.sym.path_to_used_file.len() as f64, PrettySize(self.sym.file_paths.arena.used()), PrettySize(files_before_dedup * mem::size_of::<usize>()),
                       PrettyCount(self.sym.functions.len()), funcs_before_dedup as f64 / self.sym.functions.len() as f64, PrettySize(self.sym.functions.len() * mem::size_of::<FunctionInfo>()), PrettySize(function_names_len), PrettySize(misc_arena_size),
-                      PrettyCount(subfunctions), PrettySize(subfunctions * mem::size_of::<Subfunction>()), PrettySize(subfunction_levels * mem::size_of::<usize>()),
+                      PrettyCount(subfunctions), PrettySize(subfunctions * mem::size_of::<Subfunction>()), PrettySize(subfunction_levels * mem::size_of::<usize>()), PrettyCount(subfunctions_needed_fixup),
                       PrettyCount(lines), PrettySize(lines * mem::size_of::<LineInfo>() * 2), PrettyCount(local_variables), PrettySize(local_variables * mem::size_of::<Variable>()), PrettyCount(global_variables), PrettySize(global_variables * mem::size_of::<Variable>()), PrettySize(global_variable_name_bytes),
                       PrettyCount(final_types), self.types_before_dedup as f64 / final_types as f64, self.type_offsets as f64 / self.types_before_dedup as f64, PrettyCount(type_names), PrettySize(type_names_len),
                       PrettySize(type_infos_bytes), PrettySize(fields_bytes), fields_bytes as f64 / field_used_bytes as f64 * 100.0 - 100.0, PrettyCount(nested_names), PrettySize(types_misc_bytes), PrettySize(self.type_offset_maps_bytes), PrettySize(self.type_dedup_maps_bytes),
@@ -2438,7 +2465,7 @@ impl<'a> DwarfLoader<'a> {
                     if attrs.fields & UnitAttributes::language != 0 {
                         let lang = constants::DwLang(attrs.language as u16);
                         self.unit_language = match lang {
-                            // Unfortunately the C_plus_plus_* constants are not consecutive and show no sign of becoming consecutive in future, so we'll have to update this list every few years.
+                            // Unfortunately the C_plus_plus_* constants are not consecutive and don't follow any predictable pattern, so we'll have to update this list every few years as new C++ versions are added to DWARF.
                             DW_LANG_C | DW_LANG_C11 | DW_LANG_C17 | DW_LANG_C89 | DW_LANG_C99 | DW_LANG_C_plus_plus | DW_LANG_C_plus_plus_03 | DW_LANG_C_plus_plus_11 | DW_LANG_C_plus_plus_14 | DW_LANG_C_plus_plus_17 | DW_LANG_C_plus_plus_20 => LanguageFamily::Cpp,
                             DW_LANG_Rust => LanguageFamily::Rust,
                             _ => LanguageFamily::Other,
@@ -3119,7 +3146,10 @@ impl<'a> DwarfLoader<'a> {
                                 }
                             };
                             if addr != 0 {
-                                // This is likely at an address where one of the ranges starts, so we'll have two duplicate LineInfo-s there, differing only in the STATEMENT flag. That's ok.
+                                // The inlined function call entry point is not at the start of its address range.
+                                // Make sure breakpoints on the call line resolve to this entry address instead of all range start addresses, otherwise behavior is confusing.
+                                // This address is likely at the start of one of the ranges, so we'll add two duplicate LineInfo-s, differing only in the STATEMENT flag.
+                                // That's ok for correctness, and ok for performance because DW_AT_entry_pc is rare.
                                 self.shard.sym.line_to_addr.push((call_line.clone().with_addr_and_flags(addr, LineFlags::INLINED_FUNCTION | LineFlags::STATEMENT), level - 1));
                                 call_line.unset_flag(LineFlags::STATEMENT);
                             }
@@ -3284,7 +3314,13 @@ impl<'a> DwarfLoader<'a> {
         }
         let levels_start = self.shard.sym.subfunction_levels.len() - 1;
         for level in 0..num_levels {
-            self.shard.sym.subfunctions.append(&mut temp.levels[level]);
+            for sf in &temp.levels[level] {
+                if sf.call_line.line() == 0 && sf.call_line.file_idx().is_some() {
+                    self.shard.subfunctions_need_fixup.push(self.shard.sym.subfunctions.len());
+                }
+                self.shard.sym.subfunctions.push(sf.clone());
+            }
+
             self.shard.sym.subfunction_levels.push(self.shard.sym.subfunctions.len());
 
             temp.levels[level].clear();
