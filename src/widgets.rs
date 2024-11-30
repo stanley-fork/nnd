@@ -243,6 +243,10 @@ pub struct TableState {
 
     // Hide cursor. If any cursor movement key is pressed, unhide it and inset this flag. Used e.g. in filtered threads list if the selected thread doesn't pass the filter.
     pub cursor_elsewhere: bool,
+
+    // TODO: Handle a specific special case: if the last fully visible row was resized and became partially visible, scroll to make it fully visible again.
+    //       This often comes up in breakpoints window: you add a conditional breakpoint, resume the program, it stops at that breakpoint because condition evaluation failed,
+    //       but there's no indication of that because error message is shown in a new line of the row.
 }
 impl TableState {
     pub fn select(&mut self, cursor: usize) {

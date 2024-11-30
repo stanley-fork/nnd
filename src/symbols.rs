@@ -217,8 +217,10 @@ pub struct Subfunction {
     // Location of the function definition (if level-0) or call site (if level > 0). Invalid if unknown.
     pub call_line: LineInfo,
     pub addr_range: Range<usize>,
-    // Unique identifier of an inlined function call within the function. If an inlined function call consists of multiple address ranges,
-    // each range gets its own Subfunction, but their `identity`s are equal.
+    // Uniquely identifies the inlined function call within the function.
+    // If an inlined function call consists of multiple address ranges, each range gets its own Subfunction, but their `identity`s are equal.
+    // This is important when stepping: if a step-over starts from inside one address range of an inlined function call and ends in another,
+    // the stack_digest logic must notice that these two Subfunction-s are logically the same; otherwise the parent stack frame gets selected, and the user becomes frustrated.
     pub identity: u32,
 }
 impl Subfunction {
@@ -1506,7 +1508,9 @@ impl SymbolsLoader {
         for &sf_idx in &shard.subfunctions_need_fixup {
             let sf = &mut shard.sym.subfunctions[sf_idx];
             assert!(sf.call_line.file_idx().is_some() && sf.call_line.line() == 0);
-            let i = shard.sym.addr_to_line.partition_point(|l| l.addr() <= sf.addr_range.start);
+            // Look for address *strictly* less than the inlined function range start (sf.addr_range.start).
+            // The line at sf.addr_range.start is usually the first line of code *inside* the inlined function, not at the call site.
+            let i = shard.sym.addr_to_line.partition_point(|l| l.addr() < sf.addr_range.start);
             if i > 0 {
                 let info = shard.sym.addr_to_line[i - 1];
                 if info.file_idx() == sf.call_line.file_idx() && info.line() != 0 {

@@ -51,9 +51,10 @@ pub struct StackSubframe {
     pub function_idx: Result<usize>,
     pub function_name: String, // demangled, present iff function_idx is present
     pub subfunction_idx: Option<usize>,
+    pub subfunction_identity: u32, // if subfunction_idx.is_none() then u32::MAX
     pub line: Option<FileLineInfo>,
 }
-impl Default for StackSubframe { fn default() -> Self { Self {frame_idx: 0, subfunction_idx: None, function_idx: err!(Internal, "not symbolized"), function_name: String::new(), line: None} } }
+impl Default for StackSubframe { fn default() -> Self { Self {frame_idx: 0, subfunction_idx: None, subfunction_identity: u32::MAX, function_idx: err!(Internal, "not symbolized"), function_name: String::new(), line: None} } }
 
 #[derive(Clone)]
 pub struct StackTrace {
@@ -73,12 +74,10 @@ impl StackTrace {
             Ok((c, _)) => c,
             Err(_) => return 0 };
         let frame_identity = (cfa as usize, frame.binary_id.clone().unwrap_or(usize::MAX));
-        if let Some(i) = subframe.subfunction_idx.as_ref() {
-            hash(&(frame_identity, *i, 0usize))
-        } else if let Ok(i) = subframe.function_idx.as_ref() {
-            hash(&(frame_identity, *i, 1usize))
+        if let Ok(&function_idx) = subframe.function_idx.as_ref() {
+            hash(&(frame_identity, function_idx, subframe.subfunction_identity))
         } else {
-            hash(&(frame_identity, 0usize, 2usize))
+            hash(&(frame_identity, 0usize, u32::MAX - 1))
         }
     }
 }

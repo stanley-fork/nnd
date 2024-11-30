@@ -1207,10 +1207,9 @@ impl Debugger {
             let subfunctions = &symbols.shards[function.shard_idx()].subfunctions;
             if kind == StepKind::Out {
                 step.internal_kind = StepKind::Over;
-                let subfunction_idx = subframe.subfunction_idx.clone().unwrap();
-                let subfunction_identity = subfunctions[subfunction_idx].identity;
+                assert!(subframe.subfunction_idx.is_some());
                 for r in symbols.subfunctions_at_level(frame.subframes.end - 1 - subframe_idx, function) {
-                    if r.identity == subfunction_identity {
+                    if r.identity == subframe.subfunction_identity {
                         static_addr_ranges.push(r.addr_range.clone());
                     }
                 }
@@ -1218,7 +1217,6 @@ impl Debugger {
             }
             if kind == StepKind::Over && frame.subframes.end - subframe_idx < function.num_levels() {
                 let subfuncs = symbols.subfunctions_at_level(frame.subframes.end - subframe_idx, function);
-                let parent_idx = subframe.subfunction_idx.clone().unwrap();
                 if let Some(start_line) = &subframe.line {
                     // Step over all inlined function calls on this line/column.
                     for s in subfuncs {
@@ -1229,10 +1227,9 @@ impl Debugger {
                     }
                 } else if subframe_idx > frame.subframes.start {
                     // Step over one specific inlined function call.
-                    let child_idx = stack.subframes[subframe_idx - 1].subfunction_idx.clone().unwrap();
-                    let child_identity = subfuncs[child_idx].identity;
+                    assert!(subframe.subfunction_idx.is_some());
                     for s in subfuncs {
-                        if s.identity == child_identity {
+                        if s.identity == subframe.subfunction_identity {
                             static_addr_ranges.push(s.addr_range.clone());
                         }
                     }
@@ -1703,11 +1700,13 @@ impl Debugger {
         match symbols.addr_to_function(static_addr) {
             Err(e) => subframes.last_mut().unwrap().function_idx = Err(e.clone()),
             Ok((function, function_idx)) => {
+                let shard = &symbols.shards[function.shard_idx()];
                 let sf = subframes.last_mut().unwrap();
                 sf.function_idx = Ok(function_idx);
                 sf.function_name = function.demangle_name();
                 if let Some((root_subfunction, root_subfunction_idx)) = symbols.root_subfunction(function) {
                     sf.subfunction_idx = Some(root_subfunction_idx);
+                    sf.subfunction_identity = shard.subfunctions[root_subfunction_idx].identity;
 
                     match self.calculate_frame_base(frame, static_addr, binary, symbols, function, root_subfunction, memory) {
                         Ok(()) => (),
@@ -1735,7 +1734,7 @@ impl Debugger {
                             Ok(subfunction.callee_idx)
                         };
 
-                        subframes.push(StackSubframe {frame_idx, subfunction_idx: Some(subfunction_idx), function_idx: callee_idx, function_name: callee_name, ..Default::default()});
+                        subframes.push(StackSubframe {frame_idx, subfunction_idx: Some(subfunction_idx), subfunction_identity: subfunction.identity, function_idx: callee_idx, function_name: callee_name, ..Default::default()});
                         frame.subframes.end += 1;
                     }
                     subframes[frame.subframes.clone()].reverse();

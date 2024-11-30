@@ -11,6 +11,7 @@ investigate why quitting is slow
 optimize symbols loading
   profile attribute loading
   madvise
+    benchmark with file pre-evicted from page cache (using vmtouch)
   fix warning about unsupported forms, especially implicit_const on flags
   try caching chase results (71M chases, 15M unique results, 205M total DIEs)
   test with dwarf 4
