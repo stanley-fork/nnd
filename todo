@@ -26,7 +26,7 @@ test with 10k threads
   maybe avoid duplicate POKEUSER calls for debug registers if the thread already had them assigned
 test with watches window filled with long arrays (I saw 50ms frames when there are ~5 of them; maybe just decrease length limit)
 
-update Vec pretty printer - the inner pointer is u8 now
+update HashMap pretty printer
 do something for downcasts in conditional breakpoints (coalesce()? maybe()? ?()? ()?? checkbox to stop on error? 'is' operator? explicit checked downcast? also function to check field presense without evaluating it)
 edit breakpoint condition on click
 support casting slices (e.g. from pretty printers) to slices of different type (especially string)
@@ -59,6 +59,7 @@ some kind of non-stop mode to prevent clickhouse server from losing keeper conne
 allow navigating from source to variables (especially global) and types declared there
 allow to put breakpoint on a whole file (by adding breakpoint on the first line, since there's never any real code on first line in practice; have a new icon for it; internally use line 0 to cover the garbage LineInfo-s with line 0; or maybe put breakpoint only on function entry points instead of everything)
 function pointers and field pointers
+handle tail calls: if you step-into a tail call (by single-stepping from instruction pointed by DW_AT_call_pc of a DW_TAG_call_site with DW_AT_call_tail_call), the tail-callee should be added to stack digest (so its stack frame is selected instead of parent)
 find function by address (like addr2line)
 use actual function name instead of "_" in namespace path, or do something else to make function-static variables usable
 show number of function inlined sites in disassembly window, allow setting breakpoint on it, allow opening inline-only functions

@@ -547,6 +547,7 @@ impl LineInfo {
     pub fn flags(&self) -> LineFlags { LineFlags::from_bits_truncate(self.data[1] >> 32) }
     pub fn set_flag(&mut self, f: LineFlags) { self.data[1] |= f.bits() << 32; }
     pub fn unset_flag(&mut self, f: LineFlags) { self.data[1] &= !(f.bits() << 32); }
+    pub fn set_line_and_column_from(&mut self, from: LineInfo) { self.data[0] = (self.data[0] & !0xffff) | (from.data[0] & 0xffff); self.data[1] = (self.data[1] & !0xffffffff) | (from.data[1] & 0xffffffff); }
 
     pub fn file_idx(&self) -> Option<usize> {
         let r = self.data[1] >> (32 + LINE_FLAGS_BITS);
@@ -572,14 +573,13 @@ impl LineInfo {
         [self.data[1] & !(LineFlags::all().bits() << 32), self.data[0] << 48 | self.data[0] >> 16]
     }
     // Sorting key equivalent to (addr(), file_idx().is_none(), line() == 0, flags().contains(INLINED_FUNCTION)).
-    // Used when sorting addr_to_line; addr() is for sorting, everything else is deduplication priority.
+    // Used when sorting addr_to_line. addr() is for sorting, everything else is deduplication priority.
     // In particular:
     //  * An address range may start where another one ends (file_idx().is_none()) - keep the start, discard the end marker.
     //  * An inlined function end (from .debug_info) may clash with an explicit line number information row (from .debug_line) - keep the explicit one.
     //  * ... except the case when the row in .debug_line is missing the line number, which does happen, ugh.
-    //  * There may be multiple line/column numbers for the same address - prefer the ones with STATEMENT flag.
     pub fn addr_filenone_linebad_inlined(&self) -> (usize, bool, bool, bool) {
-        (self.data[0] & 0xffffffffffff0000, self.data[1] == LINE_FILE_IDX_MAX as usize, self.line() == 0, (self.data[1] >> 32) & LineFlags::STATEMENT.bits() != 0)
+        (self.data[0] & 0xffffffffffff0000, self.data[1] == LINE_FILE_IDX_MAX as usize, self.line() == 0, (self.data[1] >> 32) & LineFlags::INLINED_FUNCTION.bits() != 0)
     }
 }
 impl fmt::Debug for LineInfo {
@@ -896,6 +896,7 @@ impl SymbolsLoadingStatus { pub fn new() -> Self { Self {cancel: false.into(), p
 
 struct SymbolsLoaderShard {
     sym: SymbolsShard,
+    addr_to_line_len_after_debug_line: usize,
 
     units: Vec<usize>,
     symtab_ranges: Vec<Vec<Range<usize>>>,
@@ -1067,6 +1068,7 @@ impl SymbolsLoader {
         let (types_loader, types_shards) = TypesLoader::create(num_shards);
         let mut shards: Vec<SymbolsLoaderShard> = types_shards.into_iter().map(|types| SymbolsLoaderShard {
             sym: SymbolsShard {addr_to_line: Vec::new(), line_to_addr: Vec::new(), types: Types::new(), misc_arena: Arena::new(), local_variables: Vec::new(), global_variables: Arena::new(), sorted_global_variable_names: StringTable::new(), subfunctions: Vec::new(), subfunction_levels: Vec::new(), mangled_name_to_function: Vec::new()},
+            addr_to_line_len_after_debug_line: 0,
             units: Vec::new(), symtab_ranges: Vec::new(), file_dedup: Vec::new(), file_used_lines: Vec::new(), types, base_types: Vec::new(), functions: Vec::new(), subfunctions_need_fixup: Vec::new(), vtables: Vec::new(), points_of_interest: HashMap::new(),
             temp_global_var_arena: Arena::new(), max_function_end: 0, functions_before_dedup: 0, warn: Limiter::new()}).collect();
 
@@ -1186,12 +1188,13 @@ impl SymbolsLoader {
             1 => self.parse_file_tables(shard_idx, unsafe {&mut *self.shards[shard_idx].get()})?,
             2 => {
                 let shard = unsafe {&mut *self.shards[shard_idx].get()};
+                self.parse_debug_line(shard)?;
+                // We sort addr_to_line twice: before and after parsing .debug_info, because fixup_subfunction_line() needs to do lookup in the information from .debug_line.
+                self.sort_addr_to_line(shard, /*finalize*/ false);
                 self.parse_dwarf(shard_idx, shard)?;
                 self.parse_symtab(shard_idx, shard)?;
                 self.sort_functions(shard);
-                self.parse_debug_line(shard)?;
-                self.sort_addr_to_line(shard);
-                self.fixup_subfunction_call_lines(shard); // must be after sort_addr_to_line()
+                self.sort_addr_to_line(shard, /*finalize*/ true);
                 self.sort_line_to_addr(shard);
             }
             3 => {
@@ -1359,7 +1362,7 @@ impl SymbolsLoader {
                         if info.line() == 0 && info.file_idx().is_some() && prev.file_idx() == info.file_idx() && prev.line() != 0 {
                             // Often there's a zero line number out of nowhere, surrounded by good line numbers with same file.
                             // Idk what this means or whether it's intended. Let's pretend it's not there.
-                            // We also do a similar thing in sort_addr_to_line() and fixup_subfunction_call_lines().
+                            // We also do a similar thing in sort_addr_to_line() and fixup_subfunction_call_line().
                             // (Why do it here? To avoid needing stable sort in sort_addr_to_line().)
                             skip = true;
                         } else if prev.addr() == row.address() as usize {
@@ -1391,11 +1394,11 @@ impl SymbolsLoader {
                             //
                             // The logic we ended up with is: keep only one of the consecutive rows with the same address; if any rows have is_stmt == true, keep the last of them, otherwise keep the last.
 
-                            skip = true;
                             if prev.file_idx().is_none() {
-                                // End of sequence... sike, a new sequence starts at the same address. Drop the end-of-sequence marker.
+                                // End of sequence... sike, a new sequence starts at the same address. Drop the end-of-sequence marker. (This happens in practice.)
                                 shard.sym.addr_to_line.pop();
                             } else {
+                                skip = true;
                                 assert!(shard.sym.line_to_addr.last().is_some_and(|(p, _)| p.addr() == row.address() as usize));
                                 if info.file_idx().is_none() {
                                     // `prev` covers an address range of length 0. We're not interested in that.
@@ -1463,27 +1466,39 @@ impl SymbolsLoader {
         }
     }
 
-    fn sort_addr_to_line(&self, shard: &mut SymbolsLoaderShard) {
-        shard.sym.addr_to_line.sort_unstable_by_key(|x| x.addr_filenone_linebad_inlined()); // if a sequence starts at the same address another sequence ends, keep the start and discard the end
-        shard.sym.addr_to_line.dedup_by_key(|x| x.addr());
+    fn sort_addr_to_line(&self, shard: &mut SymbolsLoaderShard, finalize: bool) {
+        shard.sym.addr_to_line.sort_unstable_by_key(|x| x.addr_filenone_linebad_inlined());
 
-        // I've seen line number info like this:
-        //                       src/Functions/sleep.h:122:29
-        //   000022265edb <+4fb> call DB::IDataType::createColumnConst
-        //   000022265ee0 <+500> jmp _+505h
-        //                       src/Functions/sleep.h     <----------------------------------------- ???
-        // ⮕ 000022265ee5 <+505> lea rdi,[rbp-130h]
-        //                       src/Functions/sleep.h:122:16
-        //   000022265eec <+50c> call boost::intrusive_ptr<DB::IColumn const>::operator->
-        //
-        // What's that line table entry in the middle without a line number? Idk. Let's just remove it.
         let mut prev = LineInfo::new(0, None, 0, 0, LineFlags::empty()).unwrap();
         shard.sym.addr_to_line.retain(|l| {
-            let remove = l.line() == 0 && l.file_idx().is_some() && l.file_idx() == prev.file_idx() && prev.line() != 0;
+            // Deduplicate. E.g. if a sequence starts at the same address another sequence ends, keep the start and discard the end.
+            if l.addr() == prev.addr() {
+                return false;
+            }             
+
+            // I've seen line number info like this:
+            //                       src/Functions/sleep.h:122:29
+            //   000022265edb <+4fb> call DB::IDataType::createColumnConst
+            //   000022265ee0 <+500> jmp _+505h
+            //                       src/Functions/sleep.h     <----------------------------------------- ???
+            // ⮕ 000022265ee5 <+505> lea rdi,[rbp-130h]
+            //                       src/Functions/sleep.h:122:16
+            //   000022265eec <+50c> call boost::intrusive_ptr<DB::IColumn const>::operator->
+            //
+            // What's that line table entry in the middle without a line number? Idk. Let's just remove it.
+            if l.line() == 0 && l.file_idx().is_some() && l.file_idx() == prev.file_idx() && prev.line() != 0 {
+                return false;
+            }
+
             prev = l.clone();
-            !remove
+            true
         });
-        shard.sym.addr_to_line.shrink_to_fit();
+
+        if finalize {
+            shard.sym.addr_to_line.shrink_to_fit();
+        } else {
+            shard.addr_to_line_len_after_debug_line = shard.sym.addr_to_line.len();
+        }
     }
 
     fn sort_line_to_addr(&self, shard: &mut SymbolsLoaderShard) {
@@ -1497,25 +1512,6 @@ impl SymbolsLoader {
             match shard.file_used_lines.last_mut() {
                 Some(x) if x.0 == idx => x.1 += 1,
                 _ => shard.file_used_lines.push((idx, 1)),
-            }
-        }
-    }
-
-    fn fixup_subfunction_call_lines(&self, shard: &mut SymbolsLoaderShard) {
-        // Sometimes DW_TAG_inlined_subroutine has DW_AT_call_line == 0. Idk whether this is intended and what it's supposed to mean.
-        // In the cases I've seen, there was a good line number (line of the inlined call) in .debug_line for a slightly lower address. Let's use that.
-        // There are few such subfunctions, so performance is not very important here.
-        for &sf_idx in &shard.subfunctions_need_fixup {
-            let sf = &mut shard.sym.subfunctions[sf_idx];
-            assert!(sf.call_line.file_idx().is_some() && sf.call_line.line() == 0);
-            // Look for address *strictly* less than the inlined function range start (sf.addr_range.start).
-            // The line at sf.addr_range.start is usually the first line of code *inside* the inlined function, not at the call site.
-            let i = shard.sym.addr_to_line.partition_point(|l| l.addr() < sf.addr_range.start);
-            if i > 0 {
-                let info = shard.sym.addr_to_line[i - 1];
-                if info.file_idx() == sf.call_line.file_idx() && info.line() != 0 {
-                    sf.call_line = info;
-                }
             }
         }
     }
@@ -1751,6 +1747,7 @@ impl SymbolsLoader {
             let subfunctions_needed_fixup: usize = self.shards.iter().map(|s| unsafe {(*s.get()).subfunctions_need_fixup.len()}).sum();
             let misc_arena_size: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.misc_arena.capacity()}).sum();
             let lines: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.addr_to_line.len()}).sum();
+            let lines_in_debug_line: usize = self.shards.iter().map(|s| unsafe {(*s.get()).addr_to_line_len_after_debug_line}).sum();
             let local_variables: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.local_variables.len()}).sum();
             let global_variables: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.global_variables.used() / mem::size_of::<Variable>()}).sum();
             let global_variable_name_bytes: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.sorted_global_variable_names.arena.capacity()}).sum();
@@ -1809,7 +1806,7 @@ impl SymbolsLoader {
                        ({:.2}x dedup, {:.2}x unused, {} of paths, {} of remap), \
                        {} functions ({:.2}x dedup, {}, {} of names), {} in misc arena, \
                        {} subfunctions ({} sf, {} levels, {} fixed up), \
-                       {} lines ({}), {} local variables ({}), {} global variables ({}, names {}), \
+                       {} lines ({}, {} in .debug_line), {} local variables ({}), {} global variables ({}, names {}), \
                        {} types ({:.2}x dedup, {:.2}x offsets, {} names ({}), \
                        {} infos, {} fields ({:.2}% growth waste), {} nested names, {} misc, temp {} offset maps, temp {} dedup maps) \
                        ({} base types), {} vtables ({:.2}% unresolved){}",
@@ -1817,7 +1814,7 @@ impl SymbolsLoader {
                       files_before_dedup as f64 / self.sym.files.len() as f64, self.sym.files.len() as f64 / self.sym.path_to_used_file.len() as f64, PrettySize(self.sym.file_paths.arena.used()), PrettySize(files_before_dedup * mem::size_of::<usize>()),
                       PrettyCount(self.sym.functions.len()), funcs_before_dedup as f64 / self.sym.functions.len() as f64, PrettySize(self.sym.functions.len() * mem::size_of::<FunctionInfo>()), PrettySize(function_names_len), PrettySize(misc_arena_size),
                       PrettyCount(subfunctions), PrettySize(subfunctions * mem::size_of::<Subfunction>()), PrettySize(subfunction_levels * mem::size_of::<usize>()), PrettyCount(subfunctions_needed_fixup),
-                      PrettyCount(lines), PrettySize(lines * mem::size_of::<LineInfo>() * 2), PrettyCount(local_variables), PrettySize(local_variables * mem::size_of::<Variable>()), PrettyCount(global_variables), PrettySize(global_variables * mem::size_of::<Variable>()), PrettySize(global_variable_name_bytes),
+                      PrettyCount(lines), PrettySize(lines * mem::size_of::<LineInfo>() * 2), PrettyCount(lines_in_debug_line), PrettyCount(local_variables), PrettySize(local_variables * mem::size_of::<Variable>()), PrettyCount(global_variables), PrettySize(global_variables * mem::size_of::<Variable>()), PrettySize(global_variable_name_bytes),
                       PrettyCount(final_types), self.types_before_dedup as f64 / final_types as f64, self.type_offsets as f64 / self.types_before_dedup as f64, PrettyCount(type_names), PrettySize(type_names_len),
                       PrettySize(type_infos_bytes), PrettySize(fields_bytes), fields_bytes as f64 / field_used_bytes as f64 * 100.0 - 100.0, PrettyCount(nested_names), PrettySize(types_misc_bytes), PrettySize(self.type_offset_maps_bytes), PrettySize(self.type_dedup_maps_bytes),
                       PrettyCount(self.sym.base_types.len()), self.sym.vtables.len(), unresolved_vtables as f64 / self.sym.vtables.len() as f64 * 100.0, time_breakdown);
@@ -1929,7 +1926,7 @@ struct SubfunctionEvent {
 #[derive(Default)]
 struct LoaderTempStorage {
     // Used by finish_function(). Reused to avoid allocations (they showed up in profiling).
-    stack: Vec<(/*subfunction_idx*/ u32, /*range_idx*/ usize, /*active*/ usize)>,
+    stack: Vec<(/*range_idx*/ usize, /*active*/ usize)>,
     levels: Vec<Vec<Subfunction>>,
 }
 
@@ -2336,6 +2333,27 @@ impl<'a> DwarfLoader<'a> {
             specification_or_origin = attrs.specification_or_abstract_origin;
         }
         Ok(())
+    }
+
+    #[inline]
+    fn fixup_subfunction_call_line(shard: &SymbolsLoaderShard, line: &mut LineInfo, addr: usize) {
+        if line.line() == 0 && line.file_idx().is_some() {
+            // Sometimes DW_TAG_inlined_subroutine has DW_AT_call_line == 0. Idk whether this is intended and what it's supposed to mean.
+            // In the cases I've seen, there was a good line number (line of the inlined call) in .debug_line for a slightly lower address. Let's use that.
+            // There are few such subfunctions, so performance is not very important here.
+
+            // Look for address *strictly* less than the inlined function's range start.
+            // The line at range start is usually the first line of code *inside* the inlined function, not at the call site.
+            // (But also: .debug_line sometimes has multiple line numbers for the same address, and sometimes the earlier ones are from the inlined function's call site and the later ones are from inside the inlined function.
+            //  Maybe the idea is that the debugger would somehow figure out which is which? Maybe we should preserve some information about such duplicates in parse_debug_line() and make use of it here somehow?)
+            let i = shard.sym.addr_to_line[..shard.addr_to_line_len_after_debug_line].partition_point(|l| l.addr() < addr);
+            if i > 0 {
+                let prev = shard.sym.addr_to_line[i - 1];
+                if prev.file_idx() == line.file_idx() && prev.line() != 0 {
+                    line.set_line_and_column_from(prev);
+                }
+            }
+        }
     }
 
     fn load(&mut self) -> Result<()> {
@@ -3107,7 +3125,9 @@ impl<'a> DwarfLoader<'a> {
                                 // Make sure breakpoints on the call line resolve to this entry address instead of all range start addresses, otherwise behavior is confusing.
                                 // This address is likely at the start of one of the ranges, so we'll add two duplicate LineInfo-s, differing only in the STATEMENT flag.
                                 // That's ok for correctness, and ok for performance because DW_AT_entry_pc is rare.
-                                self.shard.sym.line_to_addr.push((call_line.clone().with_addr_and_flags(addr, LineFlags::INLINED_FUNCTION | LineFlags::STATEMENT), level - 1));
+                                let mut entry_call_line = call_line.clone().with_addr_and_flags(addr, LineFlags::INLINED_FUNCTION | LineFlags::STATEMENT);
+                                Self::fixup_subfunction_call_line(&self.shard, &mut entry_call_line, addr);
+                                self.shard.sym.line_to_addr.push((entry_call_line, level - 1));
                                 call_line.unset_flag(LineFlags::STATEMENT);
                             }
                         }
@@ -3203,17 +3223,14 @@ impl<'a> DwarfLoader<'a> {
             let level = (signed_level.abs() - 1) as usize;
             if signed_level > 0 { // start of a range
                 if level < temp.stack.len() {
-                    if temp.stack[level].0 != subfunction_idx {
-                        if self.shard.warn.check(line!()) { eprintln!("warning: overlapping inlined function ranges at address 0x{:x} in function @0x{:x}", addr, self.shard.functions[top.function].die.0); }
-                        // Increment the counter anyway, because the corresponding closing event will decrement it.
-                        // (Alternatively, we could make a memo to ignore the corresponding close event. Note that making the increment+decrement
-                        //  conditional on just subfunction_idx would be incorrect: the subfunction idx in the stack may change between the start and end event.)
-                    }
-                    temp.stack[level].2 += 1;
+                    if self.shard.warn.check(line!()) { eprintln!("warning: overlapping inlined function ranges at address 0x{:x} in function @0x{:x}", addr, self.shard.functions[top.function].die.0); }
+                    // Ignore this range but increment the counter anyway, because the corresponding closing event will decrement it. This effectively extends
+                    // the existing range to cover this range too, which is not the best behavior, but it's the simplest (?) to implement here (while ensuring the output ranges are well-nested).
+                    temp.stack[level].1 += 1;
                     continue;
                 }
                 let start_level = temp.stack.len();
-                temp.stack.resize(level + 1, (0, 0, 0));
+                temp.stack.resize(level + 1, (0, 0));
                 if level >= num_levels {
                     num_levels = level + 1;
                     if num_levels > temp.levels.len() {
@@ -3222,42 +3239,46 @@ impl<'a> DwarfLoader<'a> {
                 }
 
                 // Open a range at current level and for all ancestors that don't have a range open.
-                temp.stack.last_mut().unwrap().2 += 1;
+                temp.stack.last_mut().unwrap().1 += 1;
                 let mut cur_sf_idx = subfunction_idx;
                 for cur_level in (start_level..level+1).rev() {
                     let &(ref cur_sf, parent) = &top.subfunctions[cur_sf_idx as usize];
                     let new_range_idx = temp.levels[cur_level].len();
-                    temp.stack[cur_level].0 = cur_sf_idx;
-                    temp.stack[cur_level].1 = new_range_idx;
-                    temp.levels[cur_level].push(Subfunction {addr_range: addr..addr, ..*cur_sf});
-
+                    temp.stack[cur_level].0 = new_range_idx;
+                    let mut sf_clone = cur_sf.clone();
+                    sf_clone.addr_range = addr..addr;
                     if cur_level > 0 && cur_sf.call_line.file_idx().is_some() {
                         let extra_flags = cur_sf.call_line.flags() & LineFlags::STATEMENT;
-                        self.shard.sym.line_to_addr.push((cur_sf.call_line.clone().with_addr_and_flags(addr, LineFlags::INLINED_FUNCTION | extra_flags), cur_level as u16 - 1));
+                        sf_clone.call_line = sf_clone.call_line.with_addr_and_flags(addr, LineFlags::INLINED_FUNCTION | extra_flags);
+                        Self::fixup_subfunction_call_line(&self.shard, &mut sf_clone.call_line, addr);
+                        self.shard.sym.line_to_addr.push((sf_clone.call_line, cur_level as u16 - 1));
                     }
+
+                    temp.levels[cur_level].push(sf_clone);
 
                     cur_sf_idx = parent;
                 }
             } else {
-                temp.stack[level].2 -= 1;
-                let mut last_closed_sf = u32::MAX;
-                while let Some(&(subfunction_idx, range_idx, active)) = temp.stack.last() {
+                temp.stack[level].1 -= 1;
+                let mut last_closed_idx = usize::MAX;
+                while let Some(&(range_idx, active)) = temp.stack.last() {
                     if active != 0 {
                         break;
                     }
                     temp.stack.pop();
                     let range = &mut temp.levels[temp.stack.len()][range_idx];
                     range.addr_range.end = addr;
-                    last_closed_sf = subfunction_idx;
+                    last_closed_idx = range_idx;
                 }
-                if last_closed_sf != u32::MAX && event_idx + 1 < top.subfunction_events.len() && top.subfunction_events[event_idx + 1].addr > addr {
-                    let sf = &top.subfunctions[last_closed_sf as usize].0;
+                if last_closed_idx != usize::MAX && event_idx + 1 < top.subfunction_events.len() && top.subfunction_events[event_idx + 1].addr > addr {
+                    let sf = &temp.levels[temp.stack.len()][last_closed_idx];
                     if sf.call_line.file_idx().is_some() {
                         // .debug_line often doesn't have a row at the end of inlined function. I.e. the first few instructions
                         // after the inlined function still have the same line number as the insides of the inlined function, which makes things really confusing.
                         // I'm not sure what's the intention there. I guess the debugger is supposed to realize that the instructions after an inlined function
                         // have the same line number as the inlined function's call site? Let's interpret it that way and add LineInfo, with lower priority than the
                         // LineInfo-s from .debug_line.
+                        // This quirk sometimes appears in combination with the line() == 0 quirk, so it's important that we use the LineInfo that went through fixup_subfunction_call_line().
                         self.shard.sym.addr_to_line.push(sf.call_line.clone().with_addr_and_flags(addr, LineFlags::INLINED_FUNCTION));
                     }
                 }
@@ -3272,10 +3293,9 @@ impl<'a> DwarfLoader<'a> {
         let levels_start = self.shard.sym.subfunction_levels.len() - 1;
         for level in 0..num_levels {
             for sf in &temp.levels[level] {
-                if sf.call_line.line() == 0 && sf.call_line.file_idx().is_some() {
-                    self.shard.subfunctions_need_fixup.push(self.shard.sym.subfunctions.len());
-                }
-                self.shard.sym.subfunctions.push(sf.clone());
+                let mut sf_clone = sf.clone();
+                Self::fixup_subfunction_call_line(&self.shard, &mut sf_clone.call_line, sf_clone.addr_range.start);
+                self.shard.sym.subfunctions.push(sf_clone);
             }
 
             self.shard.sym.subfunction_levels.push(self.shard.sym.subfunctions.len());

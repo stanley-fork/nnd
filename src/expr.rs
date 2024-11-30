@@ -460,6 +460,8 @@ impl EvalState {
         err!(TypeMismatch, "no type '{}'", name)
     }
 
+    // TODO: Check that the value size is not too small, in both get_*_variable(). Often debug info has invalid (?) expressions that return 8 bytes instead of sizeof(struct). E.g. I saw that for `fde` in list_lsdas().
+    
     fn get_local_variable(&mut self, context: &mut EvalContext, name: &str, subframe_idx: usize, only_type: bool, meta: bool, found: &mut bool) -> Result<Value> {
         context.check_has_stack()?;
         let subframe = &context.stack.subframes[subframe_idx];

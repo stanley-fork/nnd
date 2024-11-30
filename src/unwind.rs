@@ -477,7 +477,6 @@ fn parse_itanium_lsda(mut lsda: usize, sorted_addr_ranges: &Vec<Range<usize>>, f
     let mut call_site_ptr = lsda;
     let call_site_table_end = call_site_ptr + call_site_table_length;
     let action_table_start = call_site_table_end;
-    let mut res: Vec<usize> = Vec::new();
     let mut steps = 0usize;
     let mut addr_ranges_idx = sorted_addr_ranges.partition_point(|r| r.end <= func_start);
     while call_site_ptr < call_site_table_end {
@@ -516,7 +515,7 @@ fn parse_itanium_lsda(mut lsda: usize, sorted_addr_ranges: &Vec<Range<usize>>, f
             let ttype_index = memory.eat_sleb128(&mut action_ptr)?;
             if ttype_index > 0 {
                 // catch
-                res.push(landing_pad);
+                out.push(landing_pad);
             }
             let mut temp = action_ptr;
             let action_offset = memory.eat_sleb128(&mut temp)?;
