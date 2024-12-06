@@ -5,7 +5,7 @@ investigate why many types are not deduped, e.g. there's DB::Block#441
 make stack unwinding work when control is in .plt or .plt.got, see "Recognise PLT entries such as" in libunwind code
 log a message if the process forked away
 fix incorrect column numbers with tab indentation (tabs should be counted as 1 column, but we turn them into multiple spaces)
-investigate why exception-aware step-over doesn't work in clickhouse, at least sometimes
+fix line-wrapped copy-paste (seems to copy only the first line of selection) and line-wrapped C-k (deletes only to the end of post-wrapping line, should use pre-wrapping line)
 
 investigate why quitting is slow
 optimize symbols loading
@@ -39,11 +39,11 @@ allow adding unconditional breakpoint on the same line as conditional one, someh
 global variables from .symtab, maybe from .debug_pubnames (maybe also look into .debug_pubtypes)
 more built-in pretty printers: sparsehash, absl, rust b-trees
 hotkey to switch between .h/.cpp (/.cc/.hh/.hpp/.cxx - maybe just anything after '.')
-when stopping in exception handler, indicate it in the UI clearly, as a new stop reason perhaps (and show stop reason in status window btw, with a different color, e.g. purple), because it can be in some obscure destructor call instead of an obvious catch block
 reordering watches
 reordering tabs
 rearranging windows
 maximizing windows
+buffer input when program is quitting, especially k+r sequence
 meta functions like checking for field presense of superclass type, and also just slice length etc, for use in conditions
 get debug info from debuginfod; (maybe also source code, though it seems always unavailable)
 thread-local storage

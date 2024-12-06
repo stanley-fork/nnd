@@ -565,12 +565,12 @@ fn fuzzy_match(haystack: &[u8], needle_padded: &PaddedString, case_sensitive: bo
         }
         match_ranges.push(haystack.len() - needle.len() .. haystack.len());
         let alphanum_before = haystack[haystack.len() - needle.len() - 1].is_ascii_alphanumeric();
-        (1, 4usize | ((alphanum_before as usize) << 1))
+        (1, ((alphanum_before as usize) << 1))
     } else if let Some(i) = memmem_maybe_case_sensitive(&haystack[..haystack.len() - 1], needle_padded, case_sensitive) {
         match_ranges.push(i..i+needle.len());
         let alphanum_before = i > 0 && haystack[i - 1].is_ascii_alphanumeric();
         let alphanum_after = i + needle.len() < haystack.len() && haystack[i + needle.len()].is_ascii_alphanumeric();
-        (1, ((alphanum_before as usize) << 1) | alphanum_after as usize)
+        (1, 4usize | ((alphanum_before as usize) << 1) | alphanum_after as usize)
     } else {
         // Check if subsequence.
         let needle = needle.as_bytes();
