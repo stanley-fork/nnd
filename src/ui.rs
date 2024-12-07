@@ -1908,6 +1908,7 @@ impl WindowContent for DisassemblyWindow {
                 match action {
                     KeyAction::Enter | KeyAction::DeleteRow | KeyAction::EditCondition | KeyAction::StepToCursor if cursor_addr != usize::MAX => {
                         let offset = cursor_static_addr - function.addr.0;
+                        // TODO: For function entry breakpoints use entry_pc instead of start of first range. Figure out how to indicate it in the UI nicely.
                         let new_breakpoint = AddressBreakpoint {function: Some((tab.locator.clone().unwrap(), offset)), addr: cursor_addr, subfunction_level: tab.selected_subfunction_level};
                         if action == KeyAction::StepToCursor {
                             ui.should_redraw = true;

@@ -260,6 +260,8 @@ pub struct FunctionInfo {
     // [functions[i].addr, functions[i+1].addr).
     pub addr: FunctionAddr,
     die: DieOffset,
+    // Entry point of the function. 0 if this is not a real function. May be outside this FunctionInfo's address range (e.g. if the function has multiple ranges).
+    entry_addr: usize,
 
     // If a function has multiple address ranges, we create a FunctionInfo for each range and link them together into a circular linked list, sorted by addr.
     // Only the FunctionInfo with lowest addr has all the fields populated, so lookup walks to it.
@@ -1546,7 +1548,7 @@ impl SymbolsLoader {
                         let name_ref: &'static str = unsafe {mem::transmute(name_ref)};
 
                         let f_addr = FunctionAddr::new(addr);
-                        shard.functions.push(FunctionInfo {addr: f_addr, die: DebugInfoOffset(usize::MAX), prev_addr: f_addr, mangled_name: name_ref.as_ptr(), mangled_name_len: name_ref.len() as u32, shard_idx: shard_idx as u16, flags: FunctionFlags::SYMTAB, language: LanguageFamily::Unknown, subfunction_levels: 0..0});
+                        shard.functions.push(FunctionInfo {addr: f_addr, die: DebugInfoOffset(usize::MAX), entry_addr: addr, prev_addr: f_addr, mangled_name: name_ref.as_ptr(), mangled_name_len: name_ref.len() as u32, shard_idx: shard_idx as u16, flags: FunctionFlags::SYMTAB, language: LanguageFamily::Unknown, subfunction_levels: 0..0});
 
                         // For some reason functions' [st_value, st_value + st_size) ranges overlap a lot. Maybe st_size is just not reliable.
                         // So we ignore st_size and assume that each function ends where the next function starts.
@@ -1597,11 +1599,11 @@ impl SymbolsLoader {
                 if s.size != 0 && s.address != 0 {
                     let name_ref = shard.sym.misc_arena.add_slice(name.as_bytes());
                     shard.functions.push(FunctionInfo {
-                        addr: FunctionAddr::new(s.address), prev_addr: FunctionAddr::new(s.address),
+                        addr: FunctionAddr::new(s.address), prev_addr: FunctionAddr::new(s.address), entry_addr: s.address,
                         die: DebugInfoOffset(usize::MAX), mangled_name: name_ref.as_ptr(), mangled_name_len: name_ref.len() as u32,
                         shard_idx: shard_idx as u16, flags: FunctionFlags::SECTION, language: LanguageFamily::Unknown, subfunction_levels: 0..0});
                     shard.functions.push(FunctionInfo {
-                        addr: FunctionAddr::new(s.address + s.size), prev_addr: FunctionAddr::new(s.address + s.size),
+                        addr: FunctionAddr::new(s.address + s.size), prev_addr: FunctionAddr::new(s.address + s.size), entry_addr: 0,
                         die: DebugInfoOffset(usize::MAX), mangled_name: "".as_ptr(), mangled_name_len: 0,
                         shard_idx: shard_idx as u16, flags: FunctionFlags::SECTION | FunctionFlags::SENTINEL, language: LanguageFamily::Unknown, subfunction_levels: 0..0});
                 }
@@ -1648,8 +1650,9 @@ impl SymbolsLoader {
                 let v = &shard.get_mut().sym.mangled_name_to_function;
                 let i = v.partition_point(|(n, _, _)| *n < name);
                 if i < v.len() && v[i].0 == name {
-                    if let Some(a) = v[i].1.addr() {
-                        sym.points_of_interest.entry(p).or_default().push(a);
+                    let f = &sym.functions[v[i].2];
+                    if f.entry_addr != 0 {
+                        sym.points_of_interest.entry(p).or_default().push(f.entry_addr);
                     }
                 }
             };
@@ -1685,7 +1688,7 @@ impl SymbolsLoader {
 
     fn dedup_functions(&mut self) {
         let max_function_end = self.shards.iter().map(|s| unsafe {&(*s.get()).max_function_end}).max().copied().unwrap_or(0);
-        let additional_functions = [FunctionInfo {addr: FunctionAddr::new(max_function_end), prev_addr: FunctionAddr::new(max_function_end), mangled_name: "".as_ptr(), mangled_name_len: 0, shard_idx: 0, flags: FunctionFlags::SENTINEL, language: LanguageFamily::Unknown, subfunction_levels: 0..0, die: DebugInfoOffset(usize::MAX)}];
+        let additional_functions = [FunctionInfo {addr: FunctionAddr::new(max_function_end), prev_addr: FunctionAddr::new(max_function_end), entry_addr: 0, mangled_name: "".as_ptr(), mangled_name_len: 0, shard_idx: 0, flags: FunctionFlags::SENTINEL, language: LanguageFamily::Unknown, subfunction_levels: 0..0, die: DebugInfoOffset(usize::MAX)}];
         let mut sources: Vec<&[FunctionInfo]> = self.shards.iter().map(|s| unsafe {&(*s.get()).functions[..]}).collect();
         sources.push(&additional_functions);
         let mut iter = MergeIterator::new(sources, |f| !Self::function_sorting_key(f));
@@ -2037,6 +2040,7 @@ impl TypeStackEntry { fn reset(&mut self, type_: *mut TypeInfo) { self.type_ = t
 #[derive(Default)]
 struct RangesStackEntry {
     // Current address range(s) to use for local variables (unless they have loclist ranges).
+    // Not necessarily sorted.
     pc_ranges: Vec<gimli::Range>,
 }
 
@@ -2138,8 +2142,6 @@ dwarf_struct!{ InlinedSubroutineAttributes {
     ranges: DwarfRanges, DW_AT_ranges, Ranges;
     call: DwarfCodeLocation, DW_AT_call_file, CodeLocation;
     abstract_origin: usize, DW_AT_abstract_origin, DebugInfoOffset;
-    entry_pc_addr: usize, DW_AT_entry_pc, Address;
-    entry_pc_int: usize, DW_AT_entry_pc, Unsigned;
 }}
 
 dwarf_struct!{ TemplateTypeParameterAttributes {
@@ -2447,7 +2449,7 @@ impl<'a> DwarfLoader<'a> {
                 DW_TAG_compile_unit | DW_TAG_partial_unit | DW_TAG_type_unit => {
                     cursor.skip_attributes(abbrev, &attribute_context)?;
                     let ranges_top = self.ranges_stack.push_uninit(&mut self.main_stack.top_mut().flags);
-                    parse_dwarf_ranges(&self.loader.sym.dwarf, &self.unit.unit, &self.unit.ranges, self.unit.fields, offset, self.loader.sym.code_addr_range.start, &mut ranges_top.pc_ranges, &mut self.shard.warn)?;
+                    parse_dwarf_ranges(&self.loader.sym.dwarf, &self.unit.unit, &self.unit.ranges, self.unit.fields, offset, self.loader.sym.code_addr_range.start, &mut ranges_top.pc_ranges, /*out_entry_pc*/ &mut 0, &mut self.shard.warn)?;
                     self.main_stack.top_mut().flags.remove(StackFlags::IS_FUNCTION_SCOPE | StackFlags::IS_TYPE_SCOPE); // this shouldn't do anything since this tag is always root, but just in case
                 }
 
@@ -2511,8 +2513,8 @@ impl<'a> DwarfLoader<'a> {
                 // Functions.
                 DW_TAG_subprogram => {
                     // Applicable attributes:
-                    // Useful: declaration, specification, frame_base, low_pc, high_pc, ranges, name, linkage_name, main_subprogram, object_pointer, return_addr, type, inline
-                    // Other: artificial, calling_convention, entry_pc, start_scope (haven't seen it in practice), trampoline, virtuality, vtable_elem_location
+                    // Useful: declaration, specification, frame_base, entry_pc, low_pc, high_pc, ranges, name, linkage_name, main_subprogram, object_pointer, return_addr, type, inline
+                    // Other: artificial, calling_convention, start_scope (haven't seen it in practice), trampoline, virtuality, vtable_elem_location
                     // Other: accessibility, address_class, alignment, defaulted, deleted, elemental, pure, explicit, external, noreturn, prototyped, recursive, reference, rvalue_reference, segment, static_link, visibility
                     let mut attrs = SubprogramAttributes::default();
                     const _: () = assert!(SubprogramAttributes::name == CommonAttributes::name && SubprogramAttributes::linkage_name == CommonAttributes::linkage_name && SubprogramAttributes::decl == CommonAttributes::decl && SubprogramAttributes::type_ == CommonAttributes::type_);
@@ -2526,7 +2528,8 @@ impl<'a> DwarfLoader<'a> {
 
                     let ranges_stack_idx = self.ranges_stack.len;
                     let ranges_top = self.ranges_stack.push_uninit(&mut self.main_stack.top_mut().flags);
-                    parse_dwarf_ranges(&self.loader.sym.dwarf, &self.unit.unit, &attrs.ranges, attrs.fields, offset, self.loader.sym.code_addr_range.start, &mut ranges_top.pc_ranges, &mut self.shard.warn)?;
+                    let mut entry_pc = 0usize;
+                    parse_dwarf_ranges(&self.loader.sym.dwarf, &self.unit.unit, &attrs.ranges, attrs.fields, offset, self.loader.sym.code_addr_range.start, &mut ranges_top.pc_ranges, &mut entry_pc, &mut self.shard.warn)?;
                     self.main_stack.top_mut().flags.remove(StackFlags::IS_ANY_SCOPE);
                     self.main_stack.top_mut().flags.insert(StackFlags::IS_FUNCTION_SCOPE);
 
@@ -2569,7 +2572,7 @@ impl<'a> DwarfLoader<'a> {
                         // Do multi-ranges also appear on C++ coroutines or Rust async functions? No, they produce multiple functions instead.
 
                         function_top.function = self.shard.functions.len();
-                        let mut f = FunctionInfo {addr: FunctionAddr(0), prev_addr: FunctionAddr(0), die: offset, mangled_name: name_ref.as_ptr(), mangled_name_len: name_ref.len() as u32, shard_idx: self.shard_idx as u16, flags: FunctionFlags::empty(), language: self.unit.language, subfunction_levels: 0..0};
+                        let mut f = FunctionInfo {addr: FunctionAddr(0), prev_addr: FunctionAddr(0), entry_addr: entry_pc, die: offset, mangled_name: name_ref.as_ptr(), mangled_name_len: name_ref.len() as u32, shard_idx: self.shard_idx as u16, flags: FunctionFlags::empty(), language: self.unit.language, subfunction_levels: 0..0};
                         if is_inlined {
                             f.flags.insert(FunctionFlags::INLINED);
                         }
@@ -2598,7 +2601,7 @@ impl<'a> DwarfLoader<'a> {
                             }
 
                             if attrs.main_subprogram {
-                                self.shard.points_of_interest.entry(PointOfInterest::MainFunction).or_default().push(ranges_top.pc_ranges[0].begin as usize);
+                                self.shard.points_of_interest.entry(PointOfInterest::MainFunction).or_default().push(entry_pc);
                             }
                         }
 
@@ -3054,7 +3057,7 @@ impl<'a> DwarfLoader<'a> {
                     unsafe {cursor.read_attributes(abbrev, /*which_layout*/ 0, &attribute_context, &raw mut attrs as *mut u8)}?;
                     if attrs.fields & (DwarfRanges::RANGES | DwarfRanges::LOW_PC) != 0 {
                         let ranges_top = self.ranges_stack.push_uninit(&mut self.main_stack.top_mut().flags);
-                        parse_dwarf_ranges(&self.loader.sym.dwarf, &self.unit.unit, &attrs.ranges, attrs.fields, offset, self.loader.sym.code_addr_range.start, &mut ranges_top.pc_ranges, &mut self.shard.warn)?;
+                        parse_dwarf_ranges(&self.loader.sym.dwarf, &self.unit.unit, &attrs.ranges, attrs.fields, offset, self.loader.sym.code_addr_range.start, &mut ranges_top.pc_ranges, /*out_entry_pc*/ &mut 0, &mut self.shard.warn)?;
                     }
                 }
 
@@ -3068,14 +3071,15 @@ impl<'a> DwarfLoader<'a> {
                 // Inlined functions.
                 DW_TAG_inlined_subroutine => {
                     // Applicable attributes:
-                    // Useful: call_file, call_line, call_column, low_pc, high_pc, ranges, abstract_origin, entry_pc
+                    // Useful: call_file, call_line, call_column, entry_pc, low_pc, high_pc, ranges, abstract_origin
                     // Other: const_expr, return_addr, segment, start_scope, trampoline
                     let mut attrs = InlinedSubroutineAttributes::default();
                     unsafe {cursor.read_attributes(abbrev, /*which_layout*/ 0, &attribute_context, &raw mut attrs as *mut u8)}?;
                     let ranges_top = self.ranges_stack.push_uninit(&mut self.main_stack.top_mut().flags);
-                    parse_dwarf_ranges(&self.loader.sym.dwarf, &self.unit.unit, &attrs.ranges, attrs.fields, offset, self.loader.sym.code_addr_range.start, &mut ranges_top.pc_ranges, &mut self.shard.warn)?;
+                    let mut entry_pc = 0usize;
+                    parse_dwarf_ranges(&self.loader.sym.dwarf, &self.unit.unit, &attrs.ranges, attrs.fields, offset, self.loader.sym.code_addr_range.start, &mut ranges_top.pc_ranges, &mut entry_pc, &mut self.shard.warn)?;
 
-                    let mut call_line = Self::parse_line_info(&mut self.shard, &self.loader, self.unit, &attrs.call);
+                    let call_line = Self::parse_line_info(&mut self.shard, &self.loader, self.unit, &attrs.call);
                     let callee_die = if attrs.fields & InlinedSubroutineAttributes::abstract_origin != 0 {
                         DebugInfoOffset(attrs.abstract_origin)
                     } else {
@@ -3095,41 +3099,10 @@ impl<'a> DwarfLoader<'a> {
                         if self.shard.warn.check(line!()) { eprintln!("warning: inlined functions nested > {} levels deep @0x{:x}; this is not supported", i16::MAX - 1, offset.0); }
                         self.main_stack.top_mut().flags.remove(StackFlags::IS_VALID_SCOPE);
                     } else {
-                        // If there's DW_AT_entry_pc, put LineFlags::STATEMENT only on that address, so that breakpoint only stops there.
-                        // Otherwise tell finish_function() to set this flag at the start of each address range.
-                        call_line.set_flag(LineFlags::STATEMENT);
-                        if call_line.file_idx().is_some() && attrs.fields & (InlinedSubroutineAttributes::entry_pc_addr | InlinedSubroutineAttributes::entry_pc_int) != 0 {
-                            let addr = if attrs.fields & InlinedSubroutineAttributes::entry_pc_addr != 0 {
-                                attrs.entry_pc_addr
-                            } else {
-                                // "If the value of the DW_AT_entry_pc attribute is of class address that address is the entry address;
-                                //  or, if it is of class constant, the value is an unsigned integer offset which, when
-                                //  added to the base address of the function, gives the entry address.
-                                //  If no DW_AT_entry_pc attribute is present, then the entry address is assumed to
-                                //  be the same as the base address of the containing scope."
-                                //
-                                // "The base address of the scope for any of the debugging information entries listed
-                                //  above is given by either the DW_AT_low_pc attribute or the first address in the
-                                //  first range entry in the list of ranges given by the DW_AT_ranges attribute. If
-                                //  there is no such attribute, the base address is undefined."
-
-                                let function_pc_ranges = &self.ranges_stack.s[f.ranges_stack_idx].pc_ranges;
-                                if function_pc_ranges.is_empty() {
-                                    0
-                                } else {
-                                    attrs.entry_pc_int + function_pc_ranges[0].begin as usize
-                                }
-                            };
-                            if addr != 0 {
-                                // The inlined function call entry point is not at the start of its address range.
-                                // Make sure breakpoints on the call line resolve to this entry address instead of all range start addresses, otherwise behavior is confusing.
-                                // This address is likely at the start of one of the ranges, so we'll add two duplicate LineInfo-s, differing only in the STATEMENT flag.
-                                // That's ok for correctness, and ok for performance because DW_AT_entry_pc is rare.
-                                let mut entry_call_line = call_line.clone().with_addr_and_flags(addr, LineFlags::INLINED_FUNCTION | LineFlags::STATEMENT);
-                                Self::fixup_subfunction_call_line(&self.shard, &mut entry_call_line, addr);
-                                self.shard.sym.line_to_addr.push((entry_call_line, level - 1));
-                                call_line.unset_flag(LineFlags::STATEMENT);
-                            }
+                        if call_line.file_idx().is_some() && entry_pc != 0 {
+                            let mut entry_call_line = call_line.clone().with_addr_and_flags(entry_pc, LineFlags::INLINED_FUNCTION | LineFlags::STATEMENT);
+                            Self::fixup_subfunction_call_line(&self.shard, &mut entry_call_line, entry_pc);
+                            self.shard.sym.line_to_addr.push((entry_call_line, level - 1));
                         }
 
                         let sf_idx = f.subfunctions.len() as u32;
@@ -3247,13 +3220,6 @@ impl<'a> DwarfLoader<'a> {
                     temp.stack[cur_level].0 = new_range_idx;
                     let mut sf_clone = cur_sf.clone();
                     sf_clone.addr_range = addr..addr;
-                    if cur_level > 0 && cur_sf.call_line.file_idx().is_some() {
-                        let extra_flags = cur_sf.call_line.flags() & LineFlags::STATEMENT;
-                        sf_clone.call_line = sf_clone.call_line.with_addr_and_flags(addr, LineFlags::INLINED_FUNCTION | extra_flags);
-                        Self::fixup_subfunction_call_line(&self.shard, &mut sf_clone.call_line, addr);
-                        self.shard.sym.line_to_addr.push((sf_clone.call_line, cur_level as u16 - 1));
-                    }
-
                     temp.levels[cur_level].push(sf_clone);
 
                     cur_sf_idx = parent;
@@ -3278,8 +3244,10 @@ impl<'a> DwarfLoader<'a> {
                         // I'm not sure what's the intention there. I guess the debugger is supposed to realize that the instructions after an inlined function
                         // have the same line number as the inlined function's call site? Let's interpret it that way and add LineInfo, with lower priority than the
                         // LineInfo-s from .debug_line.
-                        // This quirk sometimes appears in combination with the line() == 0 quirk, so it's important that we use the LineInfo that went through fixup_subfunction_call_line().
-                        self.shard.sym.addr_to_line.push(sf.call_line.clone().with_addr_and_flags(addr, LineFlags::INLINED_FUNCTION));
+                        // This quirk sometimes appears in combination with the line() == 0 quirk, so we do fixup_subfunction_call_line() as well.
+                        let mut line = sf.call_line;
+                        Self::fixup_subfunction_call_line(&self.shard, &mut line, sf.addr_range.start);
+                        self.shard.sym.addr_to_line.push(line.with_addr_and_flags(addr, LineFlags::INLINED_FUNCTION));
                     }
                 }
             }
@@ -3317,22 +3285,26 @@ impl<'a> DwarfLoader<'a> {
     }
 }
 
-fn parse_dwarf_ranges(dwarf: &Dwarf<DwarfSlice>, unit: &Unit<DwarfSlice>, ranges: &DwarfRanges, fields: u32, offset: DieOffset, code_start: usize, out: &mut Vec<gimli::Range>, warn: &mut Limiter) -> Result<()> {
-    out.clear();
+fn parse_dwarf_ranges(dwarf: &Dwarf<DwarfSlice>, unit: &Unit<DwarfSlice>, ranges: &DwarfRanges, fields: u32, offset: DieOffset, code_start: usize, out_ranges: &mut Vec<gimli::Range>, out_entry_pc: &mut usize, warn: &mut Limiter) -> Result<()> {
+    out_ranges.clear();
+    *out_entry_pc = 0;
     // Sometimes both low_pc and ranges are present on compilation units. In this case ranges take precedence, and low_pc acts as "base address" for all range lists in the unit (which gimli takes care of automatically).
     if fields & DwarfRanges::RANGES != 0 {
-        // (This is missing adding DW_AT_GNU_ranges_base in DWARF 4.)
+        // (Compatibility: in DWARF 4 we'd need to add DW_AT_GNU_ranges_base.)
         let mut it = dwarf.ranges(unit, RangeListsOffset(ranges.ranges))?;
         while let Some(range) = it.next()? {
             // In practice ranges often contain garbage near-zero addresses, even in debug builds without LTO. Presumably linker relocations get lost at some point, maybe because of compiler optimizations.
-            // Empty ranges are intended to be skipped, I guess, but often they're not empty. Sometimes they don't start at 0, and sometimes none of the bad ranges in the list start at 0.
+            // If the bad range is empty, I guess it's intended to be skipped. But sometimes these ranges are not empty, sometimes they don't start at 0, and sometimes none of the bad ranges in the list start at 0.
             // Sometimes bad ranges coexist with good ranges in the same list of ranges.
-            // Idk if that's intended or compiler bug. Let's silently ignore invalid ranges.
+            // Idk if that's intended or compiler bug (or maybe DWARF parser bug, though I checked it against dwarfdump output). Let's silently ignore invalid ranges.
             // Maybe a cleaner way to detect bad ranges would be to check if the base address is zero (suggesting missing relocation) when parsing the range list data, but that's currently hidden inside gimli.
             if range.end as usize <= code_start || range.end <= range.begin {
                 continue;
             }
-            out.push(range);
+            if out_ranges.is_empty() {
+                *out_entry_pc = range.begin as usize;
+            }
+            out_ranges.push(range);
         }
     } else if fields & DwarfRanges::LOW_PC != 0 {
         if ranges.low_pc == 0 { // same as above, see other comment
@@ -3346,8 +3318,36 @@ fn parse_dwarf_ranges(dwarf: &Dwarf<DwarfSlice>, unit: &Unit<DwarfSlice>, ranges
             ranges.high_pc
         };
         if high_pc > ranges.low_pc {
-            out.push(gimli::Range {begin: ranges.low_pc as u64, end: high_pc as u64});
+            out_ranges.push(gimli::Range {begin: ranges.low_pc as u64, end: high_pc as u64});
         }
     }
+    if fields & DwarfRanges::LOW_PC != 0 {
+        *out_entry_pc = ranges.low_pc;
+    }
+
+    if fields & DwarfRanges::ENTRY_PC != 0 {
+        if fields & DwarfRanges::ENTRY_PC_IS_RELATIVE != 0 {
+            // DWARF5.pdf says:
+            // "If the value of the DW_AT_entry_pc attribute is of class address that address is the entry address;
+            //  or, if it is of class constant, the value is an unsigned integer offset which, when
+            //  added to the base address of the function, gives the entry address.
+            //  If no DW_AT_entry_pc attribute is present, then the entry address is assumed to
+            //  be the same as the base address of the containing scope."
+            //
+            // This is so vague!
+            // Does "function" in "base address of the function" refer to the containing DW_TAG_subprogram or to the same DIE that has the DW_AT_entry_pc?
+            // What is "containing scope"? Is it the same DIE that has the DW_AT_entry_pc, or its nearest ancestor with address ranges (e.g. a DW_AT_lexical_block or DW_AT_subprogram)?
+            // This code currently assumes that the answer to both questions is "the same DIE that has the DW_AT_entry_pc" because this seems like the most sensible choice, but I have no idea.
+            //
+            // "The base address of the scope for any of the debugging information entries listed
+            //  above is given by either the DW_AT_low_pc attribute or the first address in the
+            //  first range entry in the list of ranges given by the DW_AT_ranges attribute. If
+            //  there is no such attribute, the base address is undefined."
+            *out_entry_pc += ranges.entry_pc;
+        } else {
+            *out_entry_pc = ranges.entry_pc;
+        }
+    }
+    
     Ok(())
 }

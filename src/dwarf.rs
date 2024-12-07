@@ -516,7 +516,7 @@ pub struct AttributeStructLayout {
 impl AttributeStructLayout {
     // Expand special attribute groups into individual attributes.
     fn preprocess(&mut self) {
-        assert!(self.fields.len() <= 26);
+        assert!(self.fields.len() <= 24);
         self.num_fields_included_in_flags = self.fields.len() as u32;
         let (mut saw_ranges, mut saw_location, mut saw_specification) = (false, false, false);
         for i in 0..self.num_fields_included_in_flags as usize {
@@ -527,6 +527,7 @@ impl AttributeStructLayout {
                     self.fields[i] = (offset + offsetof!(DwarfRanges, ranges) as u32, DW_AT_ranges, AttributeType::Ranges);
                     self.fields.push((offset + offsetof!(DwarfRanges, low_pc) as u32, DW_AT_low_pc, AttributeType::Ranges));
                     self.fields.push((offset + offsetof!(DwarfRanges, high_pc) as u32, DW_AT_high_pc, AttributeType::Ranges));
+                    self.fields.push((offset + offsetof!(DwarfRanges, entry_pc) as u32, DW_AT_entry_pc, AttributeType::Ranges));
                 }
                 AttributeType::CodeLocation => {
                     assert!(!mem::replace(&mut saw_location, true));
@@ -701,7 +702,7 @@ pub enum AttributeType {
     // Groups of attributes that are special-cased and grouped into sub-structs for convenience.
 
     // Type: DwarfRanges.
-    // Attributes: DW_AT_ranges (rnglist), DW_AT_low_pc (address), DW_AT_high_pc (address or constant).
+    // Attributes: DW_AT_ranges (rnglist), DW_AT_low_pc (address), DW_AT_high_pc (address or constant), DW_AT_entry_pc (address or constant).
     // DW_AT_ranges forms: DW_FORM_rnglistx, DW_FORM_sec_offset.
     // Upper bits of the `fields` bitmask will indicate which fields of DwarfRanges were set. See constants in DwarfRanges.
     Ranges,
@@ -806,21 +807,24 @@ macro_rules! dwarf_struct {
 
 // Special type that can be used in dwarf_struct!():
 //   ranges: DwarfRanges, DW_AT_ranges, AttributeType::Ranges;
-// Covers 3 attributes (even though only one is explicitly given to dwarf_struct!()): DW_AT_ranges, DW_AT_low_pc, DW_AT_high_pc.
+// Covers 4 attributes (even though only one is explicitly given to dwarf_struct!()): DW_AT_ranges, DW_AT_low_pc, DW_AT_high_pc, DW_AT_entry_pc.
 #[derive(Default)]
 pub struct DwarfRanges {
     pub ranges: usize, // offset in .debug_ranges or .debug_rnglists
     pub low_pc: usize,
     pub high_pc: usize,
+    pub entry_pc: usize,
 }
 impl DwarfRanges {
     // These bits would be set in the parent struct's `fields` bitmask.
     // (Make sure to not clash with the bit in DwarfReference. Also keep it in sync with the assert in AttributeStructLayout.preprocess())
-    pub const RANGES: u32 = 1 << 26;
-    pub const LOW_PC: u32 = 1 << 27;
-    pub const HIGH_PC: u32 = 1 << 28;
+    pub const RANGES: u32 = 1 << 24;
+    pub const LOW_PC: u32 = 1 << 25;
+    pub const HIGH_PC: u32 = 1 << 26;
     // Set if the DW_AT_high_pc had data form (i.e. it needs to be added to low_pc), unset if address form.
-    pub const HIGH_PC_IS_RELATIVE: u32 = 1 << 29;
+    pub const HIGH_PC_IS_RELATIVE: u32 = 1 << 27;
+    pub const ENTRY_PC: u32 = 1 << 28;
+    pub const ENTRY_PC_IS_RELATIVE: u32 = 1 << 29;
 }
 
 #[derive(Default, Clone, Copy)]
@@ -1287,7 +1291,7 @@ fn prepare_attribute_action(attr: AttributeSpecification, layout: &AttributeStru
 
             AttributeType::Ranges => match attr.name {
                 DW_AT_ranges => match attr.form {
-                    // Note the sec_offset case would need additional logic to support split dwarf (dwo).
+                    // Compatibility: the sec_offset case would need additional logic to support split dwarf (dwo).
                     DW_FORM_rnglistx | DW_FORM_sec_offset => *flags |= DwarfRanges::RANGES,
                     _ => found_match = false,
                 }
@@ -1298,6 +1302,11 @@ fn prepare_attribute_action(attr: AttributeSpecification, layout: &AttributeStru
                 DW_AT_high_pc => match attr.form {
                     DW_FORM_addr | DW_FORM_addrx | DW_FORM_addrx1 | DW_FORM_addrx2 | DW_FORM_addrx3 | DW_FORM_addrx4 => *flags |= DwarfRanges::HIGH_PC,
                     DW_FORM_data1 | DW_FORM_data2 | DW_FORM_data4 | DW_FORM_data8 | DW_FORM_udata => *flags |= DwarfRanges::HIGH_PC | DwarfRanges::HIGH_PC_IS_RELATIVE,
+                    _ => found_match = false,
+                }
+                DW_AT_entry_pc => match attr.form {
+                    DW_FORM_addr | DW_FORM_addrx | DW_FORM_addrx1 | DW_FORM_addrx2 | DW_FORM_addrx3 | DW_FORM_addrx4 => *flags |= DwarfRanges::ENTRY_PC,
+                    DW_FORM_data1 | DW_FORM_data2 | DW_FORM_data4 | DW_FORM_data8 | DW_FORM_udata => *flags |= DwarfRanges::ENTRY_PC | DwarfRanges::ENTRY_PC_IS_RELATIVE,
                     _ => found_match = false,
                 }
                 _ => panic!("unexpected Ranges attribute name"),

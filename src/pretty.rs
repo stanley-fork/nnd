@@ -1156,7 +1156,7 @@ fn recognize_cpp_list(substruct: &mut Substruct, val: &mut Cow<Value>, state: &m
 
 fn recognize_rust_hash_table(substruct: &mut Substruct, val: &mut Cow<Value>, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
     let mut table = find_struct_field(&["table"], substruct)?;
-    let bucket_type = find_nested_type("T", &substruct.nested_names)?;
+    let bucket_type = find_nested_type("T", &table.nested_names)?;
     let bucket_mask_field = find_int_field(&["bucket_mask"], &mut table)?;
     let mut ctrl_type: *const TypeInfo = ptr::null();
     let ctrl_field = find_pointer_field(&["ctrl"], &mut table, &mut ctrl_type)?;
