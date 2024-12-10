@@ -40,7 +40,7 @@ pub struct Thread {
     pub idx: usize,
     pub tid: pid_t,
     // Whether the thread is running or suspended, as seen by ptrace.
-    // We often want to do things when this changes, so keep the number of code sites than change it to a minimum.
+    // We often want to do things when this changes, so keep the number of code sites that change it to a minimum.
     pub state: ThreadState,
 
     pub info: ThreadInfo,
