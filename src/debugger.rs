@@ -670,6 +670,7 @@ impl Debugger {
                     if self.threads.is_empty() {
                         self.target_state = ProcessState::NoProcess;
                         self.info.clear();
+                        self.symbols.mark_all_as_unmapped();
                         self.memory = MemReader::invalid();
                     } else if stepping_this_thread {
                         self.suspend()?;

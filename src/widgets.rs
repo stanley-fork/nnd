@@ -1427,14 +1427,17 @@ pub struct SearchBar {
     pub hide_when_not_editing: bool,
 }
 impl SearchBar {
-    // Sets cur_parent's height to 0 or 1.
-    pub fn build(&mut self, left_text: Option<usize>, right_text: Option<usize>, ui: &mut UI) {
+    // Sets cur_parent's height to 0 or 1. Returns true if there was any input.
+    pub fn build(&mut self, left_text: Option<usize>, right_text: Option<usize>, ui: &mut UI) -> bool {
+        let mut had_input = false;
         if self.editing && ui.check_key(KeyAction::Enter) {
             self.editing = false;
+            had_input = true;
         }
         if self.visible && ui.check_key(KeyAction::Cancel) {
             self.editing = false;
             self.visible = false;
+            had_input = true;
         }
         if self.editing && !ui.check_focus() {
             self.editing = false;
@@ -1447,7 +1450,7 @@ impl SearchBar {
         }
         if !self.visible {
             ui.cur_mut().set_fixed_height(0);
-            return;
+            return had_input;
         }
 
         ui.cur_mut().set_fixed_height(1);
@@ -1455,7 +1458,7 @@ impl SearchBar {
         if let Some(l) = left_text {
             ui.add(widget!().width(AutoSize::Text).text(l));
         }
-        let text_widget = ui.add(widget!().identity(&'t').width(AutoSize::Remainder(1.0)));
+        let text_widget = ui.add(widget!().identity(&'t').width(AutoSize::Remainder(1.0)).min_width(10));
         if let Some(l) = right_text {
             ui.add(widget!().width(AutoSize::Text).text(l));
         }
@@ -1464,12 +1467,14 @@ impl SearchBar {
         with_parent!(ui, text_widget, {
             ui.focus();
             if self.editing {
-                self.text.build(ui);
+                had_input |= self.text.build(ui);
             } else {
                 let l = ui_writeln!(ui, default, "{}", self.text.text);
                 ui.cur_mut().draw_text = Some(l..l+1);
             }
         });
+
+        had_input
     }
 
     pub fn start_editing(&mut self) {

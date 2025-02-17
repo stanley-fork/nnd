@@ -92,15 +92,16 @@ impl Disassembly {
     }
 
     // If pseudo_addr is in between instructions, round down to the previous instruction.
-    pub fn static_pseudo_addr_to_line(&self, static_pseudo_addr: usize) -> Option<usize> {
+    // If pseudo_addr is out of range, return either first or last line (whichever is closed), with `found` = false.
+    pub fn static_pseudo_addr_to_line(&self, static_pseudo_addr: usize) -> (usize, /*found*/ bool) {
         let idx = self.lines.partition_point(|l| l.static_addr <= static_pseudo_addr);
-        if idx == 0 { return None; }
+        if idx == 0 { return (0, false); }
         let l = &self.lines[idx-1];
         // (Would be better to compare to function addr ranges instead of the MAX_X86_INSTRUCTION_BYTES guesswork.)
         if l.kind == DisassemblyLineKind::Instruction && l.static_addr + MAX_X86_INSTRUCTION_BYTES > static_pseudo_addr {
-            Some(idx-1)
+            (idx-1, true)
         } else {
-            None
+            (idx-1, false)
         }
     }
 

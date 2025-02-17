@@ -1478,10 +1478,12 @@ struct DisassemblyWindow {
     cache: HashMap<(/*binary_id*/ usize, /*function_idx*/ usize), Disassembly>,
     tabs_state: TabsState,
     search_dialog: Option<SearchDialog>,
+    go_to_address_bar: SearchBar,
+    go_to_address_error: Option<Error>,
     source_scrolled_to: Option<(/*binary_id*/ usize, /*function_idx*/ usize, /*disas_line*/ usize, /*selected_subfunction_level*/ u16)>,
 }
 
-impl Default for DisassemblyWindow { fn default() -> Self { Self {tabs: Vec::new(), cache: HashMap::new(), tabs_state: TabsState::default(), search_dialog: None, source_scrolled_to: None} } }
+impl Default for DisassemblyWindow { fn default() -> Self { Self {tabs: Vec::new(), cache: HashMap::new(), tabs_state: TabsState::default(), search_dialog: None, go_to_address_bar: SearchBar::default(), go_to_address_error: None, source_scrolled_to: None} } }
 
 impl DisassemblyWindow {
     fn open_function(&mut self, target: Result<DisassemblyScrollTarget>, debugger: &Debugger) -> Result<()> {
@@ -1513,6 +1515,60 @@ impl DisassemblyWindow {
         self.tabs_state.select(self.tabs.len() - 1);
 
         Ok(())
+    }
+
+    fn find_address(&self, mut query: &str, debugger: &Debugger) -> Result<DisassemblyScrollTarget> {
+        let relative = query.starts_with("+");
+        if relative {
+            query = &query[1..];
+        }
+        if query.starts_with("0x") { query = &query[2..]; }
+        if query.ends_with("h") { query = &query[..query.len()-1]; }
+
+        let addr = usize::from_str_radix(query, 16)?;
+
+        if relative {
+            let tab = match self.tabs.get(self.tabs_state.selected) {
+                Some(x) => x,
+                None => return err!(Usage, "no open tab"),
+            };
+            let (binary_id, function_idx) = match tab.cached_function_idx.clone() {
+                Some(x) => x,
+                None => return err!(Usage, "no open function"),
+            };
+            let function_locator = match &tab.locator {
+                Some(x) => x,
+                None => return err!(Usage, "no open function"),
+            };
+            Ok(DisassemblyScrollTarget {binary_id, function_idx, static_pseudo_addr: function_locator.addr.0.saturating_add(addr), subfunction_level: u16::MAX})
+        } else {
+            let (static_addr, binary) = match debugger.addr_to_binary(addr) {
+                Ok((_, static_addr, binary, _)) => (static_addr, binary),
+                Err(err) => {
+                    // Search in unmapped binaries too, in particular if the program is not running.
+                    let mut binary: Option<&Binary> = None;
+                    for bin in debugger.symbols.iter() {
+                        if bin.is_mapped {
+                            continue;
+                        }
+                        let elf = match bin.elf.as_ref_clone_error() {
+                            Ok(x) => x,
+                            Err(e) if e.is_loading() => return Err(e),
+                            Err(_) => continue,
+                        };
+                        if elf.addr_to_offset(addr).is_some() {
+                            binary = Some(bin);
+                            break;
+                        }
+                    }
+                    let binary = binary.ok_or(err)?;
+                    (addr, binary)
+                }
+            };
+            let symbols = binary.symbols.as_ref_clone_error()?;
+            let (function, function_idx) = symbols.addr_to_function(static_addr)?;
+            Ok(DisassemblyScrollTarget {binary_id: binary.id, function_idx, static_pseudo_addr: static_addr, subfunction_level: u16::MAX})
+        }
     }
 
     fn make_title(mut demangled_name: &str) -> String {
@@ -1618,7 +1674,7 @@ impl DisassemblyWindow {
         }
     }
 
-    // Would be nice to also support disassembling arbitrary memory, regardless of functions or binaries. E.g. for JIT-generated code.
+    // (Would be nice to also support disassembling arbitrary memory, regardless of functions or binaries. E.g. for JIT-generated code.)
     fn disassemble_function(binary: &Binary, function_idx: usize, palette: &Palette) -> Result<Disassembly> {
         let symbols = binary.symbols.as_ref().unwrap();
         let ranges = symbols.function_addr_ranges(function_idx);
@@ -1760,7 +1816,7 @@ impl WindowContent for DisassemblyWindow {
         // First do things that may open or close tabs.
 
         let mut open_dialog = false;
-        for action in ui.check_keys(&[KeyAction::Open, KeyAction::CloseTab]) {
+        for action in ui.check_keys(&[KeyAction::Open, KeyAction::CloseTab, KeyAction::GoToLine]) {
             match action {
                 KeyAction::Open if self.search_dialog.is_none() => {
                     open_dialog = true;
@@ -1773,11 +1829,62 @@ impl WindowContent for DisassemblyWindow {
                         self.tabs.remove(self.tabs_state.selected);
                     }
                 }
+                KeyAction::GoToLine => {
+                    self.go_to_address_bar.hide_when_not_editing = true;
+                    self.go_to_address_error = None;
+                    self.go_to_address_bar.start_editing();
+                }
                 _ => (),
             }
         }
 
         self.build_search_dialog(open_dialog, state, debugger, ui);
+
+        ui.cur_mut().set_vstack();
+        let tabs_widget = ui.add(widget!().fixed_height(1));
+        let go_to_address_bar = ui.add(widget!().fixed_height(0));
+        let content_root = ui.add(widget!().height(AutoSize::Remainder(1.0)));
+
+        with_parent!(ui, go_to_address_bar, {
+            ui.multifocus();
+            if self.go_to_address_bar.editing {
+                let mut close = false;
+                if ui.check_key(KeyAction::Enter) {
+                    if self.go_to_address_bar.text.text.is_empty() {
+                        close = true;
+                    } else {
+                        match self.find_address(&self.go_to_address_bar.text.text, debugger) {
+                            Ok(target) => {
+                                state.should_scroll_disassembly = Some((Ok(target), /*only_if_on_error_tab*/ false));
+                                close = true;
+                            }
+                            Err(e) => self.go_to_address_error = Some(e),
+                        }
+                    }
+                }
+                if close {
+                    self.go_to_address_bar.editing = false;
+                    self.go_to_address_bar.visible = false;
+                } else {
+                    let left = ui_writeln!(ui, default_dim, "go to address (hex): ");
+                    if let Some(e) = &self.go_to_address_error {
+                        ui_write!(ui, error, "{}", e);
+                    } else {
+                        ui_write!(ui, default_dim, "(+n - relative)");
+                    }
+                    let right = ui.text.close_line();
+                    if self.go_to_address_bar.build(Some(left), Some(right), ui) {
+                        self.go_to_address_error = None;
+                    }
+                }
+                if !self.go_to_address_bar.visible {
+                    ui.should_redraw = true; // make sure our check_key() request is not active when the bar is not open
+                }
+            }
+        });
+        with_parent!(ui, tabs_widget, {ui.multifocus()});
+        with_parent!(ui, content_root, {ui.multifocus()});
+        ui.layout_children(Axis::Y);
 
         let mut scroll_to_addr: Option<(usize, u16)> = None;
         let suppress_code_autoscroll = state.should_scroll_disassembly.is_some();
@@ -1807,9 +1914,7 @@ impl WindowContent for DisassemblyWindow {
 
         // Now the set of tabs is final.
 
-        ui.cur_mut().set_vstack();
-        with_parent!(ui, ui.add(widget!().fixed_height(1)), {
-            ui.focus();
+        with_parent!(ui, tabs_widget, {
             let mut tabs = Tabs::new(mem::take(&mut self.tabs_state), ui);
             for tab in &self.tabs {
                 let full_title = match &tab.locator {
@@ -1820,11 +1925,6 @@ impl WindowContent for DisassemblyWindow {
             }
             self.tabs_state = tabs.finish(ui);
         });
-        let content_root = ui.add(widget!().height(AutoSize::Remainder(1.0)));
-        with_parent!(ui, content_root, {
-            ui.multifocus();
-        });
-        ui.layout_children(Axis::Y);
 
         // Now the selected tab is final.
 
@@ -1863,10 +1963,9 @@ impl WindowContent for DisassemblyWindow {
         let disas = Self::find_or_disassemble_function(&mut self.cache, binary, function_idx, &ui.palette);
 
         if let Some((static_pseudo_addr, subfunction_level)) = scroll_to_addr {
-            if let Some(line) = disas.static_pseudo_addr_to_line(static_pseudo_addr) {
-                tab.selected_subfunction_level = subfunction_level;
-                tab.area_state.select(line);
-            }
+            let line = disas.static_pseudo_addr_to_line(static_pseudo_addr).0;
+            tab.selected_subfunction_level = subfunction_level;
+            tab.area_state.select(line);
         }
 
         let rel_addr_digits = (((disas.max_abs_relative_addr as f64 + 1.0).log2() / 4.0).ceil() as usize).max(1); // how many hex digits to use in the "<+1abc>" things
@@ -1962,7 +2061,8 @@ impl WindowContent for DisassemblyWindow {
         for (idx, frame) in state.stack.frames.iter().enumerate() {
             if frame.binary_id.as_ref() == Some(&binary.id) {
                 let static_pseudo_addr = frame.pseudo_addr.wrapping_sub(frame.addr_static_to_dynamic);
-                if let Some(line) = disas.static_pseudo_addr_to_line(static_pseudo_addr) {
+                let (line, found) = disas.static_pseudo_addr_to_line(static_pseudo_addr);
+                if found {
                     ip_lines.push((line, idx == state.selected_frame));
                 }
             }
