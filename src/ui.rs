@@ -249,6 +249,7 @@ impl DebuggerUI {
         for key in &keys {
             match self.ui.key_binds.normal.key_to_action.get(key) {
                 Some(KeyAction::Quit) => {
+                    LogTimestampInDestructor("shutdown requested");
                     self.should_quit = true;
                     return Ok(());
                 }

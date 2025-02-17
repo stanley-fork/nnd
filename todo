@@ -1,45 +1,3 @@
-thread 'main' panicked at src/pretty.rs:1081:12:
-attempt to multiply with overflow
-stack backtrace:
-   0: rust_begin_unwind
-             at /rustc/f6e511eec7342f59a25f7c0534f1dbea00d01b14/library/std/src/panicking.rs:662:5
-   1: core::panicking::panic_fmt
-             at /rustc/f6e511eec7342f59a25f7c0534f1dbea00d01b14/library/core/src/panicking.rs:74:14
-   2: core::panicking::panic_const::panic_const_mul_overflow
-             at /rustc/f6e511eec7342f59a25f7c0534f1dbea00d01b14/library/core/src/panicking.rs:181:21
-   3: nnd::pretty::recognize_absl_inlined_vector
-             at /home/al13n/Dropbox/coding/nnd/src/pretty.rs:1081:12
-   4: nnd::pretty::recognize_containers
-             at /home/al13n/Dropbox/coding/nnd/src/pretty.rs:780:11
-   5: nnd::pretty::prettify_value
-             at /home/al13n/Dropbox/coding/nnd/src/pretty.rs:51:11
-   6: nnd::expr::format_value_recurse
-             at /home/al13n/Dropbox/coding/nnd/src/expr.rs:684:15
-   7: nnd::expr::format_value_recurse
-             at /home/al13n/Dropbox/coding/nnd/src/expr.rs:843:29
-   8: nnd::expr::format_value_recurse
-             at /home/al13n/Dropbox/coding/nnd/src/expr.rs:764:24
-   9: nnd::expr::format_value_recurse
-             at /home/al13n/Dropbox/coding/nnd/src/expr.rs:843:29
-  10: nnd::expr::format_value
-             at /home/al13n/Dropbox/coding/nnd/src/expr.rs:627:5
-  11: nnd::ui::WatchesWindow::ensure_node_info
-             at /home/al13n/Dropbox/coding/nnd/src/ui.rs:689:62
-  12: nnd::ui::WatchesWindow::build_widgets
-             at /home/al13n/Dropbox/coding/nnd/src/ui.rs:807:17
-  13: <nnd::ui::WatchesWindow as nnd::ui::WindowContent>::build
-             at /home/al13n/Dropbox/coding/nnd/src/ui.rs:1303:13
-  14: nnd::ui::DebuggerUI::build
-             at /home/al13n/Dropbox/coding/nnd/src/ui.rs:350:17
-  15: nnd::ui::DebuggerUI::update_and_render
-             at /home/al13n/Dropbox/coding/nnd/src/ui.rs:219:9
-  16: nnd::run
-             at /home/al13n/Dropbox/coding/nnd/src/main.rs:395:13
-  17: nnd::main
-             at /home/al13n/Dropbox/coding/nnd/src/main.rs:219:11
-  18: core::ops::function::FnOnce::call_once
-             at /rustc/f6e511eec7342f59a25f7c0534f1dbea00d01b14/library/core/src/ops/function.rs:250:5
-
 bugs:
 investigate `clickhouse local` progress spinner appearing in debugger window despite -t
 fix empty symbols loading stage name near the end
@@ -51,7 +9,6 @@ fix incorrect column numbers with tab indentation (tabs should be counted as 1 c
 fix line-wrapped copy-paste (seems to copy only the first line of selection) and line-wrapped C-k (deletes only to the end of post-wrapping line, should use pre-wrapping line)
 
 performance:
-investigate why quitting is slow; in particular, after attached process died, so there are no threads to detach
 optimize symbols loading
   profile attribute loading
   madvise

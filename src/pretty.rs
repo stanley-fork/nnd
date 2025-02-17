@@ -1078,8 +1078,9 @@ fn recognize_absl_inlined_vector(substruct: &mut Substruct, val: &mut Cow<Value>
     } else {
         let inner_size = unsafe {(*inner_type).calculate_size()};
         let inlined_size = unsafe {(*inlined_type).calculate_size()};
-        if len * inner_size > inlined_capacity * inlined_size {
-            return err!(Runtime, "short len > capacity: {}*{} > {}*{}", len, inner_size, inlined_capacity, inlined_size);
+        match (len.checked_mul(inner_size), inlined_capacity.checked_mul(inlined_size)) {
+            (Some(s), Some(inl)) if s <= inl => (),
+            _ => return err!(Runtime, "short len > capacity: {}*{} > {}*{} or overflow", len, inner_size, inlined_capacity, inlined_size),
         }
         return make_array_or_slice(val, inlined_field.start/8, len, inner_type, false, state);
     }

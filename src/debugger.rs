@@ -2446,21 +2446,21 @@ impl Debugger {
         let (val, _dubious) = eval_parsed_expression(expr, &mut eval_state, &mut eval_context)?;
         Ok(is_value_truthy(&val, &mut eval_context.memory)?)
     }
-}
 
-// Make a best effort to detach from the process, i.e. remove all breakpoints and detach from all threads.
-// Called just before exiting the process. Leaves the Debugger in potentially unusable state.
-// May be called from a panic handler in main thread, without unwinding the stack! The Debugger may be in inconsistent state,
-// so this function should make as few assumptions as possible about that.
-//
-// We can't guarantee that this semi-graceful detaching always happens (e.g. we may be SIGKILLed), but we at least do it on normal exit and on
-// panics in main thread. (Currently not on panics in other threads, though they should be rare; and not on things like segfaults.)
-//
-// (The PTRACE_DETACH part is probably not necessary, `man ptrace` says:
-//  "If the tracer dies, all tracees are automatically detached and restarted, unless they were in group-stop".
-//  We do it along the way anyway because it's easy, we have to stop all threads to unset debug registers anyway.)
-impl Drop for Debugger {
-    fn drop(&mut self) {
+    // Do cleanup just before exit. The Debugger is not usable after this.
+    //
+    // Make a best effort to detach from the process, i.e. remove all breakpoints and detach from all threads.
+    // Called just before exiting the process. Leaves the Debugger in potentially unusable state.
+    // May be called from a panic handler in main thread, without unwinding the stack! The Debugger may be in inconsistent state,
+    // so this function should make as few assumptions as possible about that.
+    //
+    // We can't guarantee that this semi-graceful detaching always happens (e.g. we may be SIGKILLed), but we at least do it on normal exit and on
+    // panics in main thread. (Currently not on panics in other threads, though they should be rare; and not on things like segfaults.)
+    //
+    // (The PTRACE_DETACH part is probably not necessary, `man ptrace` says:
+    //  "If the tracer dies, all tracees are automatically detached and restarted, unless they were in group-stop".
+    //  We do it along the way anyway because it's easy, we have to stop all threads to unset debug registers anyway.)
+    pub fn shutdown(&mut self) {
         if self.mode != RunMode::Attach || self.target_state == ProcessState::NoProcess {
             return;
         }
@@ -2539,5 +2539,11 @@ impl Drop for Debugger {
 
             running_threads.remove(&tid);
         }
+    }
+}
+
+impl Drop for Debugger {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }

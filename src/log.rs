@@ -128,6 +128,20 @@ impl TscScopeExcludingSyscalls {
     }
 }
 
+pub struct LogTimestampInDestructor(pub &'static str);
+impl Drop for LogTimestampInDestructor {
+    fn drop(&mut self) {
+        let mut t: libc::timespec;
+        let r;
+        unsafe {
+            t = mem::zeroed();
+            r = libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t as _);
+        }
+        assert!(r == 0);
+        eprintln!("[{}.{:09}] {}", t.tv_sec, t.tv_nsec, self.0);
+    }
+}
+
 pub struct ProfileBucket {
     // Currently not all syscalls are instrumented, only the few ones that are likely to be frequent in practice (especially syscalls that happen for each thread or for each ptrace event).
     pub syscall_count: usize,

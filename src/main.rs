@@ -395,9 +395,18 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, command_line: Option<Vec<S
             ui.update_and_render(&mut debugger)?;
 
             if ui.should_quit {
-                // Clean exit. Save state and call destructors. The only important destructor is TerminalRestorer.
+                // Clean exit. We need to:
+                //  * Save PersistentState.
+                //  * Detach from the process if in Attach mode. (If in Run mode, the process will get killed automatically because of PR_SET_PDEATHSIG).
+                //  * Restore terminal state.
+                //  * Flush stderr.
+                // After that, just quit without wasting time on calling all the destructors.
+                // In particular, destroying Symbols can take seconds, which is really annoying for the user. (That's mostly because of lots of small Vec-s in Symbols; it would be nice to get rid of them for loading performance too.)
                 PersistentState::try_to_save_state_if_changed(&mut debugger, &mut ui);
-                return Ok(());
+                debugger.shutdown();
+                restore_terminal();
+                LogTimestampInDestructor("shutdown complete");
+                std::process::exit(0); // flushes stderr
             }
 
             schedule_render |= ui.ui.should_redraw || ui.should_drop_caches;
