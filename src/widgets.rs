@@ -225,11 +225,13 @@ pub struct Column {
     pub title: &'static str,
     pub auto_width: AutoSize, // Fixed, Text, Children, Remainder are supported
     pub sortable: bool,
+    pub spacing: usize, // horizontal gap betwen end of previous column and start of this one; ignored for first column
     width: usize,
     pos: isize,
 }
 impl Column {
-    pub fn new(title: &'static str, auto_width: AutoSize, sortable: bool) -> Self { Self {auto_width, title, sortable, width: str_width(title) + sortable as usize, pos: 0} }
+    pub fn new(title: &'static str, auto_width: AutoSize, sortable: bool) -> Self { Self {auto_width, title, sortable, width: str_width(title) + sortable as usize, pos: 0, spacing: 1} }
+    pub fn with_spacing(mut self, spacing: usize) -> Self { self.spacing = spacing; self }
 }
 
 #[derive(Default, Clone)]
@@ -464,7 +466,7 @@ impl Table {
 
         // Calculate Remainder column widths.
         let mut remainder_helper = RemainderFractionHelper::new(ui.get(self.rows_container).axes[Axis::X].size);
-        remainder_helper.declare_fixed_part(self.columns.len().saturating_sub(1) + reserved);
+        remainder_helper.declare_fixed_part(reserved);
         for (col_idx, col) in self.columns.iter_mut().enumerate() {
             match col.auto_width {
                 AutoSize::Remainder(f) => remainder_helper.declare_remainder_fraction(f, col_idx),
@@ -475,15 +477,21 @@ impl Table {
                 }
                 _ => panic!("unexpected auto_width for column {}", col.title),
             }
+            if col_idx > 0 {
+                remainder_helper.declare_fixed_part(col.spacing);
+            }
         }
         let mut pos = 0isize;
         for (col_idx, col) in self.columns.iter_mut().enumerate() {
+            if col_idx > 0 {
+                pos += col.spacing as isize;
+            }
             match col.auto_width {
                 AutoSize::Remainder(f) => col.width = remainder_helper.calculate_remainder_fraction(f, col_idx),
                 _ => (),
             }
             col.pos = pos;
-            pos += 1 + col.width as isize;
+            pos += col.width as isize;
         }
 
         // Update all cells with final column widths and positions. (Instead of assigning positions manually we could add spacer widgets, but that would be slightly slower and no less code.)
@@ -1368,7 +1376,7 @@ impl SearchDialog {
             let mut columns = vec![Column::new("", AutoSize::Remainder(1.0), false)];
             if properties.have_mangled_names {
                 // Hidden column only visible in tooltip.
-                columns.push(Column::new("mangled name", AutoSize::Fixed(0), false));
+                columns.push(Column::new("mangled name", AutoSize::Fixed(0), false).with_spacing(0));
             }
             let mut table = Table::new(mem::take(&mut self.table_state), ui, columns);
             let range = table.lazy(res.results.len(), lines_per_result, ui);

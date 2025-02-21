@@ -1864,7 +1864,7 @@ fn open_debuglink(elf: &ElfFile) -> Result<Option<ElfFile>> {
             let filename = str::from_utf8(filename)?;
             let crc32 = u32::from_le_bytes(crc32.try_into().unwrap());
 
-            let build_id = elf.parse_note(build_id)?;
+            let (build_id, _) = parse_elf_note(elf.section_data(build_id))?;
             if build_id.desc.len() < 1 { return err!(Dwarf, ".note.gnu.build-id descr is too short: {}", build_id.desc.len()); }
 
             let path = format!("/usr/lib/debug/.build-id/{:02x}/{}", build_id.desc[0], filename);

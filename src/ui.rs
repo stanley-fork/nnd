@@ -72,7 +72,7 @@ pub trait WindowContent {
     // Called after some symbols finished loading, or if the user requested a redraw.
     fn drop_caches(&mut self) {}
 
-    fn get_key_hints(&self, out: &mut Vec<KeyHint>) {}
+    fn get_key_hints(&self, out: &mut Vec<KeyHint>, debugger: &Debugger) {}
 
     fn has_persistent_state(&self) -> bool {false}
     fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {panic!("unreachable")}
@@ -308,13 +308,12 @@ impl DebuggerUI {
 
         // Hints window content. Keep it brief, there's not much space.
         let mut hints = Vec::new();
-        if debugger.target_state == ProcessState::NoProcess {
-            hints.push(KeyHint::key(KeyAction::Quit, "quit"));
-        } else if debugger.mode == RunMode::Attach {
-            hints.push(KeyHint::key(KeyAction::Quit, "detach and quit"));
-        } else {
-            hints.push(KeyHint::key(KeyAction::Quit, "kill and quit"));
-        }
+        hints.push(KeyHint::key(KeyAction::Quit, match debugger.mode {
+            RunMode::CoreDump => "quit",
+            _ if debugger.target_state == ProcessState::NoProcess => "quit",
+            RunMode::Run => "kill and quit",
+            RunMode::Attach => "detach and quit",
+        }));
         hints.push(KeyHint::ranges(&[[KeyAction::Window0, KeyAction::Window9], [KeyAction::WindowLeft, KeyAction::WindowDown]], "switch window"));
         hints.push(KeyHint::keys(&[KeyAction::NextTab, KeyAction::PreviousTab], "switch tab"));
         match debugger.target_state {
@@ -334,13 +333,13 @@ impl DebuggerUI {
                 KeyHint::key(KeyAction::StepIntoInstruction, "run to early start")]),
             _ => (),
         }
-        if debugger.mode == RunMode::Run && debugger.target_state != ProcessState::NoProcess {
+        if debugger.mode == RunMode::Run && debugger.target_state.process_ready() {
             hints.push(KeyHint::key(KeyAction::Kill, "kill"));
         }
         if let &Some(id) = &self.layout.active_window {
             if let Some(w) = self.layout.windows.try_get(id) {
                 hints.push(KeyHint::keys(&[], "")); // spacer
-                w.content.get_key_hints(&mut hints);
+                w.content.get_key_hints(&mut hints, debugger);
             }
         }
         self.state.key_hints = hints;
@@ -1319,7 +1318,7 @@ impl WindowContent for WatchesWindow {
         self.seen.2 = usize::MAX;
     }
 
-    fn get_key_hints(&self, out: &mut Vec<KeyHint>) {
+    fn get_key_hints(&self, out: &mut Vec<KeyHint>, debugger: &Debugger) {
         out.extend([
             KeyHint::key(KeyAction::Enter, "edit/add"),
             KeyHint::key(KeyAction::DuplicateRow, "duplicate"),
@@ -1383,7 +1382,7 @@ impl WindowContent for LocationsWindow {
         });
     }
 
-    fn get_key_hints(&self, out: &mut Vec<KeyHint>) {
+    fn get_key_hints(&self, out: &mut Vec<KeyHint>, debugger: &Debugger) {
         out.extend([
             KeyHint::key(KeyAction::Tooltip, "tooltip"),
         ]);
@@ -2215,13 +2214,19 @@ impl WindowContent for DisassemblyWindow {
         });
     }
 
-    fn get_key_hints(&self, out: &mut Vec<KeyHint>) {
+    fn get_key_hints(&self, out: &mut Vec<KeyHint>, debugger: &Debugger) {
         out.extend([
             KeyHint::key(KeyAction::Open, "find function"),
+            KeyHint::key(KeyAction::GoToLine, "go to address"),
             KeyHint::key(KeyAction::CloseTab, "close/pin tab"),
-            KeyHint::keys(&[KeyAction::Enter, KeyAction::DeleteRow, KeyAction::EditCondition], "toggle/delete/edit breakpoint"),
-            KeyHint::key(KeyAction::StepToCursor, "run to cursor"),
-            KeyHint::keys(&[KeyAction::PreviousLocation, KeyAction::NextLocation], "select level")]);
+            KeyHint::keys(&[KeyAction::PreviousLocation, KeyAction::NextLocation], "select level"),
+        ]);
+        if debugger.mode != RunMode::CoreDump {
+            out.extend([
+                KeyHint::keys(&[KeyAction::Enter, KeyAction::DeleteRow, KeyAction::EditCondition], "breakpoint"),
+                KeyHint::key(KeyAction::StepToCursor, "run to cursor"),
+            ]);
+        }
     }
 
     fn has_persistent_state(&self) -> bool {
@@ -2311,7 +2316,7 @@ impl WindowContent for StatusWindow {
             ProcessState::Stepping => ui_writeln!(ui, state_other, "stepping"),
             ProcessState::Running if debugger.stopped_until_symbols_are_loaded.is_some() => ui_writeln!(ui, state_other, "loading symbols ({}%), then running", symbols_progress_pct),
             ProcessState::Running => ui_writeln!(ui, state_running, "running"),
-            ProcessState::Suspended => {
+            ProcessState::Suspended | ProcessState::CoreDump => {
                 let mut stop_reason: (isize, Option<StopReason>) = (-1, None);
                 for (tid, thread) in &debugger.threads {
                     for reason in &thread.stop_reasons {
@@ -2321,12 +2326,13 @@ impl WindowContent for StatusWindow {
                         }
                     }
                 }
+                let state = if debugger.target_state == ProcessState::Suspended {"suspended"} else {"core dump"};
                 match stop_reason.1 {
-                    None => ui_writeln!(ui, state_suspended, "suspended"),
-                    Some(StopReason::Breakpoint(_)) => ui_writeln!(ui, state_suspended, "suspended (hit breakpoint)"),
-                    Some(StopReason::Step) => ui_writeln!(ui, state_suspended, "suspended (stepped)"),
-                    Some(StopReason::Exception) => ui_writeln!(ui, state_suspended, "suspended (exception during step)"),
-                    Some(StopReason::Signal(s)) => styled_writeln!(ui.text, ui.palette.thread_crash.apply(ui.palette.state_suspended), "suspended (signal {})", signal_name(s)),
+                    None => ui_writeln!(ui, state_suspended, "{}", state),
+                    Some(StopReason::Breakpoint(_)) => ui_writeln!(ui, state_suspended, "{} (hit breakpoint)", state),
+                    Some(StopReason::Step) => ui_writeln!(ui, state_suspended, "{} (stepped)", state),
+                    Some(StopReason::Exception) => ui_writeln!(ui, state_suspended, "{} (exception during step)", state),
+                    Some(StopReason::Signal(s)) => styled_writeln!(ui.text, ui.palette.thread_crash.apply(ui.palette.state_suspended), "{} (signal {})", state, signal_name(s)),
                 }
             }
         };
@@ -2334,12 +2340,13 @@ impl WindowContent for StatusWindow {
         ui.add(widget!().height(AutoSize::Text).text(l).fill(' ', style));
 
         let start = ui.text.num_lines();
-        if debugger.target_state != ProcessState::NoProcess {
-            ui_write!(ui, default_dim, "pid: ");
-            ui_write!(ui, default, "{}", debugger.pid);
-            ui_writeln!(ui, default_dim, " cpu {:.0}% mem {}", debugger.info.total_resource_stats.cpu_percentage(debugger.context.settings.periodic_timer_ns), PrettySize(debugger.info.total_resource_stats.latest.rss_bytes()));
-        } else {
-            ui_writeln!(ui, default_dim, "pid: none");
+        match debugger.target_state {
+            ProcessState::NoProcess | ProcessState::CoreDump => {ui_writeln!(ui, default_dim, "pid: none");}
+            _ => {
+                ui_write!(ui, default_dim, "pid: ");
+                ui_write!(ui, default, "{}", debugger.pid);
+                ui_writeln!(ui, default_dim, " cpu {:.0}% mem {}", debugger.info.total_resource_stats.cpu_percentage(debugger.context.settings.periodic_timer_ns), PrettySize(debugger.info.total_resource_stats.latest.rss_bytes()));
+            }
         }
         ui_writeln!(ui, default_dim, "nnd pid: {} cpu {:.0}% mem {}", my_pid(), debugger.my_resource_stats.cpu_percentage(debugger.context.settings.periodic_timer_ns), PrettySize(debugger.my_resource_stats.latest.rss_bytes()));
         match &debugger.persistent.path {
@@ -2680,7 +2687,7 @@ impl WindowContent for BinariesWindow {
         self.table_state = table.finish(ui);
     }
 
-    fn get_key_hints(&self, out: &mut Vec<KeyHint>) {
+    fn get_key_hints(&self, out: &mut Vec<KeyHint>, debugger: &Debugger) {
         out.extend([
             KeyHint::key(KeyAction::Tooltip, "tooltip"),
         ]);
@@ -2789,7 +2796,7 @@ impl WindowContent for ThreadsWindow {
         for action in ui.check_keys(&[KeyAction::Find, KeyAction::ToggleSort]) {
             match action {
                 KeyAction::Find => self.filter.bar.start_editing(),
-                KeyAction::ToggleSort => {
+                KeyAction::ToggleSort if debugger.mode != RunMode::CoreDump => {
                     (self.table_state.sort_column, self.table_state.sort_descending) =
                         if (self.table_state.sort_column, self.table_state.sort_descending) == (0, false) {
                             (4, true)
@@ -2812,13 +2819,14 @@ impl WindowContent for ThreadsWindow {
         });
         ui.layout_children(Axis::Y);
 
+        let have_stats = (debugger.mode != RunMode::CoreDump) as usize;
         let mut table = with_parent!(ui, table_widget, {
             Table::new(mem::take(&mut self.table_state), ui, vec![
                 Column::new("idx", AutoSize::Fixed(5), true),
                 Column::new("tid", AutoSize::Fixed(10), true),
                 Column::new("name", AutoSize::Fixed(15), true),
-                Column::new("s", AutoSize::Fixed(1), true),
-                Column::new("cpu", AutoSize::Fixed(4), true),
+                Column::new("s", AutoSize::Fixed(2*have_stats), true).with_spacing(have_stats),
+                Column::new("cpu", AutoSize::Fixed(4*have_stats), true).with_spacing(have_stats),
                 Column::new("function", AutoSize::Remainder(1.0), false),
                 Column::new("addr", AutoSize::Fixed(12), true),
                 Column::new("bin", AutoSize::Fixed(3), false),
@@ -3010,12 +3018,16 @@ impl WindowContent for ThreadsWindow {
         self.filter.cached_results.clear();
     }
 
-    fn get_key_hints(&self, out: &mut Vec<KeyHint>) {
+    fn get_key_hints(&self, out: &mut Vec<KeyHint>, debugger: &Debugger) {
         out.extend([
             KeyHint::key(KeyAction::Find, "filter"),
-            KeyHint::key(KeyAction::ToggleSort, "sort by cpu"),
             KeyHint::key(KeyAction::Tooltip, "tooltip"),
         ]);
+        if debugger.mode != RunMode::CoreDump {
+            out.extend([
+                KeyHint::key(KeyAction::ToggleSort, "sort by cpu"),
+            ]);
+        }
     }
 }
 
@@ -3230,7 +3242,7 @@ impl WindowContent for StackWindow {
         self.rerequest_scroll = true;
     }
 
-    fn get_key_hints(&self, out: &mut Vec<KeyHint>) {
+    fn get_key_hints(&self, out: &mut Vec<KeyHint>, debugger: &Debugger) {
         out.extend([
             KeyHint::key(KeyAction::Tooltip, "tooltip"),
         ]);
@@ -4071,17 +4083,21 @@ impl WindowContent for CodeWindow {
         self.search.tab_identity = 0;
     }
 
-    fn get_key_hints(&self, out: &mut Vec<KeyHint>) {
+    fn get_key_hints(&self, out: &mut Vec<KeyHint>, debugger: &Debugger) {
         out.extend([
             KeyHint::key(KeyAction::Open, "open file"),
             KeyHint::key(KeyAction::CloseTab, "close/pin tab"),
-            KeyHint::keys(&[KeyAction::Enter, KeyAction::DeleteRow, KeyAction::EditCondition], "toggle/delete/edit breakpoint"),
-            KeyHint::key(KeyAction::StepToCursor, "run to cursor"),
             KeyHint::keys(&[KeyAction::PreviousLocation, KeyAction::NextLocation], "cycle disasm addrs"),
             KeyHint::key(KeyAction::GoToLine, "go to line"),
             KeyHint::key(KeyAction::Find, "find"),
             KeyHint::keys(&[KeyAction::NextMatch, KeyAction::PreviousMatch], "find next/previous"),
         ]);
+        if debugger.mode != RunMode::CoreDump {
+            out.extend([
+                KeyHint::keys(&[KeyAction::Enter, KeyAction::DeleteRow, KeyAction::EditCondition], "toggle/delete/edit breakpoint"),
+                KeyHint::key(KeyAction::StepToCursor, "run to cursor"),
+            ]);
+        }
     }
 
     fn has_persistent_state(&self) -> bool {
@@ -4124,7 +4140,7 @@ struct BreakpointsWindow {
     condition_input: Option<(BreakpointId, TextInput)>,
 }
 impl WindowContent for BreakpointsWindow {
-    fn get_key_hints(&self, out: &mut Vec<KeyHint>) {
+    fn get_key_hints(&self, out: &mut Vec<KeyHint>, debugger: &Debugger) {
         out.extend([
             KeyHint::key(KeyAction::DeleteRow, "delete breakpoint"),
             KeyHint::keys(&[KeyAction::Enter, KeyAction::EditCondition], "enable/disable/edit breakpoint"),

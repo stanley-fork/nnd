@@ -1,6 +1,6 @@
 use crate::{*, error::*, log::*};
 use libc::{pid_t, c_char, c_void};
-use std::{io, io::{Read, BufReader, BufRead, Write}, str::FromStr, ptr, mem, mem::ManuallyDrop, fmt, fmt::Write as fmtWrite, os::fd::{RawFd, AsRawFd}, ffi::{CStr, OsString, CString}, os::unix::ffi::{OsStringExt, OsStrExt}, arch::asm, cell::UnsafeCell, sync::atomic::{AtomicBool, Ordering}, ops::{Deref, DerefMut, FnOnce}, fs::File, collections::{BinaryHeap, hash_map::DefaultHasher}, hash::{Hash, Hasher}, cmp::Ord, cmp, path::{Path, PathBuf}};
+use std::{io, io::{Read, BufReader, BufRead, Write}, str::FromStr, ptr, mem, mem::{ManuallyDrop, MaybeUninit}, fmt, fmt::Write as fmtWrite, os::fd::{RawFd, AsRawFd}, ffi::{CStr, OsString, CString}, os::unix::ffi::{OsStringExt, OsStrExt}, arch::asm, cell::UnsafeCell, sync::atomic::{AtomicBool, Ordering}, ops::{Deref, DerefMut, FnOnce}, fs::File, collections::{BinaryHeap, hash_map::DefaultHasher}, hash::{Hash, Hasher}, cmp::Ord, cmp, path::{Path, PathBuf}};
 
 pub fn tgkill(pid: pid_t, tid: pid_t, sig: i32) -> Result<i32> {
     //eprintln!("trace: tgkill({}, {}, {})", pid, tid, sig);
@@ -22,11 +22,9 @@ pub fn tgkill(pid: pid_t, tid: pid_t, sig: i32) -> Result<i32> {
     Ok(ret)
 }
 
-pub unsafe fn ptrace(request: i32, pid: pid_t, addr: u64, data: u64, prof: &mut ProfileBucket) -> Result<i64> {
+pub unsafe fn ptrace(request: i32, pid: pid_t, addr: u64, data: u64, _prof: &mut ProfileBucket) -> Result<i64> {
     (*libc::__errno_location()) = 0;
-    let r = profile_syscall!(prof, {
-        libc::ptrace(request, pid, addr, data)
-    });
+    let r = profile_syscall!(libc::ptrace(request, pid, addr, data));
     //eprintln!("trace: ptrace({}, {}, 0x{:x}, 0x{:x}) -> 0x{:x}", ptrace_request_name(request), pid, addr, data, r);
     if r == -1 {
         if (*libc::__errno_location()) != 0 {
@@ -754,3 +752,15 @@ impl Drop for Mmap {
 }
 unsafe impl Send for Mmap {}
 unsafe impl Sync for Mmap {}
+
+pub unsafe fn memcpy_struct<'a, T: Copy>(a: &'a [u8], name: &'static str) -> Result<(T, /*remainder*/ &'a [u8])> {
+    let sizeof = mem::size_of::<T>();
+    if a.len() < sizeof {
+        return err!(MalformedExecutable, "{} too short: {} < {}", name, a.len(), sizeof);
+    }
+    unsafe {
+        let mut t: MaybeUninit<T> = MaybeUninit::uninit();
+        ptr::copy_nonoverlapping(a.as_ptr(), &raw mut t as *mut u8, sizeof);
+        Ok((t.assume_init(), &a[sizeof..]))
+    }
+}

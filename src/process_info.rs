@@ -1,5 +1,5 @@
-use crate::{*, debugger::*, error::*, util::*, symbols::*, symbols_registry::*, procfs::*, unwind::*, registers::*, log::*, settings::*};
-use std::{collections::{HashMap, hash_map::Entry}, time::Instant, fs, os::unix::fs::MetadataExt};
+use crate::{*, debugger::*, error::*, util::*, symbols::*, symbols_registry::*, procfs::*, unwind::*, registers::*, log::*, settings::*, elf::*};
+use std::{collections::{HashMap, hash_map::Entry}, time::Instant, fs, os::unix::fs::MetadataExt, sync::Arc, ops::Range};
 use std::mem;
 use libc::pid_t;
 
@@ -110,15 +110,17 @@ impl ProcessInfo {
 }
 
 impl ThreadInfo {
-    pub fn invalidate(&mut self) {
-        self.regs = Registers::default();
+    pub fn invalidate(&mut self, mode: RunMode) {
+        if mode != RunMode::CoreDump {
+            self.regs = Registers::default();
+        }
         self.partial_stack = None;
         self.stack = None;
     }
 }
 
 pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) -> /*binaries_added*/ bool {
-    if debugger.info.exe_inode == 0 {
+    if debugger.info.exe_inode == 0 && debugger.target_state.process_ready() {
         let path = format!("/proc/{}/exe", debugger.pid);
         let m = match fs::metadata(&path) {
             Err(e) => {
@@ -133,15 +135,26 @@ pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) -> /*binaries_add
         }
     }
 
-    let mut maps = match MemMapsInfo::read_proc_maps(debugger.pid) {
-        Err(e) => {
-            eprintln!("error: failed to read maps: {}", e);
-            return false;
+    let mut maps = if debugger.mode == RunMode::CoreDump {
+        // For core dump, we need to do refresh_maps_and_binaries_info() twice even though maps never change.
+        // The first time we kick off symbols loading for all mapped binaries.
+        // After ELF files for all binaries are loaded, we need to point CoreDumpMemReader to them - that's what subsequent refreshes are for.
+        // Why not just parse ELF headers for all binaries synchronously in first refresh?
+        // Because the plan is to support downloading binaries from debuginfod, which is not necessarily fast, so we shouldn't lock up the UI.
+        debugger.info.maps.clone()
+    } else {
+        match MemMapsInfo::read_proc_maps(debugger.pid) {
+            Err(e) => {
+                eprintln!("error: failed to read maps: {}", e);
+                return false;
+            }
+            Ok(m) => m
         }
-        Ok(m) => m };
+    };
 
     let prev_mapped = debugger.symbols.mark_all_as_unmapped();
 
+    let mut new_elves: Vec<(Range<usize>, /*offset*/ usize, Arc<ElfFile>)> = Vec::new();
     for (idx, map) in maps.maps.iter_mut().enumerate() {
         let locator = match &map.binary_locator {
             None => continue,
@@ -150,9 +163,10 @@ pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) -> /*binaries_add
         let bin = match debugger.symbols.locator_to_id.get(locator) {
             Some(id) => debugger.symbols.get_mut(*id).unwrap(),
             None => {
+                //asdqwe extract build id, pass it to registry, have it index and use supplementary binaries (with fallback to matching by file name if build ids are missing, maybe have a setting to ignore build id), put error in Binary if file name matches but build id doesn't
                 let mut additional_elf_paths: Vec<String> = Vec::new();
-                let custom_path = if locator.inode == debugger.info.exe_inode {
-                    if let Some(p) = debugger.context.settings.unstripped_executable_path.clone() {
+                let custom_path = if debugger.mode != RunMode::CoreDump && locator.inode == debugger.info.exe_inode {
+                    if let Some(p) = debugger.context.settings.main_executable_path.clone() {//asdqwe delet
                         additional_elf_paths.push(p);
                     }
 
@@ -171,10 +185,40 @@ pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) -> /*binaries_add
             bin.addr_map.update(map, elf, &locator.path);
         }
         bin.mmap_idx = idx;
+        if !map.elf_seen {
+            if let Ok(elf) = &bin.elf {
+                map.elf_seen = true;
+                new_elves.push((map.start..map.start+map.len, map.offset, elf.clone()));
+            }
+        }
     }
     debugger.symbols.update_priority_order();
 
     debugger.info.maps = maps;
+
+    if !new_elves.is_empty() && debugger.mode == RunMode::CoreDump {
+        let mut new_ranges = match &debugger.memory {
+            MemReader::CoreDump(x) => x.ranges.clone(),
+            _ => panic!("huh"),
+        };
+        for (range, off, elf) in new_elves {
+            // (It's not expected that new_ranges has ranges that partially overlap the mmap range, so we silently ignore them instead of splitting.)
+            let mut idx = new_ranges.partition_point(|r| r.start_address < range.start);
+            while idx < new_ranges.len() && new_ranges[idx].start_address < range.end {
+                let r = &mut new_ranges[idx];
+                match &r.source {
+                    CoreDumpMemorySource::MissingFile => {
+                        // Core dump says that the crashed process had this address range mapped to a file, and we located that file (`elf`). Point MemReader to it.
+                        let offset = off + (r.start_address - range.start);
+                        r.source = CoreDumpMemorySource::File {file: elf.clone(), offset};
+                    }
+                    _ => (),
+                }
+                idx += 1;
+            }
+        }
+        debugger.memory = MemReader::CoreDump(Arc::new(CoreDumpMemReader {ranges: new_ranges}));
+    }
 
     // Check if any of the mapped binaries are new or changed address.
     for b in debugger.symbols.iter() {
@@ -190,6 +234,9 @@ pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) -> /*binaries_add
 // Should also be called when the thread is created (to assign thread name) or resumed (to update stats).
 // We skip calling this if the thread was suspended and immediately resumed, e.g. skipped conditional breakpoints or passed-through user signals.
 pub fn refresh_thread_info(pid: pid_t, t: &mut Thread, prof: &mut ProfileBucket, settings: &Settings) {
+    if pid == 0 { // core dump
+        return;
+    }
     if !t.exiting {
         let s = ProcStat::parse(&format!("/proc/{}/task/{}/stat", pid, t.tid), prof);
         t.info.resource_stats.update(s, Instant::now(), t.state == ThreadState::Suspended, settings.periodic_timer_ns);
@@ -211,18 +258,21 @@ pub fn refresh_all_resource_stats(pid: pid_t, my_stats: &mut ResourceStats, debu
     let now = Instant::now();
     my_stats.update(ProcStat::parse("/proc/self/stat", prof), now, false, settings.periodic_timer_ns);
     let mut any_error = my_stats.error.clone();
-    if !threads.is_empty() {
-        debuggee_stats.update(ProcStat::parse(&format!("/proc/{}/stat", pid), prof), now, false, settings.periodic_timer_ns);
-        any_error = any_error.or_else(|| debuggee_stats.error.clone());
-    } else {
-        *debuggee_stats = ResourceStats::default();
-    }
 
-    for (tid, t) in threads {
-        if !t.exiting {
-            let s = ProcStat::parse(&format!("/proc/{}/task/{}/stat", pid, tid), prof);
-            t.info.resource_stats.update(s, Instant::now(), t.state == ThreadState::Suspended, settings.periodic_timer_ns);
-            any_error = any_error.or_else(|| t.info.resource_stats.error.clone());
+    if pid != 0 {
+        if !threads.is_empty() {
+            debuggee_stats.update(ProcStat::parse(&format!("/proc/{}/stat", pid), prof), now, false, settings.periodic_timer_ns);
+            any_error = any_error.or_else(|| debuggee_stats.error.clone());
+        } else {
+            *debuggee_stats = ResourceStats::default();
+        }
+
+        for (tid, t) in threads {
+            if !t.exiting {
+                let s = ProcStat::parse(&format!("/proc/{}/task/{}/stat", pid, tid), prof);
+                t.info.resource_stats.update(s, Instant::now(), t.state == ThreadState::Suspended, settings.periodic_timer_ns);
+                any_error = any_error.or_else(|| t.info.resource_stats.error.clone());
+            }
         }
     }
 

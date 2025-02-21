@@ -344,15 +344,18 @@ impl UnwindInfo {
             return Ok(None);
         }
 
-        let offset = regs.get_int(RegisterIdx::Rsp).unwrap().0 as usize + offsetof!(libc::ucontext_t, uc_mcontext.gregs);
-        let mut gregs = [0u64; 23];
+        let offset = regs.get_int(RegisterIdx::Rsp).unwrap().0 as usize + offsetof!(libc::ucontext_t, uc_mcontext);
+        let mut mcontext: libc::mcontext_t;
         unsafe {
-            let size = gregs.len() * 8;
-            let slice = std::slice::from_raw_parts_mut(gregs.as_mut_ptr() as *mut u8, size);
+            mcontext = mem::zeroed();
+            let slice = std::slice::from_raw_parts_mut(&raw mut mcontext as *mut u8, mem::size_of::<libc::mcontext_t>());
             memory.read(offset, slice)?;
         }
 
-        Ok(Some(Registers::from_context(&gregs)))
+        let mut new_regs = Registers::from_context(&mcontext.gregs);
+        //asdqwe read xsave from *mcontext.fpregs
+
+        Ok(Some(new_regs))
     }
 }
 

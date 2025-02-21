@@ -1,3 +1,14 @@
+core dumps:
+hide ui things in core dump mode: pid, resource stats in status window, cpu usage in threads window, hints for stepping and breakpoints, etc
+search for pid to see what else to disable
+test with breakpad minidumps
+fetch from debuginfod
+test that signaled thread is selected on startup
+match by build id, repeated --exe
+documentation
+  command line
+  repeated --exe
+
 bugs:
 investigate `clickhouse local` progress spinner appearing in debugger window despite -t
 fix empty symbols loading stage name near the end
@@ -28,6 +39,7 @@ test with 10k threads
 test with watches window filled with long arrays (I saw 50ms frames when there are ~5 of them; maybe just decrease length limit)
 
 todo:
+core dumps
 use RssAnon (from /proc/pid/status) instead of VmRss (includes page cache)
 don't immediately kill child on debugger panic; have a simple fallback state where the child is running, and the user can kill+quit, detach+quit, or do nothing (maybe also pause/resume)
 allow specifying cgroup and user (or maybe it's too hard, need to maybe inherit groups from parent somehow too)
@@ -104,7 +116,6 @@ watches, expressions
   make basic types like u16 available without big search, with consistent names
   also consider subset of the language for injecting conditional breakpoint code
 
-opening core dumps
 show disassembly even if symbols are missing
 group threads by stack trace, to make it easy to exclude pool threads waiting for work
 show return value after step-out (and other steps that happened to step out)

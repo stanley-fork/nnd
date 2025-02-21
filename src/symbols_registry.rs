@@ -58,7 +58,7 @@ impl SymbolsRegistry {
         let mut elf_contents_maybe: Result<Vec<u8>> = err!(Internal, "no contents");
         match &locator.special {
             SpecialSegmentId::None => (),
-            SpecialSegmentId::Vdso((_, range)) => {
+            SpecialSegmentId::Vdso(range) => {
                 let mut buf: Vec<u8> = vec![0; range.len()];
                 elf_contents_maybe = match memory.read(range.start, &mut buf) {
                     Err(e) => Err(e),
@@ -221,7 +221,7 @@ fn load_elf(locator: &BinaryLocator, contents_maybe: Result<Vec<u8>>, custom_pat
             let path = custom_path.as_ref().unwrap_or(&locator.path);
             let file = File::open(path)?;
             let metadata = file.metadata()?;
-            if metadata.ino() != locator.inode && custom_path.is_none() {
+            if locator.inode != 0 && metadata.ino() != locator.inode && custom_path.is_none() {
                 return err!(Usage, "binary changed");
             }
             // TODO: Try madvise()ing the big sections: MADV_WILLNEED all .debug_* sections et al, MADV_SEQUENTIAL the .debug_info, MADV_RANDOM .debug_str, MADV_DONTNEED .debug_info after loading.
@@ -231,6 +231,9 @@ fn load_elf(locator: &BinaryLocator, contents_maybe: Result<Vec<u8>>, custom_pat
             ElfFile::from_contents(locator.path.clone(), contents_maybe?)?
         }
     };
+    if elf.is_core_dump {
+        return err!(ProcessState, "unexpected core dump instead of executable");
+    }
     Ok(Arc::new(elf))
 }
 

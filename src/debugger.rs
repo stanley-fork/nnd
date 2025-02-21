@@ -7,7 +7,10 @@ use std::{io, ptr, rc::Rc, collections::{HashMap, VecDeque, HashSet}, mem, path:
 pub enum RunMode {
     Run, // start the program inside the debugger
     Attach, // attach to a running process
-    // TODO: CoreDump,
+    CoreDump,
+}
+impl RunMode {
+    pub fn human_string(self) -> &'static str { match self {RunMode::Run => "run", RunMode::Attach => "attach", RunMode::CoreDump => "coredump"} }
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -19,12 +22,14 @@ pub enum ProcessState {
     Running,
     Suspended,
 
+    CoreDump, // something between NoProcess and Suspended
+
     Stepping,
 }
 impl ProcessState {
     pub fn process_ready(self) -> bool {
         match self {
-            Self::NoProcess | Self::Starting | Self::Exiting => false,
+            Self::NoProcess | Self::Starting | Self::Exiting | Self::CoreDump => false,
             Self::Running | Self::Suspended | Self::Stepping => true,
         }
     }
@@ -372,7 +377,7 @@ impl Thread {
 
 impl Debugger {
     fn new(mode: RunMode, command_line: Vec<String>, context: Arc<Context>, symbols: SymbolsRegistry, breakpoints: Pool<Breakpoint>, persistent: PersistentState, my_resource_stats: ResourceStats, prof: Profiling) -> Self {
-        Debugger {mode, command_line, context, pid: 0, target_state: ProcessState::NoProcess, log: Log::new(), prof, threads: HashMap::new(), pending_wait_events: VecDeque::new(), next_thread_idx: 1, info: ProcessInfo::default(), my_resource_stats, symbols, memory: MemReader::invalid(), waiting_for_initial_sigstop: false, stepping: None, pending_step: None, breakpoint_locations: Vec::new(), breakpoints, stopping_to_handle_breakpoints: false, stopped_until_symbols_are_loaded: None, hardware_breakpoints: std::array::from_fn(|_| HardwareBreakpoint {active: false, thread_specific: None, addr: 0}), persistent}
+        Debugger {mode, command_line, context, pid: 0, target_state: ProcessState::NoProcess, log: Log::new(), prof, threads: HashMap::new(), pending_wait_events: VecDeque::new(), next_thread_idx: 1, info: ProcessInfo::default(), my_resource_stats, symbols, memory: MemReader::Invalid, waiting_for_initial_sigstop: false, stepping: None, pending_step: None, breakpoint_locations: Vec::new(), breakpoints, stopping_to_handle_breakpoints: false, stopped_until_symbols_are_loaded: None, hardware_breakpoints: std::array::from_fn(|_| HardwareBreakpoint {active: false, thread_specific: None, addr: 0}), persistent}
     }
 
     pub fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {
@@ -404,7 +409,7 @@ impl Debugger {
         let mut r = Self::new(RunMode::Attach, Vec::new(), context.clone(), SymbolsRegistry::new(context), Pool::new(), persistent, ResourceStats::default(), Profiling::new());
         r.pid = pid;
         r.target_state = ProcessState::Running;
-        r.memory = MemReader::new(pid);
+        r.memory = MemReader::Pid(PidMemReader::new(pid));
 
         let mut seen_threads: HashSet<pid_t> = HashSet::new();
         for round in 0.. {
@@ -446,8 +451,31 @@ impl Debugger {
         Ok(r)
     }
 
+    pub fn open_core_dump(core_dump_path: &str, context: Arc<Context>, persistent: PersistentState) -> Result<Self> {
+        let file = fs::File::open(core_dump_path)?;
+        let metadata = file.metadata()?;
+        let elf = ElfFile::from_file(core_dump_path.to_string(), &file, metadata.len())?;
+        let (memory, threads, maps) = parse_core_dump(Arc::new(elf))?;
+        let mut r = Self::new(RunMode::CoreDump, Vec::new(), context.clone(), SymbolsRegistry::new(context), Pool::new(), persistent, ResourceStats::default(), Profiling::new());
+        r.pid = 0; // (we could use pid from core dump, but that would just be inviting bugs; if we ever want to show it in ui, we should put it somewhere other than this field and and special-case it in ui)
+        r.target_state = ProcessState::CoreDump;
+        r.info.maps = maps;
+        r.memory = MemReader::CoreDump(Arc::new(memory));
+        for (tid, info, signal) in threads {
+            let mut t = Thread::new(r.next_thread_idx, tid, ThreadState::Suspended);
+            r.next_thread_idx += 1;
+            t.info = info;
+            if let Some(s) = signal {
+                t.stop_reasons.push(StopReason::Signal(s));
+            }
+            r.threads.insert(tid, t);
+        }
+        refresh_maps_and_binaries_info(&mut r);
+        Ok(r)
+    }
+
     pub fn start_child(&mut self, initial_step: Option<BreakpointOn>) -> Result<()> {
-        if self.mode != RunMode::Run { return err!(Usage, "can't start new process in attach mode"); }
+        if self.mode != RunMode::Run { return err!(Usage, "can't start new process in {} mode", self.mode.human_string()); }
         if self.target_state != ProcessState::NoProcess { return err!(Usage, "already debugging, can't start"); }
         eprintln!("info: starting child");
 
@@ -540,6 +568,7 @@ impl Debugger {
                     }
 
                     // This is probably not necessary, but makes debugging sessions more reproducible.
+                    //asdqwe add a setting to disable it, use it all the time to test better
                     if libc::personality(libc::ADDR_NO_RANDOMIZE as u64) == -1 {
                         msg = b"child: failed to disable ASLR\0";
                         break 'child;
@@ -582,7 +611,7 @@ impl Debugger {
         self.target_state = ProcessState::Starting;
         self.pending_step = initial_step.map(|on| (pid, on));
         self.waiting_for_initial_sigstop = true;
-        self.memory = MemReader::new(pid);
+        self.memory = MemReader::Pid(PidMemReader::new(pid));
         let thread = Thread::new(self.next_thread_idx, pid, ThreadState::Running);
         self.threads.insert(pid, thread);
         self.next_thread_idx += 1;
@@ -591,6 +620,10 @@ impl Debugger {
     }
 
     pub fn process_events(&mut self) -> Result<(/*have_more_events_to_process*/ bool, /*drop_caches*/ bool)> {
+        if self.mode == RunMode::CoreDump {
+            return Ok((false, false));
+        }
+        
         // If all we did was skip conditional breakpoints, don't waste time refreshing process info. Otherwise conditional breakpoints would be very slow.
         // (Also useful for other spurious traps, e.g. when doing step-over in a recursive function.)
         let mut refresh_info = false;
@@ -627,9 +660,7 @@ impl Debugger {
                     }
                 }
                 if thread.is_none() {
-                    tid = profile_syscall!(self.prof.bucket, {
-                        libc::waitpid(-1, &mut wstatus, libc::WNOHANG)
-                    });
+                    tid = profile_syscall!(libc::waitpid(-1, &mut wstatus, libc::WNOHANG));
                     if tid < 0 { return errno_err!("waitpid() failed"); }
                     if tid == 0 {
                         break;
@@ -671,7 +702,7 @@ impl Debugger {
                         self.target_state = ProcessState::NoProcess;
                         self.info.clear();
                         self.symbols.mark_all_as_unmapped();
-                        self.memory = MemReader::invalid();
+                        self.memory = MemReader::Invalid;
                     } else if stepping_this_thread {
                         self.suspend()?;
                     }
@@ -681,7 +712,7 @@ impl Debugger {
                     let thread_prev_state = mem::replace(&mut thread.state, ThreadState::Suspended);
                     let mut thread_initial_stop = false;
                     thread.subframe_to_select = None;
-                    thread.info.invalidate();
+                    thread.info.invalidate(self.mode);
                     let mut force_resume = thread.exiting;
 
                     if signal == libc::SIGSTOP && self.waiting_for_initial_sigstop {
@@ -876,7 +907,7 @@ impl Debugger {
         }
         match self.target_state {
             ProcessState::NoProcess | ProcessState::Starting | ProcessState::Exiting | ProcessState::Running => ThreadState::Running,
-            ProcessState::Suspended => ThreadState::Suspended,
+            ProcessState::Suspended | ProcessState::CoreDump => ThreadState::Suspended,
             ProcessState::Stepping => {
                 let s = self.stepping.as_ref().unwrap();
                 if s.tid == tid || !s.keep_other_threads_suspended { ThreadState::Running } else { ThreadState::Suspended }
@@ -905,11 +936,15 @@ impl Debugger {
         if self.target_state.process_ready() {
             refresh_maps_and_binaries_info(self);
             for t in self.threads.values_mut() {
-                t.info.invalidate();
+                t.info.invalidate(self.mode);
                 refresh_thread_info(self.pid, t, &mut self.prof.bucket, &self.context.settings);
             }
-
             self.try_pending_step_and_activate_breakpoints()?;
+        } else if self.mode == RunMode::CoreDump {
+            refresh_maps_and_binaries_info(self);
+            for t in self.threads.values_mut() {
+                t.info.invalidate(self.mode);
+            }            
         }
 
         Ok(())
@@ -960,7 +995,7 @@ impl Debugger {
 
     pub fn murder(&mut self) -> Result<()> {
         if self.mode == RunMode::Attach { return err!(Usage, "not killing attached process"); }
-        if self.target_state == ProcessState::NoProcess || self.target_state == ProcessState::Exiting { return err!(Usage, "no process"); }
+        if !self.target_state.process_ready() { return err!(Usage, "no process"); }
         eprintln!("info: kill");
         unsafe {
             let r = libc::kill(self.pid, libc::SIGKILL);
@@ -1474,7 +1509,7 @@ impl Debugger {
         match self.target_state {
             ProcessState::Suspended | ProcessState::Running | ProcessState::Stepping => (),
             ProcessState::NoProcess => return self.start_child(Some(cursor)),
-            ProcessState::Starting | ProcessState::Exiting => return err!(Usage, "not ready"),
+            ProcessState::Starting | ProcessState::Exiting | ProcessState::CoreDump => return err!(Usage, "not ready"),
         }
         if self.threads.get(&tid).is_none() {
             return err!(Usage, "no thread");
@@ -2023,7 +2058,6 @@ impl Debugger {
         } else {
             let byte_idx = addr % 8;
             let bit_idx = byte_idx * 8;
-            // Note that some threads might be running right now, so this is a bit precarious, but should still be correct.
             let word = self.memory.read_u64(addr - byte_idx)?;
             self.breakpoint_locations[idx].original_byte = ((word >> bit_idx) & 0xff) as u8;
             let word = word & !(0xff << bit_idx) | (0xcc << bit_idx);

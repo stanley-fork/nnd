@@ -122,11 +122,9 @@ impl ScreenBuffer {
     }
 }
 
-fn terminal_size(prof: &mut ProfileBucket) -> Result<(/*rows*/ u16, /*columns*/ u16)> {
+fn terminal_size(_prof: &mut ProfileBucket) -> Result<(/*rows*/ u16, /*columns*/ u16)> {
     let mut s: libc::winsize = unsafe {mem::zeroed()};
-    let r = profile_syscall!(prof, {
-        unsafe {libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut s as *mut _)}
-    });
+    let r = profile_syscall!(unsafe {libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut s as *mut _)});
     if r != 0 {
         return errno_err!("ioctl(STDOUT, TIOCGWINSZ) failed");
     }
@@ -314,8 +312,8 @@ impl Terminal {
         commands
     }
 
-    pub fn present(&mut self, buffer: ScreenBuffer, commands: Vec<u8>, prof: &mut ProfileBucket) -> Result<()> {
-        profile_syscall!(prof, {
+    pub fn present(&mut self, buffer: ScreenBuffer, commands: Vec<u8>, _prof: &mut ProfileBucket) -> Result<()> {
+        profile_syscall!({
             io::stdout().write_all(&commands)?;
             io::stdout().flush()?;
         });
@@ -601,12 +599,10 @@ impl InputReader {
         }
     }
 
-    fn read_bytes(buf: &mut [u8], prof: &mut ProfileBucket) -> Result<usize> {
+    fn read_bytes(buf: &mut [u8], _prof: &mut ProfileBucket) -> Result<usize> {
         loop { // retry EINTR
             let mut pfd = libc::pollfd {fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0};
-            let r = profile_syscall!(prof, {
-                unsafe {libc::poll(&mut pfd as *mut libc::pollfd, 1, 0)}
-            });
+            let r = profile_syscall!(unsafe {libc::poll(&mut pfd as *mut libc::pollfd, 1, 0)});
             if r < 0 {
                 let e = io::Error::last_os_error();
                 if e.kind() == io::ErrorKind::Interrupted {
@@ -618,9 +614,7 @@ impl InputReader {
                 return Ok(0);
             }
 
-            let r = profile_syscall!(prof, {
-                unsafe {libc::read(libc::STDIN_FILENO, buf.as_ptr() as *mut libc::c_void, buf.len())}
-            });
+            let r = profile_syscall!(unsafe {libc::read(libc::STDIN_FILENO, buf.as_ptr() as *mut libc::c_void, buf.len())});
             if r < 0 {
                 let e = io::Error::last_os_error();
                 if e.kind() == io::ErrorKind::Interrupted {

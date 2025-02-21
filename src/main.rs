@@ -2,7 +2,7 @@
 #![allow(unused_variables)]
 #![allow(unused_imports)]
 use nnd::{*, elf::*, error::*, debugger::*, util::*, ui::*, log::*, process_info::*, symbols::*, symbols_registry::*, procfs::*, unwind::*, range_index::*, settings::*, context::*, executor::*, persistent::*, doc::*, terminal::*, common_ui::*};
-use std::{rc::Rc, mem, fs, os::fd::{FromRawFd}, io::Read, io, io::Write, panic, process, thread, thread::ThreadId, cell::UnsafeCell, ptr, pin::Pin, sync::Arc, str::FromStr, path::PathBuf};
+use std::{rc::Rc, mem, fs, os::fd::{FromRawFd}, io::Read, io, io::Write, panic, process, thread, thread::ThreadId, cell::UnsafeCell, ptr, pin::Pin, sync::Arc, str::FromStr, path::PathBuf, collections::HashSet};
 use libc::{self, STDIN_FILENO, pid_t};
 
 // Pipes written from corresponding signal handlers, read from main loop. We could use one pipe and write signal number to it, but it would break in the unlikely case when one signal fills up the whole pipe before the main loop drains it - then other signals would get lost. Probably not actually important.
@@ -24,12 +24,21 @@ fn drain_signal_pipe(fd: i32) {
     }
 }
 
-fn parse_arg(args: &mut &[String], long_name: &str, short_name: &str, bool_switch: bool) -> Option<String> {
+fn parse_arg(args: &mut &[String], seen_args: &mut HashSet<String>, long_name: &str, short_name: &str, bool_switch: bool, repeatable: bool) -> Option<String> {
     assert!(!args.is_empty());
     if args[0].is_empty() {
         return None;
     }
+    let check_duplicate = |seen_args: &mut HashSet<String>, long_name: &str, short_name: &str, name: &str, repeatable: bool| {
+        if !repeatable {
+            if !seen_args.insert(name.to_string()) {
+                eprintln!("{} can't be specified multiple times", name);
+                process::exit(1);
+            }
+        }
+    };
     if !long_name.is_empty() && args[0].starts_with(long_name) && args[0][long_name.len()..].starts_with("=") {
+        check_duplicate(seen_args, long_name, short_name, long_name, repeatable);
         if bool_switch {
             eprintln!("{} doesn't accept a value", long_name);
             process::exit(1);
@@ -39,12 +48,14 @@ fn parse_arg(args: &mut &[String], long_name: &str, short_name: &str, bool_switc
         return Some(v);
     }
     if &args[0][..] == short_name || &args[0][..] == long_name {
+        let name = if &args[0][..] == short_name {short_name} else {long_name};
+        check_duplicate(seen_args, long_name, short_name, name, repeatable);
         if bool_switch {
             *args = &args[1..];
             return Some(String::new());
         }
         if args.len() == 1 {
-            eprintln!("{} requires an argument", long_name);
+            eprintln!("{} requires an argument", name);
             process::exit(1);
         }
         let v = args[1].clone();
@@ -62,11 +73,13 @@ fn main() {
     let mut attach_pid: Option<pid_t> = None;
     let mut command_line: Option<Vec<String>> = None;
     let mut tty_file: Option<String> = None;
+    let mut core_dump_path: Option<String> = None;
 
     let all_args: Vec<String> = std::env::args().collect();
     let mut args = &all_args[1..];
+    let mut seen_args: HashSet<String> = HashSet::new();
     while !args.is_empty() && args[0].starts_with("-") {
-        if let Some(v) = parse_arg(&mut args, "--pid", "-p", false) {
+        if let Some(v) = parse_arg(&mut args, &mut seen_args, "--pid", "-p", false, false) {
             attach_pid = match pid_t::from_str(&v) {
                 Err(_) => {
                     eprintln!("invalid pid: {}", v);
@@ -74,19 +87,19 @@ fn main() {
                 }
                 Ok(x) => Some(x),
             };
-        } else if let Some(v) = parse_arg(&mut args, "--tty", "-t", false) {
+        } else if let Some(v) = parse_arg(&mut args, &mut seen_args, "--tty", "-t", false, false) {
             tty_file = Some(v);
-        } else if let Some(v) = parse_arg(&mut args, "--stdin", "", false) {
+        } else if let Some(v) = parse_arg(&mut args, &mut seen_args, "--stdin", "", false, false) {
             settings.stdin_file = Some(v);
-        } else if let Some(v) = parse_arg(&mut args, "--stdout", "", false) {
+        } else if let Some(v) = parse_arg(&mut args, &mut seen_args, "--stdout", "", false, false) {
             settings.stdout_file = Some(v);
-        } else if let Some(v) = parse_arg(&mut args, "--stderr", "", false) {
+        } else if let Some(v) = parse_arg(&mut args, &mut seen_args, "--stderr", "", false, false) {
             settings.stderr_file = Some(v);
-        } else if let Some(_) = parse_arg(&mut args, "--stop", "-s", true) {
+        } else if let Some(_) = parse_arg(&mut args, &mut seen_args, "--stop", "-s", true, false) {
             settings.stop_on_main = true;
-        } else if let Some(_) = parse_arg(&mut args, "--stop-early", "-ss", true) {
+        } else if let Some(_) = parse_arg(&mut args, &mut seen_args, "--stop-early", "-ss", true, false) {
             settings.stop_on_initial_exec = true;
-        } else if let Some(m) = parse_arg(&mut args, "--mouse", "-m", false) {
+        } else if let Some(m) = parse_arg(&mut args, &mut seen_args, "--mouse", "-m", false, false) {
             settings.mouse_mode = match &m.to_lowercase()[..] {
                 "full" => MouseMode::Full,
                 "no-hover" => MouseMode::NoHover,
@@ -96,19 +109,19 @@ fn main() {
                     process::exit(1);
                 }
             };
-        } else if let Some(_) = parse_arg(&mut args, "--echo-input", "", true) {
+        } else if let Some(_) = parse_arg(&mut args, &mut seen_args, "--echo-input", "", true, false) {
             match run_input_echo_tool() {
                 Ok(()) => (),
                 Err(e) => eprintln!("error: {}", e),
             }
             return;
-        } else if let Some(_) = parse_arg(&mut args, "--fixed-fps", "", true) {
+        } else if let Some(_) = parse_arg(&mut args, &mut seen_args, "--fixed-fps", "", true, false) {
             settings.fixed_fps = true;
-        } else if let Some(path) = parse_arg(&mut args, "--dir", "-d", false) {
+        } else if let Some(path) = parse_arg(&mut args, &mut seen_args, "--dir", "-d", false, false) {
             settings.code_dirs.push(PathBuf::from(path));
-        } else if let Some(path) = parse_arg(&mut args, "--unstripped", "", false) {
-            settings.unstripped_executable_path = Some(path);
-        } else if let Some(s) = parse_arg(&mut args, "--period", "", false) {
+        } else if let Some(path) = parse_arg(&mut args, &mut seen_args, "--exe", "", false, false) {
+            settings.main_executable_path = Some(path);
+        } else if let Some(s) = parse_arg(&mut args, &mut seen_args, "--period", "", false, false) {
             let seconds = match s.parse::<f64>() {
                 Ok(p) if p >= 0.0 && p <= 4e9 => p,
                 _ => {
@@ -117,9 +130,9 @@ fn main() {
                 }
             };
             settings.periodic_timer_ns = (seconds * 1e9) as usize;
-        } else if let Some(_) = parse_arg(&mut args, "--verbose", "", true) {
+        } else if let Some(_) = parse_arg(&mut args, &mut seen_args, "--verbose", "", true, false) {
             settings.trace_logging = true;
-        } else if let Some(v) = parse_arg(&mut args, "--max-threads", "", false) {
+        } else if let Some(v) = parse_arg(&mut args, &mut seen_args, "--max-threads", "", false, false) {
             settings.max_threads = match usize::from_str(&v) {
                 Err(_) => {
                     eprintln!("invalid --max-threads (expected nonnegative integer): {}", v);
@@ -127,6 +140,8 @@ fn main() {
                 }
                 Ok(x) => x,
             };
+        } else if let Some(s) = parse_arg(&mut args, &mut seen_args, "--core", "-c", false, false) {
+            core_dump_path = Some(s);
         } else if print_help_chapter(&args[0], &all_args[0]) {
             process::exit(0);
         } else {
@@ -136,6 +151,19 @@ fn main() {
     }
     if settings.code_dirs.is_empty() {
         settings.code_dirs.push(PathBuf::from(""));
+    }
+
+    // Autodetect core dump without requiring -c.
+    if core_dump_path.is_none() && attach_pid.is_none() && !args.is_empty() {
+        let r = is_core_dump_file(&args[0]);
+        if let Ok(true) = r { // silently ignore errors
+            core_dump_path = Some(args[0].clone());
+            args = &args[1..];
+        }
+    }
+    if core_dump_path.is_some() && settings.main_executable_path.is_none() && !args.is_empty() {
+        settings.main_executable_path = Some(args[0].clone());
+        args = &args[1..];
     }
 
     if !args.is_empty() {
@@ -151,16 +179,16 @@ fn main() {
         settings.stdout_file = Some(v);
     }
 
-    if attach_pid.is_none() && command_line.is_none() {
-        eprintln!("usage: {} (-p pid | path [args..] | --help)", all_args[0]);
+    if attach_pid.is_none() && command_line.is_none() && core_dump_path.is_none() {
+        eprintln!("usage: {} (-p pid | executable_path [args..] | [-c] core_dump_path [[--exe] executable_path] | --help)", all_args[0]);
         process::exit(1);
     }
-    if attach_pid.is_some() && command_line.is_some() {
-        eprintln!("can't have both --pid and command line");
+    if (attach_pid.is_some() as usize) + (command_line.is_some() as usize) + (core_dump_path.is_some() as usize) > 1 {
+        eprintln!("must have exactly one of: --pid, --core, command line");
         process::exit(1);
     }
     if command_line.is_none() && (settings.stdin_file.is_some() || settings.stdout_file.is_some() || settings.stderr_file.is_some()) {
-        eprintln!("can't have both --pid and --stdin/--stdout/--stderr/--tty");
+        eprintln!("--stdin/--stdout/--stderr/--tty are not allowed with --pid or --core");
         process::exit(1);
     }
 
@@ -216,7 +244,7 @@ fn main() {
         }));
     }
 
-    match run(settings, attach_pid, command_line, persistent) {
+    match run(settings, attach_pid, core_dump_path, command_line, persistent) {
         Ok(()) => (),
         Err(e) => {
             eprintln!("fatal: {}", e);
@@ -230,7 +258,7 @@ fn main() {
     }
 }
 
-fn run(settings: Settings, attach_pid: Option<pid_t>, command_line: Option<Vec<String>>, persistent: PersistentState) -> Result<()> {
+fn run(settings: Settings, attach_pid: Option<pid_t>, core_dump_path: Option<String>, command_line: Option<Vec<String>>, persistent: PersistentState) -> Result<()> {
     let num_threads = thread::available_parallelism().map_or(8, |n| n.get()).min(settings.max_threads).max(1);
     let context = Arc::new(Context {settings, executor: Executor::new(num_threads), wake_main_thread: Arc::new(EventFD::new())});
 
@@ -282,6 +310,8 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, command_line: Option<Vec<S
     if let &Some(pid) = &attach_pid {
         debugger = Pin::new(Box::new(Debugger::attach(pid, context.clone(), persistent)?));
         unsafe { *DEBUGGER_TO_DROP_ON_PANIC.get() = Some(&mut *debugger); }
+    } else if let Some(path) = &core_dump_path {
+        debugger = Pin::new(Box::new(Debugger::open_core_dump(path, context.clone(), persistent)?));
     } else {
         debugger = Pin::new(Box::new(Debugger::from_command_line(&command_line.unwrap(), context.clone(), persistent)));
 

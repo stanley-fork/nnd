@@ -1,5 +1,5 @@
 use crate::{*, util::*, common_ui::*};
-use std::{collections::VecDeque, time::Instant, mem, fmt::Write};
+use std::{collections::VecDeque, time::Instant, mem, fmt::Write, sync::atomic::{AtomicUsize, AtomicU64, Ordering}};
 use core::arch::x86_64::_rdtsc;
 
 // We should rework logging. I initially thought we'd want to show a very minimal log on screen.
@@ -184,6 +184,10 @@ impl ProfileBucket {
     }
 }
 
+// Global counters that are periodically added to ProfileBucket and zeroed. Because passing ProfileBucket to all syscall sites would be too inconvenient (specifically for MemReader, all other sites would be fine with explicit passing of ProfileBucket).
+pub static SYSCALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+pub static SYSCALL_TSC: AtomicU64 = AtomicU64::new(0);
+
 pub struct Profiling {
     pub buckets: VecDeque<ProfileBucket>,
     pub bucket: ProfileBucket,
@@ -191,7 +195,11 @@ pub struct Profiling {
 impl Profiling {
     pub fn new() -> Self { Self {buckets: VecDeque::new(), bucket: ProfileBucket::new(Instant::now(), rdtsc())} }
 
+    // (Mutates global variables.)
     pub fn advance_bucket(&mut self) {
+        // May have torn read between the two atomics. This is fine, in part because we currently only do syscalls in main thread.
+        self.bucket.syscall_count += SYSCALL_COUNT.swap(0, Ordering::Relaxed);
+        self.bucket.syscall_tsc += SYSCALL_TSC.swap(0, Ordering::Relaxed);
         let time = Instant::now();
         let tsc = rdtsc();
         self.bucket.finish(time, tsc);
@@ -206,11 +214,11 @@ impl Profiling {
 
 #[macro_export]
 macro_rules! profile_syscall {
-    ($prof:expr, {$($code:tt)*}) => {{
+    ($($code:tt)*) => {{
         let timer = TscScope::new();
         let r = {$($code)*};
-        $prof.syscall_count += 1;
-        $prof.syscall_tsc += timer.finish();
+        SYSCALL_TSC.fetch_add(timer.finish(), std::sync::atomic::Ordering::Relaxed);
+        SYSCALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         r
     }};
 }

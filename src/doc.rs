@@ -11,6 +11,7 @@ If you work at ClickHouse, report to #debugger channel in slack or DM Michael Ko
 Usage:
 {0} command [args...]   - run a program under the debugger (i.e. just prepend {0} to the command line)
 sudo {0} -p pid   - attach to an existing process
+{0} -c core_dump_path [executable_path]   - open core dump
 
 Additional arguments:
 --stdin/--stdout/--stderr path   - redirect stdin/stdout/stderr to file
@@ -18,7 +19,7 @@ Additional arguments:
 -s   - stop on main() (only applies to the first time the program starts; when starting it again from UI, press 'step' key instead of 'run' to stop on main())
 -ss  - stop early in process startup sequence (long before main(), but after loading dynamic libraries)
 -d path   - directory in which to look for source code; if specified multiple times, multiple directories will be searched; default: current directory
---unstripped path   - path to executable from which to load debug symbols; useful if the running executable is stripped and you have an unstripped version on the side
+--exe path   - path to executable from which to load debug symbols; useful if the running executable is stripped and you have an unstripped version on the side
 -m full|no-hover|disabled   - mouse mode; 'no-hover' to react only to clicking and dragging, 'disabled' to disable mouse altogether; default is 'full' (if it doesn't work, check if mouse reporting is enabled in the terminal application)
 --help   - show this help message; see below for more help pages
 
