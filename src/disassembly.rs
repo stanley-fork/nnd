@@ -198,9 +198,9 @@ pub fn disassemble_function(function_idx: usize, mut static_addr_ranges: Vec<Ran
             code
         } else if let Some(symbols) = &symbols {
             // Read the machine code from file rather than memory so that it doesn't show our breakpoint instructions.
-            match symbols.elf.addr_range_to_offset_range(static_addr_range.start, static_addr_range.end) {
+            match symbols.elves[0].addr_range_to_offset_range(static_addr_range.start, static_addr_range.end) {
                 None => return res.with_error(error!(Dwarf, "function address range out of bounds of executable: {:x}-{:x}", static_addr_range.start, static_addr_range.end), palette),
-                Some((start, end)) => &symbols.elf.data()[start..end],
+                Some((start, end)) => &symbols.elves[0].data()[start..end],
             }
         } else {
             panic!("huh");

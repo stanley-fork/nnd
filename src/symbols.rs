@@ -138,12 +138,7 @@ impl PointOfInterest {
 }
 
 pub struct Symbols {
-    pub elf: Arc<ElfFile>,
-    // Unstripped binary or debuglink file.
-    pub additional_elves: Vec<ElfFile>,
-
-    pub warnings: Vec<String>,
-    pub notices: Vec<String>,
+    pub elves: Vec<Arc<ElfFile>>,
 
     // .debug_info, .debug_line, etc - sections describing things in the source code (functions, line numbers, structs and their fields, etc) and how they map to address ranges.
     // If some or all sections are missing, we treat them as empty, and no special handling is needed because empty sections parse as valid DWARF debug info with 0 units.
@@ -951,81 +946,46 @@ unsafe impl Sync for GlobalVariableNameMessage {}
 
 // Usage: call new(), then alternate between single-threaded calls to prepare_stage(i) and multi-threaded calls to run(i, shard_idx) (for all shard_idx in parallel); when prepare_stage() returns Ok(false), call into_result().
 impl SymbolsLoader {
-    pub fn new(elf: Arc<ElfFile>, additional_elf_paths: Vec<String>, binary_id: usize, max_shards: usize, status: Arc<SymbolsLoadingStatus>) -> Result<Self> {
+    pub fn new(elves: Vec<Arc<ElfFile>>, binary_id: usize, max_shards: usize, status: Arc<SymbolsLoadingStatus>) -> Result<Self> {
+        assert!(!elves.is_empty());
         let start_time = Instant::now();
 
-        *status.stage.lock().unwrap() = "opening additional elves".to_string();
-
-        let mut warnings: Vec<String> = Vec::new();
-        let mut notices: Vec<String> = Vec::new();
-        let mut additional_elves: Vec<ElfFile> = Vec::new();
-
-        for path in additional_elf_paths {
-            match open_additional_elf(&elf, path.clone(), "additional", None) {
-                Ok(x) => {
-                    notices.push(format!("additional binary: {}", path));
-                    additional_elves.push(x);
-                }
-                Err(e) => warnings.push(format!("{}", e)),
-            };
-        }
-
-        match open_debuglink(&elf) {
-            Ok(None) => (),
-            Ok(Some(x)) => {
-                notices.push(format!("debuglink file: {}", x.name));
-                additional_elves.push(x);
-            }
-            Err(e) => warnings.push(format!("{}", e)),
-        }
-
-        let mut elves: Vec<&ElfFile> = vec![&elf];
-        elves.extend(&additional_elves);
-
-        let load_section = |id: SectionId| -> std::result::Result<DwarfSlice, gimli::Error> {
-            for &elf in &elves {
-                if let Some(&idx) = elf.section_by_name.get(id.name()) {
+        let find_section = |name: &str| -> Option<(&[u8], /*addr*/ usize)> {
+            for elf in &elves {
+                if let Some(&idx) = elf.section_by_name.get(name) {
                     let data = elf.section_data(idx);
                     if !data.is_empty() {
-                        return Ok(DwarfSlice::new(unsafe {mem::transmute(data)}));
+                        return Some((data, elf.sections[idx].address));
                     }
                 }
             }
-            Ok(DwarfSlice::new(&[0u8;0][..]))
+            None
         };
-
-        let code_addr_range;
-        {
-            let text = match elf.section_by_name.get(".text") {
-                None => return err!(UnsupportedExecutable, "no .text section"),
-                Some(i) => &elf.sections[*i],
-            };
-            code_addr_range = text.address..text.address+text.size;
-        }
+        let load_section = |id: SectionId| -> std::result::Result<DwarfSlice, gimli::Error> {
+            match find_section(id.name()) {
+                Some((data, _)) => Ok(DwarfSlice::new(unsafe {mem::transmute(data)})),
+                None => Ok(DwarfSlice::new(&[0u8;0][..])),
+            }
+        };
 
         let mut dwarf = Dwarf::load(load_section)?;
         *status.stage.lock().unwrap() = "listing units".to_string();
-
-        if dwarf.debug_info.reader().is_empty() && warnings.is_empty() {
-            warnings.push("no debug symbols".to_string());
-        }
 
         if !dwarf.debug_types.reader().is_empty() {
             // This was removed in DWARF 5, so probably not worth supporting.
             return err!(Dwarf, ".debug_types not supported");
         }
 
+        let code_addr_range = match find_section(".text") {
+            Some((data, addr)) => addr..addr+data.len(),
+            None => 0..0,
+        };
+
         let mut strtab_symtab: Vec<[&'static [u8]; 2]> = Vec::new();
-        for &elf in &elves {
-            for [strtab_name, symtab_name] in [[".strtab", ".symtab"], [".dynstr", ".dynsym"]] {
-                match (elf.section_data_by_name(strtab_name), elf.section_data_by_name(symtab_name)) {
-                    (Some(strtab), Some(symtab)) => {
-                        if symtab.len() != 0 {
-                            strtab_symtab.push(unsafe {[mem::transmute(strtab), mem::transmute(symtab)]});
-                        }
-                    }
-                    _ => (),
-                }
+        for [strtab_name, symtab_name] in [[".strtab", ".symtab"], [".dynstr", ".dynsym"]] {
+            match (find_section(strtab_name), find_section(symtab_name)) {
+                (Some((strtab, _)), Some((symtab, _))) => strtab_symtab.push(unsafe {[mem::transmute(strtab), mem::transmute(symtab)]}),
+                _ => (),
             }
         }
 
@@ -1098,7 +1058,7 @@ impl SymbolsLoader {
             CommonAttributes::layout(),
             vec![DW_TAG_label, DW_TAG_variable, DW_TAG_formal_parameter, DW_TAG_subprogram, DW_TAG_inlined_subroutine]);
 
-        let (mut units, abbreviations_shared) = list_units(&mut dwarf, &elf.name, layouts)?;
+        let (mut units, abbreviations_shared) = list_units(&mut dwarf, &elves[0].name, layouts)?;
         for (i, unit) in units.iter_mut().enumerate() {
             if unit.offset.0 > round_robin_offset + unit_distribution_granularity {
                 round_robin_offset = unit.offset.0;
@@ -1130,7 +1090,7 @@ impl SymbolsLoader {
 
         prepare_time_per_stage_ns[0] = start_time.elapsed().as_nanos() as usize;
         Ok(SymbolsLoader {
-            num_shards: shards.len(), binary_id, sym: Symbols {elf, additional_elves, warnings, notices, dwarf, units, files: Vec::new(), file_paths: StringTable::new(), path_to_used_file: HashMap::new(), functions: Vec::new(), shards: Vec::new(), builtin_types: BuiltinTypes::invalid(), base_types: Vec::new(), vtables: Vec::new(), points_of_interest: HashMap::new(), code_addr_range},
+            num_shards: shards.len(), binary_id, sym: Symbols {elves, dwarf, units, files: Vec::new(), file_paths: StringTable::new(), path_to_used_file: HashMap::new(), functions: Vec::new(), shards: Vec::new(), builtin_types: BuiltinTypes::invalid(), base_types: Vec::new(), vtables: Vec::new(), points_of_interest: HashMap::new(), code_addr_range},
             shards: shards.into_iter().map(|s| SyncUnsafeCell::new(CachePadded::new(s))).collect(), die_to_function_shards: (0..num_shards).map(|_| SyncUnsafeCell::new(CachePadded::new(Vec::new()))).collect(), types: types_loader, send_global_variable_names, strtab_symtab, status, progress_per_stage,
             abbreviations_shared, prepare_time_per_stage_ns, run_time_per_stage_ns, shard_progress_ppm: (0..num_shards).map(|_| CachePadded::new(AtomicUsize::new(0))).collect(), stage: 0, types_before_dedup: 0, type_offsets: 0, type_offset_maps_bytes: 0, type_dedup_maps_bytes: 0})
     }
@@ -1594,8 +1554,8 @@ impl SymbolsLoader {
     fn parse_misc_sections(&self, shard_idx: usize, shard: &mut SymbolsLoaderShard) {
         // Sections that contain executable code but are not usually covered by debug symbols. We pretend that each of them is a function, to make them show up in disassembly window at all.
         for name in [".init", ".fini", ".plt", ".plt.got", ".plt.sec"] {
-            if let Some(&idx) = self.sym.elf.section_by_name.get(name) {
-                let s = &self.sym.elf.sections[idx];
+            if let Some(&idx) = self.sym.elves[0].section_by_name.get(name) {
+                let s = &self.sym.elves[0].sections[idx];
                 if s.size != 0 && s.address != 0 {
                     let name_ref = shard.sym.misc_arena.add_slice(name.as_bytes());
                     shard.functions.push(FunctionInfo {
@@ -1813,7 +1773,7 @@ impl SymbolsLoader {
                        {} types ({:.2}x dedup, {:.2}x offsets, {} names ({}), \
                        {} infos, {} fields ({:.2}% growth waste), {} nested names, {} misc, temp {} offset maps, temp {} dedup maps) \
                        ({} base types), {} vtables ({:.2}% unresolved){}",
-                      self.sym.elf.name, total_wall_ns as f64 / 1e9, total_cpu_ns as f64 / 1e9, self.num_shards, peak_mem_str, PrettyCount(self.sym.units.len()), PrettyCount(self.sym.files.len()),
+                      self.sym.elves[0].name, total_wall_ns as f64 / 1e9, total_cpu_ns as f64 / 1e9, self.num_shards, peak_mem_str, PrettyCount(self.sym.units.len()), PrettyCount(self.sym.files.len()),
                       files_before_dedup as f64 / self.sym.files.len() as f64, self.sym.files.len() as f64 / self.sym.path_to_used_file.len() as f64, PrettySize(self.sym.file_paths.arena.used()), PrettySize(files_before_dedup * mem::size_of::<usize>()),
                       PrettyCount(self.sym.functions.len()), funcs_before_dedup as f64 / self.sym.functions.len() as f64, PrettySize(self.sym.functions.len() * mem::size_of::<FunctionInfo>()), PrettySize(function_names_len), PrettySize(misc_arena_size),
                       PrettyCount(subfunctions), PrettySize(subfunctions * mem::size_of::<Subfunction>()), PrettySize(subfunction_levels * mem::size_of::<usize>()), PrettyCount(subfunctions_needed_fixup),
@@ -1822,56 +1782,6 @@ impl SymbolsLoader {
                       PrettySize(type_infos_bytes), PrettySize(fields_bytes), fields_bytes as f64 / field_used_bytes as f64 * 100.0 - 100.0, PrettyCount(nested_names), PrettySize(types_misc_bytes), PrettySize(self.type_offset_maps_bytes), PrettySize(self.type_dedup_maps_bytes),
                       PrettyCount(self.sym.base_types.len()), self.sym.vtables.len(), unresolved_vtables as f64 / self.sym.vtables.len() as f64 * 100.0, time_breakdown);
         }
-    }
-}
-
-fn open_additional_elf(main_elf: &ElfFile, path: String, name_for_logging: &str, expected_crc32: Option<u32>) -> Result<ElfFile> {
-    eprintln!("info: opening {} file for {} at {}", name_for_logging, main_elf.name, path);
-    let file = match File::open(&path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return err!(MissingSymbols, "{} file not found: {}", name_for_logging, path),
-        Err(e) => return Err(e.into()),
-    };
-
-    let res = ElfFile::from_file(path.clone(), &file, file.metadata()?.len())?;
-
-    if let Some(crc32) = expected_crc32 {
-        let actual_crc32 = crc32fast::hash(res.data());
-        if actual_crc32 != crc32 { return err!(Dwarf, "{} file checksum mismatch: expected {}, found {} in {}", name_for_logging, crc32, actual_crc32, path); }
-    }
-
-
-    // Check that the two binaries are not obviously mismatched.
-    if let (&Some(main_idx), &Some(res_idx)) = (&main_elf.text_section, &res.text_section) {
-        let (main_text, res_text) = (&main_elf.sections[main_idx], &res.sections[res_idx]);
-        if (main_text.address, main_text.size) != (res_text.address, res_text.size) {
-            return err!(Usage, "{} file doesn't seem to match the main binary: .text section has different address or size", name_for_logging);
-        }
-    }
-
-    Ok(res)
-}
-    
-fn open_debuglink(elf: &ElfFile) -> Result<Option<ElfFile>> {
-    match (elf.section_by_name.get(".gnu_debuglink"), elf.section_by_name.get(".note.gnu.build-id")) {
-        (Some(&debuglink), Some(&build_id)) => {
-            let _prof = ProfileScope::with_threshold(0.01, format!("opening debuglink elf {}", elf.name));
-
-            let debuglink = elf.section_data(debuglink);
-            if debuglink.len() <= 4 { return err!(Dwarf, ".gnu_debuglink section is too short: {}", debuglink.len()); }
-            let (filename, crc32) = debuglink.split_at(debuglink.len()-4);
-            let filename = &filename[..filename.iter().position(|&x| x == b'\0').unwrap_or(filename.len())]; // null-terminated string
-            let filename = str::from_utf8(filename)?;
-            let crc32 = u32::from_le_bytes(crc32.try_into().unwrap());
-
-            let (build_id, _) = parse_elf_note(elf.section_data(build_id))?;
-            if build_id.desc.len() < 1 { return err!(Dwarf, ".note.gnu.build-id descr is too short: {}", build_id.desc.len()); }
-
-            let path = format!("/usr/lib/debug/.build-id/{:02x}/{}", build_id.desc[0], filename);
-            let res = open_additional_elf(elf, path, "debuglink", Some(crc32))?;
-            Ok(Some(res))
-        }
-        _ => Ok(None),
     }
 }
 

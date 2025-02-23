@@ -401,12 +401,12 @@ impl Debugger {
         Ok(())
     }
 
-    pub fn from_command_line(args: &[String], context: Arc<Context>, persistent: PersistentState) -> Self {
-        Self::new(RunMode::Run, args.into(), context.clone(), SymbolsRegistry::new(context), Pool::new(), persistent, ResourceStats::default(), Profiling::new())
+    pub fn from_command_line(args: &[String], context: Arc<Context>, persistent: PersistentState, supp: SupplementaryBinaries) -> Self {
+        Self::new(RunMode::Run, args.into(), context.clone(), SymbolsRegistry::new(context, supp), Pool::new(), persistent, ResourceStats::default(), Profiling::new())
     }
 
-    pub fn attach(pid: pid_t, context: Arc<Context>, persistent: PersistentState) -> Result<Self> {
-        let mut r = Self::new(RunMode::Attach, Vec::new(), context.clone(), SymbolsRegistry::new(context), Pool::new(), persistent, ResourceStats::default(), Profiling::new());
+    pub fn attach(pid: pid_t, context: Arc<Context>, persistent: PersistentState, supp: SupplementaryBinaries) -> Result<Self> {
+        let mut r = Self::new(RunMode::Attach, Vec::new(), context.clone(), SymbolsRegistry::new(context, supp), Pool::new(), persistent, ResourceStats::default(), Profiling::new());
         r.pid = pid;
         r.target_state = ProcessState::Running;
         r.memory = MemReader::Pid(PidMemReader::new(pid));
@@ -451,12 +451,12 @@ impl Debugger {
         Ok(r)
     }
 
-    pub fn open_core_dump(core_dump_path: &str, context: Arc<Context>, persistent: PersistentState) -> Result<Self> {
+    pub fn open_core_dump(core_dump_path: &str, context: Arc<Context>, persistent: PersistentState, supp: SupplementaryBinaries) -> Result<Self> {
         let file = fs::File::open(core_dump_path)?;
         let metadata = file.metadata()?;
         let elf = ElfFile::from_file(core_dump_path.to_string(), &file, metadata.len())?;
         let (memory, threads, maps) = parse_core_dump(Arc::new(elf))?;
-        let mut r = Self::new(RunMode::CoreDump, Vec::new(), context.clone(), SymbolsRegistry::new(context), Pool::new(), persistent, ResourceStats::default(), Profiling::new());
+        let mut r = Self::new(RunMode::CoreDump, Vec::new(), context.clone(), SymbolsRegistry::new(context, supp), Pool::new(), persistent, ResourceStats::default(), Profiling::new());
         r.pid = 0; // (we could use pid from core dump, but that would just be inviting bugs; if we ever want to show it in ui, we should put it somewhere other than this field and and special-case it in ui)
         r.target_state = ProcessState::CoreDump;
         r.info.maps = maps;
@@ -485,7 +485,7 @@ impl Debugger {
             let mode = self.mode;
             let command_line = mem::take(&mut self.command_line);
             let context = mem::replace(&mut self.context, Context::invalid());
-            let symbols = mem::replace(&mut self.symbols, SymbolsRegistry::new(Context::invalid()));
+            let symbols = mem::replace(&mut self.symbols, SymbolsRegistry::new(Context::invalid(), SupplementaryBinaries::default()));
             let persistent = mem::take(&mut self.persistent);
             let my_resource_stats = mem::replace(&mut self.my_resource_stats, ResourceStats::default());
             let mut breakpoints = mem::replace(&mut self.breakpoints, Pool::new());
@@ -568,7 +568,7 @@ impl Debugger {
                     }
 
                     // This is probably not necessary, but makes debugging sessions more reproducible.
-                    //asdqwe add a setting to disable it, use it all the time to test better
+                    // TODO: Add a setting to disable it, use it all the time for testing.
                     if libc::personality(libc::ADDR_NO_RANDOMIZE as u64) == -1 {
                         msg = b"child: failed to disable ASLR\0";
                         break 'child;
@@ -1623,8 +1623,12 @@ impl Debugger {
             frame.addr_static_to_dynamic = binary.addr_map.static_to_dynamic(static_pseudo_addr).wrapping_sub(static_pseudo_addr);
 
             // This populates CFA "register", so needs to happen before symbolizing the frame (because frame_base expression might use CFA).
-            let unwind = binary.unwind.as_ref_clone_error()?;
-            let step_result = unwind.step(&mut memory, &binary.addr_map, &mut scratch, pseudo_addr, frame, &**binary.elf.as_ref().unwrap());
+            let unwind = match &binary.unwind {
+                Ok(x) => x,
+                Err(e) if e.is_loading() => return Err(e.clone()),
+                Err(_) => return err!(MissingSymbols, "no unwind info for binary"),
+            };
+            let step_result = unwind.step(&mut memory, &binary.addr_map, &mut scratch, pseudo_addr, frame);
 
             if step_result.as_ref().is_ok_and(|(_, is_signal_trampoline)| *is_signal_trampoline) {
                 // Un-decrement the instruction pointer, there's no `call` in signal trampoline.

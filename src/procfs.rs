@@ -96,11 +96,6 @@ impl AddrMap {
     pub fn update(&mut self, map: &MemMapInfo, elf: &ElfFile, /* just for logging */ path: &str) {
         // We assume that all mmaps backed by ELF files are created by the ELF loader, and so correspond to ELF sections and have consistent difference between dynamic and static addresses.
         // (So if the program manually mmap()s its own executable or some dynamic library it's using, we may get incorrect `diff` value and fail to use debug symbols correctly and even fail to unwind stacks correctly.)
-        // For now we just look at .text section (and other executable sections, which are not important). Would be nice to check all sections/segments (in particular, .data, .rodata, .got) and print warnings if their `diff` values are different;
-        // this would be done by guessing the mmap <-> segment correspondence by looking at both addresses and flags (writable, executable).
-        if !map.perms.contains(MemMapPermissions::EXECUTE) {
-            return;
-        }
         match &map.binary_locator.as_ref().unwrap().special {
             SpecialSegmentId::None => (),
             SpecialSegmentId::Vdso(range) => {

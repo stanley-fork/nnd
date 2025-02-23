@@ -155,40 +155,53 @@ pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) -> /*binaries_add
     let prev_mapped = debugger.symbols.mark_all_as_unmapped();
 
     let mut new_elves: Vec<(Range<usize>, /*offset*/ usize, Arc<ElfFile>)> = Vec::new();
+    let mut is_first_mapped_binary = true;
     for (idx, map) in maps.maps.iter_mut().enumerate() {
         let locator = match &map.binary_locator {
             None => continue,
             Some(b) => b,
         };
+        let is_first = is_first_mapped_binary;
+        is_first_mapped_binary = false;
         let bin = match debugger.symbols.locator_to_id.get(locator) {
             Some(id) => debugger.symbols.get_mut(*id).unwrap(),
             None => {
-                //asdqwe extract build id, pass it to registry, have it index and use supplementary binaries (with fallback to matching by file name if build ids are missing, maybe have a setting to ignore build id), put error in Binary if file name matches but build id doesn't
-                let mut additional_elf_paths: Vec<String> = Vec::new();
-                let custom_path = if debugger.mode != RunMode::CoreDump && locator.inode == debugger.info.exe_inode {
-                    if let Some(p) = debugger.context.settings.main_executable_path.clone() {//asdqwe delet
-                        additional_elf_paths.push(p);
+                let mut build_id: Option<Vec<u8>> = None;
+                let mut reconstruction: Option<BinaryReconstructionInput> = None;
+                if map.offset == 0 {
+                    match extract_build_id_from_mapped_elf(&debugger.memory, map.start, map.len) {
+                        Ok(id) => build_id = Some(id),
+                        Err(e) => eprintln!("warning: couldn't extract build id from mapped binary {}: {}", locator.path, e),
                     }
-
+                    if let MemReader::CoreDump(mem) = &debugger.memory {
+                        reconstruction = Some(BinaryReconstructionInput {memory: mem.clone(), maps: debugger.info.maps.clone(), elf_prefix_addr: map.start..map.start+map.len});
+                    }
+                }
+                if let Some(id) = &build_id {
+                    eprintln!("info: mapped binary {} has build id {}", locator.path, hexdump(id, 1000));
+                }
+                let custom_path = if debugger.mode != RunMode::CoreDump && locator.inode == debugger.info.exe_inode {
                     // Use this special symlink instead of the regular path because it's available even after the file is deleted.
                     // Useful when recompiling the program without closing the debugger.
                     Some(format!("/proc/{}/exe", debugger.pid))
                 } else {
                     None
                 };
-                debugger.symbols.add(locator.clone(), &debugger.memory, custom_path, additional_elf_paths)
+                debugger.symbols.add(locator.clone(), &debugger.memory, custom_path, build_id, is_first, reconstruction)
             }
         };
         map.binary_id = Some(bin.id);
         bin.is_mapped = true;
-        if let Ok(elf) = &bin.elf {
-            bin.addr_map.update(map, elf, &locator.path);
+        if let Ok(elves) = &bin.elves {
+            bin.addr_map.update(map, &elves[0], &locator.path);
         }
         bin.mmap_idx = idx;
         if !map.elf_seen {
-            if let Ok(elf) = &bin.elf {
+            if let Ok(elves) = &bin.elves {
                 map.elf_seen = true;
-                new_elves.push((map.start..map.start+map.len, map.offset, elf.clone()));
+                if !elves[0].is_reconstructed {
+                    new_elves.push((map.start..map.start+map.len, map.offset, elves[0].clone()));
+                }
             }
         }
     }

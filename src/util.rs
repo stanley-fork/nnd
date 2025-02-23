@@ -715,9 +715,9 @@ impl fmt::Write for FmtString<'_> {
 }
 
 pub fn hexdump(s: &[u8], lim: usize) -> String {
-    let mut r = "0x".to_string();
+    let mut r = String::new();
     for x in &s[..lim.min(s.len())] {
-        write!(r, "{:x}", x).unwrap();
+        write!(r, "{:02x}", x).unwrap();
     }
     if s.len() > lim {
         write!(r, "… {} more bytes", s.len() - lim).unwrap();

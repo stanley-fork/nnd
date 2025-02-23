@@ -19,8 +19,8 @@ Additional arguments:
 -s   - stop on main() (only applies to the first time the program starts; when starting it again from UI, press 'step' key instead of 'run' to stop on main())
 -ss  - stop early in process startup sequence (long before main(), but after loading dynamic libraries)
 -d path   - directory in which to look for source code; if specified multiple times, multiple directories will be searched; default: current directory
---exe path   - path to executable from which to load debug symbols; useful if the running executable is stripped and you have an unstripped version on the side
--m full|no-hover|disabled   - mouse mode; 'no-hover' to react only to clicking and dragging, 'disabled' to disable mouse altogether; default is 'full' (if it doesn't work, check if mouse reporting is enabled in the terminal application)
+--module path   - path to executable or dynamic library from which to load debug symbols; useful if the running executable is stripped and you have an unstripped version on the side; can be specified multiple times to provide multiple dynamic libraries (they'll be automatically matched by build id)
+--mouse full|no-hover|disabled   - mouse mode; 'no-hover' to react only to clicking and dragging, 'disabled' to disable mouse altogether; default is 'full' (if it doesn't work, check if mouse reporting is enabled in the terminal application)
 --help   - show this help message; see below for more help pages
 
 Documentation chapters:
@@ -110,8 +110,8 @@ If you work at ClickHouse, report to #debugger channel in slack or DM Michael Ko
    The plan is to add a fuzzy search dialog for type names, similar to file and function search.
    (There is no plan to actually parse the template type names into their component parts; doing it correctly would be crazy complicated like everything else in C++.)
  * Can't assign to the debugged program's variables or registers
- * No data breakpoints, whole-file breakpoints, special breakpoints (signals, exceptions/panics).
- * Conditional breakpoints are not very fast: a few thousand evaluations per second.
+ * No data breakpoints, whole-file breakpoints, special breakpoints (signals, exceptions/panics, except for always-on stop on fatal signals). (For exceptions/panics, you can set breakpoint manually: in disassembly window press 'o' to search for function, find __cxa_throw or rustc_panic, and put a breakpoint at the start.)
+ * Conditional breakpoints are not super fast: a few thousand evaluations per second.
  * Inside libraries that were dlopen()ed at runtime, breakpoints get disabled on program restart. Manually disable-enable the breakpoint after the dlopen() to reactivate it.
  * The disassembly window can only open functions that appear in .symtab or debug info. Can't disassemble arbitrary memory, e.g. JIT-generated code or code from binaries without .symtab or debug info.
  * The debugger gets noticeably slow when the program has > 1K threads, and unusably slow with 20K threads. Part of it is inevitable syscalls

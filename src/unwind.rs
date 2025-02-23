@@ -1,11 +1,11 @@
 use crate::{*, error::{*, Error, Result}, range_index::*, util::*, elf::*, procfs::*, registers::*, symbols::*, expr::*, dwarf::*};
 use gimli::*;
-use std::{sync::Arc, rc::Rc, mem, path::PathBuf, ops::Range};
+use std::{sync::Arc, rc::Rc, mem, path::PathBuf, ops::Range, mem::MaybeUninit};
 
 pub type UnwindScratchBuffer = UnwindContext<usize>;
 
 pub struct UnwindInfo {
-    elf: Arc<ElfFile>,
+    elves: Vec<Arc<ElfFile>>,
 
     // .eh_frame - section with information needed for stack unwinding, e.g. where's the return address and saved registers (for different address ranges).
     eh_frame: Option<UnwindSectionIndex<EhFrame<DwarfSlice>>>,
@@ -144,41 +144,40 @@ fn find_cie_in(offset: u64, cies: &Vec<CommonInformationEntry<DwarfSlice>>) -> g
 }
 
 impl UnwindInfo {
-    pub fn load(elf: Arc<ElfFile>) -> Result<Self> {
+    pub fn load(elves: Vec<Arc<ElfFile>>) -> Result<Self> {
         // Section data and its static address.
-        let load_section = |name| -> Result<(&'static [u8], u64)> {
-            let section = match elf.section_by_name.get(name) {
-                None => return err!(NoSection, "no section {}", name),
-                Some(idx) => &elf.sections[*idx],
-            };
-            let data = &elf.data()[section.offset..section.offset+section.size];
-            let addr = section.address;
-            Ok((unsafe { mem::transmute(data) }, addr as u64))
+        let load_section = |name| -> Option<(&'static [u8], u64)> {
+            for elf in &elves {
+                let section_idx = match elf.section_by_name.get(name) {
+                    None => continue,
+                    Some(&idx) => idx,
+                };
+                let data = elf.section_data(section_idx);
+                let addr = elf.sections[section_idx].address;
+                return Some((unsafe { mem::transmute(data) }, addr as u64));
+            }
+            None
         };
 
         // Addresses in eh_frame may be encoded relative to these sections.
         // At this point we only know their static addresses (from elf), not dynamic ones (from runtime memory maps); we assume that:
         //  1. The relative addresses of these sections are preserved when the binary is loaded. I.e. dynamic address = static address + const.
         //  2. CIEs don't use BaseAddresses for anything we care about. So we can parse them now once rather than on every stack walk.
-        let (_text_data, text_addr) = load_section(".text")?;
-        let mut static_base_addresses = BaseAddresses::default().set_text(text_addr);
-        match load_section(".got") {
-            Ok((_, addr)) => static_base_addresses = static_base_addresses.set_got(addr),
-            Err(e) if e.is_no_section() => (),
-            Err(e) => return Err(e), // if .got is present in ELF but not mapped at runtime, that's unexpected
+        let mut static_base_addresses = BaseAddresses::default();
+        if let Some((_, addr)) = load_section(".text") {
+            static_base_addresses = static_base_addresses.set_text(addr);
+        }
+        if let Some((_, addr)) = load_section(".got") {
+            static_base_addresses = static_base_addresses.set_got(addr);
         };
 
-        let mut res = Self {elf: elf.clone(), eh_frame: None, debug_frame: None};
+        let mut res = Self {elves: elves.clone(), eh_frame: None, debug_frame: None};
 
-        match load_section(".eh_frame") {
-            Ok((data, addr)) => res.eh_frame = Some(UnwindSectionIndex::load(data, static_base_addresses.clone().set_eh_frame(addr), EhFrame::from(DwarfSlice::new(data)))?),
-            Err(e) if e.is_no_section() => (),
-            Err(e) => return Err(e),
+        if let Some((data, addr)) = load_section(".eh_frame") {
+            res.eh_frame = Some(UnwindSectionIndex::load(data, static_base_addresses.clone().set_eh_frame(addr), EhFrame::from(DwarfSlice::new(data)))?);
         }
-        match load_section(".debug_frame") {
-            Ok((data, addr)) => res.debug_frame = Some(UnwindSectionIndex::load(data, static_base_addresses, DebugFrame::from(DwarfSlice::new(data)))?),
-            Err(e) if e.is_no_section() => (),
-            Err(e) => return Err(e),
+        if let Some((data, addr)) = load_section(".debug_frame") {
+            res.debug_frame = Some(UnwindSectionIndex::load(data, static_base_addresses, DebugFrame::from(DwarfSlice::new(data)))?);
         }
         if res.eh_frame.is_none() && res.debug_frame.is_none() {
             return err!(MissingSymbols, "no .eh_frame or .debug_frame section");
@@ -227,8 +226,8 @@ impl UnwindInfo {
     }
 
     // Assigns cfa and return address in current frame and returns registers for next frame.
-    pub fn step(&self, memory: &mut CachedMemReader, addr_map: &AddrMap, scratch: &mut UnwindScratchBuffer, pseudo_addr: usize, frame: &mut StackFrame, elf: &ElfFile) -> Result<(Registers, /*is_signal_trampoline*/ bool)> {
-        if let Some(r) = self.step_through_sig_return(memory, addr_map, &mut frame.regs, elf)? {
+    pub fn step(&self, memory: &mut CachedMemReader, addr_map: &AddrMap, scratch: &mut UnwindScratchBuffer, pseudo_addr: usize, frame: &mut StackFrame) -> Result<(Registers, /*is_signal_trampoline*/ bool)> {
+        if let Some(r) = self.step_through_sig_return(memory, addr_map, &mut frame.regs)? {
             return Ok((r, true));
         }
 
@@ -311,7 +310,7 @@ impl UnwindInfo {
         Ok((new_regs, fde.is_signal_trampoline()))
     }
 
-    fn step_through_sig_return(&self, memory: &mut CachedMemReader, addr_map: &AddrMap, regs: &mut Registers, elf: &ElfFile) -> Result<Option<Registers>> {
+    fn step_through_sig_return(&self, memory: &mut CachedMemReader, addr_map: &AddrMap, regs: &mut Registers) -> Result<Option<Registers>> {
         // Recognize signal trampoline machine code, like GDB does. Because some libc implementations (musl) don't have correct DWARF unwind information for this function.
         const CODE: [u8; 9] = [
             0x48u8, 0xc7, 0xc0, 0x0f, 0x00, 0x00, 0x00, // mov rax, 15
@@ -319,18 +318,24 @@ impl UnwindInfo {
         ];
         const MID: usize = 7usize; // size of the first instruction
 
-        let pc = regs.get_int(RegisterIdx::Rip).unwrap().0 as usize;
-        let pc = addr_map.dynamic_to_static(pc);
-        // Read the machine code from file rather than memory to avoid our breakpoint instructions. And it's probably faster because we have it mmapped.
-        let section_idx = match &elf.text_section {
-            None => return Ok(None),
-            &Some(x) => x };
-        let section = &elf.sections[section_idx];
-        if pc < section.address || pc >= section.address + section.size {
-            return Ok(None);
-        }
-        let pos = pc - section.address;
-        let data = elf.section_data(section_idx);
+        let addr = regs.get_int(RegisterIdx::Rip).unwrap().0 as usize;
+        // Prefer to read the machine code from file rather than memory to avoid our breakpoint instructions. And it's probably faster because we have it mmapped.
+        let mut data_buf = [MaybeUninit::<u8>::uninit(); MID + CODE.len()];
+        let elf = &self.elves[0];
+        let (data, pos) = if let &Some(section_idx) = &elf.text_section {
+            let pc = addr_map.dynamic_to_static(addr);
+            let section = &elf.sections[section_idx];
+            if pc < section.address || pc >= section.address + section.size {
+                return Ok(None);
+            }
+            (elf.section_data(section_idx), pc - section.address)
+        } else {
+            // (This fallback is currently unnecessary, we always expect to have .text section. Even for binaries reconstructed from core dump we add a fake .text section, for convenience.)
+            (match memory.read_uninit(addr.saturating_sub(MID), &mut data_buf) {
+                Ok(x) => &*x,
+                Err(_) => return Ok(None),
+            }, MID)
+        };
 
         let matches = match data[pos] {
             x if x == CODE[0] => pos + CODE.len() <= data.len() && &CODE == &data[pos..pos+CODE.len()],
@@ -352,8 +357,8 @@ impl UnwindInfo {
             memory.read(offset, slice)?;
         }
 
-        let mut new_regs = Registers::from_context(&mcontext.gregs);
-        //asdqwe read xsave from *mcontext.fpregs
+        let new_regs = Registers::from_context(&mcontext.gregs);
+        // TODO: [simd] read xsave from *mcontext.fpregs
 
         Ok(Some(new_regs))
     }

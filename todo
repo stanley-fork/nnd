@@ -8,6 +8,7 @@ match by build id, repeated --exe
 documentation
   command line
   repeated --exe
+vdso bad notices: build id mismatch, debuglink not found
 
 bugs:
 investigate `clickhouse local` progress spinner appearing in debugger window despite -t
@@ -18,6 +19,7 @@ make stack unwinding work when control is in .plt or .plt.got, see "Recognise PL
 log a message if the process forked away
 fix incorrect column numbers with tab indentation (tabs should be counted as 1 column, but we turn them into multiple spaces)
 fix line-wrapped copy-paste (seems to copy only the first line of selection) and line-wrapped C-k (deletes only to the end of post-wrapping line, should use pre-wrapping line)
+Rust String pretty printer broke
 
 performance:
 optimize symbols loading
@@ -39,7 +41,11 @@ test with 10k threads
 test with watches window filled with long arrays (I saw 50ms frames when there are ~5 of them; maybe just decrease length limit)
 
 todo:
+update README already ffs
 core dumps
+get debug info from debuginfod; (maybe also source code, though it seems always unavailable)
+buffer input when program is quitting, especially k+r and steps
+floating point and simd registers ("TODO: [simd]")
 use RssAnon (from /proc/pid/status) instead of VmRss (includes page cache)
 don't immediately kill child on debugger panic; have a simple fallback state where the child is running, and the user can kill+quit, detach+quit, or do nothing (maybe also pause/resume)
 allow specifying cgroup and user (or maybe it's too hard, need to maybe inherit groups from parent somehow too)
@@ -50,7 +56,7 @@ update rust HashMap pretty printer
 do something for downcasts in conditional breakpoints (coalesce()? maybe()? ?()? ()?? checkbox to stop on error? 'is' operator? explicit checked downcast? also function to check field presense without evaluating it)
 edit breakpoint condition on click
 support casting slices (e.g. from pretty printers) to slices of different type (especially string)
-allow casting n-byte arrays/structs to/from n-byte primitive types
+allow casting arrays/structs/primitives by value to other arrays/structs/primitives with same sizeof; maybe have some override to allow for different sizes too
 `in` operator, e.g. x in [1, 2, 3]
 make names in MetaType etc unexpandable as array
 scroll code to next breakpoint when deleting breakpoint in breakpoints window
@@ -63,9 +69,7 @@ reordering watches
 reordering tabs
 rearranging windows
 maximizing windows
-buffer input when program is quitting, especially k+r sequence
 meta functions like checking for field presense of superclass type, and also just slice length etc, for use in conditions
-get debug info from debuginfod; (maybe also source code, though it seems always unavailable)
 thread-local storage
 key to freeze value in watches window; can also be used for controlling when to run the expression if it has side effects
 key to add watch value as new watch, maybe cast to type, e.g. *(0x1234 as *DB::Block)
@@ -74,7 +78,6 @@ key to send SIGINT to the program
 make return key do something in each window: go from threads to stack -> code -> disassembly -> code; from locals create a watch; from watch sub-value create another watch for that field/element; from breakpoints to code/disassembly/watch (depending on breakpoint type)
 allow expressions (especially conditions) to have multiple statements separated by ';'
 "unexpectedly big memory read" (16 bytes) for f64 local variables on the stack in rust
-floating point and simd registers
 some kind of non-stop mode to prevent clickhouse server from losing keeper connection when stepping through the code
 allow navigating from source to variables (especially global) and types declared there
 allow to put breakpoint on a whole file (by adding breakpoint on the first line, since there's never any real code on first line in practice; have a new icon for it; internally use line 0 to cover the garbage LineInfo-s with line 0; or maybe put breakpoint only on function entry points instead of everything)

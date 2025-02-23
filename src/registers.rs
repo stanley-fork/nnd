@@ -4,7 +4,7 @@ use crate::{*, error::*};
 #[derive(Clone, Default)]
 pub struct Registers {
     pub ints: [u64; RegisterIdx::INT_COUNT],
-    //asdqwe make these two available everywhere
+    // TODO: [simd] make these two available everywhere
     pub vecs: [[u64; 8]; 32], // zmm0 - zmm31 (or ymm or xmm - they're mutually exclusive)
     pub opmask: [usize; 8], // AVX-512 opmask
     // Can add floating-point and vector registers similarly. Probably use shared indexing, with ranges corresponding to types.
@@ -52,7 +52,7 @@ pub enum RegisterIdx {
     Ret = 26, // return address according to .eh_frame
 
     // SSE control register (thing like rounding mode and fp exception mask).
-    Mxcsr = 27,//asdqwe populate
+    Mxcsr = 27,// TODO: [simd] populate
 }
 
 impl RegisterIdx {
@@ -62,7 +62,7 @@ impl RegisterIdx {
     pub fn from_dwarf(r: gimli::Register) -> Option<RegisterIdx> {
         match r.0 {
             0..=16 => Some(unsafe {mem::transmute(r.0 as u8)}),
-            //asdqwe 17-32 are xmm0-xmm15
+            // TODO: [simd] 17-32 are xmm0-xmm15
             // 33-48 - obsolete floating point registers
             49 => Some(RegisterIdx::Flags),
             // 50 - es
@@ -75,8 +75,8 @@ impl RegisterIdx {
             58 => Some(RegisterIdx::FsBase),
             59 => Some(RegisterIdx::GsBase),
             64 => Some(RegisterIdx::Mxcsr),
-            //asdqwe 67+ are xmm16-xmm31
-            //asdqwe 118+ are k0-k7
+            // TODO: [simd] 67+ are xmm16-xmm31
+            // TODO: [simd] 118+ are k0-k7
             _ => None,
         }
     }
@@ -132,12 +132,49 @@ impl Registers {
 
     // Given the first XSAVE_PREFIX_SIZE bytes, tell how many more bytes to read.
     pub fn calculate_xsave_suffix_size(prefix: &[u8]) -> usize {
-        //asdqwe
+        // TODO: [simd]
         0
     }
 
-    pub fn add_from_xsave(&mut self, xsave: &[u8]) {//asdqwe call from unwind, ptrace, and core dump
-        //asdqwe
+    pub fn add_from_xsave(&mut self, xsave: &[u8]) {
+        // TODO: [simd] call from unwind, ptrace, and core dump
+        // TODO: [simd] parse
+        //   // Legacy area (512 bytes, same as user_fpregs_struct)
+        //   struct fxsave_area { // aka libc::user_fpregs_struct
+        //       uint16_t cwd;                     // FPU control word
+        //       uint16_t swd;                     // FPU status word
+        //       uint16_t twd;                     // Tag word
+        //       uint16_t fop;                     // Last instruction opcode
+        //       uint64_t rip;                     // Instruction pointer
+        //       uint64_t rdp;                     // Data pointer
+        //       uint32_t mxcsr;                   // SSE control/status register
+        //       uint32_t mxcsr_mask;             // Valid bits in mxcsr
+        //       uint8_t st_space[128];           // 8 x87 registers in 80-bit format
+        //       uint8_t xmm_space[256];          // 16 128-bit SSE registers
+        //       uint8_t padding[48];
+        //       uint8_t sw_reserved[48];
+        //   };
+        //
+        //   // XSAVE header (64 bytes, starts at offset 512)
+        //   struct xsave_header {
+        //       uint64_t xstate_bv;       // States in this frame [bitmask of XSTATE_BIT_* values]
+        //       uint64_t xcomp_bv;        // Compaction mode (should be 0 for user space)
+        //       uint64_t reserved[6];     // Reserved for future use
+        //   };
+        //
+        //   // Common extended state offsets (from start of extended region at 576):
+        //   // YMM state (AVX):          0    (16 * 16 bytes for upper 128 bits)
+        //   // AVX-512 opmask:          576   (8 * 8 bytes for k0-k7)
+        //   // AVX-512 ZMM_Hi256:       597   (16 * 32 bytes for upper ZMM0-15)
+        //   // AVX-512 Hi16_ZMM:        1152  (16 * 64 bytes for ZMM16-31)
+        //
+        //   // Bitmap values for xstate_bv:
+        //   #define XSTATE_BIT_FP        0x1
+        //   #define XSTATE_BIT_SSE       0x2
+        //   #define XSTATE_BIT_YMM       0x4
+        //   #define XSTATE_BIT_OPMASK    0x20
+        //   #define XSTATE_BIT_ZMM_Hi256 0x40
+        //   #define XSTATE_BIT_Hi16_ZMM  0x80
     }
 
     pub fn set_int(&mut self, reg: RegisterIdx, val: u64, dubious: bool) {

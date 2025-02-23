@@ -18,8 +18,7 @@ pub struct Settings {
     pub exception_aware_steps: bool,
 
     pub code_dirs: Vec<PathBuf>,
-    //asdqwe Instead of having a concept of "main" executable, accept an arbitrary set of binaries and match them to mmaps by build id.
-    pub main_executable_path: Option<String>,
+    pub supplementary_binary_paths: Vec<String>,
 
     pub stdin_file: Option<String>,
     pub stdout_file: Option<String>,
@@ -39,7 +38,7 @@ impl Default for Settings {
         periodic_timer_ns: 250_000_000,
         mouse_mode: MouseMode::Full,
         code_dirs: Vec::new(),
-        main_executable_path: None,
+        supplementary_binary_paths: Vec::new(),
         exception_aware_steps: true,
 
         stdin_file: None,

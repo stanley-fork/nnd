@@ -99,7 +99,7 @@ fn main() {
             settings.stop_on_main = true;
         } else if let Some(_) = parse_arg(&mut args, &mut seen_args, "--stop-early", "-ss", true, false) {
             settings.stop_on_initial_exec = true;
-        } else if let Some(m) = parse_arg(&mut args, &mut seen_args, "--mouse", "-m", false, false) {
+        } else if let Some(m) = parse_arg(&mut args, &mut seen_args, "--mouse", "", false, false) {
             settings.mouse_mode = match &m.to_lowercase()[..] {
                 "full" => MouseMode::Full,
                 "no-hover" => MouseMode::NoHover,
@@ -119,8 +119,8 @@ fn main() {
             settings.fixed_fps = true;
         } else if let Some(path) = parse_arg(&mut args, &mut seen_args, "--dir", "-d", false, false) {
             settings.code_dirs.push(PathBuf::from(path));
-        } else if let Some(path) = parse_arg(&mut args, &mut seen_args, "--exe", "", false, false) {
-            settings.main_executable_path = Some(path);
+        } else if let Some(path) = parse_arg(&mut args, &mut seen_args, "--module", "-m", false, /*repeatable*/ true) {
+            settings.supplementary_binary_paths.push(path);
         } else if let Some(s) = parse_arg(&mut args, &mut seen_args, "--period", "", false, false) {
             let seconds = match s.parse::<f64>() {
                 Ok(p) if p >= 0.0 && p <= 4e9 => p,
@@ -161,8 +161,8 @@ fn main() {
             args = &args[1..];
         }
     }
-    if core_dump_path.is_some() && settings.main_executable_path.is_none() && !args.is_empty() {
-        settings.main_executable_path = Some(args[0].clone());
+    if core_dump_path.is_some() && !args.is_empty() {
+        settings.supplementary_binary_paths.insert(0, args[0].clone());
         args = &args[1..];
     }
 
@@ -191,6 +191,14 @@ fn main() {
         eprintln!("--stdin/--stdout/--stderr/--tty are not allowed with --pid or --core");
         process::exit(1);
     }
+
+    let supplementary_binaries = match SymbolsRegistry::open_supplementary_binaries(&settings) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("{}", e);
+            process::exit(1);
+        }
+    };
 
     // This redirects stderr to the log file, so we have to do it early.
     let persistent = PersistentState::init();
@@ -244,7 +252,7 @@ fn main() {
         }));
     }
 
-    match run(settings, attach_pid, core_dump_path, command_line, persistent) {
+    match run(settings, attach_pid, core_dump_path, command_line, persistent, supplementary_binaries) {
         Ok(()) => (),
         Err(e) => {
             eprintln!("fatal: {}", e);
@@ -258,7 +266,7 @@ fn main() {
     }
 }
 
-fn run(settings: Settings, attach_pid: Option<pid_t>, core_dump_path: Option<String>, command_line: Option<Vec<String>>, persistent: PersistentState) -> Result<()> {
+fn run(settings: Settings, attach_pid: Option<pid_t>, core_dump_path: Option<String>, command_line: Option<Vec<String>>, persistent: PersistentState, supplementary_binaries: SupplementaryBinaries) -> Result<()> {
     let num_threads = thread::available_parallelism().map_or(8, |n| n.get()).min(settings.max_threads).max(1);
     let context = Arc::new(Context {settings, executor: Executor::new(num_threads), wake_main_thread: Arc::new(EventFD::new())});
 
@@ -308,12 +316,12 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, core_dump_path: Option<Str
 
     let mut debugger: Pin<Box<Debugger>>;
     if let &Some(pid) = &attach_pid {
-        debugger = Pin::new(Box::new(Debugger::attach(pid, context.clone(), persistent)?));
+        debugger = Pin::new(Box::new(Debugger::attach(pid, context.clone(), persistent, supplementary_binaries)?));
         unsafe { *DEBUGGER_TO_DROP_ON_PANIC.get() = Some(&mut *debugger); }
     } else if let Some(path) = &core_dump_path {
-        debugger = Pin::new(Box::new(Debugger::open_core_dump(path, context.clone(), persistent)?));
+        debugger = Pin::new(Box::new(Debugger::open_core_dump(path, context.clone(), persistent, supplementary_binaries)?));
     } else {
-        debugger = Pin::new(Box::new(Debugger::from_command_line(&command_line.unwrap(), context.clone(), persistent)));
+        debugger = Pin::new(Box::new(Debugger::from_command_line(&command_line.unwrap(), context.clone(), persistent, supplementary_binaries)));
 
         // Apply this only for the first time we start the program. For subsequent starts, the user can use steps instead (e.g. 's' to start and run to main()).
         let initial_step = if context.settings.stop_on_initial_exec {

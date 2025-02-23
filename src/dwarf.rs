@@ -1248,6 +1248,7 @@ fn prepare_attribute_action(attr: AttributeSpecification, layout: &AttributeStru
             }
             AttributeType::Unsigned => match attr.form {
                 DW_FORM_data1 | DW_FORM_data2 | DW_FORM_data4 | DW_FORM_data8 | DW_FORM_udata => (),
+                DW_FORM_implicit_const => param = attr.implicit_const_value, // or maybe we should check that it's <= i64::MAX, since implicit_const is, in theory, signed
                 _ => found_match = false,
             }
             AttributeType::Signed => match attr.form {

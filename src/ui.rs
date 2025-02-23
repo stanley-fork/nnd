@@ -1551,12 +1551,12 @@ impl DisassemblyWindow {
                         if bin.is_mapped {
                             continue;
                         }
-                        let elf = match bin.elf.as_ref_clone_error() {
+                        let elves = match bin.elves.as_ref_clone_error() {
                             Ok(x) => x,
                             Err(e) if e.is_loading() => return Err(e),
                             Err(_) => continue,
                         };
-                        if elf.addr_to_offset(addr).is_some() {
+                        if elves[0].addr_to_offset(addr).is_some() {
                             binary = Some(bin);
                             break;
                         }
@@ -2600,7 +2600,7 @@ impl WindowContent for BinariesWindow {
             Column::new("offset", AutoSize::Fixed(12), false),
             Column::new("file", AutoSize::Fixed(PrettySize::MAX_LEN), false),
             // Hidden column only visible in the tooltip.
-            Column::new("", AutoSize::Fixed(0), false),
+            Column::new("", AutoSize::Fixed(0), false).with_spacing(0),
         ]);
         table.hide_cursor_if_unfocused = true;
         for binary in debugger.symbols.iter() {
@@ -2642,18 +2642,18 @@ impl WindowContent for BinariesWindow {
                     let style = if e.is_missing_symbols() {ui.palette.default_dim} else {ui.palette.error};
                     styled_writeln!(ui.text, style, "{}", e);
                 };
-                if let Err(e) = &binary.elf {
+                if let Err(e) = &binary.elves {
                     print_error(e);
                 } else {
                     if let Err(e) = &binary.unwind {
                         print_error(e);
                     }
-                    match &binary.symbols {
-                        Err(e) => print_error(e),
-                        Ok(s) => for w in &s.warnings {
-                            ui_writeln!(ui, default_dim, "{}", w);
-                        }
+                    if let Err(e) = &binary.symbols {
+                        print_error(e);
                     }
+                }
+                for w in &binary.warnings {
+                    ui_writeln!(ui, default_dim, "{}", w);
                 }
                 let end = ui.text.num_lines();
                 if end > start {
@@ -2663,22 +2663,24 @@ impl WindowContent for BinariesWindow {
 
             if binary.is_mapped {
                 ui_writeln!(ui, default_dim, "{:>12x}", binary.addr_map.static_to_dynamic(0) & 0xffffffffffff);
+            } else {
+                ui_writeln!(ui, default_dim, "");
             }
             table.text_cell(ui);
 
             // ELF or unwind error/loading/stats.
-            match &binary.elf {
-                Err(e) if e.is_loading() => ui_writeln!(ui, running, "loading"),
-                Err(e) => ui_writeln!(ui, error, "error"),
-                Ok(elf) => ui_writeln!(ui, default_dim, "{}", PrettySize(elf.data().len())),
+            match &binary.elves {
+                Err(_) => {ui_writeln!(ui, default, "");}
+                Ok(elves) => {
+                    let max_size = elves.iter().map(|elf| elf.data().len()).max().unwrap();
+                    ui_writeln!(ui, default_dim, "{}", PrettySize(max_size));
+                }
             };
             table.text_cell(ui);
 
             let start = ui.text.num_lines();
-            if let Ok(s) = &binary.symbols {
-                for s in &s.notices {
-                    ui_writeln!(ui, default_dim, "{}", s);
-                }
+            for s in &binary.notices {
+                ui_writeln!(ui, default_dim, "{}", s);
             }
             let end = ui.text.num_lines();
             table.text_cell_lines(start..end, ui);
@@ -3032,18 +3034,23 @@ impl WindowContent for ThreadsWindow {
 }
 
 // Location of a stack trace subframe that tries to stay on the "same" subframe when the stack changes slightly,
-// to avoid the focus jumping around unexpectedly to the user. Specifically:
+// to avoid the focus jumping around unexpectedly to the user. Currently this only comes into play during initial loading, when stack changes as more unwind info or symbols were loaded.
+// Specifically we want:
 //  * When symbols finish loading, some frames get expanded into multiple subframes. Focus should stay on the same frame as it was, though subframe index changes completely.
 //    Hence storing frame and subframe idx separately.
-//  * When the process is resumed and suspended without ever returning from the selected subfunction, keep focus on that subfunction if the stack window is locked.
-//    Hence counting from the bottom of the stack rather than the top.
+//  * If stack failed to fully unwind because unwind info hadn't been loaded yet, then a later unwind succeeded and produced longer stack, we should stay on the same frame relative to the top of the stack.
+//    Hence frame_idx counting from the top rather than bottom (just like regular subframe_idx, nothing fancy).
+//  * (Originally the idea was that this would store index from the *bottom* of the stack and be useful when window locking is implemented.
+//     If the process is resumed and suspended without ever returning from the selected subfunction, keep focus on that subfunction.
+//     But this is incompatible with the previous requirement: if stack became less truncated then we should keep index relative to the *top*.
+//     Maybe window locking would require something like Debugger's stack digest. Or maybe we'll count from the top when unlocked and from the bottom when locked, or detect when base frame's addr changes.)
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct StableSubframeIdx {
-    frame_idx_rev: usize,
-    subframe_subidx_rev: usize,
+    frame_idx: usize,
+    subframe_subidx: usize,
 }
 impl StableSubframeIdx {
-    fn top() -> Self { Self {frame_idx_rev: usize::MAX, subframe_subidx_rev: usize::MAX} }
+    fn top() -> Self { Self {frame_idx: 0, subframe_subidx: 0} }
     fn new(stack: &StackTrace, mut subframe_idx: usize) -> Self {
         if stack.frames.is_empty() {
             return Self::top();
@@ -3051,14 +3058,15 @@ impl StableSubframeIdx {
         subframe_idx = subframe_idx.min(stack.subframes.len() - 1);
         let frame_idx = stack.subframes[subframe_idx].frame_idx;
         let frame = &stack.frames[frame_idx];
-        Self {frame_idx_rev: stack.frames.len() - frame_idx, subframe_subidx_rev: frame.subframes.end - subframe_idx}
+        Self {frame_idx, subframe_subidx: subframe_idx - frame.subframes.start}
     }
     fn subframe_idx(&self, stack: &StackTrace) -> usize {
-        if self.frame_idx_rev > stack.frames.len() || self.frame_idx_rev == 0 || self.subframe_subidx_rev == 0 {
+        if stack.frames.is_empty() {
             return 0;
         }
-        let frame = &stack.frames[stack.frames.len() - self.frame_idx_rev];
-        frame.subframes.start + frame.subframes.len().saturating_sub(self.subframe_subidx_rev)
+        let frame_idx = self.frame_idx.min(stack.frames.len() - 1);
+        let frame = &stack.frames[frame_idx];
+        (frame.subframes.start + self.subframe_subidx).min(frame.subframes.end - 1)
     }
 }
 

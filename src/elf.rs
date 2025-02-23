@@ -1,5 +1,5 @@
 use crate::{*, error::*, log::*, util::*, registers::*, procfs::*, process_info::*};
-use std::{fs::{File}, mem, mem::MaybeUninit, io::{self, BufReader, SeekFrom, Seek, Read, BufRead}, sync::Arc, collections::{HashMap, hash_map::Entry}, str, ptr, fmt::Debug, fmt, result};
+use std::{fs::{File}, mem, mem::MaybeUninit, io::{self, BufReader, SeekFrom, Seek, Read, BufRead}, sync::Arc, collections::{HashMap, hash_map::Entry}, str, ptr, fmt::Debug, fmt, result, slice, ops::Range};
 use libc::pid_t;
 
 pub struct ElfSection {
@@ -52,6 +52,9 @@ pub struct ElfFile {
     pub text_section: Option<usize>,
 
     pub is_core_dump: bool,
+    pub is_reconstructed: bool, // fake ELF assembled from pieces available in a core dump
+
+    pub build_id: Option<Vec<u8>>,
 
     // Slightly longer than the file because of padding.
     mmapped: Option<Mmap>,
@@ -62,6 +65,7 @@ pub struct ElfFile {
 
 pub const SHT_PROGBITS: u32 = 0x1;
 pub const SHT_SYMTAB: u32 = 0x2;
+pub const SHT_NOTE: u32 = 0x7;
 pub const SHT_NOBITS: u32 = 0x8; // pronounced as "shit! no bits!"
 
 pub const SHF_TLS: u64 = 1 << 10;
@@ -75,12 +79,16 @@ pub const STT_OBJECT: u8 = 1;
 pub const SHN_UNDEF: u16 = 0;
 
 pub const PT_LOAD: u32 = 1;
+pub const PT_DYNAMIC: u32 = 2;
 pub const PT_NOTE: u32 = 4;
+pub const PT_GNU_EH_FRAME: u32 = 0x60000000 + 0x474e550;
 
 // Segment permissions.
 pub const PF_R: u32 = 0x4;
 pub const PF_W: u32 = 0x2;
 pub const PF_X: u32 = 0x1;
+
+pub const NT_GNU_BUILD_ID: u32 = 3;
 
 // These are used in core dumps.
 pub const NT_PRSTATUS: u32 = 1;
@@ -188,8 +196,8 @@ pub fn parse_elf_note<'a>(data: &'a [u8]) -> Result<(ElfNote<'a>, /*remainder*/ 
     let name_len = reader.read_u32()? as usize;
     let desc_len = reader.read_u32()? as usize;
     let type_ = reader.read_u32()?;
-    let name_len_padded = (name_len + 3) / 4 * 4;
-    let desc_len_padded = (desc_len + 3) / 4 * 4;
+    let name_len_padded = (name_len + 3) & !3;
+    let desc_len_padded = (desc_len + 3) & !3;
     let pos = reader.position() as usize;
     if pos + name_len_padded + desc_len_padded > data.len() {
         return err!(MalformedExecutable, "ELF note is too short");
@@ -255,13 +263,9 @@ pub fn parse_core_dump(elf: Arc<ElfFile>) -> Result<(CoreDumpMemReader, Vec<(pid
         return err!(Usage, "not a core dump file");
     }
 
-    // Be careful to not confuse:
-    //  * Mapping between the crashed process's virtual memory ranges and core dump file offset ranges.
-    //    This just tells CoreDumpMemReader how to read from "memory", and also which memory ranges were executable.
-    //    This is elf.segments.
-    //  * Binaries that the crashed process had mapped. Analogous to /proc/<pid>/maps of a running debuggee.
-    //    Has file paths and offsets into those files (not into core dump file).
-    //    This is in NT_FILE note.
+    // Be careful to not confuse two mappings:
+    //  * Address <-> core dump offset. For virtual memory ranges that were resident in RAM at the time of crash, and therefore were dumped into the file. This is in elf.segments.
+    //  * Address <-> binary+offset. For file-based mmaps that the process had at the time of crash. In particular, loaded dynamic libraries and main executable. This is in NT_FILE note.
 
     let mut ranges: Vec<CoreDumpMemoryRange> = Vec::new();
     let mut notes: Vec<ElfNote> = Vec::new();
@@ -318,7 +322,7 @@ pub fn parse_core_dump(elf: Arc<ElfFile>) -> Result<(CoreDumpMemReader, Vec<(pid
             NT_AUXV => (),
             NT_PRFPREG => (), // prefix of NT_X86_XSTATE
             NT_X86_XSTATE => {
-                //asdqwe xsave
+                // TODO: [simd] xsave
             }
             NT_FILE => {
                 let mut reader = io::Cursor::new(note.desc);
@@ -408,6 +412,25 @@ impl CoreDumpMemReader {
         }
         unsafe {Ok(std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len()))}
     }
+
+    pub fn read_best_effort(&self, addr: usize, buf: &mut [u8]) {
+        let start_idx = self.ranges.partition_point(|r| r.start_address + r.size <= addr);
+        for range in &self.ranges[start_idx..] {
+            if range.start_address >= addr + buf.len() {
+                break;
+            }
+            let &CoreDumpMemorySource::File {ref file, offset} = &range.source else {
+                continue;
+            };
+            let start = if addr > range.start_address {addr - range.start_address} else {0};
+            let end = range.size.min(file.data.len().saturating_sub(offset)).min(addr + buf.len() - range.start_address);
+            if end <= start {
+                continue;
+            }
+            let pos = range.start_address + start - addr;
+            buf[pos..pos+(end-start)].copy_from_slice(&file.data[offset+start..offset+end]);
+        }
+    }
 }
 
 // Quickly parses the first few bytes of ELF header to tell whether it's a core dump.
@@ -422,6 +445,210 @@ pub fn is_core_dump_file(path: &str) -> Result<bool> {
     reader.read_exact(&mut skip)?;
     let e_type = reader.read_u16()?;
     Ok(e_type == 4)
+}
+
+// Reads and parses just enough ELF headers to find build id. That's usually just first page of the file,
+// and it's usually resident in memory (and so present in coredumps) even under memory pressure (I couldn't figure out what's the mechanism for keeping it resident).
+// This looks like a big hack, but it appears to be the standard way of extracting build ids of loaded binaries from core dumps;
+// or maybe not, I'm not sure, I didn't have the patience to read enough of eu-unstrip code to find how it does it.
+// `len` is the length of the prefix of the file that we have available, not necessarily the whole file.
+pub fn extract_build_id_from_mapped_elf(memory: &MemReader, addr: usize, len: usize) -> Result<Vec<u8>> {
+    let mut reader = CachedMemReader::new(memory.clone());
+    let mut header: libc::Elf64_Ehdr;
+    unsafe {
+        header = mem::zeroed();
+        reader.read(addr, slice::from_raw_parts_mut(&raw mut header as *mut u8, mem::size_of::<libc::Elf64_Ehdr>()))?;
+    }
+    if &header.e_ident[..4] != &[0x7f, 0x45, 0x4c, 0x46] { return err!(MalformedExecutable, "invalid ELF magic bytes: {}", hexdump(&header.e_ident[..4], 100)); }
+    let phdr_size = mem::size_of::<libc::Elf64_Phdr>();
+    if (header.e_phentsize as usize) < phdr_size { return err!(MalformedExecutable, "section header size too small: {}", header.e_phentsize); }
+
+    let mut have_notes_out_of_bounds = false;
+    for idx in 0..header.e_phnum as usize {
+        let offset = idx.saturating_mul(header.e_phentsize as usize).saturating_add(header.e_phoff as usize);
+        if offset.saturating_add(phdr_size) > len {
+            return err!(MalformedExecutable, "segment header is outside of mapped range");
+        }
+        let mut segment: libc::Elf64_Phdr;
+        unsafe {
+            segment = mem::zeroed();
+            reader.read(offset.saturating_add(addr), slice::from_raw_parts_mut(&raw mut segment as *mut u8, phdr_size))?;
+        }
+        if segment.p_type != PT_NOTE {
+            continue;
+        }
+
+        let mut offset = segment.p_offset as usize;
+        let end_offset = offset.saturating_add(segment.p_filesz as usize);
+        while offset < end_offset {
+            if offset.saturating_add(12) > len {
+                have_notes_out_of_bounds = true;
+                break;
+            }
+            let name_len = reader.read_u32(offset + addr)? as usize;
+            let desc_len = reader.read_u32(offset + addr + 4)? as usize;
+            let type_ = reader.read_u32((offset + 8).saturating_add(addr))?;
+            offset += 12;
+            let name_len_padded = (name_len + 3) / 4 * 4;
+            let desc_len_padded = (desc_len + 3) / 4 * 4;
+            if offset.saturating_add(name_len_padded).saturating_add(desc_len_padded) > len {
+                have_notes_out_of_bounds = true;
+                break;
+            }
+            if type_ == NT_GNU_BUILD_ID {
+                if desc_len > 10000 { return err!(Sanity, "NT_GNU_BUILD_ID note is very long: {} bytes", desc_len); }
+                let mut build_id = vec![0u8; desc_len];
+                reader.read((offset + name_len_padded).saturating_add(addr), &mut build_id)?;
+                return Ok(build_id);
+            }
+            offset += name_len_padded + desc_len_padded;
+        }
+    }
+    err!(MalformedExecutable, "{}", if have_notes_out_of_bounds {"NOTE segment not mapped"} else {"no NOTE segment"})
+}
+
+// Situation: the user opened a core dump produced on another machine, and the crashed process used some dynamic libraries that is not available on this machine (e.g. a different version of libc),
+// and we failed to find it in debuginfod etc. If we do nothing, the debugger won't even be able to unwind stack through this library, which usually makes the debugger useless.
+// We really want to at least get .eh_frame, and maybe also .dynsym and .dynstr (for function names). But they're usually mapped and resident in memory, so are usually present in the core dump.
+// This function extracts these sections (whichever are available) and puts them together into a fake "ElfFile".
+// ... After implementing this, I noticed that usually core dumps don't have .eh_frame anyway. Either it's usually not resident or the core dump code excludes it. Oops. This code can probably be removed.
+pub fn reconstruct_elf_from_mapped_parts(name: String, memory: &Arc<CoreDumpMemReader>, maps: MemMapsInfo, elf_prefix_addr: Range<usize>) -> Result<ElfFile> {
+    let mut reader = CachedMemReader::new(MemReader::CoreDump(memory.clone()));
+    let mut header: libc::Elf64_Ehdr;
+    unsafe {
+        header = mem::zeroed();
+        reader.read(elf_prefix_addr.start, slice::from_raw_parts_mut(&raw mut header as *mut u8, mem::size_of::<libc::Elf64_Ehdr>()))?;
+    }
+    if &header.e_ident[..4] != &[0x7f, 0x45, 0x4c, 0x46] { return err!(MalformedExecutable, "invalid ELF magic bytes: {}", hexdump(&header.e_ident[..4], 100)); }
+    let phdr_size = mem::size_of::<libc::Elf64_Phdr>();
+    if (header.e_phentsize as usize) < phdr_size { return err!(MalformedExecutable, "section header size too small: {}", header.e_phentsize); }
+
+    let mut elf = ElfFile {name, segments: Vec::new(), sections: Vec::new(), entry_point: 0, section_by_offset: Vec::new(), section_by_name: HashMap::new(), text_section: None, is_core_dump: false, is_reconstructed: true, build_id: None, mmapped: None, owned: Vec::new(), data: &[]};
+
+    // Find .eh_frame, .text (very roughly), .dynstr, .dynsym.
+
+    // Assume that all segments that we care about are loaded at addresses with the same offset relative to their addresses in segment headers.
+    // And that one of the segments starts at file offset 0, which is how we're able to get the elf file header at all.
+    // And that the file-offset-0 segment is listed earlier than any other segments we care about.
+    let mut addr_static_to_dynamic = 0usize;
+    let mut found_map_at_offset_zero = false;
+
+    let mut longest_executable_segment: (Vec<u8>, /*addr*/ usize, /*offset*/ usize) = (Vec::new(), 0, 0);
+    for idx in 0..header.e_phnum as usize {
+        let offset = idx.saturating_mul(header.e_phentsize as usize).saturating_add(header.e_phoff as usize);
+        if offset.saturating_add(phdr_size) > elf_prefix_addr.len() {
+            return err!(MalformedExecutable, "segment header is outside of mapped range");
+        }
+        let mut segment: libc::Elf64_Phdr;
+        unsafe {
+            segment = mem::zeroed();
+            reader.read(offset.saturating_add(elf_prefix_addr.start), slice::from_raw_parts_mut(&raw mut segment as *mut u8, phdr_size))?;
+        }
+
+        if segment.p_memsz == 0 || segment.p_filesz == 0 {
+            continue;
+        }
+
+        if segment.p_offset == 0 {
+            addr_static_to_dynamic = elf_prefix_addr.start.wrapping_sub(segment.p_vaddr as usize);
+            found_map_at_offset_zero = true;
+        }
+        let segment_addr = (segment.p_vaddr as usize).wrapping_add(addr_static_to_dynamic);
+
+        match segment.p_type {
+            PT_GNU_EH_FRAME => {
+                if !found_map_at_offset_zero { return err!(Dwarf, "got .eh_frame before segment with offset zero"); }
+
+                // EH_FRAME segment is .eh_frame_hdr section. But we want .eh_frame, which is usually somewhere in the middle of another segment.
+                // Parse the beginning of .eh_frame_hdr to get the address of .eh_frame start.
+                let mut buf = [0u8; 4];
+                match reader.read(segment_addr, &mut buf) {
+                    Ok(()) => (),
+                    Err(_) => return err!(ProcessState, "EH_FRAME segment is not in the core dump (addr 0x{:x} + 0x{:x})", segment.p_vaddr, addr_static_to_dynamic),
+                }
+                let encoding = buf[1];
+                let mut addr = segment_addr + 4;
+                let eh_frame_addr = match encoding & 0xf {
+                    0xf => return err!(Dwarf, "EH_FRAME doesn't have a pointer to .eh_frame"),
+                    0x1 => reader.eat_uleb128(&mut addr)?,
+                    0x9 => reader.eat_sleb128(&mut addr)? as usize,
+                    0x2 => reader.read_u16(addr)? as usize,
+                    0x3 => reader.read_u32(addr)? as usize,
+                    0x4 | 0xc => reader.read_usize(addr)?,
+                    0xa => reader.read_u16(addr)? as i16 as isize as usize,
+                    0xb => reader.read_u32(addr)? as i32 as isize as usize,
+                    _ => return err!(Dwarf, "EH_FRAME has unexpected pointer encoding: {}", encoding),
+                };
+                let eh_frame_addr = match encoding & 0xf0 {
+                    0x00 => eh_frame_addr,
+                    0x10 => eh_frame_addr.wrapping_add(segment_addr + 4),
+                    0x30 => eh_frame_addr.wrapping_add(segment_addr),
+                    _ => return err!(Dwarf, "EH_FRAME has unexpected pointer encoding: {}", encoding),
+                };
+
+                // Neither .eh_frame_hdr nor .eh_frame header has the size of .eh_frame, ugh. So we scan .eh_frame to find the null terminator (idk whether it's always present, but in the one binary I looked at it was).
+                let mut data: Vec<u8> = Vec::new();
+                loop {
+                    let len = reader.read_u32(eh_frame_addr + data.len())?;
+                    data.extend_from_slice(&len.to_le_bytes());
+                    if len == 0 {
+                        break;
+                    }
+                    let mut len = len as usize;
+                    if len == u32::MAX as usize {
+                        len = reader.read_usize(eh_frame_addr + data.len())? as usize;
+                        data.extend_from_slice(&len.to_le_bytes());
+                    }
+                    if data.len().saturating_add(len) > 1<<32 {
+                        return err!(Sanity, "suspiciously long .eh_frame in core dump: >= {} + {} bytes", data.len(), len);
+                    }
+                    let prev_len = data.len();
+                    data.resize(data.len() + len, 0u8);
+                    reader.read(eh_frame_addr + prev_len, &mut data[prev_len..])?;
+                }
+
+                let section = ElfSection {idx: elf.sections.len(), name: ".eh_frame".to_string(), section_type: SHT_PROGBITS, flags: 0, address: eh_frame_addr.wrapping_sub(addr_static_to_dynamic), offset: elf.owned.len(), size: data.len(), link: 0, info: 0, alignment: 0, entry_size: 0, name_offset_in_strtab: 0, decompressed_data: Vec::new()};
+                elf.owned.append(&mut data);
+                elf.sections.push(section);
+            }
+            PT_DYNAMIC => {
+                if !found_map_at_offset_zero { return err!(Dwarf, "got .dynamic before segment with offset zero"); }
+                // (Here we should parse the contents of this segment to find address+size of .dynstr and address of .dynsym)
+            }
+            _ if segment.p_flags & PF_X != 0 => {
+                if !found_map_at_offset_zero { return err!(Dwarf, "got executable segment before segment with offset zero"); }
+
+                if segment.p_memsz > 16<<30 {
+                    return err!(Sanity, "suspiciously long executable segment: {} bytes", segment.p_memsz);
+                }
+                if segment.p_memsz as usize > longest_executable_segment.0.len() {
+                    longest_executable_segment.0.resize(segment.p_memsz as usize, 0u8);
+                    memory.read_best_effort(segment_addr, &mut longest_executable_segment.0[..]);
+                    longest_executable_segment.1 = segment_addr;
+                    longest_executable_segment.2 = segment.p_offset as usize;
+                }
+            }
+            _ => (),
+        }
+    }
+
+    let section = ElfSection {idx: elf.sections.len(), name: ".text".to_string(), section_type: SHT_PROGBITS, flags: 0, address: longest_executable_segment.1.wrapping_sub(addr_static_to_dynamic), offset: longest_executable_segment.2, size: longest_executable_segment.0.len(), link: 0, info: 0, alignment: 0, entry_size: 0, name_offset_in_strtab: 0, decompressed_data: Vec::new()};
+    elf.owned.append(&mut longest_executable_segment.0);
+    elf.text_section = Some(elf.sections.len());
+    elf.sections.push(section);
+
+    for idx in 0..elf.sections.len() {
+        let section = &elf.sections[idx];
+        if section.size > 0 {
+            elf.section_by_offset.push((section.offset, section.offset + section.size, idx));
+        }
+        elf.section_by_name.insert(section.name.clone(), idx);
+    }
+    elf.section_by_offset.sort_unstable_by_key(|t| t.0);
+    elf.owned.reserve_exact(ELF_PAD_RIGHT);
+    elf.data = unsafe {mem::transmute(&elf.owned[..])};
+
+    Ok(elf)
 }
 
 // Read the ELF headers.
@@ -447,104 +674,66 @@ fn open_elf(name: String, file: Option<(&File, /*file_len*/ usize)>, mut owned: 
         None => &owned[..len],
     };
 
-    let mut reader = io::Cursor::new(&data[..]);
+    let (header, _) = unsafe {memcpy_struct::<libc::Elf64_Ehdr>(data, "Elf64_Ehdr")}?;
 
-    let magic = reader.read_u32()?;
-    if magic != 0x464c457f { return err!(MalformedExecutable, "invalid ELF magic bytes: 0x{:x}", magic); }
+    if &header.e_ident[..4] != &[0x7f, 0x45, 0x4c, 0x46] { return err!(MalformedExecutable, "invalid ELF magic bytes: {}", hexdump(&header.e_ident[..4], 100)); }
 
-    let x = reader.read_u8()?;
-    if x == 1 { return err!(UnsupportedExecutable, "32-bit executables are not supported"); }
-    if x != 2 { return err!(MalformedExecutable, "invalid EI_CLASS: {}", x); }
+    if header.e_ident[4] == 1 { return err!(UnsupportedExecutable, "32-bit executables are not supported"); }
+    if header.e_ident[4] != 2 { return err!(MalformedExecutable, "invalid EI_CLASS: {}", header.e_ident[4]); }
 
-    let x = reader.read_u8()?;
-    if x == 2 { return err!(UnsupportedExecutable, "big-endian executables are not supported"); }
-    if x != 1 { return err!(MalformedExecutable, "invalid EI_DATA: {}", x); }
+    if header.e_ident[5] == 2 { return err!(UnsupportedExecutable, "big-endian executables are not supported"); }
+    if header.e_ident[5] != 1 { return err!(MalformedExecutable, "invalid EI_DATA: {}", header.e_ident[5]); }
 
-    let x = reader.read_u8()?;
-    if x != 1 { return err!(MalformedExecutable, "invalid EI_VERSION: {}", x); }
+    if header.e_ident[6] != 1 { return err!(MalformedExecutable, "invalid EI_VERSION: {}", header.e_ident[6]); }
 
-    let abi = reader.read_u8()?;
+    let abi = header.e_ident[7];
     if abi != 0 && abi != 3 { return err!(UnsupportedExecutable, "only Linux and System V ABIs are supported (got: EI_OSABI = {})", abi); }
 
-    reader.read_u64()?;
-
-    let x = reader.read_u16()?;
-    let is_core_dump = x == 4;
+    let is_core_dump = header.e_type == 4;
     // 3 is "Shared object", and some executables use it.
-    if !is_core_dump && x != 2 && x != 3 { return err!(UnsupportedExecutable, "unexpected or unsupported species of elf: e_type = {}", x); }
+    if !is_core_dump && header.e_type != 2 && header.e_type != 3 { return err!(UnsupportedExecutable, "unexpected or unsupported species of elf: e_type = {}", header.e_type); }
 
-    let machine = reader.read_u16()?;
-    if machine != 0x3e { return err!(UnsupportedExecutable, "only AMD x86-64 executables are supported, for now (got: e_machine = {})", machine); }
+    if header.e_machine != 0x3e { return err!(UnsupportedExecutable, "only AMD x86-64 executables are supported, for now (got: e_machine = {})", header.e_machine); }
 
-    let x = reader.read_u32()?;
-    if x != 1 { return err!(MalformedExecutable, "invalid e_version: {}", x); }
+    if header.e_version != 1 { return err!(MalformedExecutable, "invalid e_version: {}", header.e_version); }
 
-    let entry_point = reader.read_u64()? as usize;
-    let program_header_table_offset = reader.read_u64()? as usize;
-    let section_header_table_offset = reader.read_u64()? as usize;
-    let flags = reader.read_u32()?;
+    let entry_point = header.e_entry as usize;
 
-    let x = reader.read_u16()?;
+    if header.e_phnum > 0 && (header.e_phentsize as usize) < mem::size_of::<libc::Elf64_Phdr>() { return err!(MalformedExecutable, "ELF e_phentsize too small in {}", name); }
+    if header.e_shnum > 0 && (header.e_shentsize as usize) < mem::size_of::<libc::Elf64_Shdr>() { return err!(MalformedExecutable, "ELF e_shentsize too small in {}", name); }
+    if (header.e_phnum as usize).saturating_mul(header.e_phentsize as usize).saturating_add(header.e_phoff as usize) > data.len() { return err!(MalformedExecutable, "ELF program header out of bounds in {}", name); }
+    if (header.e_shnum as usize).saturating_mul(header.e_shentsize as usize).saturating_add(header.e_shoff as usize) > data.len() { return err!(MalformedExecutable, "ELF section header out of bounds in {}", name); }
 
-    let program_header_entry_size = reader.read_u16()? as usize;
-    let program_header_entry_count = reader.read_u16()? as usize;
-    let section_header_entry_size = reader.read_u16()? as usize;
-    let section_header_entry_count = reader.read_u16()? as usize;
-    let section_names_section_idx = reader.read_u16()? as usize;
-
-    reader.seek(SeekFrom::Start(program_header_table_offset as u64))?;
     let mut segments: Vec<ElfSegment> = Vec::new();
-    for idx in 0..program_header_entry_count {
-        if program_header_entry_size < 0x38 { return err!(MalformedExecutable, "invalid program header entry size: {}", program_header_entry_size); }
-        if idx > 0 { io::copy(&mut reader.by_ref().take(program_header_entry_size as u64 - 0x38), &mut io::sink())?; }
+    for idx in 0..header.e_phnum as usize {
+        let (segment, _) = unsafe {memcpy_struct::<libc::Elf64_Phdr>(&data[header.e_phoff as usize + idx * header.e_phentsize as usize..], "Elf64_Phdr").unwrap()};
 
-        let segment_type = reader.read_u32()?;
-        let flags = reader.read_u32()?;
-        let mut offset = reader.read_u64()? as usize;
-        let address = reader.read_u64()? as usize;
-        let physical_address = reader.read_u64()? as usize;
-        let mut size_in_file = reader.read_u64()? as usize;
-        let size_in_memory = reader.read_u64()? as usize;
-        let alignment = reader.read_u64()? as usize;
-
+        let mut offset = segment.p_offset as usize;
+        let mut size_in_file = segment.p_filesz as usize;
         if offset.saturating_add(size_in_file) > data.len() {
-            eprintln!("warning: ELF segment {} out of bounds (type: 0x{:x}, offset: {}, size in file: {}, address: {}, size in memory: {}, file size: {})", idx, segment_type, offset, size_in_file, address, size_in_memory, data.len());
+            eprintln!("warning: ELF segment {} out of bounds (offset: {}, size in file: {}, file size: {})", idx, offset, size_in_file, data.len());
             offset = offset.min(data.len());
             size_in_file = size_in_file.min(data.len() - offset);
         }
 
-        segments.push(ElfSegment {idx, segment_type, flags, offset, address, size_in_file, size_in_memory, alignment});
-        //println!("segment: type: 0x{:x}, flags: 0x{:x}, offset: {}, address: {}, paddr: {}, size in file: {}, size in memory: {}, alignment: {}", segment_type, flags, offset, address, physical_address, size_in_file, size_in_memory, alignment);
+        segments.push(ElfSegment {idx, segment_type: segment.p_type, flags: segment.p_flags, offset, address: segment.p_vaddr as usize, size_in_file, size_in_memory: segment.p_memsz as usize, alignment: segment.p_align as usize});
     }
 
-    reader.seek(SeekFrom::Start(section_header_table_offset as u64))?;
     let mut sections: Vec<ElfSection> = Vec::new();
-    for idx in 0..section_header_entry_count {
-        if section_header_entry_size < 0x40 { return err!(MalformedExecutable, "invalid section header entry size: {}", section_header_entry_size); }
-        if idx > 0 { io::copy(&mut reader.by_ref().take(section_header_entry_size as u64 - 0x40), &mut io::sink())?; }
-
+    for idx in 0..header.e_shnum as usize {
+        let (section, _) = unsafe {memcpy_struct::<libc::Elf64_Shdr>(&data[header.e_shoff as usize + idx * header.e_shentsize as usize..], "Elf64_Shdr").unwrap()};
         sections.push(ElfSection {
-            idx: idx,
-            name: String::new(),
-            name_offset_in_strtab: reader.read_u32()?,
-            section_type: reader.read_u32()?,
-            flags: reader.read_u64()?,
-            address: reader.read_u64()? as usize,
-            offset: reader.read_u64()? as usize,
-            size: reader.read_u64()? as usize,
-            link: reader.read_u32()?,
-            info: reader.read_u32()?,
-            alignment: reader.read_u64()? as usize,
-            entry_size: reader.read_u64()? as usize,
-            decompressed_data: Vec::new()});
+            idx, name: String::new(), name_offset_in_strtab: section.sh_name, section_type: section.sh_type, flags: section.sh_flags,
+            address: section.sh_addr as usize, offset: section.sh_offset as usize, size: section.sh_size as usize, link: section.sh_link,
+            info: section.sh_info, alignment: section.sh_addralign as usize, entry_size: section.sh_entsize as usize, decompressed_data: Vec::new()});
     }
 
     let data: &'static [u8] = unsafe {mem::transmute(data)};
 
-    let mut elf = ElfFile {name, mmapped, owned, data, segments, sections, entry_point, section_by_offset: Vec::new(), section_by_name: HashMap::new(), text_section: None, is_core_dump};
+    let mut elf = ElfFile {name, mmapped, owned, data, segments, sections, entry_point, section_by_offset: Vec::new(), section_by_name: HashMap::new(), text_section: None, is_core_dump, is_reconstructed: false, build_id: None};
 
     for idx in 0..elf.sections.len() {
-        let name = unsafe{elf.str_from_strtab(elf.sections[section_names_section_idx].offset, elf.sections[idx].name_offset_in_strtab as usize)?}.to_string();
+        let name = unsafe{elf.str_from_strtab(elf.sections[header.e_shstrndx as usize].offset, elf.sections[idx].name_offset_in_strtab as usize)?}.to_string();
         elf.sections[idx].name = name.clone();
 
         let s = &mut elf.sections[idx];
@@ -555,7 +744,6 @@ fn open_elf(name: String, file: Option<(&File, /*file_len*/ usize)>, mut owned: 
             s.size = s.size.min(elf.data.len() - s.offset);
         }
 
-        
         if s.flags & SHF_COMPRESSED != 0 {
             let compressed = &elf.data[s.offset..s.offset+s.size_in_file()];
             let mut reader = io::Cursor::new(compressed);
@@ -567,7 +755,8 @@ fn open_elf(name: String, file: Option<(&File, /*file_len*/ usize)>, mut owned: 
             };
             let header_bytes = reader.position();
             let compressed = &reader.into_inner()[header_bytes as usize..];
-            let mut decompressed = vec![0u8; header.ch_size as usize];
+            let mut decompressed = vec![0u8; header.ch_size as usize + ELF_PAD_RIGHT];
+            decompressed.truncate(header.ch_size as usize);
 
             match header.ch_type {
                 ELFCOMPRESS_ZLIB => {
@@ -604,6 +793,30 @@ fn open_elf(name: String, file: Option<(&File, /*file_len*/ usize)>, mut owned: 
     }
 
     elf.text_section = elf.section_by_name.get(".text").copied();
+
+    // Parse all notes to find build id. We could instead just look at section ".note.gnu.build-id", but it's not always present, e.g. it's missing in vdso on my machine.
+    let mut build_id = None;
+    for section_idx in 0..elf.sections.len() {
+        if elf.sections[section_idx].section_type == SHT_NOTE {
+            let mut data = elf.section_data(section_idx);
+            while !data.is_empty() {
+                let note;
+                (note, data) = parse_elf_note(data)?;
+                match note.type_ {
+                    NT_GNU_BUILD_ID if note.name == b"GNU\0" => if !note.desc.is_empty() {
+                        build_id = Some(note.desc.to_owned());
+                    }
+                    _ => (),
+                }
+            }
+        }
+    }
+    elf.build_id = build_id;
+    if let Some(s) = &elf.build_id {
+        eprintln!("info: build id {} in {}", hexdump(s, 1000), elf.name);
+    } else if !elf.is_core_dump && elf.name != "[vdso]" {
+        eprintln!("warning: no build id in {}", elf.name);
+    }
 
     Ok(elf)
 }
