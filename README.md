@@ -17,30 +17,39 @@ Limitations:
  * Linux only
  * x86 only
  * 64-bit only
+ * for native code only (e.g. C++ or Rust, not Java or Python)
  * TUI only (no REPL, no GUI)
  * no remote debugging (but works fine over ssh)
  * single process (doesn't follow forks)
  * no record/replay or backwards stepping
 
 Development status:
+ * Essential features are there. But different people consider different features essential, and probably many of them are not implemented. Let me know.
  * I use it every day and find it very helpful.
- * Essential features are there. But different people probably consider different features essential, and probably many of them are not implemented. Let me know.
- * Not widely tested - I only used it on a few machines and a few executables.
+ * Not widely tested - I only tried it on a few machines and a few real executables.
 
 Distributed as a single 4 MB statically linked executable file.
 
-Download:
+"Installation":
 ```bash
 curl -L -o nnd 'https://github.com/al13n321/nnd/releases/latest/download/nnd'
 chmod +x nnd
-# use ./nnd
+# try `./nnd --help` to get started
 ```
 
 Or build from source:
-```
-rustup target add x86_64-unknown-linux-musl  # run this once to install musl
+```bash
+# Prerequisites:
+#  1. Install Rust.
+#  2. Install musl target:
+rustup target add x86_64-unknown-linux-musl
+#  3. Install musl-tools
+sudo apt install musl-tools
+
+# Build:
 cargo build --profile dbgo --bin nnd
-# the executable is at target/x86_64-unknown-linux-musl/dbgo/nnd
+
+# The executable is at target/x86_64-unknown-linux-musl/dbgo/nnd
 ```
 
 Run `nnd --help` for documentation.
