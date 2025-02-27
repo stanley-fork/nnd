@@ -3,7 +3,7 @@ set -e
 
 if [ "$1" != "allow-uncommitted" ]
 then
-    status="$(git status)"
+    status="$(git status --porcelain)"
     if [ "$status" != "" ]
     then
         echo "uncommitted changes"
