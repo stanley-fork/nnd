@@ -1,6 +1,5 @@
 #!/bin/bash
 set -e
-set -v
 
 if [ "$1" != "allow-uncommitted" ]
 then
