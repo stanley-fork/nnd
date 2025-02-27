@@ -19,7 +19,7 @@ cp target/x86_64-unknown-linux-musl/dbgo/nnd ../../nnd-release/nnd-new && mv ../
 
 butler push target/x86_64-unknown-linux-musl/release/nnd al13n/nnd:linux
 
-TAG_NUM=`git describe --tags --abbrev=0 | grep -Po '(?<=^v0\.)\d+$' | sort -n | tail -n1`
+TAG_NUM=`git tag | grep -Po '(?<=^v0\.)\d+$' | sort -n | tail -n1`
 if [ "$TAG_NUM" == "" ]
 then
     echo "couldn't find latest tag number"
