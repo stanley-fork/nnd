@@ -1,5 +1,5 @@
 use crate::{*, error::*, elf::*, symbols::*, procfs::*, util::*, unwind::*, log::*, context::*, settings::*};
-use std::{fs::File, collections::{HashMap, HashSet, hash_map::Entry, VecDeque}, rc::Rc, sync::{Arc, Mutex, Condvar, Weak}, sync::atomic::{AtomicBool, AtomicUsize, Ordering}, thread::{self, JoinHandle}, mem, path::Path, io, str, ops::Range};
+use std::{fs::{File, OpenOptions}, collections::{HashMap, HashSet, hash_map::Entry, VecDeque}, rc::Rc, sync::{Arc, Mutex, Condvar, Weak}, sync::atomic::{AtomicBool, AtomicUsize, Ordering}, thread::{self, JoinHandle}, mem, path::Path, io, str, ops::Range, os::unix::{fs::OpenOptionsExt, ffi::OsStrExt}, os::fd::AsRawFd, ptr, fmt::Write as fmtWrite, io::{Read, Write}, time::{Duration, Instant}};
 use std::os::unix::fs::MetadataExt;
 
 #[derive(Clone)]
@@ -54,11 +54,13 @@ pub struct BinaryReconstructionInput {
 
 pub struct SymbolsRegistry {
     supplementary_binaries: SupplementaryBinaries,
+
+    shared: Arc<Shared>,
+
     binaries: Vec<Option<(Binary, Arc<SymbolsLoadingStatus>)>>, // id -> binary
     pub locator_to_id: HashMap<BinaryLocator, usize>,
     // Binaries in order in which they should be displayed and searched. E.g. the main executable is usually first, unmapped binaries are after mapped ones, etc.
     pub priority_order: Vec<usize>,
-    shared: Arc<Shared>,
 }
 
 impl SymbolsRegistry {
@@ -121,6 +123,10 @@ impl SymbolsRegistry {
         }
 
         let mut binary = Binary {locator: locator.clone(), build_id: build_id.clone(), id, elves: err!(Loading, "loading symbols"), symbols: err!(Loading, "loading symbols"), unwind: err!(Loading, "loading symbols"), is_mapped: false, addr_map: AddrMap::default(), mmap_idx: 0, priority_idx: 0, notices: Vec::new(), warnings: Vec::new()};
+
+        if let Some(id) = &build_id {
+            binary.notices.push(format!("build id: {}", hexdump(id, 1000)));
+        }
 
         let additional_elves = self.find_matching_supplementary_binaries(&locator, &build_id, is_first, &mut binary.notices, &mut binary.warnings);
 
@@ -287,7 +293,7 @@ fn task_load_elf(shared: Arc<Shared>, locator: BinaryLocator, id: usize, status:
     //  1. Supplementary binaries provided by the user (matched by build id etc). (Already in `elves`.)
     //  2. The file at locator.path (i.e. path from /proc/<pid>/maps).
     //  3. debuglink.
-    //  4. TODO: debuginfod
+    //  4. debuginfod.
     //  5. If it's a core dump, and all else fails, reconstruct parts of the file from what's available in the core dump.
 
     match load_elf(&locator, elf_contents_maybe, custom_path.clone()) {
@@ -301,7 +307,7 @@ fn task_load_elf(shared: Arc<Shared>, locator: BinaryLocator, id: usize, status:
         Err(e) => errors.push(e),
     }
     if !elves.is_empty() || build_id.is_some() {
-        match open_debuglink(if elves.is_empty() {None} else {Some(&elves[0])}, build_id.as_ref().map(|x| &x[..])) {
+        match open_debuglink(if elves.is_empty() {None} else {Some(&elves[0])}, &build_id) {
             Ok(Some(elf)) => {
                 notices.push(format!("debuglink: {}", elf.name));
                 elves.push(Arc::new(elf));
@@ -311,6 +317,40 @@ fn task_load_elf(shared: Arc<Shared>, locator: BinaryLocator, id: usize, status:
             Err(e) => errors.push(e),
         }
     }
+
+    let have_debug_info = elves.iter().any(|elf| elf.has_section_data(".debug_info"));
+    if !have_debug_info && !shared.context.settings.debuginfod_urls.is_empty() {
+        if let (Some(build_id), Some(debuginfod_cache_path)) = (&build_id, &shared.context.settings.debuginfod_cache_path) {
+            // We need two things: (1) a file that uses the same file offsets for sections as the binary loaded in the debuggee, and (2) a file that has .debug_info etc.
+            // Sometimes they're the same file (unstripped executable), sometimes they're separate (exeuctable with debuginfo removed + executable with machine code removed).
+            // Debuginfod offers two files: "executable" and "debuginfo"; "executable" satisfies (1), and "debuginfo" satisfies (2),
+            // but either of them may also be just the unstripped executable satisfying both (1) and (2).
+            // So we have a choice: download both files in parallel for minimum latency, or download in sequence and skip the second file if the first one has all we need.
+            // Currently we download in sequence, starting with the "debuginfo" file.
+            // Note that latency is not a theoretical concern here: debuginfod takes 2 minutes to respond sometimes for some reason, so waiting for it twice is not very good.
+            //
+            // TODO: Debuginfod servers can take minutes to respond. This should be asynchronous. First kick off symbols loading without debuginfod, then if debuginfod succeeds generate new Symbols identity and start over.
+            match try_to_download_from_debuginfod(build_id, &shared.context.settings.debuginfod_urls, "debuginfo", debuginfod_cache_path, &status) {
+                Ok((elf, cache_hit)) => {
+                    notices.push(format!("debuginfo {} from debuginfod: {}", if cache_hit {"cached"} else {"downloaded"}, elf.name));
+                    elves.push(Arc::new(elf));
+
+                    let have_text = elves.iter().any(|elf| elf.has_section_data(".text"));
+                    if !have_text {
+                        match try_to_download_from_debuginfod(build_id, &shared.context.settings.debuginfod_urls, "executable", debuginfod_cache_path, &status) {
+                            Ok((elf, cache_hit)) => {
+                                notices.push(format!("executable {} from debuginfod: {}", if cache_hit {"cached"} else {"downloaded"}, elf.name));
+                                elves.insert(0, Arc::new(elf));
+                            }
+                            Err(e) => warnings.push(format!("debuginfod executable fetch failed: {}", e)),
+                        }
+                    }
+                }
+                Err(e) => notices.push(format!("debuginfod fetch failed: {}", e)),
+            }
+        }
+    }
+
     let found_reputable_file = !elves.is_empty();
     if !found_reputable_file {
         // Get desperate.
@@ -362,7 +402,7 @@ fn task_load_elf(shared: Arc<Shared>, locator: BinaryLocator, id: usize, status:
     }
 }
 
-fn open_debuglink(elf: Option<&ElfFile>, build_id: Option<&[u8]>) -> Result<Option<ElfFile>> {
+fn open_debuglink(elf: Option<&ElfFile>, build_id: &Option<Vec<u8>>) -> Result<Option<ElfFile>> {
     let (filename, build_id, crc32) = if let Some(elf) = elf {
         let build_id = match &elf.build_id {
             None => return Ok(None),
@@ -403,6 +443,98 @@ fn open_debuglink(elf: Option<&ElfFile>, build_id: Option<&[u8]>) -> Result<Opti
     }
 
     Ok(Some(res))
+}
+
+fn try_to_download_from_debuginfod(build_id: &[u8], urls: &[String], artifact_type: &str, cache_path: &Path, status: &SymbolsLoadingStatus) -> Result<(ElfFile, /*cache_hit*/ bool)> {
+    let mut cached_file_path = cache_path.to_owned();
+    cached_file_path.push(format!("{}.{}", hexdump(build_id, 1000), artifact_type));
+    let cached_file_path_str = cached_file_path.to_string_lossy().into_owned();
+
+    let file = match File::open(&cached_file_path) {
+        Ok(file) => {
+            eprintln!("info: debuginfod cache hit: {}", cached_file_path_str);
+            let elf = ElfFile::from_file(cached_file_path_str, &file, file.metadata()?.len())?;
+            return Ok((elf, true));
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+        Err(e) => return Err(e.into()),
+    };
+
+    // TODO: Cache 404 responses. I guess write a file <build_id>.status with list of urls that were tried and last failure timestamp.
+
+    let mut cached_file = OpenOptions::new().read(true).write(true).custom_flags(libc::O_TMPFILE).open(cache_path)?;
+    let mut first_error: Option<Error> = None;
+    for url in urls {
+        let mut full_url = url.clone();
+        if !full_url.ends_with("/") {
+            full_url.push_str("/");
+        }
+        write!(full_url, "buildid/{}/{}", hexdump(build_id, 1000), artifact_type).unwrap();
+
+        eprintln!("info: sending request {}", full_url);
+        *status.stage.lock().unwrap() = format!("trying {}", url);
+
+        let start_time = Instant::now();
+        // I've seen connect() syscall to debuginfod servers take 2 minutes and time out when using IPv6.
+        let timeout = Duration::from_secs(3);
+        let config = ureq::config::Config::builder().timeout_connect(Some(timeout)).timeout_recv_response(Some(timeout)).user_agent("nnd/1").ip_family(ureq::config::IpFamily::Ipv4Only).build();
+        let agent = ureq::Agent::new_with_config(config);
+        let mut response = match agent.get(&full_url).call() {
+            Ok(x) => x,
+            Err(e) => {
+                let secs = start_time.elapsed().as_secs_f64();
+                eprintln!("info: error {} after {:.3}s: {}", full_url, secs, e);
+                if let ureq::Error::StatusCode(404) = e {}
+                else if first_error.is_none() {
+                    first_error = Some(error!(Network, "{}", e));
+                }
+                continue;
+            }
+        };
+        let mut reader = response.body_mut().as_reader();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = match reader.read(&mut buf) {
+                Ok(x) => x,
+                Err(e) => {
+                    eprintln!("warning: error when reading from {} : {}", full_url, e);
+                    return err!(Network, "error when reading from {} : {}", full_url, e);
+                }
+            };
+            if n == 0 {
+                break;
+            }
+            let mut pos = 0;
+            while pos < n {
+                let wrote = match cached_file.write(&buf[pos..n]) {
+                    Ok(0) => return err!(Environment, "failed to write to file"),
+                    Ok(x) => x,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e.into()),
+                };
+                assert!(wrote <= n);
+                pos += wrote;
+            }
+        }
+        cached_file.flush()?;
+
+        // Turn the anonymous temp file into a real file.
+        let mut cached_file_path_c_string = cached_file_path.as_os_str().as_bytes().to_owned();
+        cached_file_path_c_string.push(b'\0');
+        let fd_path_c_string = format!("/proc/self/fd/{}\0", cached_file.as_raw_fd());
+        let r = unsafe {libc::linkat(libc::AT_FDCWD, fd_path_c_string.as_bytes().as_ptr() as *const i8, libc::AT_FDCWD, cached_file_path_c_string.as_ptr() as *const i8, libc::AT_SYMLINK_FOLLOW)};
+        if r != 0 {
+            return errno_err!("linkat() failed");
+        }
+        eprintln!("info: downloaded from {} to {}", full_url, cached_file_path_str);
+        let elf = ElfFile::from_file(cached_file_path_str, &cached_file, cached_file.metadata()?.len())?;
+        return Ok((elf, false));
+    }
+    if let Some(e) = first_error {
+        Err(e)
+    } else {
+        err!(MissingSymbols, "debuginfod servers don't have it")
+    }
 }
 
 fn task_load_unwind(shared: Arc<Shared>, id: usize, elves: Vec<Arc<ElfFile>>) {

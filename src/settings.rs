@@ -1,5 +1,5 @@
 use crate::{*, terminal::*, common_ui::*, error::*};
-use std::{collections::{HashMap, hash_map::Entry}, path::PathBuf, fmt, fmt::Write as fmtWrite, path::Path, mem};
+use std::{collections::{HashMap, hash_map::Entry}, path::PathBuf, fmt, fmt::Write as fmtWrite, path::Path, mem, env};
 
 pub struct Settings {
     pub tab_width: usize,
@@ -16,6 +16,9 @@ pub struct Settings {
     pub periodic_timer_ns: usize,
     pub mouse_mode: MouseMode,
     pub exception_aware_steps: bool,
+
+    pub debuginfod_urls: Vec<String>,
+    pub debuginfod_cache_path: Option<PathBuf>,
 
     pub code_dirs: Vec<PathBuf>,
     pub supplementary_binary_paths: Vec<String>,
@@ -41,6 +44,9 @@ impl Default for Settings {
         supplementary_binary_paths: Vec::new(),
         exception_aware_steps: true,
 
+        debuginfod_urls: Vec::new(), // populated by get_debuginfod_urls() later
+        debuginfod_cache_path: None,
+
         stdin_file: None,
         stdout_file: None,
         stderr_file: None,
@@ -48,6 +54,17 @@ impl Default for Settings {
         fixed_fps: false,
         trace_logging: false,
     } }
+}
+
+pub fn get_debuginfod_urls(default: bool) -> Vec<String> {
+    if default {
+        // This is a "federated" server that queries ~10 other servers (debuginfod.ubuntu.com, debuginfod.fedoraproject.org, etc), see https://sourceware.org/elfutils/Debuginfod.html
+        return vec!["https://debuginfod.elfutils.org/".to_string()];
+    }
+    match env::var("DEBUGINFOD_URLS") {
+        Ok(v) => v.split_ascii_whitespace().map(|s| s.to_string()).collect(),
+        Err(_) => Vec::new(),
+    }
 }
 
 pub struct Palette {

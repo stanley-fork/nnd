@@ -5,6 +5,7 @@ pub struct PersistentState {
     pub path: Result<PathBuf>,
     pub configs_path: Option<PathBuf>,
     pub log_file_path: Option<PathBuf>,
+    pub debuginfod_cache_path: Option<PathBuf>,
 
     pub config_change_fd: Option<INotifyFD>,
     pub original_stderr_fd: Option<RawFd>,
@@ -16,7 +17,7 @@ pub struct PersistentState {
     save_failures: usize,
     keys_config_reload_count: usize,
 }
-impl Default for PersistentState { fn default() -> Self { Self {path: err!(Internal, "state is empty"), configs_path: None, config_change_fd: None, dir: None, lock: None, state_hash: 0, save_failures: 0, log_file_path: None, original_stderr_fd: None, keys_config_reload_count: 0} } }
+impl Default for PersistentState { fn default() -> Self { Self {path: err!(Internal, "state is empty"), configs_path: None, debuginfod_cache_path: None, config_change_fd: None, dir: None, lock: None, state_hash: 0, save_failures: 0, log_file_path: None, original_stderr_fd: None, keys_config_reload_count: 0} } }
 impl PersistentState {
     // Finds/creates a directory ~/.nnd/0, and flock()s ~/.nnd/0/lock to prevent other debugger processes from using this directory.
     // If ~/.nnd/0 is already locked, tries ~/.nnd/1, etc. The lock is released when debugger exits or dies.
@@ -52,11 +53,15 @@ impl PersistentState {
             loop {
                 let r = unsafe {libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)};
                 if r == 0 {
+                    let mut debuginfod_cache_path = parent_path.clone();
+                    debuginfod_cache_path.push("debuginfod");
+                    DirFd::open_or_create(&debuginfod_cache_path)?;
+
                     let log_file_name = "log";
                     let log = dir.open_or_create_file(Path::new(log_file_name))?;
                     let original_stderr_fd = redirect_stderr(&log)?;
                     let log_file_path = Some(path.join(log_file_name));
-                    return Ok(Self {path: Ok(path), configs_path: Some(parent_path), dir: Some(dir), lock: Some(lock), log_file_path, original_stderr_fd, ..Default::default()});
+                    return Ok(Self {path: Ok(path), configs_path: Some(parent_path), debuginfod_cache_path: Some(debuginfod_cache_path), dir: Some(dir), lock: Some(lock), log_file_path, original_stderr_fd, ..Default::default()});
                 }
                 let e = io::Error::last_os_error();
                 match e.kind() {

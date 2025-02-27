@@ -182,6 +182,13 @@ impl ElfFile {
         (0..self.sections.len()).map(|i| self.section_data(i).len()).sum()
     }
 
+    pub fn has_section_data(&self, name: &str) -> bool {
+        match self.section_by_name.get(name) {
+            Some(&idx) => self.sections[idx].section_type != SHT_NOBITS,
+            None => false,
+        }
+    }
+
     pub fn from_file(name: String, file: &File, file_len: u64) -> Result<Self> {
         open_elf(name, Some((file, file_len as usize)), Vec::new())
     }

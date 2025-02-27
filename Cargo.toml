@@ -32,7 +32,9 @@ rand = "^0.8.5"
 unicode-segmentation = "^1.10"
 unicode-width = "^0.1"
 rustc-demangle = "^0.1"
-ureq = "^3.0" # for downloading from debuginfod
+# HTTP+TLS client for downloading from debuginfod. This accounts for more than half of the dependency tree (see `cargo tree`)
+# and adds the only non-cargo dependency: musl-tools (use e.g. `apt install musl-tools`). But I couldn't find anything better :(
+ureq = "^3.0"
 
 [dev-dependencies]
 gimli = {version = "^0.31.1", default-features = false, features = ["std", "read", "write"]}

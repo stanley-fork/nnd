@@ -1,5 +1,9 @@
 A debugger for Linux. Partially inspired by RemedyBG.
 
+Mom, can we have RAD Debugger on Linux?
+No, we have debugger at home.
+Debugger at home:
+
 ![screenshot](https://github.com/user-attachments/assets/e0b03f1e-c1d1-4e38-a992-2ace7321bb75)
 
 Properties:

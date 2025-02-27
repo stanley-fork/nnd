@@ -78,6 +78,7 @@ fn main() {
     let all_args: Vec<String> = std::env::args().collect();
     let mut args = &all_args[1..];
     let mut seen_args: HashSet<String> = HashSet::new();
+    let mut use_default_debuginfod_urls = false;
     while !args.is_empty() && args[0].starts_with("-") {
         if let Some(v) = parse_arg(&mut args, &mut seen_args, "--pid", "-p", false, false) {
             attach_pid = match pid_t::from_str(&v) {
@@ -142,6 +143,8 @@ fn main() {
             };
         } else if let Some(s) = parse_arg(&mut args, &mut seen_args, "--core", "-c", false, false) {
             core_dump_path = Some(s);
+        } else if let Some(_) = parse_arg(&mut args, &mut seen_args, "--debuginfod", "-o", true, false) {
+            use_default_debuginfod_urls = true;
         } else if print_help_chapter(&args[0], &all_args[0]) {
             process::exit(0);
         } else {
@@ -149,9 +152,12 @@ fn main() {
             process::exit(1);
         }
     }
+
     if settings.code_dirs.is_empty() {
         settings.code_dirs.push(PathBuf::from(""));
     }
+
+    settings.debuginfod_urls = get_debuginfod_urls(use_default_debuginfod_urls);
 
     // Autodetect core dump without requiring -c.
     if core_dump_path.is_none() && attach_pid.is_none() && !args.is_empty() {
@@ -202,6 +208,7 @@ fn main() {
 
     // This redirects stderr to the log file, so we have to do it early.
     let persistent = PersistentState::init();
+    settings.debuginfod_cache_path = persistent.debuginfod_cache_path.clone();
 
     // There are two pieces of best-effort cleanup we need to do on panic:
     //  * Remove breakpoints and detach from the process, if attached with -p.

@@ -1,14 +1,15 @@
-core dumps:
-hide ui things in core dump mode: pid, resource stats in status window, cpu usage in threads window, hints for stepping and breakpoints, etc
-search for pid to see what else to disable
+sprint:
+debuginfod
+finish listing features in README
+test with different-versioned libraries
 test with breakpad minidumps
-fetch from debuginfod
-test that signaled thread is selected on startup
-match by build id, repeated --exe
-documentation
-  command line
-  repeated --exe
-vdso bad notices: build id mismatch, debuglink not found
+simd registers
+cast to same-size value: my_byte_array as my_struct
+cast to shorter array of same type by value: my_array as [u8; 8]
+cast to auto-size array: my_fixed_size_array as [u8]
+function pointers
+thread-local variables
+crash screen: show stack trace and process state, type something to resume+detach or kill or email stack trace or quit
 
 bugs:
 investigate `clickhouse local` progress spinner appearing in debugger window despite -t
@@ -41,10 +42,8 @@ test with 10k threads
 test with watches window filled with long arrays (I saw 50ms frames when there are ~5 of them; maybe just decrease length limit)
 
 todo:
-update README already ffs
-core dumps
-get debug info from debuginfod; (maybe also source code, though it seems always unavailable)
 buffer input when program is quitting, especially k+r and steps
+show and error if program failed to start (e.g. executable doesn't exist)
 floating point and simd registers ("TODO: [simd]")
 use RssAnon (from /proc/pid/status) instead of VmRss (includes page cache)
 don't immediately kill child on debugger panic; have a simple fallback state where the child is running, and the user can kill+quit, detach+quit, or do nothing (maybe also pause/resume)

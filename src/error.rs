@@ -28,6 +28,7 @@ pub enum ErrorCode {
     NotCalculated = 27,
     NoField = 28,
     NotContainer = 29,
+    Network = 30,
 }
 
 #[derive(Debug)]
