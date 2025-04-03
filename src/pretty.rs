@@ -1295,17 +1295,25 @@ fn recognize_libcpp_deque(substruct: &mut Substruct, val: &mut Cow<Value>, state
     find_pointer_field(&["end_cap"], &mut map, &mut value_ptr_type)?;
     map.check_all_fields_used()?;
 
-    let iterator_type = find_nested_type("iterator", unsafe {(*type_).nested_names})?;
-    let block_size = find_nested_usize_constant("_BS", unsafe {(*iterator_type).nested_names})?;
-    if block_size == 0 {
-        return err!(NotContainer, "");
-    }
-
     match unsafe {&(*value_ptr_type).t} {
         Type::Pointer(p) if p.type_ == value_type => (),
         _ => return err!(NoField, ""),
     }
     let value_size = unsafe {(*value_type).calculate_size()};
+
+    let iterator_type = find_nested_type("iterator", unsafe {(*type_).nested_names})?;
+    let mut block_size = find_nested_usize_constant("_BS", unsafe {(*iterator_type).nested_names})?;
+    if block_size == 0 {
+        // With _LIBCPP_ABI_INCOMPLETE_TYPES_IN_DEQUE, this template argument is always zero, and instead the static constant field __block_size is used.
+        // But the value of this field doesn't seem to be present anywhere in the debug symbols. Neither are instantiations of the struct __deque_block_size.
+        // So I'm falling back to calculating block size right here, using the formula from __deque_block_size from some version of libc++.
+        // This may quietly break for other versions.
+        if value_size > 0 {
+            block_size = if value_size < 256 {4096 / value_size} else {16};
+        } else {
+            return err!(NotContainer, "");
+        }
+    }
 
     let start = val.val.bit_range(start_field, &mut context.memory)?;
     let size = val.val.bit_range(size_field, &mut context.memory)?;
