@@ -3062,7 +3062,7 @@ impl<'a> DwarfLoader<'a> {
                     } else {
                         let decl = Self::parse_line_info(&mut self.shard, &self.loader, self.unit, &attrs.decl);
                         let var = Variable::new(attrs.name, attrs.type_ as *const TypeInfo, offset, decl, VariableFlags::TEMPLATE_PARAMETER);
-                        let loc = if attrs.fields & FieldAttributes::const_value_usize != 0 {
+                        let loc = if attrs.fields & TemplateValueParameterAttributes::const_value_usize != 0 {
                             DwarfVariableLocation::ConstUsize(attrs.const_value_usize)
                         } else {
                             DwarfVariableLocation::ConstSlice(attrs.const_value_slice)
