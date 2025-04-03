@@ -490,7 +490,7 @@ impl<'a, T, K: Ord, F: FnMut(&T) -> K> Iterator for MergeIterator<'a, T, K, F> {
 pub struct SyncUnsafeCell<T> { value: UnsafeCell<T> }
 unsafe impl<T: Sync> Sync for SyncUnsafeCell<T> {}
 impl<T> SyncUnsafeCell<T> {
-    pub fn new(value: T) -> Self { Self { value: UnsafeCell::new(value) } }
+    pub const fn new(value: T) -> Self { Self { value: UnsafeCell::new(value) } }
     pub fn into_inner(self) -> T { self.value.into_inner() }
     #[inline]
     pub fn get(&self) -> *mut T { self.value.get() }

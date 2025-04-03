@@ -8,7 +8,7 @@ use libc::{self, STDIN_FILENO, pid_t};
 // Pipes written from corresponding signal handlers, read from main loop. We could use one pipe and write signal number to it, but it would break in the unlikely case when one signal fills up the whole pipe before the main loop drains it - then other signals would get lost. Probably not actually important.
 static mut SIGNAL_PIPES_WRITE: [i32; 32] = [-1; 32];
 
-static mut MAIN_THREAD_ID: UnsafeCell<Option<ThreadId>> = UnsafeCell::new(None);
+static MAIN_THREAD_ID: SyncUnsafeCell<Option<ThreadId>> = SyncUnsafeCell::new(None);
 static mut DEBUGGER_TO_DROP_ON_PANIC: UnsafeCell<Option<*mut Debugger>> = UnsafeCell::new(None);
 
 extern "C" fn signal_handler(sig: i32, _: *mut libc::siginfo_t, _: *mut libc::c_void) {
@@ -234,6 +234,7 @@ fn main() {
             // but should be almost always fine, and this is best-effort anyway.
             unsafe {
                 if Some(thread::current().id()) == *MAIN_THREAD_ID.get() {
+                    #[allow(static_mut_refs)]
                     if let Some(d) = *DEBUGGER_TO_DROP_ON_PANIC.get() {
                         ptr::drop_in_place(d);
                     }
@@ -324,6 +325,7 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, core_dump_path: Option<Str
     let mut debugger: Pin<Box<Debugger>>;
     if let &Some(pid) = &attach_pid {
         debugger = Pin::new(Box::new(Debugger::attach(pid, context.clone(), persistent, supplementary_binaries)?));
+        #[allow(static_mut_refs)]
         unsafe { *DEBUGGER_TO_DROP_ON_PANIC.get() = Some(&mut *debugger); }
     } else if let Some(path) = &core_dump_path {
         debugger = Pin::new(Box::new(Debugger::open_core_dump(path, context.clone(), persistent, supplementary_binaries)?));
@@ -340,7 +342,10 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, core_dump_path: Option<Str
         };
         debugger.start_child(initial_step)?;
     }
-    defer! { unsafe { *DEBUGGER_TO_DROP_ON_PANIC.get() = None; } }
+    defer! {
+        #[allow(static_mut_refs)]
+        unsafe {*DEBUGGER_TO_DROP_ON_PANIC.get() = None;}
+    }
 
     let mut ui = DebuggerUI::new();
 
