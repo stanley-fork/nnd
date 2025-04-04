@@ -2702,6 +2702,7 @@ struct ThreadsFilter {
     cache_key: String, // when this changes, drop cached_results
     // Cached information about previously seen threads. We re-check each thread's stop_count each frame. Sorted by thread_idx.
     cached_results: Vec<(/*thread_idx*/ usize, /*stop_count*/ usize, /*passes_filter*/ bool)>,
+    last_seen_filtered_count: usize,
 }
 impl ThreadsFilter {
     fn get_filtered_tids(&mut self, debugger: &mut Debugger) -> Vec<pid_t> {
@@ -2813,7 +2814,12 @@ impl WindowContent for ThreadsWindow {
         with_parent!(ui, ui.add(widget!().identity(&'s')), {
             ui.focus();
             let l = ui_writeln!(ui, default_dim, "filter (name+stack): ");
-            self.filter.bar.build(Some(l), None, ui);
+            let r = if self.filter.bar.text.text.is_empty() {
+                None
+            } else {
+                Some(ui_writeln!(ui, default_dim, "{}/{} threads", self.filter.last_seen_filtered_count, debugger.threads.len()))
+            };
+            self.filter.bar.build(Some(l), r, ui);
         });
         let table_widget = ui.add(widget!().identity(&'t').height(AutoSize::Remainder(1.0)));
         with_parent!(ui, table_widget, {
@@ -2836,6 +2842,10 @@ impl WindowContent for ThreadsWindow {
         });
 
         let tids = self.filter.get_filtered_tids(debugger);
+        if tids.len() != self.filter.last_seen_filtered_count {
+            self.filter.last_seen_filtered_count = tids.len();
+            ui.should_redraw = true;
+        }
         let mut threads: Vec<&Thread> = tids.iter().map(|t| debugger.threads.get(t).unwrap()).collect();
         if (table.state.sort_column, table.state.sort_descending) != (0, false) {
             // This probably generates a ton of machine code. There's probably a better way to do this.
