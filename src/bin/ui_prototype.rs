@@ -495,8 +495,8 @@ const MOUSE_BUTTON_EVENT_MODE: &'static str = "\x1b[?1002h";
 const MOUSE_ANY_EVENT_MODE: &'static str = "\x1b[?1003h";
 const MOUSE_DISABLE: &'static str = "\x1b[?1003l\x1b[?1002l\x1b[?1007l\x1b[?1006l\x1b[?1004l";
 
-static mut TERMINAL_STATE_TO_RESTORE: UnsafeCell<libc::termios> = UnsafeCell::new(/*rust, why doesn't mem::zeroed() just work here*/ libc::termios{c_iflag:0,c_oflag:0,c_cflag:0,c_lflag:0,c_line:0,c_cc:[0;32],__c_ispeed:0,__c_ospeed:0});
-static mut TERMINAL_STATE_RESTORED: AtomicBool = AtomicBool::new(true);
+static TERMINAL_STATE_TO_RESTORE: SyncUnsafeCell<libc::termios> = SyncUnsafeCell::new(/*rust, why doesn't mem::zeroed() just work here*/ libc::termios{c_iflag:0,c_oflag:0,c_cflag:0,c_lflag:0,c_line:0,c_cc:[0;32],__c_ispeed:0,__c_ospeed:0});
+static TERMINAL_STATE_RESTORED: AtomicBool = AtomicBool::new(true);
 
 // Changes terminal state to raw mode, alternate screen, and bar cursor.
 // Called once at program startup. Not thread safe.

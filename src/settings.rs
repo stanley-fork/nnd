@@ -16,6 +16,13 @@ pub struct Settings {
     pub periodic_timer_ns: usize,
     pub mouse_mode: MouseMode,
     pub exception_aware_steps: bool,
+    // If false, expect the debug info to contain full accurate mapping program_counter -> source_line.
+    // If true, expect the mapping to be reliable only for the main/entry ("statement") instruction of each line+column, while
+    // other instructions potentially have garbage line number info (often line number 0).
+    // The `true` mode is more likely to understep or stop on an instruction with garbage line info (like line 0 or wrong file)
+    // if the program wasn't built with sufficiently high debug info level.
+    // The `false` mode is more likely to overstep.
+    pub steps_stop_only_on_statements: bool,
 
     pub debuginfod_urls: Vec<String>,
     pub debuginfod_cache_path: Option<PathBuf>,
@@ -26,6 +33,8 @@ pub struct Settings {
     pub stdin_file: Option<String>,
     pub stdout_file: Option<String>,
     pub stderr_file: Option<String>,
+
+    pub disable_aslr: bool,
 
     pub fixed_fps: bool, // render `fps` times per second even if nothing changes
     pub trace_logging: bool, // verbose logging, e.g. log every signal passed-through to the process
@@ -43,6 +52,7 @@ impl Default for Settings {
         code_dirs: Vec::new(),
         supplementary_binary_paths: Vec::new(),
         exception_aware_steps: true,
+        steps_stop_only_on_statements: true,
 
         debuginfod_urls: Vec::new(), // populated by get_debuginfod_urls() later
         debuginfod_cache_path: None,
@@ -50,6 +60,8 @@ impl Default for Settings {
         stdin_file: None,
         stdout_file: None,
         stderr_file: None,
+
+        disable_aslr: true,
 
         fixed_fps: false,
         trace_logging: false,
@@ -154,6 +166,8 @@ pub struct Palette {
     pub disas_jump_arrow: Style,
     pub disas_relative_address: Style,
     pub disas_filename: Style,
+    pub disas_address_statement: Style,
+    pub disas_address_not_statement: Style,
 
     pub thread_breakpoint_hit: StyleAdjustment,
     pub thread_crash: StyleAdjustment,
@@ -256,6 +270,8 @@ impl Default for Palette {
             disas_jump_arrow: Style {fg: white, ..D!()},
             disas_relative_address: Style {fg: cyan.darker(), ..D!()}, 
             disas_filename: Style {fg: cyan.darker(), ..D!()},
+            disas_address_statement: Style {fg: white.darker(), ..D!()},
+            disas_address_not_statement: Style {fg: white.darker().darker(), ..D!()},
 
             thread_breakpoint_hit: StyleAdjustment {add_fg: (100, 100, 100), add_bg: (10, 100, 10), ..D!()},
             thread_crash: StyleAdjustment {add_fg: (100, 100, 100), add_bg: (150, 50, 50), ..D!()},

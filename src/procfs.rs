@@ -90,8 +90,9 @@ pub struct AddrMap {
     // If different sections are offset by a different amount, this is set to false, so that we can show some warning in the UI or something.
     // Not to be confused with the difference between address and file offset - this difference may be different for different sections, we make no assumptions about that.
     consistent: bool,
+    shortest_used_map: usize,
 }
-impl Default for AddrMap { fn default() -> Self { Self {diff: 0, known: false, consistent: true} } }
+impl Default for AddrMap { fn default() -> Self { Self {diff: 0, known: false, consistent: true, shortest_used_map: usize::MAX} } }
 impl AddrMap {
     pub fn update(&mut self, map: &MemMapInfo, elf: &ElfFile, /* just for logging */ path: &str) {
         // We assume that all mmaps backed by ELF files are created by the ELF loader, and so correspond to ELF sections and have consistent difference between dynamic and static addresses.
@@ -115,9 +116,23 @@ impl AddrMap {
             if !self.known {
                 self.diff = diff;
                 self.known = true;
+                self.shortest_used_map = map.len;
             } else if diff != self.diff && self.consistent {
-                eprintln!("warning: inconsistent address differences between sections: section {} has diff {}, some other section has diff {} in {}", s.name, diff, self.diff, path);
+                eprintln!("warning: inconsistent address differences between sections: section {} has diff 0x{:x}, some other section has diff 0x{:x} in {}", s.name, diff, self.diff, path);
                 self.consistent = false;
+
+                // If the program manually mmap()s its own executable file (not to execute it, just to read, for some reason), this map will show up
+                // alongside the maps from the loaded executable, and AddrMap will hit this code path and be confused.
+                // If the manual mmap() is for the whole file, it's easy to distinguish: it's the biggest of the maps for that file.
+                // So in case of conflicting offsets we use offset from the shortest map, just to work around this case.
+                // In particular, this hack unbreaks daisy-chaining the debugger: `nnd -t /dev/pts/42 nnd -t /dev/pts/43 nnd my_program` - the
+                // middle nnd will mmap nnd (because the debuggee and the debugger happen to be the same executable file), and the outer nnd will get confused.
+                // (But if your program mmap()s one page of its own executable, it becomes ~undebuggable with nnd.
+                //  Looking forward to this being used for reverse engineering avoidance, then we'll have to fix this properly.)
+                if map.len < self.shortest_used_map {
+                    self.shortest_used_map = map.len;
+                    self.diff = diff;
+                }
             }
             idx += 1;
         }

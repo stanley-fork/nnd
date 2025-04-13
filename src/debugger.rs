@@ -180,17 +180,25 @@ pub struct StepState {
 
     // How to determine if the step is complete:
     //  * Into && by_instructions: addr not in step.addr_ranges
-    //  * Into: cfa != step.cfa || addr not in step.addr_ranges
-    //  * Over: cfa > step.cfa || (cfa == step.cfa && addr not in step.addr_ranges)
+    //  * Into: cfa != step.cfa || addr not in step.addr_ranges  [+ additional logic if stop_only_on_statements]
+    //  * Over: cfa > step.cfa || (cfa == step.cfa && addr not in step.addr_ranges)  [+ additional logic if stop_only_on_statements]
     //  * Out: cfa > step.cfa
     // `internal_kind` may be different from the user-level step kind. E.g. step-out-of-inlined-function is turned into step-over.
     pub internal_kind: StepKind,
     pub by_instructions: bool,
     pub addr_ranges: Vec<Range<usize>>,
-    // Canonical frame address, i.e. something like the RBP register - identifies the current call frame.
-    pub cfa: usize,
     // Do repeated PTRACE_SINGLESTEP instead of using internal breakpoints.
     pub single_steps: bool,
+
+    // Canonical frame address, i.e. something like the RBP register - identifies the current call frame.
+    pub cfa: usize,
+
+    pub stop_only_on_statements: bool,
+    // These are used only if stop_only_on_statements is true.
+    pub binary_id: usize,
+    pub start_line: Option<LineInfo>,
+    pub use_line_number_with_column: bool,
+
     // Identities of stack subframes before the step. Helps determine which subframe to select after the step, depending on internal_kind:
     //  * If stack_digest is empty, select the top subframe. E.g. for instruction steps.
     //  * If Over or Out, select the lowest common ancestor (LCA) of the pre-step and post-step stacks.
@@ -201,6 +209,7 @@ pub struct StepState {
     //    then go one subframe deeper. Otherwise stay on the LCA.
     pub stack_digest: Vec<usize>,
 }
+impl Default for StepState { fn default() -> Self { Self {tid: 0, keep_other_threads_suspended: false, disable_breakpoints: true, internal_kind: StepKind::Into, by_instructions: false, addr_ranges: Vec::new(), single_steps: false, cfa: 0, stop_only_on_statements: false, binary_id: 0, start_line: None, use_line_number_with_column: false, stack_digest: Vec::new()} } }
 
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone, Copy)]
 pub enum StepBreakpointType {
@@ -544,6 +553,7 @@ impl Debugger {
                     }
                 }
             };
+            let disable_aslr = self.context.settings.disable_aslr;
 
             pid = libc::fork();
 
@@ -568,8 +578,7 @@ impl Debugger {
                     }
 
                     // This is probably not necessary, but makes debugging sessions more reproducible.
-                    // TODO: Add a setting to disable it, use it all the time for testing.
-                    if libc::personality(libc::ADDR_NO_RANDOMIZE as u64) == -1 {
+                    if disable_aslr && libc::personality(libc::ADDR_NO_RANDOMIZE as u64) == -1 {
                         msg = b"child: failed to disable ASLR\0";
                         break 'child;
                     }
@@ -817,8 +826,14 @@ impl Debugger {
                         thread.pending_signal = Some(signal);
 
                         if [libc::SIGSEGV, libc::SIGABRT, libc::SIGILL, libc::SIGFPE].contains(&signal) {
+                            let mut si: libc::siginfo_t;
+                            unsafe {
+                                si = mem::zeroed();
+                                ptrace(libc::PTRACE_GETSIGINFO, tid, 0, &mut si as *mut _ as u64, &mut self.prof.bucket)?;
+                            }
+
                             thread.stop_reasons.push(StopReason::Signal(signal));
-                            log!(self.log, "thread {} got {}", tid, signal_name(signal));
+                            log!(self.log, "thread {} got {} at 0x{:x}", tid, signal_name(signal), si.si_addr() as usize);
                             self.target_state = ProcessState::Suspended;
                             self.cancel_stepping();
                             self.ptrace_interrupt_all_running_threads()?;
@@ -1063,7 +1078,7 @@ impl Debugger {
                     Ok(addrs) => {
                         eprintln!("info: step to cursor thread {} cursor {:?}", tid, breakpoint.on);
 
-                        let step = StepState {tid, keep_other_threads_suspended: false, disable_breakpoints: true, internal_kind: StepKind::Cursor, by_instructions: false, addr_ranges: Vec::new(), cfa: 0, single_steps: false, stack_digest: Vec::new()};
+                        let step = StepState {tid, keep_other_threads_suspended: false, disable_breakpoints: true, internal_kind: StepKind::Cursor, by_instructions: false, single_steps: false, ..StepState::default()};
                         self.stepping = Some(step);
                         self.pending_step = None;
 
@@ -1105,7 +1120,7 @@ impl Debugger {
         Ok(iced_x86::Decoder::with_ip(64, buf, range.start as u64, 0))
     }
 
-    fn jump_target_may_be_outside_ranges(instruction: &iced_x86::Instruction, ranges: &Vec<Range<usize>>) -> bool {
+    fn jump_target_may_be_outside_ranges(instruction: &iced_x86::Instruction, ranges: &[Range<usize>]) -> bool {
         if instruction.flow_control() == FlowControl::IndirectBranch {
             return true;
         }
@@ -1142,7 +1157,7 @@ impl Debugger {
         }
 
         let mut buf: Vec<u8> = Vec::new();
-        let mut step = StepState {tid, keep_other_threads_suspended: true, disable_breakpoints: true, internal_kind: kind, by_instructions, addr_ranges: Vec::new(), cfa: 0, single_steps: false, stack_digest: Vec::new()};
+        let mut step = StepState {tid, keep_other_threads_suspended: true, disable_breakpoints: true, internal_kind: kind, by_instructions, ..StepState::default()};
         let mut breakpoint_types: Vec<StepBreakpointType> = Vec::new();
         let mut unwind: Option<(Arc<UnwindInfo>, AddrMap)> = None;
 
@@ -1225,9 +1240,23 @@ impl Debugger {
             step.keep_other_threads_suspended = false;
             breakpoint_types = vec![StepBreakpointType::AfterRet];
         } else {
-            // Source-code-based steps. Require line numbers and inlined functions information from debug symbols.
+            // Source-code-based step Into or Over. Require line numbers and inlined functions information from debug symbols.
 
             assert!(!by_instructions);
+
+            // (Disabling stop_only_on_statements if use_line_number_with_column because the .debug_line is_stmt flag is particularly unreliable when
+            //  there are multiple statements on one line. Often there are even function calls in a range of instructions not marked as statement.
+            //  Alternatively, we could make stop_only_on_statements detect call instructions and consider them "statements"
+            //  even if is_stmt flag is not set.)
+            if self.context.settings.steps_stop_only_on_statements && !use_line_number_with_column {
+                step.stop_only_on_statements = true;
+                step.binary_id = frame.binary_id.clone().unwrap();
+                step.start_line = match &subframe.line {
+                    Some(l) => Some(l.line),
+                    None => None,
+                };
+                step.use_line_number_with_column = use_line_number_with_column;
+            }
 
             let function_idx = stack.subframes[frame.subframes.end - 1].function_idx.clone()?;
             let binary = match self.symbols.get(frame.binary_id.clone().unwrap()) {
@@ -1257,7 +1286,7 @@ impl Debugger {
                     // Step over all inlined function calls on this line/column.
                     for s in subfuncs {
                         let l = &s.call_line;
-                        if l.file_idx() == start_line.line.file_idx() && l.line() == start_line.line.line() && (!use_line_number_with_column || l.column() == start_line.line.column()) {
+                        if l.equals(start_line.line, use_line_number_with_column) {
                             static_addr_ranges.push(s.addr_range.clone());
                         }
                     }
@@ -1290,8 +1319,7 @@ impl Debugger {
                         let mut line_iter = symbols.addr_to_line_iter(gap.start);
                         let mut prev = usize::MAX;
                         while let Some(l) = line_iter.next() {
-                            let matches = l.file_idx() == start_line.line.file_idx() && l.line() == start_line.line.line() && (!use_line_number_with_column || l.column() == start_line.line.column());
-                            if !matches {
+                            if !l.equals(start_line.line, use_line_number_with_column) {
                                 if prev != usize::MAX {
                                     static_addr_ranges.push(prev..l.addr());
                                 }
@@ -1358,35 +1386,12 @@ impl Debugger {
                 Err(_) => (),
             }
         }
-        if breakpoint_types.contains(&StepBreakpointType::AfterRange) {
-            for r in &step.addr_ranges {
-                breakpoints_to_add.push((StepBreakpointType::AfterRange, r.end));
-            }
-        }
-        breakpoint_types.retain(|t| *t != StepBreakpointType::AfterRet && *t != StepBreakpointType::AfterRange);
 
-        if !breakpoint_types.is_empty() {
-            let bp_on_call = breakpoint_types.contains(&StepBreakpointType::Call);
-            let bp_on_jump_out = breakpoint_types.contains(&StepBreakpointType::JumpOut);
-            for range in &step.addr_ranges {
-                let mut decoder = self.make_instruction_decoder(range.clone(), &mut buf)?;
-                let mut instruction = iced_x86::Instruction::default();
-                while decoder.can_decode() {
-                    decoder.decode_out(&mut instruction);
-                    match instruction.flow_control() {
-                        FlowControl::Call if instruction.code() == iced_x86::Code::Syscall => step.keep_other_threads_suspended = false,
-                        FlowControl::Call | FlowControl::IndirectCall if bp_on_call => breakpoints_to_add.push((StepBreakpointType::Call, instruction.ip() as usize)),
-                        FlowControl::Call | FlowControl::IndirectCall => step.keep_other_threads_suspended = false,
-                        FlowControl::UnconditionalBranch | FlowControl::ConditionalBranch | FlowControl::IndirectBranch => {
-                            if bp_on_jump_out && Self::jump_target_may_be_outside_ranges(&instruction, &step.addr_ranges) {
-                                breakpoints_to_add.push((StepBreakpointType::JumpOut, instruction.ip() as usize));
-                            }
-                        }
-                        FlowControl::Return | FlowControl::Next | FlowControl::XbeginXabortXend | FlowControl::Exception | FlowControl::Interrupt => (),
-                    }
-                }
-            }
+        let mut may_do_syscalls = false;
+        for range in &step.addr_ranges {
+            self.determine_some_step_breakpoint_locations(&breakpoint_types, range.clone(), &step.addr_ranges, /*skip_first_instruction*/ false, &mut breakpoints_to_add, &mut may_do_syscalls, &mut buf)?;
         }
+        step.keep_other_threads_suspended &= !may_do_syscalls;
 
         if self.context.settings.exception_aware_steps && (step.internal_kind == StepKind::Over || step.internal_kind == StepKind::Out) {
             // If we're stepping over/out-of a function and the function throws an exception, control jumps to the 'catch' block, bypassing our AfterRet breakpoints.
@@ -1453,29 +1458,12 @@ impl Debugger {
         // 3. Actually initiate the step and add breakpoints.
 
         eprintln!("info: proceeding with step from addr 0x{:x} {:?}", frame.addr, step);
-        
+
         self.stepping = Some(step);
         self.target_state = ProcessState::Stepping;
 
         if !breakpoints_to_add.is_empty() {
-            for &(type_, breakpoint_addr) in &breakpoints_to_add {
-                self.add_breakpoint_location(BreakpointRef::Step(type_), breakpoint_addr);
-            }
-
-            // If we're already standing on one of the breakpoints we're adding, handle it the same way as if breakpoint was hit.
-            // In addition to this, the breakpoint may or may not get actually hit immediately after we resume the thread.
-            // There's no good way to guarantee that it will get hit (if the thread is currently stopped by hardware breakpoint),
-            // so we have to do this handling manually here.
-            for (type_, breakpoint_addr) in breakpoints_to_add {
-                if breakpoint_addr == stack.frames[0].addr {
-                    let mut request_single_step = false;
-                    Self::handle_step_breakpoint_hit(self.stepping.as_mut().unwrap(), type_, &mut request_single_step);
-                    if request_single_step {
-                        self.threads.get_mut(&tid).unwrap().single_stepping = true;
-                    }
-                }
-            }
-
+            self.add_step_breakpoint_locations(&breakpoints_to_add, tid, stack.frames[0].addr);
             self.arrange_handle_breakpoints()?;
         } else if self.stepping.as_ref().unwrap().single_steps {
             // Interaction between SINGLESTEP and breakpoints.
@@ -1503,6 +1491,60 @@ impl Debugger {
         }
 
         Ok(())
+    }
+
+    // Decode instructions in given address ranges and find things like calls, jump, and syscalls. Based on that, make a list of addresses for internal breakpoints needed for a step.
+    // Annoyingly, this sometimes needs to be re-done in the middle of a step (see comment at one of the call sites), so it's extracted into a function.
+    // Only some StepBreakpointType-s are handled here, others only need to be handled when starting a step.
+    fn determine_some_step_breakpoint_locations(&self, breakpoint_types: &[StepBreakpointType], addr_range: Range<usize>, all_addr_ranges: &[Range<usize>], mut skip_first_instruction: bool, breakpoints_to_add: &mut Vec<(StepBreakpointType, /*addr*/ usize)>, out_may_do_syscalls: &mut bool, buf: &mut Vec<u8>) -> Result<()> {
+        if breakpoint_types.contains(&StepBreakpointType::AfterRange) {
+            breakpoints_to_add.push((StepBreakpointType::AfterRange, addr_range.end));
+        }
+        let bp_on_call = breakpoint_types.contains(&StepBreakpointType::Call);
+        let bp_on_jump_out = breakpoint_types.contains(&StepBreakpointType::JumpOut);
+        if bp_on_call || bp_on_jump_out {
+            let mut decoder = self.make_instruction_decoder(addr_range.clone(), buf)?;
+            let mut instruction = iced_x86::Instruction::default();
+            while decoder.can_decode() {
+                decoder.decode_out(&mut instruction);
+                if skip_first_instruction {
+                    skip_first_instruction = false;
+                    continue;
+                }
+                match instruction.flow_control() {
+                    FlowControl::Call if instruction.code() == iced_x86::Code::Syscall => *out_may_do_syscalls = true,
+                    FlowControl::Call | FlowControl::IndirectCall if bp_on_call => breakpoints_to_add.push((StepBreakpointType::Call, instruction.ip() as usize)),
+                    FlowControl::Call | FlowControl::IndirectCall => *out_may_do_syscalls = true,
+                    FlowControl::UnconditionalBranch | FlowControl::ConditionalBranch | FlowControl::IndirectBranch => {
+                        if bp_on_jump_out && Self::jump_target_may_be_outside_ranges(&instruction, all_addr_ranges) {
+                            breakpoints_to_add.push((StepBreakpointType::JumpOut, instruction.ip() as usize));
+                        }
+                    }
+                    FlowControl::Return | FlowControl::Next | FlowControl::XbeginXabortXend | FlowControl::Exception | FlowControl::Interrupt => (),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn add_step_breakpoint_locations(&mut self, breakpoints_to_add: &[(StepBreakpointType, /*addr*/ usize)], tid: pid_t, addr: usize) {
+        for &(type_, breakpoint_addr) in breakpoints_to_add {
+            self.add_breakpoint_location(BreakpointRef::Step(type_), breakpoint_addr);
+        }
+
+        // If we're already standing on one of the breakpoints we're adding, handle it the same way as if breakpoint was hit.
+        // In addition to this, the breakpoint may or may not get actually hit immediately after we resume the thread.
+        // There's no good way to guarantee that it will get hit (if the thread is currently stopped by hardware breakpoint),
+        // so we have to do this handling manually here.
+        for &(type_, breakpoint_addr) in breakpoints_to_add {
+            if breakpoint_addr == addr {
+                let mut request_single_step = false;
+                Self::handle_step_breakpoint_hit(self.stepping.as_mut().unwrap(), type_, &mut request_single_step);
+                if request_single_step {
+                    self.threads.get_mut(&tid).unwrap().single_stepping = true;
+                }
+            }
+        }
     }
 
     pub fn step_to_cursor(&mut self, tid: pid_t, cursor: BreakpointOn) -> Result<()> {
@@ -2218,17 +2260,116 @@ impl Debugger {
             }
             return !in_ranges;
         }
-        let step = self.stepping.as_ref().unwrap();
+        let step = self.stepping.as_mut().unwrap();
         let cfa = Self::get_cfa_for_step(&self.info, &self.symbols, &mut self.log, &self.memory, addr, regs);
         let cfa = match cfa {
             None => return step.internal_kind == StepKind::Into,
             Some(c) => c };
-        match step.internal_kind {
-            StepKind::Into => cfa != step.cfa || !in_ranges,
-            StepKind::Over => cfa > step.cfa || (cfa == step.cfa && !in_ranges),
-            StepKind::Out => cfa > step.cfa,
+        let (cfa_done, ranges_done) = match step.internal_kind {
+            StepKind::Into => (cfa != step.cfa, !in_ranges),
+            StepKind::Over => (cfa > step.cfa, cfa == step.cfa && !in_ranges),
+            StepKind::Out => (cfa > step.cfa, false),
             StepKind::Cursor => panic!("huh"),
+        };
+        if cfa_done {
+            // Stepped in or out.
+            return true;
         }
+        if !ranges_done {
+            // Still on the initial line or inlined function.
+            return false;
+        }
+        if !step.stop_only_on_statements {
+            // Left the initial line or inlined function.
+            return true;
+        }
+
+        // The step is kind of done, except for the "stop only on statements" part. Unfortunately, it's a big part.
+
+        // Check if we're on a statement. If anything goes wrong, just finish the step here, as if stop_only_on_statements is false.
+        let Some(binary) = self.symbols.get(step.binary_id) else {return true};
+        let Ok(symbols) = binary.symbols.as_ref() else {return true};
+        let static_addr = binary.addr_map.dynamic_to_static(addr);
+        let mut line_iter = symbols.addr_to_line_iter(static_addr);
+        let line = match line_iter.next() {
+            None => return true, // hole in line number info, unusual
+            Some(line) if line.addr() > static_addr || line.file_idx().is_none() => return true, // ditto
+            Some(x) => x,
+        };
+        let mut stop = line.flags().contains(LineFlags::STATEMENT) && line.addr() == static_addr;
+        // Check if we're somehow still on the same line on which the step started.
+        // That would be unusual, normally the start_line is covered by step.addr_ranges, which we already checked.
+        // But it's currently possible because step() doesn't search for all ranges for start_line, only the range that contains current address.
+        // So we do this additional check here along the way, because it's easy.
+        // (Maybe we should make step() search for all ranges instead. I avoided it for performance, to avoid scanning addr_to_line for the whole function, but it would probably be fine.)
+        if let Some(start_line) = step.start_line.clone() {
+            stop &= !line.equals(start_line, step.use_line_number_with_column);
+        }
+        if stop {
+            return true;
+        }
+
+        // We're on an address on which we shouldn't stop. So from now on, this step should handle this address as if it were in step.addr_ranges.
+        // We do it by actually adding it to step.addr_ranges, as well as adding the corresponding internal breakpoints, same way as when starting a step.
+        // (Can we get away with something simpler, like doing single-steps until we reach a statement? AFAICT, no. I've seen this code hit non-statement `call` instructions,
+        //  which means we'd need to single-step through the whole function call subtree, which may be very slow, and also may get stuck on a syscall if step.keep_other_threads_suspended is true.)
+        // (Alternatively, when starting a step, we could populate addr_ranges with all non-statement instruction ranges in the whole function, as well as add corresponding internal breakpoints
+        //  for all jumps/calls/syscalls in the function as needed. But this sounds slow, especially adding lots of internal breakpoints.)
+        // (I wish compilers would just always emit accurate line number information for all instructions. Then we wouldn't need stop_only_on_statements.)
+
+        // Instead of adding just `addr` to step.addr_ranges, extend it to a range based on neighboring LineInfo-s.
+        let mut new_range: Option<Range<usize>> = None;
+        while let Some(next_line) = line_iter.next() {
+            if next_line.file_idx().is_none() || (next_line.flags().contains(LineFlags::STATEMENT) && !step.start_line.is_some_and(|start_line| next_line.equals(start_line, step.use_line_number_with_column))) {
+                new_range = Some(binary.addr_map.static_to_dynamic(line.addr())..binary.addr_map.static_to_dynamic(next_line.addr()));
+                break;
+            }
+        }
+        mem::drop(line_iter);
+        let Some(new_range) = new_range else {return true};
+        let skip_first_instruction = line.flags().contains(LineFlags::STATEMENT);
+
+        let mut addr_ranges = mem::take(&mut step.addr_ranges);
+        // new_range must start at instruction boundary for determine_some_step_breakpoint_locations() to work,
+        // but step.addr_ranges is ok with range start shifted by one byte to skip first instruction (which may be longer than one byte).
+        addr_ranges.push(new_range.start + (skip_first_instruction as usize)..new_range.end);
+
+        let mut breakpoint_types = vec![StepBreakpointType::AfterRange, StepBreakpointType::JumpOut];
+        if step.internal_kind == StepKind::Into {
+            breakpoint_types.push(StepBreakpointType::Call);
+        }
+        let mut breakpoints_to_add: Vec<(StepBreakpointType, usize)> = Vec::new();
+        let mut may_do_syscalls = false;
+        // (It may be possible for the new range to intersect some existing ranges. This shouldn't break anything.)
+        match self.determine_some_step_breakpoint_locations(&breakpoint_types, new_range.clone(), &addr_ranges, skip_first_instruction, &mut breakpoints_to_add, &mut may_do_syscalls, &mut Vec::new()) {
+            Err(_) => return true,
+            Ok(()) => (),
+        }
+        let step = self.stepping.as_mut().unwrap();
+        let mut need_to_resume_threads = may_do_syscalls && step.keep_other_threads_suspended;
+        step.keep_other_threads_suspended &= !may_do_syscalls;
+        step.addr_ranges = addr_ranges;
+        let step_tid = step.tid;
+        if !breakpoints_to_add.is_empty() {
+            self.add_step_breakpoint_locations(&breakpoints_to_add, step_tid, addr);
+            self.stopping_to_handle_breakpoints = true;
+            need_to_resume_threads = false;
+        }
+
+        if need_to_resume_threads {
+            // When starting the step, it seemed that it can'd hit syscalls, so we can keep other threads stopped as an optimization.
+            // But now it turned out that the step may hit syscall (when running through non-statement instructions), so we have
+            // to start other threads to avoid getting stuck if the syscall e.g. waits for a lock held by another thread.
+            let tids_to_resume: Vec<pid_t> = self.threads.keys().filter(|tid| **tid != step_tid && self.target_state_for_thread(**tid) == ThreadState::Running).copied().collect();
+            for t in tids_to_resume {
+                match self.resume_thread(t, /*refresh_info*/ true) {
+                    Err(_) => return true,
+                    Ok(()) => (),
+                }
+            }
+        }
+
+        false
     }
 
     fn determine_subframe_to_select(stack: &StackTrace, stack_digest: &Vec<usize>, is_step_into: bool, subfunction_level: u16) -> Option<usize> {
@@ -2431,10 +2572,6 @@ impl Debugger {
                 // If this turns out too slow, we could hook the current instruction instead (maybe won't work for all instructions).
                 self.stopping_to_handle_breakpoints = true;
             }
-
-            if request_single_step {
-                self.threads.get_mut(&tid).unwrap().single_stepping = true;
-            }
         } else if stopped_on_sw_breakpoint {
             eprintln!("warning: got unexpected SIGTRAP in thread {} at {:x}", tid, addr + 1);
         }
@@ -2454,6 +2591,10 @@ impl Debugger {
             }
         }
 
+        if request_single_step {
+            self.threads.get_mut(&tid).unwrap().single_stepping = true;
+        }
+
         if !stop_reasons.is_empty() {
             self.threads.get_mut(&tid).unwrap().stop_reasons.append(&mut stop_reasons);
         }
@@ -2462,7 +2603,7 @@ impl Debugger {
     }
 
     fn eval_breakpoint_condition(&mut self, tid: pid_t, id: BreakpointId, subfunction_level: u16) -> Result<bool> {
-        // All of this is slow.
+        // All of this looks slow.
         let bp = self.breakpoints.get(id);
         let expr = bp.condition.as_ref().unwrap().1.as_ref().unwrap();
         if expr.is_trivial_false() {

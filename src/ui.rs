@@ -2135,7 +2135,8 @@ impl WindowContent for DisassemblyWindow {
                     }
                     styled_write!(ui.text, style, "{}", marker);
 
-                    ui_write!(ui, default_dim, "{:012x} ", addr);
+                    let addr_style = if line.is_statement {ui.palette.disas_address_statement} else {ui.palette.disas_address_not_statement};
+                    styled_write!(ui.text, addr_style, "{:012x} ", addr);
                     ui_write!(ui, disas_relative_address, "<{: >+1$x}> ", line.relative_addr, rel_addr_digits + 1);
                     ui_write!(ui, disas_jump_arrow, " {} ", line.jump_indicator);
 

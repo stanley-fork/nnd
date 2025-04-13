@@ -145,6 +145,8 @@ fn main() {
             core_dump_path = Some(s);
         } else if let Some(_) = parse_arg(&mut args, &mut seen_args, "--debuginfod", "-o", true, false) {
             use_default_debuginfod_urls = true;
+        } else if let Some(_) = parse_arg(&mut args, &mut seen_args, "--aslr", "", true, false) {
+            settings.disable_aslr = false;
         } else if print_help_chapter(&args[0], &all_args[0]) {
             process::exit(0);
         } else {

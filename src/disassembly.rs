@@ -59,6 +59,7 @@ pub struct DisassemblyLineInfo {
     pub relative_addr: isize,
     pub jump_indicator: char,
     pub jump_target: Option<usize>,
+    pub is_statement: bool,
 
     // Line number for the current or previous LeafLineNumber or InlinedCallLineNumber.
     pub leaf_line: Option<LineInfo>,
@@ -66,7 +67,7 @@ pub struct DisassemblyLineInfo {
     pub subfunction: Option<usize>,
     pub subfunction_level: u16, // `subfunction` level, 0 if None; indentation level
 }
-impl Default for DisassemblyLineInfo { fn default() -> Self { Self {kind: DisassemblyLineKind::Error, static_addr: 0, relative_addr: 0, jump_indicator: ' ', jump_target: None, subfunction_level: 0, leaf_line: None, subfunction: None} } }
+impl Default for DisassemblyLineInfo { fn default() -> Self { Self {kind: DisassemblyLineKind::Error, static_addr: 0, relative_addr: 0, jump_indicator: ' ', jump_target: None, is_statement: false, subfunction_level: 0, leaf_line: None, subfunction: None} } }
 
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub enum DisassemblyLineKind {
@@ -241,6 +242,7 @@ pub fn disassemble_function(function_idx: usize, mut static_addr_ranges: Vec<Ran
             let static_addr = instruction.ip() as usize;
             let mut subfunction_level = 0u16;
             let mut cur_subfunction: Option<usize> = None;
+            let mut is_statement = false;
 
             if let &Some(symbols) = &symbols {
                 let write_line_number = |line: LineInfo, kind: DisassemblyLineKind, res: &mut Disassembly, subfunction_level: u16, leaf_line: &mut Option<LineInfo>, subfunction: Option<usize>| {
@@ -296,6 +298,10 @@ pub fn disassemble_function(function_idx: usize, mut static_addr_ranges: Vec<Ran
                 // Add line number information.
                 while let Some(line) = line_iter.as_mut().unwrap().next_if(|line| line.addr() <= static_addr) {
                     write_line_number(line, DisassemblyLineKind::LeafLineNumber, &mut res, subfunction_level, &mut cur_leaf_line, cur_subfunction.clone());
+
+                    if line.addr() == static_addr && line.flags().contains(LineFlags::STATEMENT) {
+                        is_statement = true;
+                    }
                 }
             }
 
@@ -328,7 +334,7 @@ pub fn disassemble_function(function_idx: usize, mut static_addr_ranges: Vec<Ran
             formatter.format(&instruction, &mut StyledFormatter {palette, text: &mut res.text});
 
             res.text.close_line();
-            res.lines.push(DisassemblyLineInfo {kind: DisassemblyLineKind::Instruction, static_addr, relative_addr: static_addr as isize - static_addr_range.start as isize, subfunction_level, jump_indicator, jump_target, leaf_line: cur_leaf_line.clone(), subfunction: cur_subfunction.clone()});
+            res.lines.push(DisassemblyLineInfo {kind: DisassemblyLineKind::Instruction, static_addr, relative_addr: static_addr as isize - static_addr_range.start as isize, subfunction_level, jump_indicator, jump_target, is_statement, leaf_line: cur_leaf_line.clone(), subfunction: cur_subfunction.clone()});
         }
     }
     res.finish()

@@ -490,7 +490,11 @@ bitflags! { pub struct LineFlags: usize {
     // In addr_to_line: end of inlined function.
     // In line_to_addr: start of inlined function.
     const INLINED_FUNCTION = 0x1;
-    // Whether this address is suitable for setting a breakpoint.
+    // Whether this is the main address corresponding to this line+column.
+    // Suitable for setting a breakpoint or stepping to.
+    // If a LineInfo covers a range of instructions, this flag applies only to the first of them (at addr()).
+    // LineInfo-s without this flag often contain garbage, presumably because compilers try to reduce debug info size that way.
+    // (I didn't find a way to reliably tell whether a non-statement line info is garbage or not, but I didn't look very thoroughly.)
     const STATEMENT = 0x2;
 }}
 const LINE_FLAGS_BITS: u32 = 2;
@@ -553,6 +557,10 @@ impl LineInfo {
         } else {
             Some(r)
         }
+    }
+
+    pub fn equals(self, other: Self, use_line_number_with_column: bool) -> bool {
+        self.file_idx() == other.file_idx() && self.line() == other.line() && (!use_line_number_with_column || self.column() == other.column())
     }
 
     pub fn with_addr(mut self, addr: usize) -> Self {
@@ -1436,7 +1444,7 @@ impl SymbolsLoader {
             // Deduplicate. E.g. if a sequence starts at the same address another sequence ends, keep the start and discard the end.
             if l.addr() == prev.addr() {
                 return false;
-            }             
+            }
 
             // I've seen line number info like this:
             //                       src/Functions/sleep.h:122:29
@@ -1709,7 +1717,8 @@ impl SymbolsLoader {
             let funcs_before_dedup: usize = self.shards.iter().map(|s| unsafe {(*s.get()).functions_before_dedup}).sum();
             let subfunctions_needed_fixup: usize = self.shards.iter().map(|s| unsafe {(*s.get()).subfunctions_need_fixup.len()}).sum();
             let misc_arena_size: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.misc_arena.capacity()}).sum();
-            let lines: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.addr_to_line.len()}).sum();
+            let addr_to_lines: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.line_to_addr.len()}).sum();
+            let line_to_addrs: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.addr_to_line.len()}).sum();
             let lines_in_debug_line: usize = self.shards.iter().map(|s| unsafe {(*s.get()).addr_to_line_len_after_debug_line}).sum();
             let local_variables: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.local_variables.len()}).sum();
             let global_variables: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.global_variables.used() / mem::size_of::<Variable>()}).sum();
@@ -1769,7 +1778,7 @@ impl SymbolsLoader {
                        ({:.2}x dedup, {:.2}x unused, {} of paths, {} of remap), \
                        {} functions ({:.2}x dedup, {}, {} of names), {} in misc arena, \
                        {} subfunctions ({} sf, {} levels, {} fixed up), \
-                       {} lines ({}, {} in .debug_line), {} local variables ({}), {} global variables ({}, names {}), \
+                       {} + {} lines ({}, {} in .debug_line), {} local variables ({}), {} global variables ({}, names {}), \
                        {} types ({:.2}x dedup, {:.2}x offsets, {} names ({}), \
                        {} infos, {} fields ({:.2}% growth waste), {} nested names, {} misc, temp {} offset maps, temp {} dedup maps) \
                        ({} base types), {} vtables ({:.2}% unresolved){}",
@@ -1777,7 +1786,7 @@ impl SymbolsLoader {
                       files_before_dedup as f64 / self.sym.files.len() as f64, self.sym.files.len() as f64 / self.sym.path_to_used_file.len() as f64, PrettySize(self.sym.file_paths.arena.used()), PrettySize(files_before_dedup * mem::size_of::<usize>()),
                       PrettyCount(self.sym.functions.len()), funcs_before_dedup as f64 / self.sym.functions.len() as f64, PrettySize(self.sym.functions.len() * mem::size_of::<FunctionInfo>()), PrettySize(function_names_len), PrettySize(misc_arena_size),
                       PrettyCount(subfunctions), PrettySize(subfunctions * mem::size_of::<Subfunction>()), PrettySize(subfunction_levels * mem::size_of::<usize>()), PrettyCount(subfunctions_needed_fixup),
-                      PrettyCount(lines), PrettySize(lines * mem::size_of::<LineInfo>() * 2), PrettyCount(lines_in_debug_line), PrettyCount(local_variables), PrettySize(local_variables * mem::size_of::<Variable>()), PrettyCount(global_variables), PrettySize(global_variables * mem::size_of::<Variable>()), PrettySize(global_variable_name_bytes),
+                      PrettyCount(addr_to_lines), PrettyCount(line_to_addrs), PrettySize((addr_to_lines + line_to_addrs) * mem::size_of::<LineInfo>()), PrettyCount(lines_in_debug_line), PrettyCount(local_variables), PrettySize(local_variables * mem::size_of::<Variable>()), PrettyCount(global_variables), PrettySize(global_variables * mem::size_of::<Variable>()), PrettySize(global_variable_name_bytes),
                       PrettyCount(final_types), self.types_before_dedup as f64 / final_types as f64, self.type_offsets as f64 / self.types_before_dedup as f64, PrettyCount(type_names), PrettySize(type_names_len),
                       PrettySize(type_infos_bytes), PrettySize(fields_bytes), fields_bytes as f64 / field_used_bytes as f64 * 100.0 - 100.0, PrettyCount(nested_names), PrettySize(types_misc_bytes), PrettySize(self.type_offset_maps_bytes), PrettySize(self.type_dedup_maps_bytes),
                       PrettyCount(self.sym.base_types.len()), self.sym.vtables.len(), unresolved_vtables as f64 / self.sym.vtables.len() as f64 * 100.0, time_breakdown);
