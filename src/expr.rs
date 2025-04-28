@@ -43,6 +43,14 @@ impl ValueBlob {
         Self::Small([s[0], s[1], 0])
     }
 
+    pub fn from_u64_slice(val: &[u64]) -> Self {
+        let mut vec: Vec<u8> = Vec::with_capacity(val.len() * 8);
+        for &x in val {
+            vec.extend_from_slice(&x.to_le_bytes());
+        }
+        Self::from_vec(vec)
+    }
+
     pub fn as_slice(&self) -> &[u8] { match self { Self::Small(a) => unsafe{std::slice::from_raw_parts(mem::transmute(a.as_slice().as_ptr()), 24)}, Self::Big(v) => v.as_slice() } }
     pub fn as_mut_slice(&mut self) -> &mut [u8] { match self { Self::Small(a) => unsafe{std::slice::from_raw_parts_mut(mem::transmute(a.as_mut_slice().as_mut_ptr()), 24)}, Self::Big(v) => v.as_mut_slice() } }
 
@@ -278,7 +286,13 @@ pub fn format_dwarf_expression<'a>(expr: Expression<DwarfSlice>, encoding: Encod
             Operation::UnsignedConstant {value} => write!(res, "{}u", value)?,
             Operation::SignedConstant {value} => write!(res, "{}s", value)?,
             Operation::RegisterOffset {register, offset, base_type} => {
-                if let Some(r) = RegisterIdx::from_dwarf(register) { write!(res, "{}", r) } else { write!(res, "register({})", register.0) }?;
+                if let Some(r) = RegisterIdx::from_dwarf(register) {
+                    write!(res, "{}", r)
+                } else if let Some(r) = ExtraRegisterIdx::from_dwarf(register) {
+                    write!(res, "{}", r)
+                } else {
+                    write!(res, "register({})", register.0)
+                }?;
                 if offset != 0 {
                     write!(res, "{}0x{:x}", if offset < 0 {"-"} else {"+"}, offset.abs())?;
                 }
@@ -306,7 +320,13 @@ pub fn format_dwarf_expression<'a>(expr: Expression<DwarfSlice>, encoding: Encod
             // These specify where the result is.
             Operation::Register {register} => {
                 write!(res, "reg(")?;
-                if let Some(r) = RegisterIdx::from_dwarf(register) { write!(res, "{}", r) } else { write!(res, "register({})", register.0) }?;
+                if let Some(r) = RegisterIdx::from_dwarf(register) {
+                    write!(res, "{}", r)
+                } else if let Some(r) = ExtraRegisterIdx::from_dwarf(register) {
+                    write!(res, "{}", r)
+                } else {
+                    write!(res, "register({})", register.0)
+                }?;
                 write!(res, ")")?;
             }
             Operation::Piece {size_in_bits, bit_offset} => write!(res, "piece({};{})", size_in_bits, bit_offset.unwrap_or(0))?,
@@ -390,13 +410,26 @@ impl EvalState {
                         return Ok(Value {val: Default::default(), type_, flags: ValueFlags::empty()});
                     }
                     let frame = &context.stack.frames[context.stack.subframes[context.selected_subframe].frame_idx];
-                    return match frame.regs.get_int(reg) {
+                    return match frame.regs.get(reg) {
                         Ok((v, dub)) => {
                             self.currently_evaluated_value_dubious |= dub;
                             Ok(Value {val: AddrOrValueBlob::Blob(ValueBlob::new(v as usize)), type_, flags: ValueFlags::empty()})
                         }
                         Err(_) => err!(Dwarf, "value of {} register is not known", reg),
                     };
+                } else if let Some(reg) = ExtraRegisterIdx::parse_ignore_case(name) {
+                    if only_type {
+                        let buf = [0u64; 8];
+                        assert!(reg.len <= buf.len());
+                        let val = &buf[..reg.len];
+                        return Ok(self.make_extra_register_value(val));
+                    }
+                    if let &Some(regs) = &context.extra_regs {
+                        let regs = regs.get();
+                        let (val, dub) = regs.get(reg)?;
+                        self.currently_evaluated_value_dubious |= dub;
+                        return Ok(self.make_extra_register_value(val));
+                    }
                 }
             }
 
@@ -505,6 +538,16 @@ impl EvalState {
         *currently_evaluated_value_dubious |= dubious;
         Ok(Value {val, type_: var.type_, flags: ValueFlags::empty()})
     }
+
+    pub fn make_extra_register_value(&mut self, val: &[u64]) -> Value {
+        assert!(!val.is_empty());
+        if val.len() == 1 {
+            return Value {val: AddrOrValueBlob::Blob(ValueBlob::new(val[0] as usize)), type_: self.builtin_types.u64_, flags: ValueFlags::HEX};
+        }
+        let array_type = self.types.add_array(self.builtin_types.u64_, val.len(), ArrayFlags::empty());
+        let blob = ValueBlob::from_u64_slice(val);
+        Value {val: AddrOrValueBlob::Blob(blob), type_: array_type, flags: ValueFlags::HEX}
+    }
 }
 
 pub struct EvalContext<'a> {
@@ -518,6 +561,9 @@ pub struct EvalContext<'a> {
     // Empty if the thread is running.
     pub stack: &'a StackTrace,
     pub selected_subframe: usize,
+
+    pub extra_regs: Option<&'a LazyExtraRegisters>,
+    pub fs_base: Option<u64>, // same as FsBase register in `stack`, but present even if `stack` is empty (when program is running)
 }
 impl EvalContext<'_> {
     pub fn check_has_stack(&self) -> Result<()> {
@@ -556,14 +602,14 @@ impl EvalContext<'_> {
         let subfunction = &symbols.shards[shard_idx].subfunctions[subfunction_idx];
         let local_variables = symbols.local_variables_in_subfunction(subfunction, shard_idx);
 
-        let context = DwarfEvalContext {memory: &mut self.memory, symbols: Some(symbols), addr_map: &binary.addr_map, encoding: unit.unit.header.encoding(), unit: Some(unit), regs: Some(&frame.regs), frame_base: Some(&frame.frame_base), local_variables};
+        let context = DwarfEvalContext {memory: &mut self.memory, symbols: Some(symbols), addr_map: &binary.addr_map, encoding: unit.unit.header.encoding(), unit: Some(unit), regs: Some(&frame.regs), extra_regs: self.extra_regs.clone(), frame_base: Some(&frame.frame_base), local_variables, fs_base: self.fs_base.clone()};
         Ok((context, function))
     }
 
     pub fn make_global_dwarf_eval_context<'a>(&'a mut self, binary: &'a Binary, die_offset: DebugInfoOffset) -> Result<DwarfEvalContext<'a>> {
         let symbols = binary.symbols.as_ref_clone_error()?;
         let unit = symbols.find_unit(die_offset)?;
-        Ok(DwarfEvalContext {memory: &mut self.memory, symbols: Some(symbols), addr_map: &binary.addr_map, encoding: unit.unit.header.encoding(), unit: Some(unit), regs: None, frame_base: None, local_variables: &[]})
+        Ok(DwarfEvalContext {memory: &mut self.memory, symbols: Some(symbols), addr_map: &binary.addr_map, encoding: unit.unit.header.encoding(), unit: Some(unit), regs: None, extra_regs: None, frame_base: None, local_variables: &[], fs_base: self.fs_base.clone()})
     }
 }
 
@@ -1166,6 +1212,8 @@ pub struct DwarfEvalContext<'a> {
     // Stack frame. Not required for global variables.
     pub regs: Option<&'a Registers>,
     pub frame_base: Option<&'a Result<(usize, /*dubious*/ bool)>>,
+    pub extra_regs: Option<&'a LazyExtraRegisters>,
+    pub fs_base: Option<u64>,
 
     pub local_variables: &'a [Variable],
 }
@@ -1213,9 +1261,17 @@ pub fn eval_dwarf_expression(mut expression: Expression<DwarfSlice>, context: &m
                 } else {
                     return err!(Dwarf, "can't look up base type (register) without symbols");
                 };
-                let reg = RegisterIdx::from_dwarf(*register).ok_or_else(|| error!(Dwarf, "unsupported register in expression: {:?}", register))?;
-                let regs = match &context.regs { Some(r) => r, None => return err!(Dwarf, "register op unexpected") };
-                let (reg_val, dub) = regs.get_int(reg)?;
+                let (reg_val, dub) = if let Some(reg) = RegisterIdx::from_dwarf(*register) {
+                    let regs = match &context.regs { Some(r) => r, None => return err!(Dwarf, "register op unexpected") };
+                    regs.get(reg)?
+                } else if let Some(reg) = ExtraRegisterIdx::from_dwarf(*register) {
+                    let &Some(regs) = &context.extra_regs else {return err!(ProcessState, "no simd registers")};
+                    let regs = regs.get();
+                    let (vec, dub) = regs.get(reg)?;
+                    (vec[0], dub)
+                } else {
+                    return err!(Dwarf, "unsupported register in expression: {:?}", register);
+                };
                 dubious |= dub;
                 let val = match value_type {
                     ValueType::Generic => gimli::Value::Generic(reg_val),
@@ -1232,7 +1288,7 @@ pub fn eval_dwarf_expression(mut expression: Expression<DwarfSlice>, context: &m
             }
             EvaluationResult::RequiresCallFrameCfa => {
                 let regs = match &context.regs { Some(r) => r, None => return err!(Dwarf, "cfa op unexpected") };
-                let (cfa, dub) = regs.get_int(RegisterIdx::Cfa)?;
+                let (cfa, dub) = regs.get(RegisterIdx::Cfa)?;
                 dubious |= dub;
                 eval.resume_with_call_frame_cfa(cfa)
             }
@@ -1283,7 +1339,8 @@ pub fn eval_dwarf_expression(mut expression: Expression<DwarfSlice>, context: &m
                 let t = symbols.find_base_type(offset)?;
                 eval.resume_with_base_type(t)
             }
-            
+
+            // TODO [tls]
             EvaluationResult::RequiresTls(_) => return err!(NotImplemented, "TLS is not supported"),
 
             // These are just alternative polite ways for the compiler to say "optimized out".
@@ -1309,17 +1366,24 @@ pub fn eval_dwarf_expression(mut expression: Expression<DwarfSlice>, context: &m
                 AddrOrValueBlob::Blob(ValueBlob::from_slice(b.slice()))
             }
             Location::Register{register: reg} => {
-                let reg = match RegisterIdx::from_dwarf(reg) {
-                    None => return err!(NotImplemented, "unsupported register: {:?}", reg),
-                    Some(r) => r,
-                };
-                let regs = match &context.regs { Some(r) => r, None => return err!(Dwarf, "register location unexpected") };
-                match regs.get_int(reg) {
-                    Err(_) => return err!(Dwarf, "register {} optimized away", reg),
-                    Ok((v, dub)) => {
-                        dubious |= dub;
-                        AddrOrValueBlob::Blob(ValueBlob::new(v as usize))
+                if let Some(reg) = RegisterIdx::from_dwarf(reg) {
+                    let &Some(regs) = &context.regs else {return err!(Dwarf, "register location unexpected")};
+                    match regs.get(reg) {
+                        Err(_) => return err!(Dwarf, "register {} optimized away", reg),
+                        Ok((v, dub)) => {
+                            dubious |= dub;
+                            AddrOrValueBlob::Blob(ValueBlob::new(v as usize))
+                        }
                     }
+                } else if let Some(reg) = ExtraRegisterIdx::from_dwarf(reg) {
+                    let &Some(regs) = &context.extra_regs else {return err!(Dwarf, "no simd registers")};
+                    let regs = regs.get();
+                    let (v, dub) = regs.get(reg)?;
+                    dubious |= dub;
+                    let blob = ValueBlob::from_u64_slice(v);
+                    AddrOrValueBlob::Blob(blob)
+                } else {
+                    return err!(NotImplemented, "unsupported register: {:?}", reg);
                 }
             }
             Location::Address{address: addr} => {

@@ -433,7 +433,7 @@ impl Debugger {
                     continue;
                 }
                 found_new_threads = true;
-                match unsafe {ptrace(libc::PTRACE_SEIZE, tid, 0, (libc::PTRACE_O_TRACECLONE | libc::PTRACE_O_TRACEEXEC | libc::PTRACE_O_TRACEEXIT | libc::PTRACE_O_TRACESYSGOOD) as u64, &mut r.prof.bucket)} {
+                match unsafe {ptrace(libc::PTRACE_SEIZE, tid, 0, (libc::PTRACE_O_TRACECLONE | libc::PTRACE_O_TRACEEXEC | libc::PTRACE_O_TRACEEXIT | libc::PTRACE_O_TRACESYSGOOD) as u64)} {
                     Ok(_) => (),
                     Err(e) if e.is_io_permission_denied() => return err!(Usage, "ptrace({}) failed: operation not permitted - missing sudo?", tid),
                     Err(e) => return Err(e),
@@ -613,7 +613,7 @@ impl Debugger {
 
             if pid < 0 { return errno_err!("fork() failed"); }
 
-            ptrace(libc::PTRACE_SEIZE, pid, 0, (libc::PTRACE_O_EXITKILL | libc::PTRACE_O_TRACECLONE | libc::PTRACE_O_TRACEEXEC | libc::PTRACE_O_TRACEEXIT | libc::PTRACE_O_TRACESYSGOOD) as u64, &mut self.prof.bucket)?;
+            ptrace(libc::PTRACE_SEIZE, pid, 0, (libc::PTRACE_O_EXITKILL | libc::PTRACE_O_TRACECLONE | libc::PTRACE_O_TRACEEXEC | libc::PTRACE_O_TRACEEXIT | libc::PTRACE_O_TRACESYSGOOD) as u64)?;
         }
 
         self.pid = pid;
@@ -764,7 +764,7 @@ impl Debugger {
                                 let new_tid;
                                 {
                                     let mut t: pid_t = 0;
-                                    ptrace(libc::PTRACE_GETEVENTMSG, tid, 0, &mut t as *mut pid_t as u64, &mut self.prof.bucket)?;
+                                    ptrace(libc::PTRACE_GETEVENTMSG, tid, 0, &mut t as *mut pid_t as u64)?;
                                     new_tid = t;
                                 }
                                 if let Some(existing_thread) = self.threads.get(&new_tid) {
@@ -829,7 +829,7 @@ impl Debugger {
                             let mut si: libc::siginfo_t;
                             unsafe {
                                 si = mem::zeroed();
-                                ptrace(libc::PTRACE_GETSIGINFO, tid, 0, &mut si as *mut _ as u64, &mut self.prof.bucket)?;
+                                ptrace(libc::PTRACE_GETSIGINFO, tid, 0, &mut si as *mut _ as u64)?;
                             }
 
                             thread.stop_reasons.push(StopReason::Signal(signal));
@@ -999,7 +999,7 @@ impl Debugger {
         for (tid, t) in &mut self.threads {
             if t.state == ThreadState::Running && !t.exiting {
                 if !t.sent_interrupt {
-                    unsafe {ptrace(libc::PTRACE_INTERRUPT, *tid, 0, 0, &mut self.prof.bucket)?};
+                    unsafe {ptrace(libc::PTRACE_INTERRUPT, *tid, 0, 0)?};
                     t.sent_interrupt = true;
                 }
                 n += 1;
@@ -1376,11 +1376,11 @@ impl Debugger {
                 return err!(Loading, "can't step while loading unwind info");
             }
 
-            step.cfa = frame.regs.get_int(RegisterIdx::Cfa)?.0 as usize;
+            step.cfa = frame.regs.get(RegisterIdx::Cfa)?.0 as usize;
         }
 
         if breakpoint_types.contains(&StepBreakpointType::AfterRet) {
-            match frame.regs.get_int(RegisterIdx::Ret) {
+            match frame.regs.get(RegisterIdx::Ret) {
                 Ok((addr, _dubious)) => breakpoints_to_add.push((StepBreakpointType::AfterRet, addr as usize)),
                 Err(e) if step.internal_kind == StepKind::Out => return err!(ProcessState, "no return address"),
                 Err(_) => (),
@@ -1599,7 +1599,7 @@ impl Debugger {
         }
         let op = if thread.single_stepping {libc::PTRACE_SINGLESTEP} else {libc::PTRACE_CONT};
         let sig = thread.pending_signal.take().unwrap_or(0);
-        unsafe {ptrace(op, tid, 0, sig as u64, &mut self.prof.bucket)?};
+        unsafe {ptrace(op, tid, 0, sig as u64)?};
         thread.state = ThreadState::Running;
         thread.stop_reasons.clear();
 
@@ -1643,7 +1643,7 @@ impl Debugger {
 
         let mut regs = thread.info.regs.clone();
         let mut scratch = UnwindScratchBuffer::default();
-        let mut pseudo_addr = regs.get_int(RegisterIdx::Rip)?.0 as usize;
+        let mut pseudo_addr = regs.get(RegisterIdx::Rip)?.0 as usize;
         let mut memory = CachedMemReader::new(self.memory.clone());
 
         loop {
@@ -1653,7 +1653,7 @@ impl Debugger {
                 return err!(ProcessState, "stack too deep");
             }
 
-            let addr = regs.get_int(RegisterIdx::Rip).unwrap().0 as usize;
+            let addr = regs.get(RegisterIdx::Rip).unwrap().0 as usize;
             stack.subframes.push(StackSubframe {frame_idx: stack.frames.len(), function_idx: err!(MissingSymbols, "unwind failed"), ..Default::default()});
             stack.frames.push(StackFrame {addr, pseudo_addr, regs: regs.clone(), subframes: stack.subframes.len()-1..stack.subframes.len(), .. Default::default()});
             let frame = &mut stack.frames.last_mut().unwrap();
@@ -1674,7 +1674,7 @@ impl Debugger {
 
             if step_result.as_ref().is_ok_and(|(_, is_signal_trampoline)| *is_signal_trampoline) {
                 // Un-decrement the instruction pointer, there's no `call` in signal trampoline.
-                frame.pseudo_addr = frame.regs.get_int(RegisterIdx::Rip).unwrap().0 as usize;
+                frame.pseudo_addr = frame.regs.get(RegisterIdx::Rip).unwrap().0 as usize;
                 static_pseudo_addr = binary.addr_map.dynamic_to_static(frame.pseudo_addr);
             }
 
@@ -1689,12 +1689,12 @@ impl Debugger {
                 // This is how stacks usually end.
                 return Ok(());
             }
-            let next_addr = next_regs.get_int(RegisterIdx::Rip).unwrap().0 as usize;
+            let next_addr = next_regs.get(RegisterIdx::Rip).unwrap().0 as usize;
             if next_addr == 0 {
                 // I've seen this in MUSL's clone.s, which has bad unwind info.
                 return err!(Dwarf, "zero return address");
             }
-            if next_addr == addr && next_regs.has(RegisterIdx::Rsp) && regs.has(RegisterIdx::Rsp) && next_regs.get_int(RegisterIdx::Rsp).unwrap().0 == regs.get_int(RegisterIdx::Rsp).unwrap().0 {
+            if next_addr == addr && next_regs.has(RegisterIdx::Rsp) && regs.has(RegisterIdx::Rsp) && next_regs.get(RegisterIdx::Rsp).unwrap().0 == regs.get(RegisterIdx::Rsp).unwrap().0 {
                 // RIP and RSP didn't change. We'd almost certainly be stuck in a loop if we continue. I've seen this in MUSL's clone.s, which has bad unwind info.
                 return err!(Dwarf, "cycle");
             }
@@ -1734,7 +1734,7 @@ impl Debugger {
             Some(o) => o,
             None => return Ok(()) };
         let unit = symbols.find_unit(debug_info_offset)?;
-        let mut context = DwarfEvalContext {memory, symbols: Some(symbols), addr_map: &binary.addr_map, encoding: unit.unit.header.encoding(), unit: Some(unit), regs: Some(&frame.regs), frame_base: None, local_variables: &[]};
+        let mut context = DwarfEvalContext {memory, symbols: Some(symbols), addr_map: &binary.addr_map, encoding: unit.unit.header.encoding(), unit: Some(unit), regs: Some(&frame.regs), extra_regs: None, frame_base: None, local_variables: &[], fs_base: None};
         for v in symbols.local_variables_in_subfunction(root_subfunction, function.shard_idx()) {
             if !v.flags().contains(VariableFlags::FRAME_BASE) {
                 // Frame bases are always first in the list.
@@ -1829,8 +1829,12 @@ impl Debugger {
         }
     }
 
-    pub fn make_eval_context<'a>(&'a self, stack: &'a StackTrace, selected_subframe: usize) -> EvalContext<'a> {
-        EvalContext {memory: CachedMemReader::new(self.memory.clone()), process_info: &self.info, symbols_registry: &self.symbols, stack, selected_subframe}
+    pub fn make_eval_context<'a>(&'a self, stack: &'a StackTrace, selected_subframe: usize, tid: pid_t) -> EvalContext<'a> {
+        let (extra_regs, fs_base) = match self.threads.get(&tid) {
+            Some(t) => (Some(&t.info.extra_regs), if t.info.regs.has(RegisterIdx::FsBase) {Some(t.info.regs.get(RegisterIdx::FsBase).unwrap().0)} else {None}),
+            None => (None, None),
+        };
+        EvalContext {memory: CachedMemReader::new(self.memory.clone()), process_info: &self.info, symbols_registry: &self.symbols, stack, selected_subframe, extra_regs, fs_base}
     }
 
     pub fn add_breakpoint(&mut self, on: BreakpointOn) -> Result<BreakpointId> {
@@ -2111,7 +2115,7 @@ impl Debugger {
             // Presumably this requirement was added just in case, back when threads didn't exist.
             // So we need to semi-artificially propagate a TID of any suspended thread into here, and we can't add/remove breakpoints
             // while all threads are running. I wish process_vm_writev() had a flag to allow writing to read-only memory (.text is usually mapped as read-only).
-            unsafe { ptrace(libc::PTRACE_POKETEXT, any_suspended_tid, (addr - byte_idx) as u64, word, &mut self.prof.bucket)?; }
+            unsafe { ptrace(libc::PTRACE_POKETEXT, any_suspended_tid, (addr - byte_idx) as u64, word)?; }
         }
         self.breakpoint_locations[idx].active = true;
         Ok(())
@@ -2134,7 +2138,7 @@ impl Debugger {
             // Other threads may be running, but it's fine.
             let word = self.memory.read_u64(location.addr - byte_idx)?;
             let word = word & !(0xff << bit_idx) | ((location.original_byte as u64) << bit_idx);
-            unsafe { ptrace(libc::PTRACE_POKETEXT, any_suspended_tid, (location.addr - byte_idx) as u64, word, &mut self.prof.bucket)?; }
+            unsafe { ptrace(libc::PTRACE_POKETEXT, any_suspended_tid, (location.addr - byte_idx) as u64, word)?; }
         }
         location.active = false;
         Ok(())
@@ -2182,7 +2186,7 @@ impl Debugger {
         let mut thread_addresses: HashMap<usize, pid_t> = HashMap::new();
         for (tid, t) in self.threads.iter() {
             if t.info.regs.has(RegisterIdx::Rip) {
-                let addr = t.info.regs.get_int(RegisterIdx::Rip)?.0 as usize;
+                let addr = t.info.regs.get(RegisterIdx::Rip)?.0 as usize;
                 thread_addresses.insert(addr, *tid);
             }
         }
@@ -2230,10 +2234,10 @@ impl Debugger {
             if !b.active || b.thread_specific.is_some_and(|x| x != tid) {
                 continue;
             }
-            unsafe { ptrace(libc::PTRACE_POKEUSER, tid, (offsetof!(libc::user, u_debugreg) + i * 8) as u64, b.addr as u64, &mut self.prof.bucket)? };
+            unsafe { ptrace(libc::PTRACE_POKEUSER, tid, (offsetof!(libc::user, u_debugreg) + i * 8) as u64, b.addr as u64)? };
             dr7 |= 1 << (i*2);
         }
-        unsafe { ptrace(libc::PTRACE_POKEUSER, tid, (offsetof!(libc::user, u_debugreg) + 7*8) as u64, dr7, &mut self.prof.bucket)? };
+        unsafe { ptrace(libc::PTRACE_POKEUSER, tid, (offsetof!(libc::user, u_debugreg) + 7*8) as u64, dr7)? };
         Ok(())
     }
 
@@ -2250,7 +2254,7 @@ impl Debugger {
         if step.internal_kind == StepKind::Cursor {
             return hit_step_breakpoint;
         }
-        let addr = regs.get_int(RegisterIdx::Rip).unwrap().0 as usize;
+        let addr = regs.get(RegisterIdx::Rip).unwrap().0 as usize;
         let i = step.addr_ranges.partition_point(|r| r.end <= addr);
         let in_ranges = i < step.addr_ranges.len() && step.addr_ranges[i].start <= addr;
         if step.internal_kind == StepKind::Into && step.by_instructions {
@@ -2436,8 +2440,8 @@ impl Debugger {
     // May also set stopping_to_handle_breakpoints to true, in which case the caller should stop all threads.
     // Otherwise treat it as a spurious wakeup and continue (e.g. breakpoint is for a different thread, or conditional breakpoint's condition evaluated to false, or something).
     fn handle_breakpoint_trap(&mut self, tid: pid_t, single_stepping: bool, ignore_next_hw_breakpoint_hit_at_addr: Option<usize>) -> Result<(/*hit*/ bool, Registers, Option<(Vec<usize>, bool, u16)>)> {
-        let mut regs = ptrace_getregs(tid, &mut self.prof.bucket)?;
-        let mut addr = regs.get_int(RegisterIdx::Rip).unwrap().0 as usize;
+        let mut regs = ptrace_getregs(tid)?;
+        let mut addr = regs.get(RegisterIdx::Rip).unwrap().0 as usize;
 
         // There's a very unfortunate detail in how the 0xcc (INT 3) instruction is handled (at least in Linux). After hitting 0xcc at address X,
         // the thread is stopped with its RIP = X+1, not X. When we see a SIGTRAP and RIP = X+1, it can mean two things:
@@ -2453,13 +2457,13 @@ impl Debugger {
         //  (3) It hit a software breakpoint. We assume this if none of the above are the case.
         //  (4) Someone sent a SIGTRAP manually at just the wrong moment. This will break things, there's not much we can do about it, AFAICT.
 
-        let dr6 = unsafe { ptrace(libc::PTRACE_PEEKUSER, tid, offsetof!(libc::user, u_debugreg) as u64 + 6*8, 0, &mut self.prof.bucket)? };
+        let dr6 = unsafe { ptrace(libc::PTRACE_PEEKUSER, tid, offsetof!(libc::user, u_debugreg) as u64 + 6*8, 0)? };
         let stopped_on_hw_breakpoint = dr6 & 15 != 0;
         if stopped_on_hw_breakpoint {
             // In case it's a stale breakpoint.
             self.set_debug_registers_for_thread(tid)?;
             // Clear the 'breakpoint was hit' bits because neither the CPU nor Linux will do it for us.
-            unsafe { ptrace(libc::PTRACE_POKEUSER, tid, (offsetof!(libc::user, u_debugreg) + 6 * 8) as u64, (dr6 & !15) as u64, &mut self.prof.bucket)? };
+            unsafe { ptrace(libc::PTRACE_POKEUSER, tid, (offsetof!(libc::user, u_debugreg) + 6 * 8) as u64, (dr6 & !15) as u64)? };
         }
 
         let mut stopped_on_sw_breakpoint = false;
@@ -2471,8 +2475,8 @@ impl Debugger {
             // But we also print a warning (below) in this case, so hopefully we'll be able to hunt down all cases where this breaks.
             stopped_on_sw_breakpoint = true;
             addr -= 1;
-            regs.set_int(RegisterIdx::Rip, addr as u64, false);
-            unsafe { ptrace(libc::PTRACE_POKEUSER, tid, offsetof!(libc::user, regs.rip) as u64, addr as u64, &mut self.prof.bucket)? };
+            regs.set(RegisterIdx::Rip, addr as u64, false);
+            unsafe { ptrace(libc::PTRACE_POKEUSER, tid, offsetof!(libc::user, regs.rip) as u64, addr as u64)? };
         }
 
         let spurious_stop = stopped_on_hw_breakpoint && ignore_next_hw_breakpoint_hit_at_addr == Some(addr);
@@ -2611,7 +2615,11 @@ impl Debugger {
             return Ok(false);
         }
         let need_full_stack = does_expression_need_full_stack(expr);
-        self.threads.get_mut(&tid).unwrap().info.regs = ptrace_getregs(tid, &mut self.prof.bucket)?;
+
+        let t = self.threads.get_mut(&tid).unwrap();
+        t.info.regs = ptrace_getregs(tid)?;
+        t.info.extra_regs.reset_with_tid(tid);
+
         let stack = self.get_stack_trace(tid, /*partial*/ !need_full_stack);
         let selected_subframe = if subfunction_level != u16::MAX && !stack.frames.is_empty() {
             stack.frames[0].subframes.end.saturating_sub(subfunction_level as usize + 1)
@@ -2621,7 +2629,7 @@ impl Debugger {
         let bp = self.breakpoints.get(id);
         let expr = bp.condition.as_ref().unwrap().1.as_ref().unwrap();
         let mut eval_state = EvalState::new();
-        let mut eval_context = self.make_eval_context(&stack, selected_subframe);
+        let mut eval_context = self.make_eval_context(&stack, selected_subframe, tid);
         let (val, _dubious) = eval_parsed_expression(expr, &mut eval_state, &mut eval_context)?;
         Ok(is_value_truthy(&val, &mut eval_context.memory)?)
     }
@@ -2654,7 +2662,6 @@ impl Debugger {
             }
         }
         let mut detach_thread = |tid: pid_t| {
-            let mut prof = ProfileBucket::invalid();
             // Remove software breakpoints when we see the first stopped thread (which is required for PTRACE_POKETEXT).
             for (addr, byte) in mem::take(&mut memory_bytes_to_restore) {
                 let byte_idx = addr % 8;
@@ -2666,26 +2673,25 @@ impl Debugger {
                         continue;
                     } };
                 let word = word & !(0xff << bit_idx) | ((byte as u64) << bit_idx);
-                if let Err(e) = unsafe { ptrace(libc::PTRACE_POKETEXT, tid, (addr - byte_idx) as u64, word, &mut prof) } {
+                if let Err(e) = unsafe { ptrace(libc::PTRACE_POKETEXT, tid, (addr - byte_idx) as u64, word) } {
                     eprintln!("warning: detach failed to remove breakpoint at 0x{:x}: PTRACE_POKETEXT failed: {}", addr, e);
                 }
             }
 
             // Disable hardware breakpoints for this thread. (Do this unconditionally because threads may have leftover breakpoints that are not in self.hardware_breakpoints or self.breakpoint_locations anymore.)
-            if let Err(e) = unsafe { ptrace(libc::PTRACE_POKEUSER, tid, (offsetof!(libc::user, u_debugreg) + 7*8) as u64, 1u64 << 10, &mut prof) } {
+            if let Err(e) = unsafe { ptrace(libc::PTRACE_POKEUSER, tid, (offsetof!(libc::user, u_debugreg) + 7*8) as u64, 1u64 << 10) } {
                 eprintln!("warning: detach failed to clear hardware breakpoints for thread {}: {}", tid, e);
             }
 
-            if let Err(e) = unsafe { ptrace(libc::PTRACE_DETACH, tid, 0, 0, &mut prof) } {
+            if let Err(e) = unsafe { ptrace(libc::PTRACE_DETACH, tid, 0, 0) } {
                 eprintln!("warning: detach failed for thread {}: {}", tid, e);
             }
         };
         let mut running_threads: HashSet<pid_t> = HashSet::new();
-        let mut prof = ProfileBucket::invalid();
         for (tid, thread) in &self.threads {
             if thread.state == ThreadState::Suspended {
                 detach_thread(*tid);
-            } else if let Err(e) = unsafe {ptrace(libc::PTRACE_INTERRUPT, *tid, 0, 0, &mut prof)} {
+            } else if let Err(e) = unsafe {ptrace(libc::PTRACE_INTERRUPT, *tid, 0, 0)} {
                 eprintln!("warning: detach failed to stop thread {}: {}", tid, e);
             } else {
                 running_threads.insert(*tid);

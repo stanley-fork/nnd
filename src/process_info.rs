@@ -15,6 +15,7 @@ pub struct ProcessInfo {
 #[derive(Default)]
 pub struct ThreadInfo {
     pub regs: Registers,
+    pub extra_regs: LazyExtraRegisters,
 
     // These are calculated lazily and cleared when the thread switches from Running to Suspended. None means it wasn't requested yet.
     // Errors are reported through StackTrace.truncated field.
@@ -256,13 +257,14 @@ pub fn refresh_thread_info(pid: pid_t, t: &mut Thread, prof: &mut ProfileBucket,
     }
 
     if t.state == ThreadState::Suspended {
-        t.info.regs = match ptrace_getregs(t.tid, prof) {
+        t.info.regs = match ptrace_getregs(t.tid) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("error: GETREGS failed: {:?}", e);
                 Registers::default()
             }
-        }
+        };
+        t.info.extra_regs.reset_with_tid(t.tid);
     }
 }
 
@@ -292,10 +294,23 @@ pub fn refresh_all_resource_stats(pid: pid_t, my_stats: &mut ResourceStats, debu
     any_error
 }
 
-pub fn ptrace_getregs(tid: pid_t, prof: &mut ProfileBucket) -> Result<Registers> {
+pub fn ptrace_getregs(tid: pid_t) -> Result<Registers> {
     unsafe {
         let mut regs: libc::user_regs_struct = mem::zeroed();
-        ptrace(libc::PTRACE_GETREGS, tid, 0, &mut regs as *mut _ as u64, prof)?;
+        ptrace(libc::PTRACE_GETREGS, tid, 0, &mut regs as *mut _ as u64)?;
         Ok(Registers::from_ptrace(&regs))
+    }
+}
+
+pub const NT_X86_XSTATE: u32 = 0x202;
+
+pub fn ptrace_get_extra_regs(tid: pid_t) -> ExtraRegisters {
+    unsafe {
+        let mut buf = [0u8; XSAVE_MAX_SIZE];
+        let mut iov = libc::iovec {iov_base: buf.as_mut_ptr() as *mut libc::c_void, iov_len: buf.len()};
+        if let Err(e) = ptrace(libc::PTRACE_GETREGSET, tid, NT_X86_XSTATE as u64, &mut iov as *mut libc::iovec as u64) {
+            return ExtraRegisters::from_error(e);
+        }
+        ExtraRegisters::from_xsave(&buf[..iov.iov_len])
     }
 }

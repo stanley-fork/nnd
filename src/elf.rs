@@ -316,7 +316,9 @@ pub fn parse_core_dump(elf: Arc<ElfFile>) -> Result<(CoreDumpMemReader, Vec<(pid
                 let (prstatus, _) = unsafe {memcpy_struct::<elf_prstatus>(note.desc, "NT_PRSTATUS")}?;
                 // Core dump has the same signo on all threads for some reason, but we want to show it only on the thread that received it (which is always listed first).
                 let signal = if threads.is_empty() && prstatus.si_signo != 0 {Some(prstatus.si_signo)} else {None};
-                threads.push((prstatus.pr_pid, ThreadInfo {regs: Registers::from_ptrace(&prstatus.pr_reg), ..Default::default()}, signal));
+                let mut extra_regs = LazyExtraRegisters::default();
+                extra_regs.set_error(error!(ProcessState, "no simd registers in core dump"));
+                threads.push((prstatus.pr_pid, ThreadInfo {regs: Registers::from_ptrace(&prstatus.pr_reg), extra_regs, ..Default::default()}, signal));
             }
             NT_PRPSINFO => {
                 let (_prpsinfo, _) = unsafe {memcpy_struct::<elf_prpsinfo>(note.desc, "NT_PRPSINFO")}?;
@@ -329,7 +331,11 @@ pub fn parse_core_dump(elf: Arc<ElfFile>) -> Result<(CoreDumpMemReader, Vec<(pid
             NT_AUXV => (),
             NT_PRFPREG => (), // prefix of NT_X86_XSTATE
             NT_X86_XSTATE => {
-                // TODO: [simd] xsave
+                if threads.is_empty() {
+                    return err!(MalformedExecutable, "unexpected NT_X86_XSTATE before any NT_PRSTATUS");
+                }
+                let extra_regs = ExtraRegisters::from_xsave(note.desc);
+                threads.last_mut().unwrap().1.extra_regs.set(extra_regs);
             }
             NT_FILE => {
                 let mut reader = io::Cursor::new(note.desc);

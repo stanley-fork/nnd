@@ -1,7 +1,6 @@
-finish listing features in README
+investigate why dumps produced by gcore don't work
 test with different-versioned libraries
 test with breakpad minidumps
-simd registers
 cast to same-size value: my_byte_array as my_struct
 cast to shorter array of same type by value: my_array as [u8; 8]
 cast to auto-size array: my_fixed_size_array as [u8]
@@ -41,16 +40,18 @@ test with 10k threads
 test with watches window filled with long arrays (I saw 50ms frames when there are ~5 of them; maybe just decrease length limit)
 
 todo:
+list features in README
+option to create a core dump instead of launching debugger (apparently there's no existing good way to do it)
 buffer input when program is quitting, especially k+r and steps
 async fetch from debuginfod (load symbols without waiting for it, then on success start over)
-show and error if program failed to start (e.g. executable doesn't exist)
-floating point and simd registers ("TODO: [simd]")
+show an error if program failed to start (e.g. executable doesn't exist)
 use RssAnon (from /proc/pid/status) instead of VmRss (includes page cache)
 don't immediately kill child on debugger panic; have a simple fallback state where the child is running, and the user can kill+quit, detach+quit, or do nothing (maybe also pause/resume)
 allow specifying cgroup and user (or maybe it's too hard, need to maybe inherit groups from parent somehow too)
 maybe refresh global variables in watches window on periodic timer tick when the program is running
 make watch window show dereferenced string-like values by default (otherwise expanding it shows the array of characters and eats all vertical space)
 update rust HashMap pretty printer
+detect and show if a pointer points to a symbol (function, global variable, vtable)
 do something for downcasts in conditional breakpoints (coalesce()? maybe()? ?()? ()?? checkbox to stop on error? 'is' operator? explicit checked downcast? also function to check field presense without evaluating it)
 edit breakpoint condition on click
 support casting slices (e.g. from pretty printers) to slices of different type (especially string)

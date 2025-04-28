@@ -22,7 +22,7 @@ pub fn tgkill(pid: pid_t, tid: pid_t, sig: i32) -> Result<i32> {
     Ok(ret)
 }
 
-pub unsafe fn ptrace(request: i32, pid: pid_t, addr: u64, data: u64, _prof: &mut ProfileBucket) -> Result<i64> {
+pub unsafe fn ptrace(request: i32, pid: pid_t, addr: u64, data: u64) -> Result<i64> {
     (*libc::__errno_location()) = 0;
     let r = profile_syscall!(libc::ptrace(request, pid, addr, data));
     //eprintln!("trace: ptrace({}, {}, 0x{:x}, 0x{:x}) -> 0x{:x}", ptrace_request_name(request), pid, addr, data, r);

@@ -70,7 +70,7 @@ impl StackTrace {
     pub fn subframe_identity(&self, subframe_idx: usize) -> usize {
         let subframe = &self.subframes[subframe_idx];
         let frame = &self.frames[subframe.frame_idx];
-        let cfa = match frame.regs.get_int(RegisterIdx::Cfa) {
+        let cfa = match frame.regs.get(RegisterIdx::Cfa) {
             Ok((c, _)) => c,
             Err(_) => return 0 };
         let frame_identity = (cfa as usize, frame.binary_id.clone().unwrap_or(usize::MAX));
@@ -232,7 +232,7 @@ impl UnwindInfo {
         }
 
         let (fde, row, cfa, cfa_dubious, section) = self.find_row_and_eval_cfa(memory, addr_map, scratch, pseudo_addr, &frame.regs)?;
-        frame.regs.set_int(RegisterIdx::Cfa, cfa as u64, cfa_dubious);
+        frame.regs.set(RegisterIdx::Cfa, cfa as u64, cfa_dubious);
         frame.fde_initial_address = fde.initial_address() as usize;
         frame.lsda = fde.lsda().clone();
 
@@ -248,10 +248,10 @@ impl UnwindInfo {
             let val = eval_register_rule(reg.clone(), rule, fde.cie().encoding(), section, &frame.regs, memory, addr_map)?;
             if let Some((v, dubious)) = val {
                 if let Some(r) = reg {
-                    new_regs.set_int(r, v, dubious);
+                    new_regs.set(r, v, dubious);
                 }
                 if *reg_num == fde.cie().return_address_register() {
-                    frame.regs.set_int(RegisterIdx::Ret, v, dubious);
+                    frame.regs.set(RegisterIdx::Ret, v, dubious);
                     found_return_address = true;
                 }
             }
@@ -280,7 +280,7 @@ impl UnwindInfo {
         //    Maybe debuggers do some code analysis: look for `push` instructions for callee-saved registers near the start of the function, then assume that
         //    these pushed values are never modified and can be used to retrieve the saved registers? Idk. I sure hope this is not how it works.
         //
-        // For now, for callee-saved registers, we just treat Undefined as SameValue, but mark the value as dubious (which is shown in UI).
+        // For now, for callee-saved registers, we just treat Undefined as SameValue, but mark the value as dubious (greyed out in UI).
         //
         // (Except for RBP - don't mark it as dubious. I saw omitted RBP recovery rule for the first instruction of a function,
         //  before the 'push rbp' happens, where clealy RegisterRule::SameValue behavior is expected. So I guess this is
@@ -288,11 +288,16 @@ impl UnwindInfo {
         for reg in [RegisterIdx::Rbp, RegisterIdx::Rbx, RegisterIdx::R12, RegisterIdx::R13, RegisterIdx::R14, RegisterIdx::R15] {
             if seen_regs & 1usize << reg as u32 == 0 && frame.regs.has(reg) {
                 let dubious = reg != RegisterIdx::Rbp;
-                new_regs.set_int(reg, frame.regs.get_int(reg).unwrap().0, dubious);
+                new_regs.set(reg, frame.regs.get(reg).unwrap().0, dubious);
             }
         }
         if seen_regs & 1usize << RegisterIdx::Rsp as u32 == 0 {
-            new_regs.set_int(RegisterIdx::Rsp, cfa as u64, false);
+            new_regs.set(RegisterIdx::Rsp, cfa as u64, false);
+        }
+        // Pass through fs_base, it's a property of a thread rather than stack frame. Maybe we should move it to ExtraRegisters (or maybe .eh_frame dwarf expressions may use it, idk).
+        if seen_regs & 1usize << RegisterIdx::FsBase as u32 == 0 && frame.regs.has(RegisterIdx::FsBase) {
+            let (v, dub) = frame.regs.get(RegisterIdx::FsBase).unwrap();
+            new_regs.set(RegisterIdx::FsBase, v, dub);
         }
 
         if !found_return_address {
@@ -302,8 +307,8 @@ impl UnwindInfo {
                 Some(r) => r };
             // Typically the return address register is just RIP, and for the root stack frame there's no RIP in new_regs.
             if new_regs.has(reg) {
-                let (v, dubious) = new_regs.get_int(reg).unwrap();
-                new_regs.set_int(RegisterIdx::Ret, v, dubious);
+                let (v, dubious) = new_regs.get(reg).unwrap();
+                new_regs.set(RegisterIdx::Ret, v, dubious);
             }
         }
 
@@ -318,7 +323,7 @@ impl UnwindInfo {
         ];
         const MID: usize = 7usize; // size of the first instruction
 
-        let addr = regs.get_int(RegisterIdx::Rip).unwrap().0 as usize;
+        let addr = regs.get(RegisterIdx::Rip).unwrap().0 as usize;
         // Prefer to read the machine code from file rather than memory to avoid our breakpoint instructions. And it's probably faster because we have it mmapped.
         let mut data_buf = [MaybeUninit::<u8>::uninit(); MID + CODE.len()];
         let elf = &self.elves[0];
@@ -349,7 +354,7 @@ impl UnwindInfo {
             return Ok(None);
         }
 
-        let offset = regs.get_int(RegisterIdx::Rsp).unwrap().0 as usize + offsetof!(libc::ucontext_t, uc_mcontext);
+        let offset = regs.get(RegisterIdx::Rsp).unwrap().0 as usize + offsetof!(libc::ucontext_t, uc_mcontext);
         let mut mcontext: libc::mcontext_t;
         unsafe {
             mcontext = mem::zeroed();
@@ -357,15 +362,20 @@ impl UnwindInfo {
             memory.read(offset, slice)?;
         }
 
-        let new_regs = Registers::from_context(&mcontext.gregs);
-        // TODO: [simd] read xsave from *mcontext.fpregs
+        let mut new_regs = Registers::from_context(&mcontext.gregs);
+        if regs.has(RegisterIdx::FsBase) {
+            let (v, dub) = regs.get(RegisterIdx::FsBase).unwrap();
+            new_regs.set(RegisterIdx::FsBase, v, dub);
+        }
+        // Is there a way to get simd registers too? I couldn't figure it out. mcontext.fpregs points to fpstate,
+        // which contains xmm registers, but doesn't seem to be followed by the rest of xsave data.
 
         Ok(Some(new_regs))
     }
 }
 
 fn eval_dwarf_expression_as_u64(expression: Expression<DwarfSlice>, encoding: Encoding, regs: &Registers, memory: &mut CachedMemReader, addr_map: &AddrMap, skip_final_dereference: bool) -> Result<(u64, /* dubious */ bool)> {
-    let (val, dubious) = eval_dwarf_expression(expression, &mut DwarfEvalContext {encoding, memory, symbols: None, unit: None, addr_map, regs: Some(regs), frame_base: None, local_variables: &[]})?;
+    let (val, dubious) = eval_dwarf_expression(expression, &mut DwarfEvalContext {encoding, memory, symbols: None, unit: None, addr_map, regs: Some(regs), frame_base: None, local_variables: &[], extra_regs: None, fs_base: None})?;
     let val = if skip_final_dereference {
         // I'm probably misunderstanding something, but the meaning of gimli::read::Location::Address seems to be different between CFA/frame-base vs registers/variables.
         // In CFA and frame base, we treat Location::Address the same as Location::Value, presumably because the "value" of CFA/frame-base is an "address", so no dereference is needed.
@@ -396,19 +406,19 @@ fn eval_cfa_rule(rule: &CfaRule<usize>, encoding: Encoding, section: DwarfSlice,
             if !registers.has(reg) {
                 return err!(Dwarf, "register {} optimized away (in cfa)", reg);
             }
-            let (r, dub) = registers.get_int(reg).unwrap();
+            let (r, dub) = registers.get(reg).unwrap();
             (r.wrapping_add(*offset as u64), dub)
         }
     })
 }
 
 fn eval_register_rule(reg: Option<RegisterIdx>, rule: &RegisterRule<usize>, encoding: Encoding, section: DwarfSlice, registers: &Registers, memory: &mut CachedMemReader, addr_map: &AddrMap) -> Result<Option<(u64, bool)>> {
-    let (cfa, cfa_dubious) = registers.get_int(RegisterIdx::Cfa).unwrap();
+    let (cfa, cfa_dubious) = registers.get(RegisterIdx::Cfa).unwrap();
     let val = match rule {
         RegisterRule::Undefined => return Ok(None),
         RegisterRule::SameValue => match &reg {
             None => return err!(Dwarf, "got same-value rule for unrecognized register"),
-            Some(reg) => match registers.get_int(*reg) {
+            Some(reg) => match registers.get(*reg) {
                 Err(_) => return err!(Dwarf, "register {} optimized away (in reg)", reg),
                 Ok(x) => x,
             }
@@ -418,7 +428,7 @@ fn eval_register_rule(reg: Option<RegisterIdx>, rule: &RegisterRule<usize>, enco
                 None => return err!(NotImplemented, "unsupported register (in reg): {:?}", reg),
                 Some(r) => r,
             };
-            match registers.get_int(reg) {
+            match registers.get(reg) {
                 Err(_) => return err!(Dwarf, "register {} optimized away (in other reg)", reg),
                 Ok(x) => x,
             }

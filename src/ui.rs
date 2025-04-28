@@ -431,6 +431,7 @@ fn get_breakpoint_icon(enabled: bool, active: bool, secondary: bool, conditional
 enum SpecialWatch {
     Locals,
     Registers,
+    RegistersGroup,
     AddWatch,
 }
 
@@ -447,6 +448,7 @@ struct ValueTreeNode {
     value: Result<Value>,
     dubious: bool,
     special: Option<SpecialWatch>,
+    registers_group: &'static [ExtraRegisterIdx],
 
     child_kind: ValueChildKind,
     deref: usize,
@@ -474,7 +476,7 @@ struct ValueTreeNode {
     layout_frame_idx: usize, // when this node's layout information was updated
     name_line_wrap_width: usize, // what width was used for line_wrapped_name
 }
-impl Default for ValueTreeNode { fn default() -> Self { Self {name: 0..0, line_wrapped_name: None, value: err!(Internal, ""), dubious: false, special: None, child_kind: ValueChildKind::Other, deref: 0, click_action: ValueClickAction::None, identity: 0, depth: 0, parent: ValueTreeNodeIdx::invalid(), formatted_value: [None, None, None], has_children: false, children: 0..0, start_y: 0, node_end_y: 0, subtree_end_y: 0, expanded: false, is_text_input: false, layout_frame_idx: 0, name_line_wrap_width: 0} } }
+impl Default for ValueTreeNode { fn default() -> Self { Self {name: 0..0, line_wrapped_name: None, value: err!(Internal, ""), dubious: false, special: None, child_kind: ValueChildKind::Other, deref: 0, click_action: ValueClickAction::None, identity: 0, depth: 0, parent: ValueTreeNodeIdx::invalid(), formatted_value: [None, None, None], has_children: false, children: 0..0, start_y: 0, node_end_y: 0, subtree_end_y: 0, expanded: false, is_text_input: false, layout_frame_idx: 0, name_line_wrap_width: 0, registers_group: &[]} } }
 
 #[derive(Default)]
 struct ValueTree {
@@ -597,9 +599,48 @@ impl WatchesWindow {
         if let Some(sf) = context.stack.subframes.get(context.selected_subframe) {
             let regs = &context.stack.frames[sf.frame_idx].regs;
             for reg in RegisterIdx::all() {
-                if let Ok((v, dubious)) = regs.get_int(*reg) {
+                if let Ok((v, dubious)) = regs.get(*reg) {
                     let l = styled_writeln!(self.tree.text, palette.default, "{}", reg);
                     let value = Value {val: AddrOrValueBlob::Blob(ValueBlob::new(v as usize)), type_: self.eval_state.builtin_types.u64_, flags: ValueFlags::HEX};
+                    self.tree.add(ValueTreeNode {name: l..l+1, value: Ok(value), dubious, identity: hash(&reg), parent, ..D!()});
+                }
+            }
+            if let Some(extra_regs) = context.extra_regs.clone() {
+                for (name, regs) in ExtraRegisterIdx::groups_for_ui() {
+                    if name.is_empty() {
+                        self.add_nodes_for_extra_registers(regs, context, parent, palette);
+                    } else {
+                        let l = styled_writeln!(self.tree.text, palette.default, "{}", name);
+                        self.tree.add(ValueTreeNode {name: l..l+1, special: Some(SpecialWatch::RegistersGroup), registers_group: regs, parent, identity: hash(name), ..D!()});
+                    }
+                }
+            }
+        }
+    }
+
+    fn eval_registers_group(&mut self, context: &mut EvalContext, parent: ValueTreeNodeIdx, palette: &Palette) {
+        let regs = self.tree.nodes[parent.0].registers_group;
+        self.add_nodes_for_extra_registers(regs, context, parent, palette);
+        if let &Some(extra_regs) = &context.extra_regs {
+            if let Some(e) = &extra_regs.get().error {
+                let l = styled_writeln!(self.tree.text, palette.error, "<{}>", e);
+                self.tree.nodes[parent.0].formatted_value[1] = Some(l..l+1);
+            }
+        }
+    }
+
+    fn add_nodes_for_extra_registers(&mut self, regs: &[ExtraRegisterIdx], context: &mut EvalContext, parent: ValueTreeNodeIdx, palette: &Palette) {
+        if let &Some(extra_regs) = &context.extra_regs {
+            let all_dubious = match context.stack.subframes.get(context.selected_subframe) {
+                Some(sf) => sf.frame_idx > 0,
+                None => true,
+            };
+            let extra_regs = extra_regs.get();
+            for &reg in regs {
+                if let Ok((v, dubious)) = extra_regs.get(reg) {
+                    let dubious = dubious || all_dubious;
+                    let l = styled_writeln!(self.tree.text, palette.default, "{}", reg);
+                    let value = self.eval_state.make_extra_register_value(v);
                     self.tree.add(ValueTreeNode {name: l..l+1, value: Ok(value), dubious, identity: hash(&reg), parent, ..D!()});
                 }
             }
@@ -661,12 +702,16 @@ impl WatchesWindow {
                                 self.eval_registers(context, node_idx, palette);
                                 "registers"
                             }
+                            SpecialWatch::RegistersGroup => {
+                                self.eval_registers_group(context, node_idx, palette);
+                                "registers"
+                            }
                             SpecialWatch::AddWatch => panic!("huh"),
                         };
                         let end = self.tree.nodes.len();
                         let node = &mut self.tree.nodes[node_idx.0];
                         node.children = start..end;
-                        if node.children.is_empty() {
+                        if node.children.is_empty() && node.formatted_value[1].is_none() {
                             let l = styled_writeln!(self.tree.text, palette.default_dim, "no {}", what);
                             node.formatted_value[1] = Some(l..l+1);
                         }
@@ -1007,7 +1052,10 @@ impl WatchesWindow {
                     components.push((0, make_expression_for_variable(name)));
                     break;
                 }
-                Some(SpecialWatch::Registers) => {
+                Some(SpecialWatch::Registers) | Some(SpecialWatch::RegistersGroup) => {
+                    if node.special == Some(SpecialWatch::RegistersGroup) {
+                        return None;
+                    }
                     components.push((0, format!("{}.#x", name)));
                     break;
                 }
@@ -1215,7 +1263,7 @@ impl WindowContent for WatchesWindow {
             }
         }
         let stack = state.stack.clone();
-        let mut eval_context = debugger.make_eval_context(&stack, state.selected_subframe);
+        let mut eval_context = debugger.make_eval_context(&stack, state.selected_subframe, state.selected_thread);
 
         // Recalculate everything if needed.
         if refresh_data {
@@ -2862,8 +2910,8 @@ impl WindowContent for ThreadsWindow {
                 (3, true ) => threads.sort_unstable_by_key(|t| (std::cmp::Reverse(t.info.resource_stats.latest.state), t.tid)),
                 (4, false) => threads.sort_unstable_by_key(|t| ( (t.info.resource_stats.cpu_percentage(debugger.context.settings.periodic_timer_ns) * 1000.0) as isize, t.idx)),
                 (4, true ) => threads.sort_unstable_by_key(|t| (-(t.info.resource_stats.cpu_percentage(debugger.context.settings.periodic_timer_ns) * 1000.0) as isize, t.idx)),
-                (6, false) => threads.sort_unstable_by_key(|t| ( t.info.regs.get_int(RegisterIdx::Rip).map_or(0, |(r, _)| r), t.idx)),
-                (6, true ) => threads.sort_unstable_by_key(|t| (!t.info.regs.get_int(RegisterIdx::Rip).map_or(0, |(r, _)| r), t.idx)),
+                (6, false) => threads.sort_unstable_by_key(|t| ( t.info.regs.get(RegisterIdx::Rip).map_or(0, |(r, _)| r), t.idx)),
+                (6, true ) => threads.sort_unstable_by_key(|t| (!t.info.regs.get(RegisterIdx::Rip).map_or(0, |(r, _)| r), t.idx)),
                 _ => (),
             }
         }
