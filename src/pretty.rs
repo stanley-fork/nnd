@@ -822,7 +822,7 @@ fn make_slice(val: &mut Cow<Value>, ptr: usize, len: usize, inner_type: *const T
 fn make_array_of_references(val: &mut Cow<Value>, data: Vec<u8>, inner_type: *const TypeInfo, is_truncated: bool, state: &mut EvalState) {
     let flags = if is_truncated {ArrayFlags::TRUNCATED} else {ArrayFlags::empty()};
     let value_ref_type = state.types.add_pointer(inner_type, PointerFlags::REFERENCE);
-    let array_type = state.types.add_array(value_ref_type, data.len() / 8, flags);
+    let array_type = state.types.add_array(value_ref_type, Some(data.len() / 8), flags);
     let v = AddrOrValueBlob::Blob(ValueBlob::from_vec(data));
     let new_val = Value {val: v, type_: array_type, flags: val.flags};
     *val = Cow::Owned(new_val);
@@ -1044,7 +1044,7 @@ fn make_array_or_slice(val: &mut Cow<Value>, byte_offset: usize, len: usize, inn
             Value {val: v, type_: slice_type, flags: val.flags}
         }
         AddrOrValueBlob::Blob(blob) => {
-            let array_type = state.types.add_array(inner_type, len, if is_string {ArrayFlags::UTF_STRING} else {ArrayFlags::empty()});
+            let array_type = state.types.add_array(inner_type, Some(len), if is_string {ArrayFlags::UTF_STRING} else {ArrayFlags::empty()});
             let inner_size = unsafe {(*inner_type).calculate_size()};
             Value {val: AddrOrValueBlob::Blob(blob.byte_range(byte_offset..byte_offset + len*inner_size)?), type_: array_type, flags: val.flags}
         }
@@ -1239,6 +1239,9 @@ fn recognize_libstdcpp_deque(substruct: &mut Substruct, val: &mut Cow<Value>, st
         return Ok(());
     }
 
+    if start_last < start_first {
+        return err!(NotContainer, "");
+    }
     let block_bytes = start_last - start_first;
     if block_bytes % value_size != 0 || block_bytes != finish_last - finish_first || block_bytes == 0 {
         return err!(NotContainer, "");

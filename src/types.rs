@@ -357,9 +357,14 @@ impl Types {
     pub fn add_pointer(&mut self, type_: *const TypeInfo, flags: PointerFlags) -> *const TypeInfo {
         self.types_arena.add(TypeInfo {size: 8, flags: TypeFlags::SIZE_KNOWN, t: Type::Pointer(PointerType {type_, flags}), ..TypeInfo::default()})
     }
-    pub fn add_array(&mut self, type_: *const TypeInfo, len: usize, extra_flags: ArrayFlags) -> *const TypeInfo {
+    pub fn add_array(&mut self, type_: *const TypeInfo, len: Option<usize>, extra_flags: ArrayFlags) -> *const TypeInfo {
         let stride = unsafe {(*type_).calculate_size()};
-        self.types_arena.add(TypeInfo {size: len * stride, flags: TypeFlags::SIZE_KNOWN, t: Type::Array(ArrayType {len, stride, type_, flags: extra_flags.union(ArrayFlags::LEN_KNOWN)}), ..TypeInfo::default()})
+        let len_or_fallback = len.clone().unwrap_or(0);
+        let mut flags = extra_flags;
+        if len.is_some() {
+            flags.insert(ArrayFlags::LEN_KNOWN);
+        }
+        self.types_arena.add(TypeInfo {size: len_or_fallback * stride, flags: TypeFlags::SIZE_KNOWN, t: Type::Array(ArrayType {len: len_or_fallback, stride, type_, flags}), ..TypeInfo::default()})
     }
     pub fn add_slice(&mut self, type_: *const TypeInfo, flags: SliceFlags) -> *const TypeInfo {
         self.types_arena.add(TypeInfo {size: 16, flags: TypeFlags::SIZE_KNOWN, t: Type::Slice(SliceType {type_, flags}), ..TypeInfo::default()})

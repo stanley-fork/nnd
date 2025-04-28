@@ -1,9 +1,6 @@
 investigate why dumps produced by gcore don't work
 test with different-versioned libraries
 test with breakpad minidumps
-cast to same-size value: my_byte_array as my_struct
-cast to shorter array of same type by value: my_array as [u8; 8]
-cast to auto-size array: my_fixed_size_array as [u8]
 function pointers
 thread-local variables
 crash screen: show stack trace and process state, type something to resume+detach or kill or email stack trace or quit
@@ -54,8 +51,6 @@ update rust HashMap pretty printer
 detect and show if a pointer points to a symbol (function, global variable, vtable)
 do something for downcasts in conditional breakpoints (coalesce()? maybe()? ?()? ()?? checkbox to stop on error? 'is' operator? explicit checked downcast? also function to check field presense without evaluating it)
 edit breakpoint condition on click
-support casting slices (e.g. from pretty printers) to slices of different type (especially string)
-allow casting arrays/structs/primitives by value to other arrays/structs/primitives with same sizeof; maybe have some override to allow for different sizes too
 `in` operator, e.g. x in [1, 2, 3]
 make names in MetaType etc unexpandable as array
 scroll code to next breakpoint when deleting breakpoint in breakpoints window

@@ -544,7 +544,7 @@ impl EvalState {
         if val.len() == 1 {
             return Value {val: AddrOrValueBlob::Blob(ValueBlob::new(val[0] as usize)), type_: self.builtin_types.u64_, flags: ValueFlags::HEX};
         }
-        let array_type = self.types.add_array(self.builtin_types.u64_, val.len(), ArrayFlags::empty());
+        let array_type = self.types.add_array(self.builtin_types.u64_, Some(val.len()), ArrayFlags::empty());
         let blob = ValueBlob::from_u64_slice(val);
         Value {val: AddrOrValueBlob::Blob(blob), type_: array_type, flags: ValueFlags::HEX}
     }
@@ -1442,7 +1442,7 @@ impl StructBuilder {
         unsafe {self.add_blob_field(name, std::slice::from_raw_parts(value.as_ptr() as *const u8, value.len() * 8), type_)};
     }
     pub fn add_str_field(&mut self, name: &'static str, value: &str, types: &mut Types, builtin_types: &BuiltinTypes) {
-        let array_type = types.add_array(builtin_types.char8, value.len(), ArrayFlags::UTF_STRING);
+        let array_type = types.add_array(builtin_types.char8, Some(value.len()), ArrayFlags::UTF_STRING);
         self.add_blob_field(name, value.as_bytes(), array_type);
     }
     pub fn add_slice_field(&mut self, name: &'static str, ptr: usize, len: usize, type_: *const TypeInfo, flags: SliceFlags, types: &mut Types) {

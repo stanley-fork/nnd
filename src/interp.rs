@@ -252,8 +252,80 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
             let mut val = eval_expression(expr, node.children[0], state, context, false)?;
             follow_references_and_prettify(&mut val, false, state, context)?;
             let type_ = eval_type(expr, node.children[1], state, context)?;
-            let b = to_basic(&val, &mut context.memory, "cast")?;
-            val.val = from_basic(b, type_)?;
+            let is_reinterpretable = |type_: *const TypeInfo, to: bool| -> bool {
+                match unsafe {&(*type_).t} {
+                    Type::Primitive(_) | Type::Pointer(_) | Type::Struct(_) | Type::Enum(_) => true,
+                    Type::Array(a) => a.flags.contains(ArrayFlags::LEN_KNOWN) || to,
+                    Type::Slice(_) => !to,
+                    _ => false,
+                }
+            };
+            if !is_reinterpretable(val.type_, false) {
+                return err!(TypeMismatch, "can't cast from {}", unsafe {(*val.type_).t.kind_name()});
+            }
+            if !is_reinterpretable(type_, true) {
+                return err!(TypeMismatch, "can't cast to {}", unsafe {(*type_).t.kind_name()});
+            }
+
+            // Special casts for numeric types, e.g. int to float.
+            match to_basic(&val, &mut context.memory, "cast") {
+                Ok(b) => {
+                    if let Some(v) = from_basic(b, type_)? {
+                        val.val = v;
+                        val.type_ = type_;
+                        return Ok(val);
+                    }
+                }
+                Err(e) if e.is_type_mismatch() => (),
+                Err(e) => return Err(e),
+            }
+
+            // Reinterpret cast for everything else, e.g. array to struct (by value).
+            // (Casting by value is useful when a value has no address, e.g. casting a simd register from [u64; 8] to [u32; 16].)
+            // Currently we're extra permissive and allow casts even when sizes don't match, and even when the value is a reference (so could be cast through pointer instead);
+            // if some of this turns out too error-prone in practice, we can add some constraints.
+            let from_t = unsafe {&*val.type_};
+            let (from_size, from_val) = match &from_t.t {
+                Type::Slice(s) => {
+                    // Cast slice as if it were an array. Useful for e.g. casting pretty-printed vectors to string (v as [char8]).
+                    let slice_val = mem::take(&mut val.val).into_value(16, &mut context.memory)?;
+                    let addr = slice_val.get_usize_at(0).unwrap();
+                    let len = slice_val.get_usize_at(8).unwrap();
+                    let inner_type = unsafe {&*s.type_};
+                    let inner_size = inner_type.calculate_size();
+                    (inner_size * len, AddrOrValueBlob::Addr(addr))
+                }
+                _ => {
+                    (unsafe {(*val.type_).calculate_size()}, mem::take(&mut val.val))
+                }
+            };
+            let t = unsafe {&*type_};
+            match &t.t {
+                Type::Array(a) if !a.flags.contains(ArrayFlags::LEN_KNOWN) => {
+                    // Special cast to unsized array. Type of the result is a sized array of the ~same size as the left hand side.
+                    // E.g. `ymm0 as [u8]` is the same as `ymm0 as [u8; 32]`.
+                    let element_size = unsafe {(*a.type_).calculate_size()};
+                    let n = from_size / element_size;
+                    let sized_array = state.types.add_array(a.type_, Some(n), ArrayFlags::empty());
+                    if let AddrOrValueBlob::Blob(blob) = &mut val.val {
+                        blob.resize(n * element_size);
+                    }
+                    val.type_ = sized_array;
+                    return Ok(val);
+                }
+                _ => (),
+            }
+            let to_size = t.calculate_size();
+            let v = mem::take(&mut val.val);
+            let v = match v {
+                AddrOrValueBlob::Addr(addr) if to_size <= from_size => AddrOrValueBlob::Addr(addr),
+                AddrOrValueBlob::Addr(addr) => AddrOrValueBlob::Blob(v.into_value(to_size, &mut context.memory)?),
+                AddrOrValueBlob::Blob(mut blob) => {
+                    blob.resize(to_size);
+                    AddrOrValueBlob::Blob(blob)
+                }
+            };
+            val.val = v;
             val.type_ = type_;
             Ok(val)
         }
@@ -313,7 +385,7 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                         if op == BinaryOperator::Index {
                             Value {val: AddrOrValueBlob::Addr(addr + idx * stride), type_: p.type_, flags: lhs.flags.inherit()}
                         } else { // Slicify
-                            let array_type = state.types.add_array(p.type_, idx, ArrayFlags::empty());
+                            let array_type = state.types.add_array(p.type_, Some(idx), ArrayFlags::empty());
                             Value {val: AddrOrValueBlob::Addr(addr), type_: array_type, flags: lhs.flags.inherit()}
                         }
                     }
@@ -364,7 +436,7 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                     return err!(Runtime, "unaligned pointer difference");
                 }
                 let len = len / size;
-                let array_type = state.types.add_array(t1, len, ArrayFlags::empty());
+                let array_type = state.types.add_array(t1, Some(len), ArrayFlags::empty());
                 return Ok(Value {val: AddrOrValueBlob::Addr(addr1), type_: array_type, flags: ValueFlags::empty()});
             }
             let mut a = to_basic(&lhs, &mut context.memory, "arithmetic")?;
@@ -546,9 +618,9 @@ fn eval_type(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, context
             let inner = eval_type(expr, node.children[0], state, context)?;
             Ok(state.types.add_pointer(inner, PointerFlags::empty()))
         }
-        &AST::ArrayType(len) => {
+        AST::ArrayType(len) => {
             let inner = eval_type(expr, node.children[0], state, context)?;
-            Ok(state.types.add_array(inner, len, ArrayFlags::empty()))
+            Ok(state.types.add_array(inner, len.clone(), ArrayFlags::empty()))
         }
         _ => panic!("unexpected non-type AST"),
     }
@@ -600,7 +672,11 @@ impl BasicValue {
 }
 
 fn to_basic(val: &Value, memory: &mut CachedMemReader, what: &str) -> Result<BasicValue> {
-    let t = unsafe {&*val.type_};
+    let mut type_ = val.type_;
+    while let Type::Enum(e) = unsafe {&(*type_).t} {
+        type_ = e.type_;
+    }
+    let t = unsafe {&*type_};
     let size = t.calculate_size();
     Ok(match &t.t {
         Type::Primitive(f) => {
@@ -621,13 +697,17 @@ fn to_basic(val: &Value, memory: &mut CachedMemReader, what: &str) -> Result<Bas
                 BasicValue::U(x)
             }
         }
-        Type::Pointer(_) | Type::Enum(_) => BasicValue::U(val.val.clone().into_value(size, memory)?.get_usize()?),
+        Type::Pointer(_) => BasicValue::U(val.val.clone().into_value(size, memory)?.get_usize()?),
         _ => return err!(TypeMismatch, "can't {} {}", what, t.t.kind_name()),
     })
 }
 
-fn from_basic(b: BasicValue, type_: *const TypeInfo) -> Result<AddrOrValueBlob> {
-    let t = unsafe {&*type_};
+fn from_basic(b: BasicValue, type_: *const TypeInfo) -> Result<Option<AddrOrValueBlob>> {
+    let mut inner = type_;
+    while let Type::Enum(e) = unsafe {&(*inner).t} {
+        inner = e.type_;
+    }
+    let t = unsafe {&*inner};
     let size = t.calculate_size();
     let mut x = match &t.t {
         Type::Primitive(f) if f.contains(PrimitiveFlags::FLOAT) => {
@@ -639,13 +719,13 @@ fn from_basic(b: BasicValue, type_: *const TypeInfo) -> Result<AddrOrValueBlob> 
             }
         }
         Type::Primitive(f) if f.contains(PrimitiveFlags::SIGNED) => b.cast_to_isize() as usize, // covers negative float to signed int
-        Type::Primitive(_) | Type::Pointer(_) | Type::Enum(_) => b.cast_to_usize(),
-        _ => return err!(TypeMismatch, "can't convert {} to {}", b.kind_name(), t.t.kind_name()),
+        Type::Primitive(_) | Type::Pointer(_) => b.cast_to_usize(),
+        _ => return Ok(None),
     };
     if size < 8 {
         x &= usize::MAX >> (64 - size*8);
     }
-    Ok(AddrOrValueBlob::Blob(ValueBlob::new(x)))
+    Ok(Some(AddrOrValueBlob::Blob(ValueBlob::new(x))))
 }
 
 
@@ -724,7 +804,7 @@ enum AST {
     TypeCast, // a as i64
     Type {name: String, quoted: bool}, // Foo
     PointerType, // *Foo
-    ArrayType(/*len*/ usize), // [Foo; 10]
+    ArrayType(/*len*/ Option<usize>), // [Foo; 10] or [Foo]
 
     Array, // [a, 42, b]
     Tuple, // (a, 42, "foo", b)
@@ -1096,15 +1176,24 @@ fn parse_type(lex: &mut Lexer, expr: &mut Expression) -> Result<ASTIdx> {
         Token::BinaryOperator(op) if op == BinaryOperator::BitAnd => return err!(Syntax, "references not supported, use pointers"),
         Token::Identifier {s, quoted} => AST::Type {name: s, quoted},
         Token::Char('[') => {
+            // Array.
             node.children.push(parse_type(lex, expr)?);
-            lex.expect("';'", |t| t.is_char(';'))?;
-            let (r, t) = lex.eat(1)?;
-            let len = match t {
-                Token::Literal(LiteralValue::Basic(BasicValue::U(len))) => len,
-                _ => return err!(Syntax, "expected nonnegative number, got {:?} at {}", t, r.start),
-            };
-            lex.expect("']'", |t| t.is_char(']'))?;
-            AST::ArrayType(len)
+            let (range, token) = lex.eat(1)?;
+            if let Token::Char(';') = token {
+                // Sized array.
+                let (r, t) = lex.eat(1)?;
+                let len = match t {
+                    Token::Literal(LiteralValue::Basic(BasicValue::U(len))) => len,
+                    _ => return err!(Syntax, "expected nonnegative number, got {:?} at {}", t, r.start),
+                };
+                lex.expect("']'", |t| t.is_char(']'))?;
+                AST::ArrayType(Some(len))
+            } else if let Token::Char(']') = token {
+                // Array with unknown size.
+                AST::ArrayType(None)
+            } else {
+                return err!(Syntax, "expected ';' or ']', got {:?} at {}", token, range.start);
+            }
         }
         _ => return err!(Syntax, "expected type, got {:?} at {}", token, node.range.start),
     };
