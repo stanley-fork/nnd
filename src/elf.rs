@@ -56,6 +56,12 @@ pub struct ElfFile {
 
     pub build_id: Option<Vec<u8>>,
 
+    // Path to dynamic linker, from .interp section.
+    pub interp: Option<String>,
+
+    // Static address at which the dynamic linker will patch the pointer to r_debug struct, if this is the main executable (as opposed to a dynamic library).
+    pub r_debug_ptr_addr: Option<usize>,
+
     // Slightly longer than the file because of padding.
     mmapped: Option<Mmap>,
     owned: Vec<u8>,
@@ -536,7 +542,7 @@ pub fn reconstruct_elf_from_mapped_parts(name: String, memory: &Arc<CoreDumpMemR
     let phdr_size = mem::size_of::<libc::Elf64_Phdr>();
     if (header.e_phentsize as usize) < phdr_size { return err!(MalformedExecutable, "section header size too small: {}", header.e_phentsize); }
 
-    let mut elf = ElfFile {name, segments: Vec::new(), sections: Vec::new(), entry_point: 0, section_by_offset: Vec::new(), section_by_name: HashMap::new(), text_section: None, is_core_dump: false, is_reconstructed: true, build_id: None, mmapped: None, owned: Vec::new(), data: &[]};
+    let mut elf = ElfFile {name, segments: Vec::new(), sections: Vec::new(), entry_point: 0, section_by_offset: Vec::new(), section_by_name: HashMap::new(), text_section: None, is_core_dump: false, is_reconstructed: true, build_id: None, mmapped: None, owned: Vec::new(), data: &[], r_debug_ptr_addr: None, interp: None};
 
     // Find .eh_frame, .text (very roughly), .dynstr, .dynsym.
 
@@ -743,7 +749,7 @@ fn open_elf(name: String, file: Option<(&File, /*file_len*/ usize)>, mut owned: 
 
     let data: &'static [u8] = unsafe {mem::transmute(data)};
 
-    let mut elf = ElfFile {name, mmapped, owned, data, segments, sections, entry_point, section_by_offset: Vec::new(), section_by_name: HashMap::new(), text_section: None, is_core_dump, is_reconstructed: false, build_id: None};
+    let mut elf = ElfFile {name, mmapped, owned, data, segments, sections, entry_point, section_by_offset: Vec::new(), section_by_name: HashMap::new(), text_section: None, is_core_dump, is_reconstructed: false, build_id: None, r_debug_ptr_addr: None, interp: None};
 
     for idx in 0..elf.sections.len() {
         let name = unsafe{elf.str_from_strtab(elf.sections[header.e_shstrndx as usize].offset, elf.sections[idx].name_offset_in_strtab as usize)?}.to_string();
@@ -825,6 +831,31 @@ fn open_elf(name: String, file: Option<(&File, /*file_len*/ usize)>, mut owned: 
         }
     }
     elf.build_id = build_id;
+    
+    // Parse .dynamic section.
+    let mut r_debug_ptr_addr = None;
+    if let Some(&section_idx) = elf.section_by_name.get(".dynamic") {
+        let data = elf.section_data(section_idx);
+        let mut offset = 0;
+        while offset + 16 <= data.len() {
+            let tag = usize::from_le_bytes(data[offset..offset+8].try_into().unwrap());
+            if tag == 21 { // DT_DEBUG
+                r_debug_ptr_addr = Some(elf.sections[section_idx].address + offset + 8);
+                break;
+            }
+            offset += 16;
+        }
+    }
+    elf.r_debug_ptr_addr = r_debug_ptr_addr;
+
+    let mut interp = None;
+    if let Some(&section_idx) = elf.section_by_name.get(".interp") {
+        let data = elf.section_data(section_idx);
+        let len = data.iter().copied().position(|x| x == b'\0').unwrap_or(data.len());
+        interp = Some(str::from_utf8(&data[..len])?.to_string());
+    }
+    elf.interp = interp;
+
     if let Some(s) = &elf.build_id {
         eprintln!("info: build id {} in {}", hexdump(s, 1000), elf.name);
     } else if !elf.is_core_dump && elf.name != "[vdso]" {

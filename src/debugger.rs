@@ -948,6 +948,7 @@ impl Debugger {
 
     pub fn drop_caches(&mut self) -> Result<()> {
         eprintln!("info: drop caches");
+        self.info.drop_caches();
         if self.target_state.process_ready() {
             refresh_maps_and_binaries_info(self);
             for t in self.threads.values_mut() {
@@ -1670,7 +1671,7 @@ impl Debugger {
                 Err(e) if e.is_loading() => return Err(e.clone()),
                 Err(_) => return err!(MissingSymbols, "no unwind info for binary"),
             };
-            let step_result = unwind.step(&mut memory, &binary.addr_map, &mut scratch, pseudo_addr, frame);
+            let step_result = unwind.step(&mut memory, binary, &mut scratch, pseudo_addr, frame);
 
             if step_result.as_ref().is_ok_and(|(_, is_signal_trampoline)| *is_signal_trampoline) {
                 // Un-decrement the instruction pointer, there's no `call` in signal trampoline.
@@ -1734,7 +1735,7 @@ impl Debugger {
             Some(o) => o,
             None => return Ok(()) };
         let unit = symbols.find_unit(debug_info_offset)?;
-        let mut context = DwarfEvalContext {memory, symbols: Some(symbols), addr_map: &binary.addr_map, encoding: unit.unit.header.encoding(), unit: Some(unit), regs: Some(&frame.regs), extra_regs: None, frame_base: None, local_variables: &[], fs_base: None};
+        let mut context = DwarfEvalContext {memory, symbols: Some(symbols), addr_map: &binary.addr_map, encoding: unit.unit.header.encoding(), unit: Some(unit), regs: Some(&frame.regs), extra_regs: None, frame_base: None, local_variables: &[], fs_base: frame.regs.get_option(RegisterIdx::FsBase).map(|(x, _)| x), tls_offset: &binary.tls_offset};
         for v in symbols.local_variables_in_subfunction(root_subfunction, function.shard_idx()) {
             if !v.flags().contains(VariableFlags::FRAME_BASE) {
                 // Frame bases are always first in the list.
@@ -2426,7 +2427,7 @@ impl Debugger {
             Ok(u) => u };
         let mut scratch = UnwindScratchBuffer::default();
         let mut memory = CachedMemReader::new(memory.clone());
-        match unwind.find_row_and_eval_cfa(&mut memory, &binary.addr_map, &mut scratch, addr, regs) {
+        match unwind.find_row_and_eval_cfa(&mut memory, binary, &mut scratch, addr, regs) {
             Err(e) => {
                 log!(log, "no frame for addr 0x{:x}: {}", addr, e);
                 eprintln!("warning: no frame for addr 0x{:x} (when determining cfa for step): {}", addr, e);

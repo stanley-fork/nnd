@@ -10,7 +10,7 @@ pub struct Binary {
     pub id: usize,
 
     // These 3 things can be loaded asynchronously separately. While loading, Err(Loading).
-    // `elves` is either nonempty if Err; there can be more than one if unstripped binary was found e.g. through debuglink.
+    // `elves` is either nonempty or Err; there can be more than one if unstripped binary was found e.g. through debuglink.
     pub elves: Result<Vec<Arc<ElfFile>>>,
     pub symbols: Result<Arc<Symbols>>, // .debug_info, .debug_line, .symtab, etc
     pub unwind: Result<Arc<UnwindInfo>>, // .eh_frame, .eh_frame_hdr, .debug_frame
@@ -22,6 +22,8 @@ pub struct Binary {
     // If this binary is currently loaded by the debuggee.
     pub is_mapped: bool,
     pub addr_map: AddrMap,
+    pub tls_offset: Result<usize>,
+
     // Last seen index among mapped binaries, in order of first mmap address.
     pub mmap_idx: usize,
     // Index in `priority_order`.
@@ -122,7 +124,7 @@ impl SymbolsRegistry {
             }
         }
 
-        let mut binary = Binary {locator: locator.clone(), build_id: build_id.clone(), id, elves: err!(Loading, "loading symbols"), symbols: err!(Loading, "loading symbols"), unwind: err!(Loading, "loading symbols"), is_mapped: false, addr_map: AddrMap::default(), mmap_idx: 0, priority_idx: 0, notices: Vec::new(), warnings: Vec::new()};
+        let mut binary = Binary {locator: locator.clone(), build_id: build_id.clone(), id, elves: err!(Loading, "loading symbols"), symbols: err!(Loading, "loading symbols"), unwind: err!(Loading, "loading symbols"), is_mapped: false, addr_map: AddrMap::default(), tls_offset: err!(Loading, "loading"), mmap_idx: 0, priority_idx: 0, notices: Vec::new(), warnings: Vec::new()};
 
         if let Some(id) = &build_id {
             binary.notices.push(format!("build id: {}", hexdump(id, 1000)));

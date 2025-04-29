@@ -1,4 +1,4 @@
-use crate::{*, error::{*, Error, Result}, range_index::*, util::*, elf::*, procfs::*, registers::*, symbols::*, expr::*, dwarf::*};
+use crate::{*, error::{*, Error, Result}, range_index::*, util::*, elf::*, procfs::*, registers::*, symbols::*, expr::*, dwarf::*, symbols_registry::Binary};
 use gimli::*;
 use std::{sync::Arc, rc::Rc, mem, path::PathBuf, ops::Range, mem::MaybeUninit};
 
@@ -186,8 +186,8 @@ impl UnwindInfo {
         Ok(res)
     }
 
-    pub fn find_row_and_eval_cfa<'a>(&self, memory: &mut CachedMemReader, addr_map: &AddrMap, scratch: &'a mut UnwindScratchBuffer, pseudo_addr: usize, regs: &Registers) -> Result<(FrameDescriptionEntry<DwarfSlice>, &'a UnwindTableRow<usize>, /*cfa*/ usize, /*cfa_dubious*/ bool, /*section*/ DwarfSlice)> {
-        let static_pseudo_addr = addr_map.dynamic_to_static(pseudo_addr);
+    pub fn find_row_and_eval_cfa<'a>(&self, memory: &mut CachedMemReader, binary: &Binary, scratch: &'a mut UnwindScratchBuffer, pseudo_addr: usize, regs: &Registers) -> Result<(FrameDescriptionEntry<DwarfSlice>, &'a UnwindTableRow<usize>, /*cfa*/ usize, /*cfa_dubious*/ bool, /*section*/ DwarfSlice)> {
+        let static_pseudo_addr = binary.addr_map.dynamic_to_static(pseudo_addr);
         let found = match &self.debug_frame {
             Some(section) => section.find_fde_and_row(static_pseudo_addr, scratch)?,
             None => None,
@@ -203,7 +203,7 @@ impl UnwindInfo {
             Some(x) => x,
             None => return err!(Dwarf, "no unwind info for address"),
         };
-        let (cfa, cfa_dubious) = eval_cfa_rule(row.cfa(), fde.cie().encoding(), section, &regs, memory, addr_map)?;
+        let (cfa, cfa_dubious) = eval_cfa_rule(row.cfa(), fde.cie().encoding(), section, &regs, memory, binary)?;
 
         let row: &'static UnwindTableRow<usize> = unsafe {mem::transmute(row)}; // work around borrow checker weirdness by transmuting to 'static and back
         Ok((fde, row, cfa as usize, cfa_dubious, section))
@@ -226,12 +226,12 @@ impl UnwindInfo {
     }
 
     // Assigns cfa and return address in current frame and returns registers for next frame.
-    pub fn step(&self, memory: &mut CachedMemReader, addr_map: &AddrMap, scratch: &mut UnwindScratchBuffer, pseudo_addr: usize, frame: &mut StackFrame) -> Result<(Registers, /*is_signal_trampoline*/ bool)> {
-        if let Some(r) = self.step_through_sig_return(memory, addr_map, &mut frame.regs)? {
+    pub fn step(&self, memory: &mut CachedMemReader, binary: &Binary, scratch: &mut UnwindScratchBuffer, pseudo_addr: usize, frame: &mut StackFrame) -> Result<(Registers, /*is_signal_trampoline*/ bool)> {
+        if let Some(r) = self.step_through_sig_return(memory, binary, &mut frame.regs)? {
             return Ok((r, true));
         }
 
-        let (fde, row, cfa, cfa_dubious, section) = self.find_row_and_eval_cfa(memory, addr_map, scratch, pseudo_addr, &frame.regs)?;
+        let (fde, row, cfa, cfa_dubious, section) = self.find_row_and_eval_cfa(memory, binary, scratch, pseudo_addr, &frame.regs)?;
         frame.regs.set(RegisterIdx::Cfa, cfa as u64, cfa_dubious);
         frame.fde_initial_address = fde.initial_address() as usize;
         frame.lsda = fde.lsda().clone();
@@ -245,7 +245,7 @@ impl UnwindInfo {
                 seen_regs |= 1usize << r as u32;
             }
 
-            let val = eval_register_rule(reg.clone(), rule, fde.cie().encoding(), section, &frame.regs, memory, addr_map)?;
+            let val = eval_register_rule(reg.clone(), rule, fde.cie().encoding(), section, &frame.regs, memory, binary)?;
             if let Some((v, dubious)) = val {
                 if let Some(r) = reg {
                     new_regs.set(r, v, dubious);
@@ -315,7 +315,7 @@ impl UnwindInfo {
         Ok((new_regs, fde.is_signal_trampoline()))
     }
 
-    fn step_through_sig_return(&self, memory: &mut CachedMemReader, addr_map: &AddrMap, regs: &mut Registers) -> Result<Option<Registers>> {
+    fn step_through_sig_return(&self, memory: &mut CachedMemReader, binary: &Binary, regs: &mut Registers) -> Result<Option<Registers>> {
         // Recognize signal trampoline machine code, like GDB does. Because some libc implementations (musl) don't have correct DWARF unwind information for this function.
         const CODE: [u8; 9] = [
             0x48u8, 0xc7, 0xc0, 0x0f, 0x00, 0x00, 0x00, // mov rax, 15
@@ -328,7 +328,7 @@ impl UnwindInfo {
         let mut data_buf = [MaybeUninit::<u8>::uninit(); MID + CODE.len()];
         let elf = &self.elves[0];
         let (data, pos) = if let &Some(section_idx) = &elf.text_section {
-            let pc = addr_map.dynamic_to_static(addr);
+            let pc = binary.addr_map.dynamic_to_static(addr);
             let section = &elf.sections[section_idx];
             if pc < section.address || pc >= section.address + section.size {
                 return Ok(None);
@@ -374,8 +374,8 @@ impl UnwindInfo {
     }
 }
 
-fn eval_dwarf_expression_as_u64(expression: Expression<DwarfSlice>, encoding: Encoding, regs: &Registers, memory: &mut CachedMemReader, addr_map: &AddrMap, skip_final_dereference: bool) -> Result<(u64, /* dubious */ bool)> {
-    let (val, dubious) = eval_dwarf_expression(expression, &mut DwarfEvalContext {encoding, memory, symbols: None, unit: None, addr_map, regs: Some(regs), frame_base: None, local_variables: &[], extra_regs: None, fs_base: None})?;
+fn eval_dwarf_expression_as_u64(expression: Expression<DwarfSlice>, encoding: Encoding, regs: &Registers, memory: &mut CachedMemReader, binary: &Binary, skip_final_dereference: bool) -> Result<(u64, /* dubious */ bool)> {
+    let (val, dubious) = eval_dwarf_expression(expression, &mut DwarfEvalContext {encoding, memory, symbols: None, unit: None, addr_map: &binary.addr_map, regs: Some(regs), frame_base: None, local_variables: &[], extra_regs: None, fs_base: regs.get_option(RegisterIdx::FsBase).map(|(x, _)| x), tls_offset: &binary.tls_offset})?;
     let val = if skip_final_dereference {
         // I'm probably misunderstanding something, but the meaning of gimli::read::Location::Address seems to be different between CFA/frame-base vs registers/variables.
         // In CFA and frame base, we treat Location::Address the same as Location::Value, presumably because the "value" of CFA/frame-base is an "address", so no dereference is needed.
@@ -392,11 +392,11 @@ fn eval_dwarf_expression_as_u64(expression: Expression<DwarfSlice>, encoding: En
 
 }
 
-fn eval_cfa_rule(rule: &CfaRule<usize>, encoding: Encoding, section: DwarfSlice, registers: &Registers, memory: &mut CachedMemReader, addr_map: &AddrMap) -> Result<(u64, bool)> {
+fn eval_cfa_rule(rule: &CfaRule<usize>, encoding: Encoding, section: DwarfSlice, registers: &Registers, memory: &mut CachedMemReader, binary: &Binary) -> Result<(u64, bool)> {
     Ok(match rule {
         CfaRule::Expression(e) => {
             let e = Expression(DwarfSlice::new(&section.slice()[e.offset..e.offset+e.length]));
-            eval_dwarf_expression_as_u64(e, encoding, registers, memory, addr_map, /*skip_final_dereference*/ true)?
+            eval_dwarf_expression_as_u64(e, encoding, registers, memory, binary, /*skip_final_dereference*/ true)?
         }
         CfaRule::RegisterAndOffset {register: reg, offset} => {
             let reg = match RegisterIdx::from_dwarf(*reg) {
@@ -412,7 +412,7 @@ fn eval_cfa_rule(rule: &CfaRule<usize>, encoding: Encoding, section: DwarfSlice,
     })
 }
 
-fn eval_register_rule(reg: Option<RegisterIdx>, rule: &RegisterRule<usize>, encoding: Encoding, section: DwarfSlice, registers: &Registers, memory: &mut CachedMemReader, addr_map: &AddrMap) -> Result<Option<(u64, bool)>> {
+fn eval_register_rule(reg: Option<RegisterIdx>, rule: &RegisterRule<usize>, encoding: Encoding, section: DwarfSlice, registers: &Registers, memory: &mut CachedMemReader, binary: &Binary) -> Result<Option<(u64, bool)>> {
     let (cfa, cfa_dubious) = registers.get(RegisterIdx::Cfa).unwrap();
     let val = match rule {
         RegisterRule::Undefined => return Ok(None),
@@ -437,12 +437,12 @@ fn eval_register_rule(reg: Option<RegisterIdx>, rule: &RegisterRule<usize>, enco
         RegisterRule::ValOffset(offset) => (cfa.wrapping_add(*offset as u64), cfa_dubious),
         RegisterRule::Expression(e) => {
             let e = Expression(DwarfSlice::new(&section.slice()[e.offset..e.offset+e.length]));
-            let (addr, dubious) = eval_dwarf_expression_as_u64(e, encoding, registers, memory, addr_map, /*skip_final_dereference*/ true)?;
+            let (addr, dubious) = eval_dwarf_expression_as_u64(e, encoding, registers, memory, binary, /*skip_final_dereference*/ true)?;
             (memory.read_usize(addr as usize)? as u64, dubious)
         }
         RegisterRule::ValExpression(e) => {
             let e = Expression(DwarfSlice::new(&section.slice()[e.offset..e.offset+e.length]));
-            eval_dwarf_expression_as_u64(e, encoding, registers, memory, addr_map, /*skip_final_dereference*/ false)?
+            eval_dwarf_expression_as_u64(e, encoding, registers, memory, binary, /*skip_final_dereference*/ false)?
         }
         RegisterRule::Architectural => return err!(Dwarf, "architectural register rule"),
 

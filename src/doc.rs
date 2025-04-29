@@ -52,7 +52,7 @@ Properties:
  * Fast.
    Operations that can be instantaneous should be instantaneous. I.e. snappy UI, no random freezes, no long waits.
    (Known exception: if the program has >~2k threads things become pretty slow, can be improved.)
-   Operations that can't be instantaneous (loading debug info, searching for functions and types) should be reasonably efficient, multi-threaded, asynchronous, cancellable, and have progress bars.
+   Operations that can't be instantaneous (e.g. loading debug info) should be reasonably efficient, multi-threaded, asynchronous, cancellable, and have progress bars.
  * Works on large executables (tested mostly on 2.5 GB clickhouse).
  * Reasonably careful error reporting.
 

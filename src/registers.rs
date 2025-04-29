@@ -297,6 +297,14 @@ impl Registers {
             Ok((self.ints[reg as usize], self.is_dubious(reg)))
         }
     }
+
+    pub fn get_option(&self, reg: RegisterIdx) -> Option<(u64, /*dubious*/ bool)> {
+        if self.mask & (1u64 << reg as u32) == 0 {
+            None
+        } else {
+            Some((self.ints[reg as usize], self.is_dubious(reg)))
+        }
+    }
 }
 
 // "XSAVE area" is how SSE and AVX registers are laid out, obtained through ptrace(PTRACE_GETREGSET), or NT_X86_XSTATE note in core dump, or fpregs in signal context.

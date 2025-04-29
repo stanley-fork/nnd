@@ -602,14 +602,14 @@ impl EvalContext<'_> {
         let subfunction = &symbols.shards[shard_idx].subfunctions[subfunction_idx];
         let local_variables = symbols.local_variables_in_subfunction(subfunction, shard_idx);
 
-        let context = DwarfEvalContext {memory: &mut self.memory, symbols: Some(symbols), addr_map: &binary.addr_map, encoding: unit.unit.header.encoding(), unit: Some(unit), regs: Some(&frame.regs), extra_regs: self.extra_regs.clone(), frame_base: Some(&frame.frame_base), local_variables, fs_base: self.fs_base.clone()};
+        let context = DwarfEvalContext {memory: &mut self.memory, symbols: Some(symbols), addr_map: &binary.addr_map, tls_offset: &binary.tls_offset, encoding: unit.unit.header.encoding(), unit: Some(unit), regs: Some(&frame.regs), extra_regs: self.extra_regs.clone(), frame_base: Some(&frame.frame_base), local_variables, fs_base: self.fs_base.clone()};
         Ok((context, function))
     }
 
     pub fn make_global_dwarf_eval_context<'a>(&'a mut self, binary: &'a Binary, die_offset: DebugInfoOffset) -> Result<DwarfEvalContext<'a>> {
         let symbols = binary.symbols.as_ref_clone_error()?;
         let unit = symbols.find_unit(die_offset)?;
-        Ok(DwarfEvalContext {memory: &mut self.memory, symbols: Some(symbols), addr_map: &binary.addr_map, encoding: unit.unit.header.encoding(), unit: Some(unit), regs: None, extra_regs: None, frame_base: None, local_variables: &[], fs_base: self.fs_base.clone()})
+        Ok(DwarfEvalContext {memory: &mut self.memory, symbols: Some(symbols), addr_map: &binary.addr_map, tls_offset: &binary.tls_offset, encoding: unit.unit.header.encoding(), unit: Some(unit), regs: None, extra_regs: None, frame_base: None, local_variables: &[], fs_base: self.fs_base.clone()})
     }
 }
 
@@ -1098,38 +1098,21 @@ fn try_format_as_string(addr: Option<usize>, preread_blob: Option<&ValueBlob>, e
             }
         }
         None => {
-            let mut addr = match addr {
+            let addr = match addr {
                 Some(x) => x,
                 None => return false,
             };
-            let page_size = 1usize << 12;
-            let mut chunk_size = 1usize << 7;
-            let mut res: Vec<u8> = Vec::new();
-            terminated = false;
-            while res.len() < limit {
-                let n = (addr & !(chunk_size - 1)) + chunk_size - addr;
-                let start = res.len();
-                res.resize(start + n, 0);
-                // We assume that each aligned 4 KiB range is either fully readable or fully unreadable.
-                match memory.read(addr, &mut res[start..]) {
-                    Ok(()) => (),
-                    Err(e) => {
-                        styled_write!(out, palette.value_misc, "{}", prefix);
-                        styled_write!(out, palette.error, "bad C string: <{}>", e);
-                        return true;
-                    }
+            temp_storage = match memory.read_null_terminated(addr, limit) {
+                Ok((r, t)) => {
+                    terminated |= t;
+                    r
                 }
-                if let Some(i) = res[start..].iter().position(|c| *c == 0) {
-                    res.truncate(start + i);
-                    terminated = true;
-                    break;
+                Err(e) => {
+                    styled_write!(out, palette.value_misc, "{}", prefix);
+                    styled_write!(out, palette.error, "bad C string: <{}>", e);
+                    return true;
                 }
-                addr += n;
-                if n == chunk_size && chunk_size < page_size {
-                    chunk_size <<= 1;
-                }
-            }
-            temp_storage = res;
+            };
             (temp_storage.len(), &temp_storage[..])
         }
     };
@@ -1204,6 +1187,7 @@ pub struct DwarfEvalContext<'a> {
     // Binary.
     pub symbols: Option<&'a Symbols>,
     pub addr_map: &'a AddrMap,
+    pub tls_offset: &'a Result<usize>,
 
     // Unit.
     pub encoding: Encoding,
@@ -1212,6 +1196,8 @@ pub struct DwarfEvalContext<'a> {
     // Stack frame. Not required for global variables.
     pub regs: Option<&'a Registers>,
     pub frame_base: Option<&'a Result<(usize, /*dubious*/ bool)>>,
+
+    // Thread info.
     pub extra_regs: Option<&'a LazyExtraRegisters>,
     pub fs_base: Option<u64>,
 
@@ -1340,8 +1326,14 @@ pub fn eval_dwarf_expression(mut expression: Expression<DwarfSlice>, context: &m
                 eval.resume_with_base_type(t)
             }
 
-            // TODO [tls]
-            EvaluationResult::RequiresTls(_) => return err!(NotImplemented, "TLS is not supported"),
+            EvaluationResult::RequiresTls(offset) => {
+                if let &Some(fs_base) = &context.fs_base {
+                    let tls_offset = context.tls_offset.clone()?;
+                    eval.resume_with_tls(fs_base.wrapping_sub(tls_offset as u64).wrapping_add(*offset))
+                } else {
+                    return err!(ProcessState, "no current thread");
+                }
+            }
 
             // These are just alternative polite ways for the compiler to say "optimized out".
             EvaluationResult::RequiresEntryValue(_) => return err!(OptimizedAway, "requires entry value"),

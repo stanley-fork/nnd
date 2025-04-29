@@ -429,6 +429,31 @@ impl CachedMemReader {
         }
         Ok((res, byte, shift))
     }
+
+    pub fn read_null_terminated(&mut self, mut offset: usize, limit: usize) -> Result<(Vec<u8>, /*terminated*/ bool)> {
+        let page_size = 1usize << 12;
+        let mut chunk_size = 1usize << 7;
+        let mut res: Vec<u8> = Vec::new();
+        let mut terminated = false;
+        while res.len() < limit {
+            let n = (offset & !(chunk_size - 1)) + chunk_size - offset;
+            let n = n.min(limit - res.len());
+            let start = res.len();
+            res.resize(start + n, 0);
+            // We assume that each aligned 4 KiB range is either fully readable or fully unreadable.
+            self.read(offset, &mut res[start..])?;
+            if let Some(i) = res[start..].iter().position(|c| *c == 0) {
+                res.truncate(start + i);
+                terminated = true;
+                break;
+            }
+            offset += n;
+            if n == chunk_size && chunk_size < page_size {
+                chunk_size <<= 1;
+            }
+        }
+        Ok((res, terminated))
+    }
 }
 
 pub fn peak_memory_usage_of_current_process() -> Result<usize> {

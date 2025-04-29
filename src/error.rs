@@ -40,6 +40,7 @@ pub enum ErrorEnum {
 #[derive(Clone)]
 pub struct Error {
     pub error: ErrorEnum,
+    // TODO: Make it enum between &'static str and String, to make simple errors fast.
     pub message: String,
 }
 

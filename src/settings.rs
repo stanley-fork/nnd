@@ -594,12 +594,12 @@ impl KeyBinds {
 impl Default for KeyBinds {
     fn default() -> Self {
         let normal = KeyMap::new(&[
-            (Key::Char('q').plain(), KeyAction::Quit),
+            (Key::Char('q').ctrl(), KeyAction::Quit),
             (Key::Char('r').plain(), KeyAction::Run),
             (Key::Char('c').plain(), KeyAction::Continue),
             (Key::Char('p').plain(), KeyAction::Suspend),
             (Key::Char('c').ctrl(), KeyAction::Suspend),
-            (Key::Char('k').plain(), KeyAction::Kill),
+            (Key::Char('k').ctrl(), KeyAction::Kill),
             (Key::Up.alt(), KeyAction::WindowUp),
             (Key::Down.alt(), KeyAction::WindowDown),
             (Key::Left.alt(), KeyAction::WindowLeft),

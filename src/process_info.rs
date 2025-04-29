@@ -1,16 +1,17 @@
 use crate::{*, debugger::*, error::*, util::*, symbols::*, symbols_registry::*, procfs::*, unwind::*, registers::*, log::*, settings::*, elf::*};
-use std::{collections::{HashMap, hash_map::Entry}, time::Instant, fs, os::unix::fs::MetadataExt, sync::Arc, ops::Range};
+use std::{collections::{HashMap, hash_map::Entry}, time::Instant, fs, os::unix::fs::MetadataExt, sync::Arc, ops::Range, str};
 use std::mem;
 use libc::pid_t;
 
-#[derive(Default)]
 pub struct ProcessInfo {
     pub maps: MemMapsInfo,
+    pub r_debug: Result<RDebug>,
     pub exe_inode: u64,
 
     // CPU and memory usage, total across all threads, recalculated periodically.
     pub total_resource_stats: ResourceStats,
 }
+impl Default for ProcessInfo { fn default() -> Self { Self {maps: Default::default(), r_debug: err!(Loading, "loading"), exe_inode: 0, total_resource_stats: Default::default()} } }
 
 #[derive(Default)]
 pub struct ThreadInfo {
@@ -35,6 +36,19 @@ pub struct ResourceStatsBucket {
     utime: usize,
     stime: usize,
     duration_ns: usize,
+}
+
+// r_debug struct filled out by glibc dynamic linker, containing information about loaded libraries.
+// All we need from it is tls_offset for each loaded binary, to locate thread-local variables.
+// Doesn't work with musl.
+pub struct RDebug {
+    link_maps: Vec<RDebugLinkMap>,
+}
+
+pub struct RDebugLinkMap {
+    ld: usize, // pointer to mapped .dynamic section
+    tls_offset: usize,
+    tls_modid: usize,
 }
 
 // Information about thread's recent CPU usage, excluding periods of time when the thread was suspended by the debugger.
@@ -107,6 +121,10 @@ impl ProcessInfo {
 
     pub fn clear(&mut self) {
         self.maps.clear();
+    }
+
+    pub fn drop_caches(&mut self) {
+        self.r_debug = err!(Loading, "loading");
     }
 }
 
@@ -234,6 +252,101 @@ pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) -> /*binaries_add
         debugger.memory = MemReader::CoreDump(Arc::new(CoreDumpMemReader {ranges: new_ranges}));
     }
 
+    if debugger.info.r_debug.as_ref().is_err_and(|e| e.is_loading()) {
+        // How TLS works (in the simpler static models; dynamic TLS models add another indirection through DTV that we don't support):
+        //  * .dynamic section of the main executable has DT_DEBUG entry. It's mapped into memory.
+        //  * The dynamic linker patches this entry in memory to be a pointer to an r_debug struct.
+        //  * The r_debug struct contains a linked list link_map with information about all loaded binaries.
+        //    One of the fields of link_map is l_tls_offset, which tells where this binary's thread-local variables start, relative to each thread's fs_base.
+        //  * We parse the link_map entries, make a name -> l_tls_offset map, and propagate the l_tls_offset values to our Binary structs.
+        //  * Finally, when a DWARF expression asks us to calculate the address of a thread-local variable at offset x, we return `fs_base - l_tls_offset + x`.
+
+        // Find the binary that has DT_DEBUG entry in .dynamic and has a nonzero pointer patched there (it's only patched for the main executable, not for dynamic libraries).
+        let mut error = None;
+        let mut r_debug = None;
+        for bin in debugger.symbols.iter() {
+            if !bin.is_mapped {
+                continue;
+            }
+            let elf = match &bin.elves {
+                Ok(e) => &e[0],
+                Err(e) if e.is_loading() => {
+                    error = Some(error!(Loading, "loading"));
+                    break;
+                }
+                Err(e) => {
+                    if error.is_none() {
+                        error = Some(e.clone());
+                    }
+                    continue;
+                }
+            };
+            let &Some(static_addr) = &elf.r_debug_ptr_addr else {continue};
+            let dynamic_addr = bin.addr_map.static_to_dynamic(static_addr);
+            match parse_r_debug(dynamic_addr, &debugger.memory, elf) {
+                Ok(Some(r)) => {
+                    r_debug = Some(r);
+                    break;
+                }
+                Ok(None) => (),
+                Err(e) => error = Some(e),
+            }
+        }
+        if let Some(r_debug) = r_debug {
+            eprintln!("info: found r_debug struct with {} loaded binaries", r_debug.link_maps.len());
+
+            // Match r_debug link_map entries to /proc/<pid>/maps entries, by name.
+            // The r_debug entry for main executable has empty name, so we have to special-case it.
+            let mut addr_to_idx: Vec<(usize, usize)> = r_debug.link_maps.iter().enumerate().map(|(i, m)| (m.ld, i)).collect();
+            addr_to_idx.sort();
+            let mut binary_to_tls_offset: HashMap<usize, usize> = HashMap::new();
+            for map in &debugger.info.maps.maps {
+                let &Some(binary_id) = &map.binary_id else {
+                    continue
+                };
+                let i = addr_to_idx.partition_point(|(ld, idx)| *ld < map.start);
+                if i == addr_to_idx.len() || addr_to_idx[i].0 >= map.start + map.len {
+                    continue;
+                }
+                let link_map = &r_debug.link_maps[addr_to_idx[i].1];
+                binary_to_tls_offset.insert(binary_id, link_map.tls_offset);
+            }
+            for binary_id in debugger.symbols.priority_order.clone() {
+                let bin = debugger.symbols.get_mut(binary_id).unwrap();
+                if !bin.is_mapped {
+                    continue;
+                }
+                let tls_offset = match binary_to_tls_offset.get(&binary_id) {
+                    Some(&x) => x,
+                    None => {
+                        eprintln!("warning: binary not found in r_debug link_map: '{}'", bin.locator.path);
+                        bin.tls_offset = err!(Dwarf, "binary not found in r_debug link_map");
+                        continue;
+                    }
+                };
+                // glibc/include/link.h seems to imply that values 0, -1, and -2 can all be used as missing value marker.
+                let tls_offset = if tls_offset == 0 || tls_offset >= usize::MAX - 1 {
+                    eprintln!("warning: binary has dynamic or missing tls_offset ({}): '{}'", tls_offset, bin.locator.path);
+                    err!(NotImplemented, "dynamic TLS models are not supported")
+                } else {
+                    Ok(tls_offset)
+                };
+                bin.tls_offset = tls_offset;
+            }
+
+            debugger.info.r_debug = Ok(r_debug);
+        } else {
+            let error = match error {
+                Some(x) => x,
+                None => error!(ProcessState, "no valid DT_DEBUG found"),
+            };
+            if !error.is_loading() {
+                eprintln!("warning: couldn't load r_debug: {}", error);
+            }
+            debugger.info.r_debug = Err(error);
+        }
+    }
+
     // Check if any of the mapped binaries are new or changed address.
     for b in debugger.symbols.iter() {
         if b.is_mapped && prev_mapped.get(&b.id) != Some(&b.addr_map.diff) {
@@ -242,6 +355,35 @@ pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) -> /*binaries_add
         }
     }
     false
+}
+
+fn parse_r_debug(ptr_addr: usize, memory: &MemReader, elf: &ElfFile) -> Result<Option<RDebug>> {
+    let ptr = memory.read_u64(ptr_addr)? as usize;
+    if ptr == 0 {
+        return Ok(None);
+    }
+    if elf.interp.as_ref().is_some_and(|s| s.find("musl").is_some()) {
+        return err!(NotImplemented, "musl TLS not supported");
+    }
+    let mut cached_memory = CachedMemReader::new(memory.clone());
+    let mut link_map_ptr = cached_memory.read_usize(ptr + 8)?;
+    let mut r_debug = RDebug {link_maps: Vec::new()};
+    while link_map_ptr != 0 {
+        // Offsets of fields in link_map struct (extended version of the struct, from glibc/include/link.h).
+        const L_LD_OFFSET: usize = 16;
+        const L_NEXT_OFFSET: usize = 24;
+        const L_TLS_OFFSET_OFFSET: usize = 1112;
+        const L_TLS_MODID_OFFSET: usize = 1120;
+        let mut buf = [0u8; L_TLS_MODID_OFFSET + 8];
+        cached_memory.read(link_map_ptr, &mut buf)?;
+        let ld = usize:: from_le_bytes(buf[L_LD_OFFSET..][..8].try_into().unwrap());
+        let tls_offset = usize::from_le_bytes(buf[L_TLS_OFFSET_OFFSET..][..8].try_into().unwrap());
+        let tls_modid = usize::from_le_bytes(buf[L_TLS_MODID_OFFSET..][..8].try_into().unwrap());
+        r_debug.link_maps.push(RDebugLinkMap {ld, tls_offset, tls_modid});
+
+        link_map_ptr = usize::from_le_bytes(buf[L_NEXT_OFFSET..][..8].try_into().unwrap());
+    }
+    Ok(Some(r_debug))
 }
 
 // Must be called when the thread gets suspended (and not immediately resumed) - to assign registers, so we can unwind the stack.
