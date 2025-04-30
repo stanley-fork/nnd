@@ -32,7 +32,7 @@ Development status:
  * I use it every day and find it very helpful.
  * Not widely tested - I only tried it on a few machines and a few real executables.
 
-Distributed as a single 4 MB executable file with no dependencies.
+Distributed as a single 6 MB executable file with no dependencies.
 
 "Installation":
 ```bash
