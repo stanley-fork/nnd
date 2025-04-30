@@ -123,7 +123,7 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                 }
                 LiteralValue::Char(c) if c.is_ascii() => state.builtin_types.char8,
                 LiteralValue::Char(c) => state.builtin_types.char32,
-                LiteralValue::String(s) => return err!(NotImplemented, "string literals not implemented"),
+                LiteralValue::String(s) => state.types.add_array(state.builtin_types.char8, Some(s.len()), ArrayFlags::empty()),
             };
             Ok(Value {val: AddrOrValueBlob::Blob(v.as_blob()), type_, flags: ValueFlags::empty()})
         }
@@ -456,6 +456,93 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                 let array_type = state.types.add_array(t1, Some(len), ArrayFlags::empty());
                 return Ok(Value {val: AddrOrValueBlob::Addr(addr1), type_: array_type, flags: ValueFlags::empty()});
             }
+            
+            // String comparison.
+            match op {
+                BinaryOperator::Eq | BinaryOperator::Ne | BinaryOperator::Gt | BinaryOperator::Lt | BinaryOperator::Ge | BinaryOperator::Le => {
+                    let check = |t: *const TypeInfo| -> (/*is_byte_array*/ bool, /*is_c_string*/ bool) {
+                        let (inner, len_known) = match unsafe {&(*t).t} {
+                            Type::Pointer(p) => (p.type_, false),
+                            Type::Array(a) => (a.type_, a.flags.contains(ArrayFlags::LEN_KNOWN)),
+                            Type::Slice(s) => (s.type_, true),
+                            _ => return (false, false),
+                        };
+                        let inner = unsafe {&*inner};
+                        if inner.calculate_size() != 1 {
+                            return (false, false);
+                        }
+                        if !len_known {
+                            return match &inner.t {
+                                Type::Primitive(p) if p.contains(PrimitiveFlags::AMBIGUOUS_CHAR) => (false, true),
+                                _ => (false, false),
+                            };
+                        }
+                        (true, false)
+                    };
+                    let (lhs_is_byte_array, lhs_is_c_string) = check(lhs.type_);
+                    let (rhs_is_byte_array, rhs_is_c_string) = check(rhs.type_);
+                    if lhs_is_byte_array || rhs_is_byte_array {
+                        if !(lhs_is_byte_array || lhs_is_c_string) {
+                            return err!(TypeMismatch, "can't compare {} to array", unsafe {(*lhs.type_).t.kind_name()});
+                        }
+                        if !(rhs_is_byte_array || rhs_is_c_string) {
+                            return err!(TypeMismatch, "can't compare array to {}", unsafe {(*rhs.type_).t.kind_name()});
+                        }
+                        
+                        // Compare as byte arrays.
+                        let as_blob = |mut val: Value, is_c_string: bool, memory: &mut CachedMemReader| -> Result<(ValueBlob, usize)> {
+                            let t = unsafe {&*val.type_};
+                            if is_c_string {
+                                let addr = match &t.t {
+                                    Type::Pointer(p) => val.val.bit_range(0..64, memory)?,
+                                    Type::Array(a) => match val.val.addr() {
+                                        Some(x) => x,
+                                        None => return err!(TypeMismatch, "array length unknown"),
+                                    }
+                                    _ => panic!("huh"),
+                                };
+                                let (blob, terminated) = memory.read_null_terminated(addr, 1 << 20)?;
+                                if !terminated {
+                                    return err!(Sanity, "C string suspiciously long: more than {} bytes", blob.len());
+                                }
+                                let size = blob.len();
+                                Ok((ValueBlob::from_vec(blob), size))
+                            } else {
+                                Ok(match &t.t {
+                                    Type::Array(a) => (mem::take(&mut val.val).into_value(a.len, memory)?, a.len),
+                                    Type::Slice(s) => {
+                                        let addr = val.val.bit_range(0..64, memory)?;
+                                        let size = val.val.bit_range(64..128, memory)?;
+                                        let mut buf = vec![0u8; size];
+                                        memory.read(addr, &mut buf)?;
+                                        (ValueBlob::from_vec(buf), size)
+                                    }
+                                    _ => panic!("huh"),
+                                })
+                            }
+                        };
+                        let (lhs_blob, lhs_len) = as_blob(lhs, lhs_is_c_string, &mut context.memory)?;
+                        let (rhs_blob, rhs_len) = as_blob(rhs, rhs_is_c_string, &mut context.memory)?;
+                        let lhs_slice = &lhs_blob.as_slice()[..lhs_len];
+                        let rhs_slice = &rhs_blob.as_slice()[..rhs_len];
+                        let c = lhs_slice.cmp(rhs_slice);
+                        let r = match op {
+                            BinaryOperator::Eq => c.is_eq(),
+                            BinaryOperator::Ne => c.is_ne(),
+                            BinaryOperator::Gt => c.is_gt(),
+                            BinaryOperator::Lt => c.is_lt(),
+                            BinaryOperator::Ge => c.is_ge(),
+                            BinaryOperator::Le => c.is_le(),
+                            _ => panic!("huh"),
+                        };
+                        let type_ = state.builtin_types.bool_;
+                        return Ok(Value {val: AddrOrValueBlob::Blob(ValueBlob::new(r as usize)), type_, flags: ValueFlags::empty()});
+                    }
+                }
+                _ => (),
+            }
+
+            // All other binary operators require both args to be simple numbers or pointers.
             let mut a = to_basic(&lhs, &mut context.memory, "arithmetic")?;
             let mut b = to_basic(&rhs, &mut context.memory, "arithmetic")?;
             let r = match op {
@@ -567,6 +654,7 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                 }
 
                 BinaryOperator::Eq | BinaryOperator::Ne | BinaryOperator::Gt | BinaryOperator::Lt | BinaryOperator::Ge | BinaryOperator::Le => {
+                    // TODO: String comparison.
                     let c = if a.is_f64() || b.is_f64() {
                         a.cast_to_f64().partial_cmp(&b.cast_to_f64())
                     } else if a.is_isize() || b.is_isize() {
@@ -621,7 +709,14 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                     _ => return err!(Syntax, "var() argument must be a variable name"),
                 }
             }
-            // TODO: downcast() to explicitly downcast to concrete type (to be able to typeof() the result)
+            "try" => {
+                for &child in &node.children {
+                    if let Ok(val) = eval_expression(expr, child, state, context, false) {
+                        return Ok(val);
+                    }
+                }
+                Ok(Value {val: AddrOrValueBlob::Blob(ValueBlob::new(0)), type_: state.builtin_types.u64_, flags: ValueFlags::empty()})
+            }
             _ => return err!(NoFunction, "no builtin function '{}' (calling debuggee functions is not supported)", name),
         }
         AST::Type {..} | AST::PointerType | AST::ArrayType(_) => panic!("unexpected type AST"),

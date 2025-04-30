@@ -95,6 +95,9 @@ Debugging tips:
  * Step-into-instruction ('S' key by default) works no matter what, even if there's no debug info or if disassembly or stack unwinding fails. Use it when other steps fail.
  * Breakpoints are preserved across debugger restarts, but they're put into disabled state on startup. Use Enter key in breakpoints window to reactivate.
  * To make a conditional breakpoint, press M-enter (by default) on a regular breakpoint and edit the condition expression (in breakpoints window).
+   Conditional breakpoint stops the program if the condition expression evaluates to nonzero or fails to evaluate.
+   If you don't want to stop on evaluation error, wrap the expression in 'try(...)' (it returns 0 on if evaluation failed for any reason).
+   E.g.: 'try(abstract_class_ptr.concrete_class_field)' will stop only if abstract_class_ptr was auto-downcast to a class that has the given field, and the field is nonzero.
  * The function search (in disassembly window, 'o' key by default) currently does fuzzy search over *mangled* function names (for peformance reasons).
    The search results display demangled names, i.e. slightly different from what's actually searched. Press tab to see mangled name.
  * In watches window, on non-root tree nodes press Enter to add a corresponding watch. E.g. for local variable or struct field or array element.
@@ -131,11 +134,11 @@ Currently the language has no loops or conditionals, just expressions. The synta
 (Throughout this document, single quotes '' denote example watch expressions. The quotes themselves are not part of the expression.)
 
 General info:
- * Can access the debugged program's local variables (as seen in the locals window), global variables, and registers: 'my_local_var', 'rdi'.
+ * Can access the debugged program's local variables (as seen in the locals window), global variables (including thread-locals and static variables in functions), and registers: 'my_local_var', 'rdi'.
+   If a local variable is not found, it's probably optimized out. Fields of 'this' are accessible as 'this.my_field', not 'my_field'.
  * Has basic C-like things you'd expect: arithmetic and logical operators, literals, array indexing, pointer arithmetic, '&x' to take address, '*x' to dereference.
  * Type cast: 'p as *u8'. Casts are very permissive, ~any value can be reinterpreted as ~any type.
- * Field access: 'my_struct.my_field'.
- * There's no '->' operator, use '.' instead (it auto-dereferences pointers).
+ * Field access: 'my_struct.my_field'. Pointers are auto-dereferenced: 'my_ptr.my_field'. There's no '->' operator.
  * Fields can also be accessed by index: 'my_struct.3' (useful when field names are empty or duplicate).
  * 'p.[n]' to turn pointer 'p' to array of length 'n'. E.g. 'my_string.ptr.[my_string.len]'.
  * 'begin..end' to turn a pair of pointers to the array [begin, end). E.g. 'my_vector.begin..my_vector.end'.
