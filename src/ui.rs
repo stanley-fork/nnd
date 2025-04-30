@@ -316,6 +316,7 @@ impl DebuggerUI {
         }));
         hints.push(KeyHint::ranges(&[[KeyAction::Window0, KeyAction::Window9], [KeyAction::WindowLeft, KeyAction::WindowDown]], "switch window"));
         hints.push(KeyHint::keys(&[KeyAction::NextTab, KeyAction::PreviousTab], "switch tab"));
+        hints.push(KeyHint::keys(&[KeyAction::PreviousStackFrame, KeyAction::NextStackFrame, KeyAction::PreviousThread, KeyAction::NextThread], "switch frame/thread"));
         match debugger.target_state {
             ProcessState::Running => hints.push(
                 KeyHint::key(KeyAction::Suspend, "suspend")),
@@ -323,7 +324,6 @@ impl DebuggerUI {
                 KeyHint::key(KeyAction::Suspend, "suspend"),
                 KeyHint::key(KeyAction::Continue, "continue")]),
             ProcessState::Suspended => hints.extend([
-                KeyHint::keys(&[KeyAction::PreviousStackFrame, KeyAction::NextStackFrame, KeyAction::PreviousThread, KeyAction::NextThread], "switch frame/thread"),
                 KeyHint::key(KeyAction::Continue, "continue"),
                 KeyHint::keys(&[KeyAction::StepIntoLine, KeyAction::StepOverLine, KeyAction::StepOut, KeyAction::StepOverColumn], "step into/over/out/column"),
                 KeyHint::keys(&[KeyAction::StepIntoInstruction, KeyAction::StepOverInstruction], "step into/over instruction")]),

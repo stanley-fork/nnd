@@ -613,9 +613,11 @@ impl EvalContext<'_> {
     }
 }
 
-bitflags! { pub struct ValueFlags: u8 {
+bitflags! { pub struct ValueFlags: u16 {
     // Ignore pretty printers. Affects formatting, field access, dereferencing (for smart pointers), indexing (for containers).
     const RAW = 0x1;
+    // Force prettified value where normally raw value would be used (e.g. typeof(x.#p)). Mutually exclusive with RAW.
+    const PRETTY = 0x20;
 
     const HEX = 0x2;
     const BIN = 0x4;

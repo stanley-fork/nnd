@@ -429,7 +429,8 @@ impl KeyBinds {
 #
 # Key names can be discovered using `nnd --echo-input`. It's highly recommended to use it to check every key combination beforehand; if you use incorrect name, it may silently fail to work.
 # Many key combinations are unavailable or indistinguishable in terminal (e.g. tab, ctrl+tab, and ctrl+i all send the same control sequence).
-# Prefixes: C- - ctrl, M- - alt, S- - shift (but usually capital letter is used instead, e.g. use "X" instead of "S-x").
+# Prefixes: C- - ctrl, M- - alt.
+# For shift+key combination, use capital letter, e.g. "X" for shift+x. Prefix S- can be used for some keys that don't have capital-letter versions, e.g. "S-F3" is shift+F3.
 #
 # To have multiple keys for the same action, use multiple lines with the same "action: " part.
 # If an action is not listed, default key(s) for it are used. Assigning key(s) to an action overrides all default keys for that action.

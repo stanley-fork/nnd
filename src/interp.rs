@@ -139,8 +139,22 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
             let mut val = eval_expression(expr, node.children[0], state, context, false)?; // disable only_type here so that pretty-printers don't have to support it
             if !quoted {
                 match name.as_str() {
-                    "#r" => { val.flags.insert(ValueFlags::RAW); return Ok(val); }
-                    "#p" => { val.flags.remove(ValueFlags::RAW); return Ok(val); }
+                    "#r" => {
+                        if val.flags.contains(ValueFlags::PRETTY) {
+                            val.flags.remove(ValueFlags::PRETTY);
+                        } else {
+                            val.flags.insert(ValueFlags::RAW);
+                        }
+                        return Ok(val);
+                    }
+                    "#p" => {
+                        if val.flags.contains(ValueFlags::RAW) {
+                            val.flags.remove(ValueFlags::RAW);
+                        } else {
+                            val.flags.insert(ValueFlags::PRETTY);
+                        }
+                        return Ok(val);
+                    }
                     "#x" => { val.flags.insert(ValueFlags::HEX); return Ok(val); }
                     "#b" => { val.flags.insert(ValueFlags::BIN); return Ok(val); }
                     _ => (),
@@ -285,7 +299,7 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
             // Currently we're extra permissive and allow casts even when sizes don't match, and even when the value is a reference (so could be cast through pointer instead);
             // if some of this turns out too error-prone in practice, we can add some constraints.
             let from_t = unsafe {&*val.type_};
-            let (from_size, from_val) = match &from_t.t {
+            let (from_size, mut from_val) = match &from_t.t {
                 Type::Slice(s) => {
                     // Cast slice as if it were an array. Useful for e.g. casting pretty-printed vectors to string (v as [char8]).
                     let slice_val = mem::take(&mut val.val).into_value(16, &mut context.memory)?;
@@ -307,19 +321,19 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                     let element_size = unsafe {(*a.type_).calculate_size()};
                     let n = from_size / element_size;
                     let sized_array = state.types.add_array(a.type_, Some(n), ArrayFlags::empty());
-                    if let AddrOrValueBlob::Blob(blob) = &mut val.val {
+                    if let AddrOrValueBlob::Blob(blob) = &mut from_val {
                         blob.resize(n * element_size);
                     }
+                    val.val = from_val;
                     val.type_ = sized_array;
                     return Ok(val);
                 }
                 _ => (),
             }
             let to_size = t.calculate_size();
-            let v = mem::take(&mut val.val);
-            let v = match v {
+            let v = match from_val {
                 AddrOrValueBlob::Addr(addr) if to_size <= from_size => AddrOrValueBlob::Addr(addr),
-                AddrOrValueBlob::Addr(addr) => AddrOrValueBlob::Blob(v.into_value(to_size, &mut context.memory)?),
+                AddrOrValueBlob::Addr(addr) => AddrOrValueBlob::Blob(from_val.into_value(to_size, &mut context.memory)?),
                 AddrOrValueBlob::Blob(mut blob) => {
                     blob.resize(to_size);
                     AddrOrValueBlob::Blob(blob)
@@ -344,7 +358,10 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                             Ok(_) => return err!(Runtime, "assigning to debuggee variables is not supported; to assign to a script variable use a different name (shadowing not allowed)"),
                         }
                     }
-                    let val = eval_expression(expr, node.children[1], state, context, false)?;
+                    let mut val = eval_expression(expr, node.children[1], state, context, false)?;
+                    if val.flags.contains(ValueFlags::PRETTY) {
+                        follow_references_and_prettify(&mut val, /*pointers_too*/ false, state, context)?;
+                    }
                     state.variables.insert(name.clone(), val.clone());
                     Ok(val)
                 }
@@ -587,7 +604,10 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                 if node.children.len() != 1 {
                     return err!(TypeMismatch, "typeof() expects 1 argument, got {}", node.children.len());
                 }
-                let val = eval_expression(expr, node.children[0], state, context, true)?;
+                let mut val = eval_expression(expr, node.children[0], state, context, true)?;
+                if val.flags.contains(ValueFlags::PRETTY) {
+                    follow_references_and_prettify(&mut val, /*pointers_too*/ true, state, context)?;
+                }
                 Ok(Value {val: AddrOrValueBlob::Blob(ValueBlob::new(val.type_ as usize)), type_: state.types.types_arena.add(TypeInfo {name: "type", size: 8, flags: TypeFlags::SIZE_KNOWN, t: Type::MetaType, ..Default::default()}), flags: ValueFlags::empty()})
             }
             "var" => {
@@ -602,7 +622,6 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                 }
             }
             // TODO: downcast() to explicitly downcast to concrete type (to be able to typeof() the result)
-            // TODO: maybe pretty() to explicitly apply pretty-printers
             _ => return err!(NoFunction, "no builtin function '{}' (calling debuggee functions is not supported)", name),
         }
         AST::Type {..} | AST::PointerType | AST::ArrayType(_) => panic!("unexpected type AST"),

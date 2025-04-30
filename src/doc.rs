@@ -67,7 +67,7 @@ When running the debugger for the first time, notice:
 This information should be enough to discover most features by trial and error, which is recommended. Additionally, reading --help-known-problems and --help-watches is recommended.
 
 UI tips:
- * Not compatible with Mac OS default Terminal application. Use e.g. iTerm2 or kitty instead.
+ * Not compatible with Mac OS default Terminal application. Use e.g. iTerm2 or kitty instead. (Only relevant when ssh'd to a Linux machine, since the debugger doesn't support running on Mac OS.)
  * There's mouse support. If it's not working, check if mouse reporting is enabled in the terminal application settings.
  * When mouse is enabled, click+dragging usually doesn't select text (to copy it out of the terminal). But terminal applications usually have a way to override this and select text anyway.
    Try shift+drag (in GNOME Terminal or kitty) or option+drag (in iTerm2).
@@ -133,28 +133,33 @@ Currently the language has no loops or conditionals, just expressions. The synta
 General info:
  * Can access the debugged program's local variables (as seen in the locals window), global variables, and registers: 'my_local_var', 'rdi'.
  * Has basic C-like things you'd expect: arithmetic and logical operators, literals, array indexing, pointer arithmetic, '&x' to take address, '*x' to dereference.
- * Type cast: 'p as *u8'.
+ * Type cast: 'p as *u8'. Casts are very permissive, ~any value can be reinterpreted as ~any type.
  * Field access: 'my_struct.my_field'.
  * There's no '->' operator, use '.' instead (it auto-dereferences pointers).
  * Fields can also be accessed by index: 'my_struct.3' (useful when field names are empty or duplicate).
  * 'p.[n]' to turn pointer 'p' to array of length 'n'. E.g. 'my_string.ptr.[my_string.len]'.
  * 'begin..end' to turn a pair of pointers to the array [begin, end). E.g. 'my_vector.begin..my_vector.end'.
  * '^x' looks for variable x in all stack frames.
- * 'var(x)' shows additional information about variable x.
+ * 'var(x)' shows additional information about variable x, e.g. its declaration site.
 
 Gotchas:
  * 'var(x)' and 'type(t)'/'typeof(x)' show variable/type declaration site (if present in debug info). Press enter on it (or click) to open in code window.
- * If a variable has the same name as a register, use '`rax`' to refer to the variable.
- * If a global variable has the same name as a local variable, use '::foo' to refer to the global variable.
+ * If a variable has the same name as a register, use `` to refer to the variable: '`rax`'.
+ * If a global variable has the same name as a local variable, use :: prefix to refer to the global variable: '::foo'.
  * Currently only fully-qualified type names and global variable names are recognized.
  * Currently types and global variables nested inside functions are difficult to access. The recognized "fully-qualified" name has a "_" instead of the function name.
-   Use variable search (watches window, 'o' key by default), start the query with '@' to search by filename, add ":<number>" to filter by line number.
+   Use variable search (watches window, 'o' key by default); optionally, start the query with '@' to search by filename, add ":<number>" to filter by line number.
+ * Be careful with operator precedence when combining casts and pointer arithmetic (casts have higher precedence):
+   'offset + (my_u64_ptr as *u8)' and 'offset + my_u64_ptr as *u8' produce different result.
 
 Types:
  * Can access the types from the debugged program's debug info (structs, classes, enums, unions, primitive types, etc) and typedefs.
  * Common primitive types are also always available by the following names: void, u8, u16, u32, u64, i8, i16, i32, i64, f32, f64, char8, char32, bool.
  * '* MyType' (without quotes) is pointer to MyType.
- * '[100] MyType' is array of 100 MyType-s.
+ * '[MyType; 100]' is array of 100 MyType-s.
+ * '[MyType]' is an array of unknown length of MyType-s. Useful for casting simd registers: 'ymm3 as [u16]' (equivalent to 'ymm as [u16; 16]'), or other values: 'my_struct as [u64]'.
+ * 'char8' and arrays of 'char8' are shown as strings (UTF8), 'u8'/'i8' and their arrays are shown as numbers. Cast between them if needed,
+   e.g. 'my_array as [char8]' to show as string, 'my_string as [u8]' to show as numbers.
 
 Inspecting types:
  * 'type(<name>)' to get information about a type, e.g. 'type(DB::Chunk)' - contains things like size and field offsets.
@@ -173,6 +178,8 @@ Script variables:
  * If the debugged program has a variable with the same name, it can be accessed with backticks: '`x`', while the script variable can be accessed without backticks: 'x'
 
 Pretty-printers:
+ * "Pretty-printers" are actually not printers, they're transformations that turn values into other values, which may then be printed using normal printers.
+   E.g. an std::map is turned into an array of pairs.
  * If a struct has exactly one nonempty field, we replace the struct with the value of that field.
    Useful for trivial wrappers that are ubiquitous in C++ and Rust.
    E.g. unwraps std::unique_ptr into a plain pointer, even though it actually has multiple levels of wrappers, inheritance, and empty fields.
@@ -184,15 +191,18 @@ Pretty-printers:
    newer or older than mine - please report and I'll probably make pretty-printers work for it too.
  * Currently no support for custom pretty-printers.
  * All of the above transformations can be disabled by adding ".#r" to the expression.
+ * Pretty-printers apply to intermediate values as well. E.g. 'my_vector[42]' uses a pretty-printer to turn the vector into array before applying the [] operator to it;
+   to access fields of the original struct, use #r: 'my_vector.#r.__M_begin'.
 
 Value modifiers:
- * 'value.#x' to print in hexadecimal.
+ * 'value.#x' to print in hexadecimal. Affects numbers, strings, and byte arrays.
  * 'value.#b' to print in binary.
  * 'value.#r' to disable pretty-printers.
    This applies both to how the value is printed and to field access:
    'foo.bar' will access field 'bar' of the transformed 'foo', i.e. after unwrapping single-field structs, downcasting to concrete type, and inlining base class fields.
    'foo.#r.bar' will access field 'bar' of 'foo' verbatim.
- * Modifiers propagate to descendants. E.g. doing 'my_struct.#x' will print all struct's fields as hexadecimal.
+ * Modifiers propagate to descendants. E.g. 'my_struct.#x' will print all struct's fields as hexadecimal.
+ * Modifiers propagate through most operations. E.g. 'my_array.#x as [u8]' is the same as '(my_array as [u8]).#x'.
  * 'value.#p' is the opposite of '.#r'. Can be useful with field access: 'my_struct.#r.my_field.#p' re-enables pretty-printing after disabling it to access a raw field."###),
         "--help-state" => println!(r###"The debugger creates directory ~/.nnd/ and stores a few things there, such as log file and saved state (watches, breakpoints, open tabs).
 It doesn't create any other files or make any other changes to your system.
@@ -212,7 +222,7 @@ Files inside ~/.nnd/<number>/:
  * log - some messages from the debugger itself. Sometimes useful for debugging the debugger. Sometimes there are useful stats about debug info.
    On crash, error message and stack trace goes to this file. Please include this file when reporting bugs, especially crashes.
  * lock - prevents multiple nnd processes from using the same directory simultaneously."###),
-        "--help-tty" => println!(r###"The debugger occupies the whole terminal with its TUI. How to debug a program that also wants to use the terminal in an interactive way?
+        "--help-tty" => println!(r###"The debugger occupies the whole terminal with its TUI. But what if the debugged program also wants to use the terminal in an interactive way?
 E.g. how to use nnd to debug itself?
 
 One way is to just attach using -p <pid>.
@@ -221,8 +231,8 @@ But what if you need to set breakpoints before the program starts, e.g. to debug
  1. Open a terminal window (in terminal application or tmux or whatever). Let's call this window A. This is where you'll be able interact with the debugged program.
  2. This terminal window is attached to some 'pty' pseudo-device in /dev/pts/ . Figure out which one:
      $ ls -l /proc/$$/fd | grep /dev/pts/
-    For example, suppose it output /dev/pts/2 . You can also double-check this with: `echo henlo > /dev/pts/2` - if the text appears in the correct terminal then it's the correct path.
- 3. Pacify the shell in this terminal window:
+    For example, suppose this outputs /dev/pts/2 . You can also double-check this with: `echo henlo > /dev/pts/2` - if the text appears in the correct terminal then it's the correct path.
+ 3. Pacify the shell in this terminal window (to prevent it from eating input):
      $ sleep 1000000000
  4. In another terminal window (B) run the debugger:
      $ nnd --tty /dev/pts/2 the_program_to_debug
@@ -231,8 +241,8 @@ But what if you need to set breakpoints before the program starts, e.g. to debug
 
 The latter approach is often more convenient than -p, even when both approaches are viable.
 
-(This can even be chained multiple levels deep: `nnd --tty /dev/pts/1 nnd --tty /dev/pts/2 my_program`. The longest chain I've used in practice is 3 nnd-s + 1 clickhouse."###),
-        "--help-features" => println!(r###"Appendix: raw list of features (optional reading)
+(This can even be chained multiple levels deep: `nnd --tty /dev/pts/1 nnd --tty /dev/pts/2 my_program`. The longest chain I've used in practice is 4 nnd-s + 1 clickhouse.)"###),
+        "--help-features" => println!(r###"Appendix: raw list of features (optional reading) (a little outdated)
 
 loading debug info
   progress bar in the binaries window (top right)

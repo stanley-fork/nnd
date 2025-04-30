@@ -354,17 +354,24 @@ pub fn parse_core_dump(elf: Arc<ElfFile>) -> Result<(CoreDumpMemReader, Vec<(pid
                     if end_address < start_address { return err!(MalformedExecutable, "inverted address range in NT_FILE"); }
                     let offset_pages = reader.read_u64()? as usize;
 
+                    // Find mmaps overlapping this range.
                     let mut perms = MemMapPermissions::empty();
                     let mut idx = ranges.partition_point(|r| r.start_address + r.size <= start_address);
                     if idx < ranges.len() && ranges[idx].start_address < end_address {
                         perms = ranges[idx].permissions;
                         while idx < ranges.len() && ranges[idx].start_address < end_address {
+                            if ranges[idx].start_address < start_address || ranges[idx].start_address + ranges[idx].size > end_address {
+                                eprintln!("warning: core dump has file address range [0x{:x}, 0x{:x}) partially overlapping a mmap address range [0x{:x}, 0x{:x}); this is not supported well", start_address, end_address, ranges[idx].start_address, ranges[idx].start_address + ranges[idx].size);
+                            }
                             if let CoreDumpMemorySource::Zero = ranges[idx].source {
                                 ranges[idx].source = CoreDumpMemorySource::MissingFile; // we'll assign it later if we find the file
                             }
                             idx += 1;
                         }
                     }
+                    // Cores produced by gdump are missing the 'executable' flag on most maps for some reason.
+                    // So we pretend that all maps are executable to make our binary detection work at all.
+                    perms.insert(MemMapPermissions::EXECUTE);
 
                     maps.push(MemMapInfo {start: start_address, len: end_address - start_address, perms, offset: offset_pages * page_size, inode: 0, path: None, binary_locator: None, binary_id: None, elf_seen: false});
                 }
@@ -793,7 +800,8 @@ fn open_elf(name: String, file: Option<(&File, /*file_len*/ usize)>, mut owned: 
         }
 
         let prev = elf.section_by_name.insert(s.name.clone(), idx);
-        if prev.is_some() {
+        // (Core dumps produced by gdump have lots of sections named "load".)
+        if prev.is_some() && !is_core_dump {
             eprintln!("warning: ELF has duplicate section name: {}", s.name);
         }
 

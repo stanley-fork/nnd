@@ -357,13 +357,23 @@ fn unravel_struct(substruct: &mut Substruct) {
                     }
                     inlined = true;
                     changed = true;
+
+                    // This code merged the sets of nested names between the parent and the field, but that's not good
+                    // because e.g. Option::Some(String) breaks because nested name 'T' is inherited from Option into
+                    // String, and the String pretty-printer thinks it's the element type.
+                    // For now we just discard parent's nested_names, but it's not obvious to me whether there are cases
+                    // that want the union; if so, can change this to take the union but set a flag telling which names
+                    // are from the innermost field.
+                    /*
                     if !field_type.nested_names.is_empty() {
                         if substruct.nested_names.is_empty() {
                             substruct.nested_names = Cow::Borrowed(field_type.nested_names);
                         } else {
                             substruct.nested_names.to_mut().extend_from_slice(field_type.nested_names);
                         }
-                    }
+                    }*/
+                    substruct.nested_names = Cow::Borrowed(field_type.nested_names);
+
                     if !field_type.name.is_empty() {
                         substruct.additional_names.push(field_type.name);
                     }
