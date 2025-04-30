@@ -37,6 +37,6 @@ fi
 cp target/x86_64-unknown-linux-musl/dbgo/nnd nnd-dbgo
 trap 'rm nnd-dbgo' EXIT
 
-gh release create "$TAG" --notes "" target/x86_64-unknown-linux-musl/release/nnd nnd-dbgo
+gh release create "$TAG" target/x86_64-unknown-linux-musl/release/nnd nnd-dbgo
 
 echo "all done!"
