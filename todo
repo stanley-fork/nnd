@@ -1,9 +1,3 @@
-investigate why dumps produced by gcore don't work
-test with different-versioned libraries
-test with breakpad minidumps
-function pointers
-crash screen: show stack trace and process state, type something to resume+detach or kill or email stack trace or quit
-
 bugs:
 get stuck when debuggee is OOM-killed by linux
 investigate `clickhouse local` progress spinner appearing in debugger window despite -t
@@ -40,10 +34,11 @@ investigate unresponsive ui when conditional breakpoint is hit at a high rate
 list features in README
 option to create a core dump instead of launching debugger (apparently there's no existing good way to do it)
 buffer input when program is quitting, especially k+r and steps
+test with breakpad minidumps
+function pointers
 async fetch from debuginfod (load symbols without waiting for it, then on success start over)
 show an error if program failed to start (e.g. executable doesn't exist)
-use RssAnon (from /proc/pid/status) instead of VmRss (includes page cache)
-don't immediately kill child on debugger panic; have a simple fallback state where the child is running, and the user can kill+quit, detach+quit, or do nothing (maybe also pause/resume)
+panic screen: show stack trace and process state, type something to resume+detach or kill or email stack trace or quit
 allow specifying cgroup and user (or maybe it's too hard, need to maybe inherit groups from parent somehow too)
 maybe refresh global variables in watches window on periodic timer tick when the program is running
 make watch window show dereferenced string-like values by default (otherwise expanding it shows the array of characters and eats all vertical space)
