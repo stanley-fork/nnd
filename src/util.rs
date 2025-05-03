@@ -1,6 +1,6 @@
 use crate::{*, error::*, log::*};
 use libc::{pid_t, c_char, c_void};
-use std::{io, io::{Read, BufReader, BufRead, Write}, str::FromStr, ptr, mem, mem::{ManuallyDrop, MaybeUninit}, fmt, fmt::Write as fmtWrite, os::fd::{RawFd, AsRawFd}, ffi::{CStr, OsString, CString}, os::unix::ffi::{OsStringExt, OsStrExt}, arch::asm, cell::UnsafeCell, sync::atomic::{AtomicBool, Ordering}, ops::{Deref, DerefMut, FnOnce}, fs::File, collections::{BinaryHeap, hash_map::DefaultHasher}, hash::{Hash, Hasher}, cmp::Ord, cmp, path::{Path, PathBuf}};
+use std::{io, io::{Read, BufReader, BufRead, Write}, str::FromStr, ptr, mem, mem::{ManuallyDrop, MaybeUninit}, fmt, fmt::Write as fmtWrite, os::fd::{RawFd, AsRawFd}, ffi::{CStr, OsString, CString}, os::unix::ffi::{OsStringExt, OsStrExt}, arch::asm, cell::UnsafeCell, sync::atomic::{AtomicBool, Ordering}, ops::{Deref, DerefMut, FnOnce}, fs::File, collections::{BinaryHeap, hash_map::DefaultHasher}, hash::{Hash, Hasher}, cmp::Ord, cmp, path::{Path, PathBuf}, slice};
 
 pub fn tgkill(pid: pid_t, tid: pid_t, sig: i32) -> Result<i32> {
     //eprintln!("trace: tgkill({}, {}, {})", pid, tid, sig);
@@ -226,7 +226,7 @@ impl INotifyFD {
             if r == 0 {
                 break;
             }
-            let mut slice = unsafe {std::slice::from_raw_parts(buf.as_ptr() as *const u8, r as usize)};
+            let mut slice = unsafe {slice::from_raw_parts(buf.as_ptr() as *const u8, r as usize)};
             while !slice.is_empty() {
                 let sizeof = mem::size_of::<libc::inotify_event>();
                 // man inotify: "Each successful read(2) returns a buffer containing one or more of the following structures".
@@ -599,6 +599,7 @@ pub trait ByteWrite : Write {
     fn write_slice(&mut self, s: &[u8]) -> io::Result<()>;
     fn write_str(&mut self, s: &str) -> io::Result<()>;
     fn write_path(&mut self, s: &Path) -> io::Result<()>;
+    fn write_struct<T>(&mut self, s: &T) -> io::Result<()>;
 }
 impl<R: Write> ByteWrite for R {
     fn write_u8(&mut self, x: u8) -> io::Result<()> { self.write_all(&[x]) }
@@ -614,6 +615,7 @@ impl<R: Write> ByteWrite for R {
     fn write_slice(&mut self, s: &[u8]) -> io::Result<()> { self.write_usize(s.len())?; self.write_all(s) }
     fn write_str(&mut self, s: &str) -> io::Result<()> { self.write_slice(s.as_bytes()) }
     fn write_path(&mut self, s: &Path) -> io::Result<()> { self.write_slice(s.as_os_str().as_bytes()) }
+    fn write_struct<T>(&mut self, s: &T) -> io::Result<()> { unsafe {self.write_all(slice::from_raw_parts(s as *const T as *const u8, mem::size_of::<T>()))} }
 }
 
 // sysconf(_SC_CLK_TCK), assigned at the start of main().
@@ -743,7 +745,7 @@ impl Mmap {
         Ok(Mmap {ptr: file_map, file_len, mapped_len})
     }
 
-    pub fn data(&self) -> &[u8] { unsafe {std::slice::from_raw_parts(self.ptr as *const u8, self.file_len)} }
+    pub fn data(&self) -> &[u8] { unsafe {slice::from_raw_parts(self.ptr as *const u8, self.file_len)} }
 }
 impl Drop for Mmap {
     fn drop(&mut self) {

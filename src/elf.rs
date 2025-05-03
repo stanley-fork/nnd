@@ -232,43 +232,43 @@ impl ElfSection {
 
 #[repr(C)]
 #[derive(Copy, Clone)]
-struct elf_prstatus {
-	si_signo: i32, // signal number
+pub struct elf_prstatus {
+	pub si_signo: i32, // signal number
     // These two seem to be reversed compared to siginfo_t. They also don't seem to be populated by binfmt_elf.c. The real siginfo is in NT_SIGINFO.
-	si_code_but_actually_it_is_zero: i32,  // extra code
-	si_errno_but_actually_it_is_zero: i32, // errno
+	pub si_code_but_actually_it_is_zero: i32,  // extra code
+	pub si_errno_but_actually_it_is_zero: i32, // errno
 
-    pr_cursig: i16, // Current signal
-    pr_sigpend: usize, // Set of pending signals
-    pr_sighold: usize, // Set of held signals
-    pr_pid: pid_t,
-    pr_ppid: pid_t,
-    pr_pgrp: pid_t,
-    pr_sid: pid_t,
-    pr_utime: libc::timeval, // User time
-    pr_stime: libc::timeval, // System time
-    pr_cutime: libc::timeval, // Cumulative user time
-    pr_cstime: libc::timeval, // Cumulative system time
-    pr_reg: libc::user_regs_struct, // GP registers
-    pr_fpvalid: i32, // True if math co-processor being used.
+    pub pr_cursig: i16, // Current signal
+    pub pr_sigpend: usize, // Set of pending signals
+    pub pr_sighold: usize, // Set of held signals
+    pub pr_pid: pid_t,
+    pub pr_ppid: pid_t,
+    pub pr_pgrp: pid_t,
+    pub pr_sid: pid_t,
+    pub pr_utime: libc::timeval, // User time
+    pub pr_stime: libc::timeval, // System time
+    pub pr_cutime: libc::timeval, // Cumulative user time
+    pub pr_cstime: libc::timeval, // Cumulative system time
+    pub pr_reg: libc::user_regs_struct, // GP registers
+    pub pr_fpvalid: i32, // True if math co-processor being used.
 }
 
 #[repr(C)]
 #[derive(Copy, Clone)]
-struct elf_prpsinfo {
-    pr_state: i8, // numeric process state
-    pr_sname: i8, // char for pr_state
-    pr_zomb: i8, // zombie
-    pr_nice: i8, // nice val
-    pr_flag: u64, // flags
-    pr_uid: u32,
-    pr_gid: u32,
-    pr_pid: pid_t,
-    pr_ppid: pid_t,
-    pr_pgrp: pid_t,
-    pr_sid: pid_t,
-    pr_fname: [u8; 16], // filename of executable
-    pr_psargs: [u8; 80], // initial part of arg list
+pub struct elf_prpsinfo {
+    pub pr_state: i8, // numeric process state
+    pub pr_sname: i8, // char for pr_state
+    pub pr_zomb: i8, // zombie
+    pub pr_nice: i8, // nice val
+    pub pr_flag: u64, // flags
+    pub pr_uid: u32,
+    pub pr_gid: u32,
+    pub pr_pid: pid_t,
+    pub pr_ppid: pid_t,
+    pub pr_pgrp: pid_t,
+    pub pr_sid: pid_t,
+    pub pr_fname: [u8; 16], // filename of executable
+    pub pr_psargs: [u8; 80], // initial part of arg list
 }
 
 pub fn parse_core_dump(elf: Arc<ElfFile>) -> Result<(CoreDumpMemReader, Vec<(pid_t, ThreadInfo, Option</*signal*/ i32>)>, MemMapsInfo)> {

@@ -422,7 +422,7 @@ impl SliceReader {
                 // DW_FORM_ref_sup8 => ,
                 // DW_FORM_GNU_ref_alt => ,
 
-                _ => panic!("unexpected attribute form in prepared action"), // (we already validated action.form in prepare_attribute_action())
+                _ => panic!("unexpected attribute form in prepared action: {}", action.form), // (we already validated action.form in prepare_attribute_action())
             }
         }
 
@@ -572,7 +572,9 @@ impl AllAttributeStructLayouts {
                 layouts.push((tag, layout.clone()));
             }
         }
-        layouts.push((DW_TAG_compile_unit, UnitLateAttributes::layout()));
+        for tag in [DW_TAG_compile_unit, DW_TAG_partial_unit, DW_TAG_type_unit] {
+            layouts.push((tag, UnitLateAttributes::layout()));
+        }
 
         layouts.sort_unstable_by_key(|(t, _)| *t);
         for i in 0..layouts.len()-1 {
@@ -605,7 +607,7 @@ impl AllAttributeStructLayouts {
     }
 
     fn find_secondary(&self, tag: DwTag) -> Option<usize> {
-        if tag == DW_TAG_compile_unit {
+        if tag == DW_TAG_compile_unit || tag == DW_TAG_partial_unit || tag == DW_TAG_type_unit {
             Some(self.unit_layout_idx)
         } else if self.secondary_tags.contains(&tag) {
             Some(self.secondary_layout_idx)
@@ -1025,7 +1027,6 @@ pub fn list_units(dwarf: &mut Dwarf<DwarfSlice>, binary_name: &str, layouts: All
 
             let mut cursor = initial_cursor.clone();
             let Some(abbrev) = cursor.read_abbreviation(&attribute_context)? else { return err!(Dwarf, "unit missing root DIE") };
-            if abbrev.tag != DW_TAG_compile_unit { return err!(Dwarf, "unexpected unit root DIE tag: {}", abbrev.tag) }
             let mut attrs = UnitEarlyAttributes::default();
             unsafe {cursor.read_attributes(&abbrev, /*which_layout*/ 1, &attribute_context, &raw mut attrs as *mut u8)?};
 
@@ -1037,7 +1038,6 @@ pub fn list_units(dwarf: &mut Dwarf<DwarfSlice>, binary_name: &str, layouts: All
             let attribute_context = AttributeContext {unit: &unit, dwarf, shared: &shared};
             let mut cursor = initial_cursor.clone();
             let Some(abbrev) = cursor.read_abbreviation(&attribute_context)? else { return err!(Sanity, "file changed") }; // re-lookup because of borrow checker
-            if abbrev.tag != DW_TAG_compile_unit { return err!(Sanity, "file changed") }
             let mut attrs = UnitLateAttributes::default();
             unsafe {cursor.read_attributes(&abbrev, /*which_layout*/ 0, &attribute_context, &raw mut attrs as *mut u8)?};
 
@@ -1207,7 +1207,7 @@ const DW_FORM_addrx4: DwForm = DwForm(0x2c);
 const DW_FORM_GNU_addr_index: DwForm = DwForm(0x1f01);
 const DW_FORM_GNU_str_index: DwForm = DwForm(0x1f02);
 const DW_FORM_GNU_ref_alt: DwForm = DwForm(0x1f20);
-const DW_FORM_GNU_strp_alt: DwForm = DwForm(0x1f2);
+const DW_FORM_GNU_strp_alt: DwForm = DwForm(0x1f21);
 
 // These are not actual DWARF forms, I made these numbers up. If future versions of the standard clash with these values, change them. (Or, if you're philosophically opposed to this, change the type to u32 and use values >= 2^16.)
 const DW_EXTRA_FORM_skip_bytes: DwForm = DwForm(0xfe00);
@@ -1336,11 +1336,10 @@ fn prepare_attribute_action(attr: AttributeSpecification, layout: &AttributeStru
             // Some more form conversions to make life easier (and faster) for parser.
             match form {
                 DW_FORM_GNU_str_index => form = DW_FORM_strx,
-                DW_FORM_GNU_strp_alt => form = DW_FORM_strp_sup,
                 DW_FORM_GNU_addr_index => form = DW_FORM_addrx,
                 DW_FORM_ref_addr | DW_FORM_sec_offset => form = if encoding.format.word_size() == 4 {DW_FORM_data4} else {DW_FORM_data8},
                 DW_FORM_strp => form = if encoding.format.word_size() == 4 {DW_EXTRA_FORM_strp4} else {DW_EXTRA_FORM_strp8},
-                DW_FORM_strp_sup => form = if encoding.format.word_size() == 4 {DW_EXTRA_FORM_strp_sup4} else {DW_EXTRA_FORM_strp_sup8},
+                DW_FORM_strp_sup | DW_FORM_GNU_strp_alt => form = if encoding.format.word_size() == 4 {DW_EXTRA_FORM_strp_sup4} else {DW_EXTRA_FORM_strp_sup8},
                 DW_FORM_line_strp => form = if encoding.format.word_size() == 4 {DW_EXTRA_FORM_line_strp4} else {DW_EXTRA_FORM_line_strp8},
                 _ => (),
             }

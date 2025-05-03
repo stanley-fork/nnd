@@ -12,6 +12,7 @@ Usage:
 {0} command [args...]   - run a program under the debugger (i.e. just prepend {0} to the command line)
 sudo {0} -p pid   - attach to an existing process
 {0} -c core_dump_path [executable_path]   - open core dump; -o flag (see below) is recommended if the core was produced on a different machine (with different version of libc than available locally)
+{0} --dump-core [--mode=direct|live|fork] -p pid > out   - instead of running the debugger, make a core dump snapshot of a running program, similar to gdump
 
 Additional arguments:
 --stdin/--stdout/--stderr path   - redirect stdin/stdout/stderr to file

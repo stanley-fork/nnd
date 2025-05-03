@@ -198,7 +198,13 @@ impl MemMapsInfo {
             if inode.is_none() { return err!(Format, "too few fields"); }
             let inode = u64::from_str_radix(inode.unwrap(), 10)?;
 
-            let path = match rest { None => None, Some(p) => Some(p.trim_start().to_string()) };
+            let path = match rest {
+                None => None,
+                Some(p) => match p.trim_start() {
+                    "" => None,
+                    p => Some(p.to_string()),
+                }
+            };
 
             res.push(MemMapInfo {start, len: end - start, perms: permissions, offset, inode, path, binary_locator: None, binary_id: None, elf_seen: false});
         }
@@ -316,12 +322,13 @@ impl PidMemReader {
             let r = libc::process_vm_readv(self.pid, &local_iov as *const libc::iovec, 1, &mut remote_iov as *mut libc::iovec, 1, 0);
             if r < 0 {
                 if unsafe {*libc::__errno_location()} == libc::EFAULT {
-                    return err!(ProcessState, "bad address"); // shorter message for common error (e.g. null pointer dereference in watch expression)
+                    return err!(ProcessState, "bad address: 0x{:x}", addr); // shorter message for common error (e.g. null pointer dereference in watch expression)
                 } else {
                     return errno_err!("process_vm_readv failed");
                 }
             }
             if r != buf.len() as isize {
+                // "Partial transfers apply at the granularity of iovec elements.  These system calls won't perform a partial transfer that splits  a  single  iovec  element."
                 return err!(ProcessState, "unexpected EOF in mem @{:x}:0x{:x}", addr, buf.len());
             }
             Ok(std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len()))
@@ -431,7 +438,6 @@ impl CachedMemReader {
     }
 
     pub fn read_null_terminated(&mut self, mut offset: usize, limit: usize) -> Result<(Vec<u8>, /*terminated*/ bool)> {
-        let page_size = 1usize << 12;
         let mut chunk_size = 1usize << 7;
         let mut res: Vec<u8> = Vec::new();
         let mut terminated = false;
@@ -448,7 +454,7 @@ impl CachedMemReader {
                 break;
             }
             offset += n;
-            if n == chunk_size && chunk_size < page_size {
+            if n == chunk_size && chunk_size < PAGE_SIZE {
                 chunk_size <<= 1;
             }
         }

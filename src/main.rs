@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
 #![allow(unused_imports)]
-use nnd::{*, elf::*, error::*, debugger::*, util::*, ui::*, log::*, process_info::*, symbols::*, symbols_registry::*, procfs::*, unwind::*, range_index::*, settings::*, context::*, executor::*, persistent::*, doc::*, terminal::*, common_ui::*};
+use nnd::{*, elf::*, error::*, debugger::*, util::*, ui::*, log::*, process_info::*, symbols::*, symbols_registry::*, procfs::*, unwind::*, range_index::*, settings::*, context::*, executor::*, persistent::*, doc::*, terminal::*, common_ui::*, core_dumper::*};
 use std::{rc::Rc, mem, fs, os::fd::{FromRawFd}, io::Read, io, io::Write, panic, process, thread, thread::ThreadId, cell::UnsafeCell, ptr, pin::Pin, sync::Arc, str::FromStr, path::PathBuf, collections::HashSet};
 use libc::{self, STDIN_FILENO, pid_t};
 
@@ -9,7 +9,9 @@ use libc::{self, STDIN_FILENO, pid_t};
 static mut SIGNAL_PIPES_WRITE: [i32; 32] = [-1; 32];
 
 static MAIN_THREAD_ID: SyncUnsafeCell<Option<ThreadId>> = SyncUnsafeCell::new(None);
-static mut DEBUGGER_TO_DROP_ON_PANIC: UnsafeCell<Option<*mut Debugger>> = UnsafeCell::new(None);
+struct DebuggerPtr(*mut Debugger);
+unsafe impl Sync for DebuggerPtr {}
+static DEBUGGER_TO_DROP_ON_PANIC: SyncUnsafeCell<DebuggerPtr> = SyncUnsafeCell::new(DebuggerPtr(ptr::null_mut()));
 
 extern "C" fn signal_handler(sig: i32, _: *mut libc::siginfo_t, _: *mut libc::c_void) {
     unsafe {
@@ -79,6 +81,9 @@ fn main() {
     let mut args = &all_args[1..];
     let mut seen_args: HashSet<String> = HashSet::new();
     let mut use_default_debuginfod_urls = false;
+    let mut dump_core = false;
+    let mut core_dumper_buffer_size = 1usize << 20;
+    let mut core_dumper_mode = CoreDumperMode::Fork;
     while !args.is_empty() && args[0].starts_with("-") {
         if let Some(v) = parse_arg(&mut args, &mut seen_args, "--pid", "-p", false, false) {
             attach_pid = match pid_t::from_str(&v) {
@@ -116,6 +121,29 @@ fn main() {
                 Err(e) => eprintln!("error: {}", e),
             }
             return;
+        } else if let Some(_) = parse_arg(&mut args, &mut seen_args, "--dump-core", "", true, false) {
+            dump_core = true;
+        } else if let Some(m) = parse_arg(&mut args, &mut seen_args, "--mode", "", false, false) {
+            // TODO: Document.
+            core_dumper_mode = match &m.to_lowercase()[..] {
+                "direct" => CoreDumperMode::Direct,
+                "live" => CoreDumperMode::Live,
+                "fork" => CoreDumperMode::Fork,
+                // TODO: Add this when userfaultfd mode is implemented: "userfaultfd" => CoreDumperMode::UserFaultFD,
+                _ => {
+                    eprintln!("unrecognized --mode (core dumping mode): '{}'; expected one of: direct, fork, userfaultfd", m);
+                    process::exit(1);
+                }
+            };
+        } else if let Some(s) = parse_arg(&mut args, &mut seen_args, "--buffer-size", "", false, false) {
+            core_dumper_buffer_size = match s.parse::<isize>() {
+                Ok(n) if n == -1 => usize::MAX,
+                Ok(n) if n > 0 => n as usize,
+                Ok(_) | Err(_) => {
+                    eprintln!("invalid --buffer-size (core dumper buffer size): '{}'; expected a positive number or -1 (representing infinity)", s);
+                    process::exit(1);
+                }
+            };
         } else if let Some(_) = parse_arg(&mut args, &mut seen_args, "--fixed-fps", "", true, false) {
             settings.fixed_fps = true;
         } else if let Some(path) = parse_arg(&mut args, &mut seen_args, "--dir", "-d", false, false) {
@@ -153,6 +181,15 @@ fn main() {
             eprintln!("unrecognized argument: '{}' (if it's the command to run, prepend '\\' to escape)", args[0]);
             process::exit(1);
         }
+    }
+
+    if dump_core {
+        if attach_pid.is_none() {
+            eprintln!("--dump-core requires -p <pid>");
+            process::exit(1);
+        }
+        run_core_dumper_tool(attach_pid.unwrap(), core_dumper_buffer_size, core_dumper_mode);
+        return;
     }
 
     if settings.code_dirs.is_empty() {
@@ -237,7 +274,8 @@ fn main() {
             unsafe {
                 if Some(thread::current().id()) == *MAIN_THREAD_ID.get() {
                     #[allow(static_mut_refs)]
-                    if let Some(d) = *DEBUGGER_TO_DROP_ON_PANIC.get() {
+                    let d = (*DEBUGGER_TO_DROP_ON_PANIC.get()).0;
+                    if d != ptr::null_mut() {
                         ptr::drop_in_place(d);
                     }
                 }
@@ -328,7 +366,7 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, core_dump_path: Option<Str
     if let &Some(pid) = &attach_pid {
         debugger = Pin::new(Box::new(Debugger::attach(pid, context.clone(), persistent, supplementary_binaries)?));
         #[allow(static_mut_refs)]
-        unsafe { *DEBUGGER_TO_DROP_ON_PANIC.get() = Some(&mut *debugger); }
+        unsafe { *DEBUGGER_TO_DROP_ON_PANIC.get() = DebuggerPtr(&mut *debugger); }
     } else if let Some(path) = &core_dump_path {
         debugger = Pin::new(Box::new(Debugger::open_core_dump(path, context.clone(), persistent, supplementary_binaries)?));
     } else {
@@ -346,7 +384,7 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, core_dump_path: Option<Str
     }
     defer! {
         #[allow(static_mut_refs)]
-        unsafe {*DEBUGGER_TO_DROP_ON_PANIC.get() = None;}
+        unsafe {*DEBUGGER_TO_DROP_ON_PANIC.get() = DebuggerPtr(ptr::null_mut());}
     }
 
     let mut ui = DebuggerUI::new();

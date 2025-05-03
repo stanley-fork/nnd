@@ -40,3 +40,4 @@ pub mod common_ui;
 pub mod imgui;
 pub mod terminal;
 pub mod dwarf;
+pub mod core_dumper;

@@ -2303,7 +2303,7 @@ impl<'a> DwarfLoader<'a> {
             // Check if we're done.
             let offset = DebugInfoOffset(cursor.offset_from(self.section_slice.slice()));
             if cursor.is_empty() {
-                if self.main_stack.len != 2 { // expected stack contents: fake root, DW_TAG_compile_unit (which doesn't have a DW_TAG_null to terminator at the end, for some reason)
+                if self.main_stack.len != 2 { // expected stack contents: fake root, DW_TAG_compile_unit (which doesn't have a DW_TAG_null terminator at the end, for some reason)
                     return err!(Dwarf, "tree ended early @0x{:x}", offset.0);
                 }
                 return Ok(());
