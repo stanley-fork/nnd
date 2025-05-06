@@ -208,7 +208,7 @@ Value modifiers:
  * Modifiers propagate to descendants. E.g. 'my_struct.#x' will print all struct's fields as hexadecimal.
  * Modifiers propagate through most operations. E.g. 'my_array.#x as [u8]' is the same as '(my_array as [u8]).#x'.
  * 'value.#p' is the opposite of '.#r'. Can be useful with field access: 'my_struct.#r.my_field.#p' re-enables pretty-printing after disabling it to access a raw field."###),
-        "--help-state" => println!(r###"The debugger creates directory ~/.nnd/ and stores a few things there, such as log file and saved state (watches, breakpoints, open tabs).
+        "--help-files" => println!(r###"The debugger creates directory ~/.nnd/ and stores a few things there, such as log file and saved state (watches, breakpoints, open tabs).
 It doesn't create any other files or make any other changes to your system.
 
 Key bindings can be customized by creating ~/.nnd/keys . Read the comments in ~/.nnd/keys.default to get started.
@@ -296,7 +296,7 @@ breakpoints (top right, second tab)
   jump to location when selecting in the breakpoints window
   shows adjusted line
 autosaving/restoring state
-  see --help-state
+  see --help-files
 obscure feature: locations window
   tells where each variable lives (register, memory location, expression, etc) (actually it just prints the DWARF expression)
   for selected disassembly line
