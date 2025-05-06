@@ -124,14 +124,12 @@ fn main() {
         } else if let Some(_) = parse_arg(&mut args, &mut seen_args, "--dump-core", "", true, false) {
             dump_core = true;
         } else if let Some(m) = parse_arg(&mut args, &mut seen_args, "--mode", "", false, false) {
-            // TODO: Document.
             core_dumper_mode = match &m.to_lowercase()[..] {
                 "direct" => CoreDumperMode::Direct,
                 "live" => CoreDumperMode::Live,
                 "fork" => CoreDumperMode::Fork,
-                // TODO: Add this when userfaultfd mode is implemented: "userfaultfd" => CoreDumperMode::UserFaultFD,
                 _ => {
-                    eprintln!("unrecognized --mode (core dumping mode): '{}'; expected one of: direct, fork, userfaultfd", m);
+                    eprintln!("unrecognized --mode (core dumping mode): '{}'; expected one of: direct, fork, live", m);
                     process::exit(1);
                 }
             };

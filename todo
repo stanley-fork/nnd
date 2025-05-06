@@ -33,8 +33,6 @@ list some features in README
 support gnu_debugaltlink, as found in zsh in debuginfod
 get debuglink binaries from debuginfod
 "Expected an attribute value to be a string form" on zsh
-detect vdso in core dumps somehow
-option to create a core dump instead of launching debugger (apparently there's no existing good way to do it)
 buffer input when program is quitting, especially k+r and steps
 test with breakpad minidumps
 function pointers

@@ -603,8 +603,21 @@ fn fuzzy_match(haystack: &[u8], needle_padded: &PaddedString, case_sensitive: bo
     Some((case << 61) | (extra << 32) | haystack.len())
 }
 
-#[cfg(target_feature = "avx2")]
 pub fn memmem_maybe_case_sensitive(haystack: &[u8], needle: &PaddedString, case_sensitive: bool) -> Option<usize> {
+    // Check at runtime if AVX2 is supported.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { memmem_maybe_case_sensitive_avx2(haystack, needle, case_sensitive) };
+        }
+    }
+
+    memmem_maybe_case_sensitive_fallback(haystack, needle, case_sensitive)
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn memmem_maybe_case_sensitive_avx2(haystack: &[u8], needle: &PaddedString, case_sensitive: bool) -> Option<usize> {
     unsafe {
         let needle = needle.get();
         if needle.is_empty() {
@@ -696,6 +709,30 @@ pub fn memmem_maybe_case_sensitive(haystack: &[u8], needle: &PaddedString, case_
             }
         }
 
+        None
+    }
+}
+
+fn memmem_maybe_case_sensitive_fallback(haystack: &[u8], needle: &PaddedString, case_sensitive: bool) -> Option<usize> {
+    let needle = needle.get().as_bytes();
+    if needle.is_empty() {
+        return Some(0);
+    }
+    if needle.len() > haystack.len() {
+        return None;
+    }
+
+    if case_sensitive {
+        haystack.windows(needle.len()).position(|window| window == needle)
+    } else {
+        'outer: for i in 0..=haystack.len() - needle.len() {
+            for j in 0..needle.len() {
+                if !haystack[i + j].eq_ignore_ascii_case(&needle[j]) {
+                    continue 'outer;
+                }
+            }
+            return Some(i);
+        }
         None
     }
 }

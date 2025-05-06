@@ -2,12 +2,17 @@ use crate::{*, util::*, error::*, procfs::*, elf::*};
 use std::{ptr, process, collections::HashSet, io, io::{Read, Write}, panic, fs, str, os::unix::io::FromRawFd, mem, mem::MaybeUninit, time::{Instant, Duration}, slice};
 use libc::pid_t;
 
+// TODO: Colors.
+// TODO: Write to file if stdout is tty.
+
+const CLEAR_LINE: &'static str = "\x1B[2K";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CoreDumperMode {
     Direct,
     Live,
     Fork,
-    UserFaultFD,
+    // TODO: Consider userfaultfd.
 }
 
 struct RangeToDump {
@@ -39,6 +44,8 @@ struct CoreDumper {
     attached_threads: Vec<pid_t>,
     forked_pid: Option<pid_t>,
     // If set, we're currently in the precarious critical section where the target process is in a broken state, and we must restore it before exiting.
+    // (We have it here to do cleanup in case we die during that short critical section; e.g. if for some reason waitpid gets stuck, and the user hits control-C.
+    //  Alternatively, we could just have a timeout for waitpid and be extra careful to not do anything risky in that critical section, but this seems better.)
     fork_state: Option<ForkInjectionState>,
 
     notes_buf: Vec<u8>,
@@ -59,7 +66,7 @@ impl CoreDumper {
         if let Some(forked_pid) = self.forked_pid.take() {
             let r = unsafe {libc::kill(forked_pid, libc::SIGKILL)};
             if r == 0 {
-                eprintln!("killed the forked process (pid {})", forked_pid);
+                eprintln!("(killed the forked pid {})", forked_pid);
             } else {
                 eprintln!("error: failed to kill forked process with pid {}: {}", forked_pid, io::Error::last_os_error());
             }
@@ -68,18 +75,13 @@ impl CoreDumper {
 
     fn detach_ptrace(&mut self) {
         if !self.attached_threads.is_empty() {
-            eprintln!("resuming and detaching {} threads", self.attached_threads.len());
-            let mut all_ok = true;
+            eprintln!("(resuming and detaching {} threads)", self.attached_threads.len());
             for &tid in &self.attached_threads {
                 if let Err(e) = unsafe { ptrace(libc::PTRACE_DETACH, tid, 0, 0) } {
                     eprintln!("warning: failed to detach thread {}: {}", tid, e);
-                    all_ok = false;
                 }
             }
             self.attached_threads.clear();
-            if all_ok {
-                eprintln!("detached cleanly");
-            }
             let detach_time = Instant::now();
             eprintln!("the process was paused for {:.3}s", (detach_time - self.start_time).as_secs_f64());
         }
@@ -103,7 +105,7 @@ impl CoreDumper {
             if added_threads.is_empty() {
                 break;
             }
-            eprintln!("attaching to {} threads", added_threads.len());
+            eprintln!("(attaching to {} threads)", added_threads.len());
             let mut running_threads: HashSet<pid_t> = HashSet::new();
             for tid in added_threads {
                 match unsafe {ptrace(libc::PTRACE_SEIZE, tid, 0, ptrace_seize_flags as u64)} {
@@ -116,7 +118,7 @@ impl CoreDumper {
                 unsafe {ptrace(libc::PTRACE_INTERRUPT, tid, 0, 0)}?;
             }
 
-            eprintln!("waiting for {} threads to stop", running_threads.len());
+            eprintln!("(waiting for {} threads to stop)", running_threads.len());
             while !running_threads.is_empty() {
                 let mut wstatus = 0i32;
                 let tid = unsafe {libc::waitpid(-1, &mut wstatus, 0)};
@@ -168,12 +170,12 @@ impl CoreDumper {
             return err!(Sanity, "no threads");
         }
 
-        eprintln!("retrieving memory maps and registers");
+        eprintln!("(retrieving memory maps and registers)");
         let maps = MemMapsInfo::read_proc_maps(self.pid)?;
         self.prepare_notes(&maps)?;
         let ranges = self.write_headers(&maps)?;
         let headers_end_time = Instant::now();
-        eprintln!("wrote {} of headers in {:.3}s", PrettySize(self.bytes_written), (headers_end_time - self.start_time).as_secs_f64());
+        eprintln!("(wrote {} of headers in {:.3}s)", PrettySize(self.bytes_written), (headers_end_time - self.start_time).as_secs_f64());
         self.bytes_written = 0; // show just memory dump files in progress bar
 
         match self.mode {
@@ -183,7 +185,6 @@ impl CoreDumper {
                 self.do_the_fork_nonsense(&maps)?;
                 self.detach_ptrace();
             }
-            CoreDumperMode::UserFaultFD => return err!(NotImplemented, "userfaultfd mode not implemented"),
         }
 
         self.bytes_total = ranges.iter().map(|r| r.file_size).sum();
@@ -191,14 +192,14 @@ impl CoreDumper {
         let mut buf: Vec<u8> = Vec::with_capacity(self.buffer_size.min(self.bytes_total));
 
         self.dump_memory_ranges(&ranges, &mut buf)?;
-        eprint!("\r"); // erase progress bar
+        eprint!("\r{}", CLEAR_LINE); // erase progress bar
 
         self.cleanup();
         self.detach_ptrace();
 
-        eprintln!("writing remaining buffered data");
+        eprintln!("(writing remaining buffered data)");
         self.flush_buf(&mut buf)?;
-        eprint!("\r");
+        eprint!("\r{}", CLEAR_LINE);
 
         let (read_secs, write_secs) = (self.read_duration.as_secs_f64(), self.write_duration.as_secs_f64());
         let gib = self.bytes_total as f64 / (1usize << 30) as f64;
@@ -262,8 +263,8 @@ impl CoreDumper {
         let original_code = u64::from_le_bytes(original_code.try_into().unwrap());
         let state = ForkInjectionState {tid: tid_to_hijack, addr, original_code, regsets};
 
-        eprintln!("picked thread {} and address 0x{:x} for injecting a fork call", tid_to_hijack, addr);
-        eprintln!("doing a practice run first");
+        eprintln!("(picked thread {} and address 0x{:x} for injecting a fork call)", tid_to_hijack, addr);
+        eprintln!("(doing a practice run first)");
 
         // We're going to temporarily put the process in a broken state, then restore it.
         // Be extra careful to avoid leaving it in the broken state.
@@ -273,19 +274,19 @@ impl CoreDumper {
             return err!(Sanity, "code injection dry run failed, aborting");
         }
 
-        eprintln!("practice run succeeded, proceeding to injecting the fork call");
+        eprintln!("(practice run succeeded, proceeding to injecting the fork call)");
         self.fork_state = Some(state);
 
         let inject_failed = match self.inject_fork(tid_to_hijack, addr, code_to_inject, &regs_struct) {
             Ok(()) => false,
             Err(e) => {
-                eprintln!("failed to inject fork: {}", e);
+                eprintln!("error: failed to inject fork: {}", e);
                 true
             }
         };
 
         let state = self.fork_state.take().unwrap();
-        eprintln!("restoring state");
+        eprintln!("(restoring state)");
         if !Self::restore_state_after_fork(&state, false) {
             return err!(Sanity, "failed to restore state after injecting fork");
         }
@@ -343,7 +344,7 @@ impl CoreDumper {
                         libc::PTRACE_EVENT_FORK => unsafe {
                             let mut new_pid = 0usize;
                             ptrace(libc::PTRACE_GETEVENTMSG, tid, 0, &mut new_pid as *mut _ as u64)?;
-                            eprintln!("forked pid: {}", new_pid);
+                            eprintln!("(forked pid: {})", new_pid);
                             if self.forked_pid.is_some() {
                                 eprintln!("error: multiple forks were reported somehow");
                                 // Keep going, can't stop+restore in this state.
@@ -721,7 +722,9 @@ impl CoreDumper {
         let period_bytes = 1 << 28;
         if bytes > self.bytes_at_last_progress_update + period_bytes {
             self.bytes_at_last_progress_update = bytes;
-            eprint!("\r{}/{}/{}", PrettySize(self.bytes_written), PrettySize(self.bytes_read), PrettySize(self.bytes_total));
+            let bytes_per_second = bytes as f64 / (self.read_duration + self.write_duration).as_secs_f64();
+            let eta = (self.bytes_total * 2 - bytes) as f64 / bytes_per_second;
+            eprint!("\r{}{}/{}/{}  eta: {:.0}s", CLEAR_LINE, PrettySize(self.bytes_written), PrettySize(self.bytes_read), PrettySize(self.bytes_total), eta);
             let _ = io::stderr().flush();
         }
     }
@@ -740,8 +743,18 @@ extern "C" fn fatal_signal_handler(sig: i32, _: *mut libc::siginfo_t, _: *mut li
             eprintln!("failed: fatal signal");
         }
 
-        //asdqwe figure out the correct way to die on signal - call default handler?
-        process::exit(4);
+        // Restore default signal handler and re-raise the signal to proceed with crashing.
+
+        let mut action: libc::sigaction = mem::zeroed();
+        action.sa_sigaction = libc::SIG_DFL;
+        libc::sigemptyset(&mut action.sa_mask);
+        action.sa_flags = 0;
+        libc::sigaction(sig, &action, std::ptr::null_mut());
+
+        libc::raise(sig);
+
+        // In case raising doesn't kill us (shouldn't happen).
+        process::exit(128 + sig as i32);
     }
 }
 

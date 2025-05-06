@@ -3,5 +3,4 @@ target = "x86_64-unknown-linux-musl"
 rustflags = [
 "-C", "force-unwind-tables=yes", # backtrace on panic doen't work in debug mode without this (but works in release for some reason)
 "-C", "force-frame-pointers=yes", # make profilers work slightly better, maybe
-"-C", "target-feature=+avx2", # our case-insensitive search uses AVX2 and can't be bothered with a fallback implementation for very old CPUs
 ]

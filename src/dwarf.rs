@@ -1411,39 +1411,37 @@ fn prepare_abbreviation_actions(attributes: &[AttributeSpecification], layout_id
     Ok(AbbreviationActions {flags_offset: layout.flags_offset, flags_value, actions})
 }
 
-// The input must have at least 31 readable bytes after the end of the string (we're reading in blocks of 32 bytes).
-#[cfg(target_feature = "avx2")]
+// The input must have at least 15 readable bytes after the end of the string (we're reading in blocks of 16 bytes).
 unsafe fn strlen_padded(s: *const u8, n: usize) -> usize {
     let mut ptr = s;
     let end = s.add(n);
-    let zero = _mm256_setzero_si256();
+    let zero = _mm_setzero_si128();
     while ptr < end {
-        let v = _mm256_loadu_si256(ptr as *const __m256i);
-        let eq = _mm256_cmpeq_epi8(v, zero);
-        let mask = _mm256_movemask_epi8(eq);
+        let v = _mm_loadu_si128(ptr as *const __m128i);
+        let eq = _mm_cmpeq_epi8(v, zero);
+        let mask = _mm_movemask_epi8(eq);
         if mask != 0 {
             let mut res = ptr as usize - s as usize;
             res += mask.trailing_zeros() as usize;
             return res
         }
-        ptr = ptr.add(32);
+        ptr = ptr.add(16);
     }
     n
 }
 
 // (We could merge this with strlen_padded() for more speed, but it doesn't seem likely to help much.)
-#[cfg(target_feature = "avx2")]
 unsafe fn is_ascii_padded(s: *const u8, n: usize) -> bool {
     let mut ptr = s;
     let end = s.add(n);
     while ptr < end {
-        let v = _mm256_loadu_si256(ptr as *const __m256i);
-        let mask = _mm256_movemask_epi8(v);
+        let v = _mm_loadu_si128(ptr as *const __m128i);
+        let mask = _mm_movemask_epi8(v);
         if mask != 0 {
             let fail_pos = mask.trailing_zeros() as usize;
             return ptr.add(fail_pos) >= end;
         }
-        ptr = ptr.add(32);
+        ptr = ptr.add(16);
     }
     true
 }
