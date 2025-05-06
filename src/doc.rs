@@ -6,7 +6,7 @@ pub fn print_help_chapter(arg: &str, executable_name: &str) -> bool {
         "--help" => println!(r###"Hi, I'm a debugger.
 
 Please (pretty please!) report all bugs, usability issues, slowness, first impressions, improvement ideas, feature requests, etc.
-If you work at ClickHouse, report to #debugger channel in slack or DM Michael Kolupaev. Otherwise email to mk.al13n+nnd@gmail.com or comment at https://al13n.itch.io/nnd
+Create an issue at https://github.com/al13n321/nnd/issues or send an email to mk.al13n+nnd@gmail.com
 
 Usage:
 {0} command [args...]   - run a program under the debugger (i.e. just prepend {0} to the command line)
@@ -107,7 +107,7 @@ Debugging tips:
  * For clickhouse server, use CLICKHOUSE_WATCHDOG_ENABLE=0. Otherwise it forks on startup, and the debugger doesn't follow forks.
 
 Please (pretty please!) report all bugs, usability issues, slowness, first impressions, improvement ideas, feature requests, etc.
-If you work at ClickHouse, report to #debugger channel in slack or DM Michael Kolupaev. Otherwise email to mk.al13n+nnd@gmail.com or comment at https://al13n.itch.io/nnd"###),
+Create an issue at https://github.com/al13n321/nnd/issues or send an email to mk.al13n+nnd@gmail.com"###),
         "--help-known-problems" =>             println!(r###"Current limitations:
  * Thread filter ('/' in the threads window) is too limited: just a substring match in function name, file name, and thread name. Need to extend it enough to be able to e.g. filter out idle threads waiting for work or epoll.
  * In watch expressions, type names (for casts or type info) have to be spelled *exactly* the same way as they appear in the debug info.
@@ -245,7 +245,7 @@ But what if you need to set breakpoints before the program starts, e.g. to debug
 
 The latter approach is often more convenient than -p, even when both approaches are viable.
 
-(This can even be chained multiple levels deep: `nnd --tty /dev/pts/1 nnd --tty /dev/pts/2 my_program`. The longest chain I've used in practice is 4 nnd-s + 1 clickhouse.)"###),
+(This can even be chained multiple levels deep: `nnd --tty /dev/pts/1 nnd --tty /dev/pts/2 my_program`. The longest chain I've used in practice is 4 nnd-s + 1 other program.)"###),
         "--help-features" => println!(r###"Appendix: raw list of features (optional reading) (a little outdated)
 
 loading debug info
