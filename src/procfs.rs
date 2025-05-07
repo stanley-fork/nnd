@@ -49,6 +49,7 @@ impl SpecialSegmentId {
     fn is_vdso(&self) -> bool { match self { Self::Vdso(_) => true, _ => false } }
 }
 
+// VMA from /proc/<pid>/maps . (This codebase uses the word "mmap" or "map" instead of "VMA" because I didn't know what they're called, sorry, feel free to rename.)
 #[derive(Clone, Debug)]
 pub struct MemMapInfo {
     pub start: usize,
@@ -82,6 +83,7 @@ pub struct MemMapsInfo {
 // We'll call these "static" vs "dynamic" addresses. This struct is responsible for mapping between the two.
 // We expect that the difference between dynamic and static addresses is consistent across all sections that we care about (.text, .data, etc).
 // So, the "mapping" is just one number that needs to be added/subtracted. (It gets a whole struct because it turned out more convenient this way, and in case this mapping turns out to be more complex on other platforms.)
+// (Maybe the correct word is "relocated" addresses instead of "dynamic"?)
 #[derive(Clone)]
 pub struct AddrMap {
     // `dynamic - static`. May be "negative", use wrapping_add.

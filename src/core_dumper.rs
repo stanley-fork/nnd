@@ -184,6 +184,11 @@ impl CoreDumper {
             CoreDumperMode::Fork => {
                 self.do_the_fork_nonsense(&maps)?;
                 self.detach_ptrace();
+                // Tell OOM killer to kill our forked process first if the system runs out of memory.
+                match Self::set_oom_score_to_max(self.forked_pid.clone().unwrap()) {
+                    Ok(()) => (),
+                    Err(e) => eprintln!("info: failed to adjust oom score: {}", e),
+                }
             }
         }
 
@@ -406,6 +411,14 @@ impl CoreDumper {
             return false;
         }
         true
+    }
+
+    fn set_oom_score_to_max(pid: pid_t) -> Result<()> {
+        let path = format!("/proc/{}/oom_score_adj", pid);
+        let value = "1000";
+        eprintln!("(writing '{}' to {})", value, path);
+        fs::File::create(path)?.write_all(value.as_bytes())?;
+        Ok(())
     }
 
     fn ptrace_getregset<'a>(tid: pid_t, regset: u32, buf: &'a mut [u8]) -> Result<&'a [u8]> {

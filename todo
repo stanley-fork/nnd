@@ -36,6 +36,7 @@ get debuglink binaries from debuginfod
 buffer input when program is quitting, especially k+r and steps
 test with breakpad minidumps
 function pointers
+modifying debuggee variables (memory and registers), modifying ip
 log a message if the process forked away
 add alternative default key binds for next/prev search result, F3 is not always available on mac
 async fetch from debuginfod (load symbols without waiting for it, then on success start over)
