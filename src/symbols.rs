@@ -242,7 +242,15 @@ bitflags! { pub struct FunctionFlags: u8 {
 pub struct FunctionAddr(pub usize);
 pub const FUNCTION_ADDR_MAX: usize = 1 << 60; // reserve at least two high bits for function_sorting_key
 impl FunctionAddr {
-    pub fn new(addr: usize) -> Self { assert!(addr < FUNCTION_ADDR_MAX); Self(addr) }
+    pub fn new(mut addr: usize, warn: &mut Limiter) -> Self {
+        if addr >= FUNCTION_ADDR_MAX {
+            if warn.check(line!()) {
+                eprintln!("warning: function address too high: 0x{:x}", addr);
+            }
+            addr = FUNCTION_ADDR_MAX - 1;
+        }
+        Self(addr)
+    }
     pub fn inline(die: DieOffset) -> Self { assert!(die.0 < FUNCTION_ADDR_MAX); Self(FUNCTION_ADDR_MAX + die.0) }
 
     pub fn addr(&self) -> Option<usize> { if self.0 < FUNCTION_ADDR_MAX { Some(self.0) } else { None } }
@@ -1515,7 +1523,7 @@ impl SymbolsLoader {
                         };
                         let name_ref: &'static str = unsafe {mem::transmute(name_ref)};
 
-                        let f_addr = FunctionAddr::new(addr);
+                        let f_addr = FunctionAddr::new(addr, &mut shard.warn);
                         shard.functions.push(FunctionInfo {addr: f_addr, die: DebugInfoOffset(usize::MAX), entry_addr: addr, prev_addr: f_addr, mangled_name: name_ref.as_ptr(), mangled_name_len: name_ref.len() as u32, shard_idx: shard_idx as u16, flags: FunctionFlags::SYMTAB, language: LanguageFamily::Unknown, subfunction_levels: 0..0});
 
                         // For some reason functions' [st_value, st_value + st_size) ranges overlap a lot. Maybe st_size is just not reliable.
@@ -1566,12 +1574,14 @@ impl SymbolsLoader {
                 let s = &self.sym.elves[0].sections[idx];
                 if s.size != 0 && s.address != 0 {
                     let name_ref = shard.sym.misc_arena.add_slice(name.as_bytes());
+                    let start_addr = FunctionAddr::new(s.address, &mut shard.warn);
+                    let end_addr = FunctionAddr::new(s.address.saturating_add(s.size), &mut shard.warn);
                     shard.functions.push(FunctionInfo {
-                        addr: FunctionAddr::new(s.address), prev_addr: FunctionAddr::new(s.address), entry_addr: s.address,
+                        addr: start_addr, prev_addr: start_addr, entry_addr: s.address,
                         die: DebugInfoOffset(usize::MAX), mangled_name: name_ref.as_ptr(), mangled_name_len: name_ref.len() as u32,
                         shard_idx: shard_idx as u16, flags: FunctionFlags::SECTION, language: LanguageFamily::Unknown, subfunction_levels: 0..0});
                     shard.functions.push(FunctionInfo {
-                        addr: FunctionAddr::new(s.address + s.size), prev_addr: FunctionAddr::new(s.address + s.size), entry_addr: 0,
+                        addr: end_addr, prev_addr: end_addr, entry_addr: 0,
                         die: DebugInfoOffset(usize::MAX), mangled_name: "".as_ptr(), mangled_name_len: 0,
                         shard_idx: shard_idx as u16, flags: FunctionFlags::SECTION | FunctionFlags::SENTINEL, language: LanguageFamily::Unknown, subfunction_levels: 0..0});
                 }
@@ -1655,8 +1665,9 @@ impl SymbolsLoader {
     }
 
     fn dedup_functions(&mut self) {
-        let max_function_end = self.shards.iter().map(|s| unsafe {&(*s.get()).max_function_end}).max().copied().unwrap_or(0);
-        let additional_functions = [FunctionInfo {addr: FunctionAddr::new(max_function_end), prev_addr: FunctionAddr::new(max_function_end), entry_addr: 0, mangled_name: "".as_ptr(), mangled_name_len: 0, shard_idx: 0, flags: FunctionFlags::SENTINEL, language: LanguageFamily::Unknown, subfunction_levels: 0..0, die: DebugInfoOffset(usize::MAX)}];
+        let max_function_end = self.shards.iter_mut().map(|s| s.get_mut().max_function_end).max().unwrap_or(0);
+        let end_addr = FunctionAddr::new(max_function_end, &mut self.shards[0].get_mut().warn);
+        let additional_functions = [FunctionInfo {addr: end_addr, prev_addr: end_addr, entry_addr: 0, mangled_name: "".as_ptr(), mangled_name_len: 0, shard_idx: 0, flags: FunctionFlags::SENTINEL, language: LanguageFamily::Unknown, subfunction_levels: 0..0, die: DebugInfoOffset(usize::MAX)}];
         let mut sources: Vec<&[FunctionInfo]> = self.shards.iter().map(|s| unsafe {&(*s.get()).functions[..]}).collect();
         sources.push(&additional_functions);
         let mut iter = MergeIterator::new(sources, |f| !Self::function_sorting_key(f));
@@ -2508,8 +2519,8 @@ impl<'a> DwarfLoader<'a> {
                             self.subfunction_stack.push_uninit(&mut self.main_stack.top_mut().flags).reset(sf_idx, /*subfunction_level*/ 0);
                             for (i, range) in ranges_top.pc_ranges.iter().enumerate() {
                                 let mut f = f.clone();
-                                f.addr = FunctionAddr::new(range.begin as usize);
-                                f.prev_addr = FunctionAddr::new(ranges_top.pc_ranges[(i + ranges_top.pc_ranges.len() - 1) % ranges_top.pc_ranges.len()].begin as usize);
+                                f.addr = FunctionAddr::new(range.begin as usize, &mut self.shard.warn);
+                                f.prev_addr = FunctionAddr::new(ranges_top.pc_ranges[(i + ranges_top.pc_ranges.len() - 1) % ranges_top.pc_ranges.len()].begin as usize, &mut self.shard.warn);
                                 self.shard.functions.push(f);
 
                                 function_top.subfunction_events.push(SubfunctionEvent {addr: range.begin as usize, subfunction_idx: sf_idx, signed_level: 1});
