@@ -224,7 +224,7 @@ impl Default for Palette {
             placeholder_fill: Some(('.', Style {fg: white.darker(), bg: black, ..D!()})),
             truncation_indicator: (("…".to_string(), "…".to_string(), Style {fg: white.darker(), ..D!()})),
             hscroll_indicator: (("❮".to_string(), "❯".to_string(), Style {fg: white.darker(), ..D!()})),
-            line_wrap_indicator: ("\\".to_string(), "\\".to_string(), Style {fg: white.darker(), ..D!()}),
+            line_wrap_indicator: ("↳".to_string(), "↵".to_string(), Style {fg: white.darker(), ..D!()}),
 
             progress_bar: Style {fg: blue, bg: Color(30, 30, 30), ..D!()},
             scroll_bar_background: Style {fg: white.darker(), ..D!()},

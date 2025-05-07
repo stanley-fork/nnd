@@ -29,7 +29,8 @@ test with watches window filled with long arrays (I saw 50ms frames when there a
 investigate unresponsive ui when conditional breakpoint is hit at a high rate
 
 todo:
-list some features in README
+don't require cfa for steps
+unwind: fall back to assuming non-omitted frame pointer if no .eh_frame info
 support gnu_debugaltlink, as found in zsh in debuginfod
 get debuglink binaries from debuginfod
 "Expected an attribute value to be a string form" on zsh
