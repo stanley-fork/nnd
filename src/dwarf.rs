@@ -1278,7 +1278,7 @@ fn prepare_attribute_action(attr: AttributeSpecification, layout: &AttributeStru
                 _ => found_match = false,
             }
             AttributeType::LocationListsOffset => match attr.form {
-                DW_FORM_loclistx | DW_FORM_sec_offset => (),
+                DW_FORM_loclistx | DW_FORM_sec_offset | DW_FORM_data4 | DW_FORM_data8 => (),
                 _ => found_match = false,
             }
             AttributeType::Flag => match attr.form {
@@ -1286,14 +1286,15 @@ fn prepare_attribute_action(attr: AttributeSpecification, layout: &AttributeStru
                 _ => found_match = false,
             }
             AttributeType::SectionOffset => match attr.form {
-                DW_FORM_sec_offset => (),
+                // Allow data4 and data8 to partially support DWARF 3.
+                DW_FORM_sec_offset | DW_FORM_data4 | DW_FORM_data8 => (),
                 _ => found_match = false,
             }
 
             AttributeType::Ranges => match attr.name {
                 DW_AT_ranges => match attr.form {
                     // Compatibility: the sec_offset case would need additional logic to support split dwarf (dwo).
-                    DW_FORM_rnglistx | DW_FORM_sec_offset => *flags |= DwarfRanges::RANGES,
+                    DW_FORM_rnglistx | DW_FORM_sec_offset | DW_FORM_data4 | DW_FORM_data8 => *flags |= DwarfRanges::RANGES,
                     _ => found_match = false,
                 }
                 DW_AT_low_pc => match attr.form {
