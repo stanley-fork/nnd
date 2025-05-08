@@ -3193,6 +3193,8 @@ impl WindowContent for StackWindow {
             Column::new("location", AutoSize::Remainder(1.0), false),
             Column::new("address", AutoSize::Fixed(12), false),
             Column::new("bin", AutoSize::Fixed(3), false),
+            // Hidden column only visible in the tooltip.
+            Column::new("", AutoSize::Fixed(0), false).with_spacing(0),
         ]);
 
         let write_stack_truncated_error = |e: &Error, ui: &mut UI| -> usize {
@@ -3257,6 +3259,9 @@ impl WindowContent for StackWindow {
                 ui_writeln!(ui, default_dim, "?");
             }
             table.text_cell(ui);
+
+            ui_writeln!(ui, default_dim, "unwind info: {:?}", frame.unwind_source);
+            table.text_cell(ui);
         }
         if state.stack.subframes.is_empty() {
             if let Some(e) = &state.stack.truncated {
@@ -3268,6 +3273,7 @@ impl WindowContent for StackWindow {
                 table.text_cell(ui);
 
                 ui.text.close_line();
+                table.text_cell(ui);
                 table.text_cell(ui);
                 table.text_cell(ui);
             }

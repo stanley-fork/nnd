@@ -13,6 +13,15 @@ pub struct UnwindInfo {
     debug_frame: Option<UnwindSectionIndex<DebugFrame<DwarfSlice>>>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UnwindInfoSource {
+    None,
+    EhFrame,
+    DebugFrame,
+    SigReturn,
+    FramePointer,
+}
+
 #[derive(Clone)]
 pub struct StackFrame {
     pub addr: usize,
@@ -42,8 +51,11 @@ pub struct StackFrame {
 
     // Indices in StackTrace.subframes, from innermost to outermost inlined functions. Last one represents the frame. Not empty.
     pub subframes: Range<usize>,
+
+    // How we stepped from this stack frame to the next. Just to show in UI.
+    pub unwind_source: UnwindInfoSource,
 }
-impl Default for StackFrame { fn default() -> Self { Self {addr: 0, pseudo_addr: 0, regs: Registers::default(), frame_base: err!(Dwarf, "no frame base"), binary_id: None, addr_static_to_dynamic: 0, subframes: 0..0, fde_initial_address: 0, lsda: None} } }
+impl Default for StackFrame { fn default() -> Self { Self {addr: 0, pseudo_addr: 0, regs: Registers::default(), frame_base: err!(Dwarf, "no frame base"), binary_id: None, addr_static_to_dynamic: 0, subframes: 0..0, fde_initial_address: 0, lsda: None, unwind_source: UnwindInfoSource::None} } }
 
 #[derive(Clone)]
 pub struct StackSubframe {
@@ -88,6 +100,28 @@ pub struct FileLineInfo {
     pub filename: PathBuf,
     pub path: PathBuf,
     pub version: FileVersionInfo,
+}
+
+// We recognize some situations by looking at machine code near the instruction pointer.
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum SpecialUnwindLocation {
+    None,
+    
+    // Signal trampoline:
+    //   mov rax, 15
+    //   syscall
+    SigReturn,
+
+    // Function prelude:
+    //   push rbp
+    //   mov rbp,rsp
+    PreludeStart,
+    PreludeMiddle,
+
+    // Function epilogue:
+    //   pop rbp
+    //   ret
+    EpilogueMiddle,
 }
 
 
@@ -186,27 +220,40 @@ impl UnwindInfo {
         Ok(res)
     }
 
-    pub fn find_row_and_eval_cfa<'a>(&self, memory: &mut CachedMemReader, binary: &Binary, scratch: &'a mut UnwindScratchBuffer, pseudo_addr: usize, regs: &Registers) -> Result<(FrameDescriptionEntry<DwarfSlice>, &'a UnwindTableRow<usize>, /*cfa*/ usize, /*cfa_dubious*/ bool, /*section*/ DwarfSlice)> {
+    pub fn find_row_and_eval_cfa<'a>(&self, memory: &mut CachedMemReader, binary: &Binary, scratch: &'a mut UnwindScratchBuffer, pseudo_addr: usize, regs: &Registers) -> Result<Option<(FrameDescriptionEntry<DwarfSlice>, &'a UnwindTableRow<usize>, /*cfa*/ usize, /*cfa_dubious*/ bool, /*section*/ DwarfSlice, UnwindInfoSource)>> {
         let static_pseudo_addr = binary.addr_map.dynamic_to_static(pseudo_addr);
+        let mut unwind_source = UnwindInfoSource::None;
         let found = match &self.debug_frame {
-            Some(section) => section.find_fde_and_row(static_pseudo_addr, scratch)?,
+            Some(section) => {
+                let r = section.find_fde_and_row(static_pseudo_addr, scratch)?;
+                if r.is_some() {
+                    unwind_source = UnwindInfoSource::DebugFrame;
+                }
+                r
+            }
             None => None,
         };
         let found = match found {
             Some(x) => Some(x),
             None => match &self.eh_frame {
-                Some(section) => section.find_fde_and_row(static_pseudo_addr, scratch)?,
+                Some(section) => {
+                    let r = section.find_fde_and_row(static_pseudo_addr, scratch)?;
+                    if r.is_some() {
+                        unwind_source = UnwindInfoSource::EhFrame;
+                    }
+                    r
+                }
                 None => None,
             }
         };
         let (fde, row, section) = match found {
             Some(x) => x,
-            None => return err!(Dwarf, "no unwind info for address"),
+            None => return Ok(None),
         };
         let (cfa, cfa_dubious) = eval_cfa_rule(row.cfa(), fde.cie().encoding(), section, &regs, memory, binary)?;
 
         let row: &'static UnwindTableRow<usize> = unsafe {mem::transmute(row)}; // work around borrow checker weirdness by transmuting to 'static and back
-        Ok((fde, row, cfa as usize, cfa_dubious, section))
+        Ok(Some((fde, row, cfa as usize, cfa_dubious, section, unwind_source)))
     }
 
     fn list_lsdas(&self, sorted_addr_ranges: &Vec<Range<usize>>, addr_map: &AddrMap) -> Result<Vec<(/*fde_initial_address*/ usize, /*lsda*/ gimli::Pointer)>> {
@@ -227,14 +274,71 @@ impl UnwindInfo {
 
     // Assigns cfa and return address in current frame and returns registers for next frame.
     pub fn step(&self, memory: &mut CachedMemReader, binary: &Binary, scratch: &mut UnwindScratchBuffer, pseudo_addr: usize, frame: &mut StackFrame) -> Result<(Registers, /*is_signal_trampoline*/ bool)> {
-        if let Some(r) = self.step_through_sig_return(memory, binary, &mut frame.regs)? {
-            return Ok((r, true));
+        let addr = frame.regs.get(RegisterIdx::Rip)?.0 as usize;
+        let special = self.recognize_special_location(memory, binary, addr);
+
+        if special == SpecialUnwindLocation::SigReturn {
+            let new_regs = self.step_through_sig_return(memory, &mut frame.regs)?;
+            frame.unwind_source = UnwindInfoSource::SigReturn;
+            if let Some((x, dub)) = new_regs.get_option(RegisterIdx::Rip) {
+                frame.regs.set(RegisterIdx::Ret, x, dub);
+            }
+            return Ok((new_regs, true));
         }
 
-        let (fde, row, cfa, cfa_dubious, section) = self.find_row_and_eval_cfa(memory, binary, scratch, pseudo_addr, &frame.regs)?;
+        if let Some(r) = self.step_using_dwarf(memory, binary, scratch, pseudo_addr, frame)? {
+            return Ok(r);
+        }
+
+        let r = self.step_using_frame_pointer(special, memory, frame)?;
+        frame.unwind_source = UnwindInfoSource::FramePointer;
+        Ok((r, false))
+    }
+
+    fn step_using_frame_pointer(&self, special: SpecialUnwindLocation, memory: &mut CachedMemReader, frame: &mut StackFrame) -> Result<Registers> {
+        // push rbp         PreludeStart
+        // mov rbp,rsp      PreludeMiddle
+        // [function body]
+        // pop rbp
+        // ret              EpilogueMiddle
+
+        let rbp = frame.regs.get(RegisterIdx::Rbp)?.0 as usize;
+        let rsp = frame.regs.get(RegisterIdx::Rsp)?.0 as usize;
+        let prev_rsp = match special {
+            SpecialUnwindLocation::None => rbp.saturating_add(16),
+            SpecialUnwindLocation::PreludeMiddle => rsp.saturating_add(16),
+            SpecialUnwindLocation::PreludeStart | SpecialUnwindLocation::EpilogueMiddle => rsp.saturating_add(8),
+            SpecialUnwindLocation::SigReturn => panic!("huh"),
+        };
+        if prev_rsp % 16 != 0 || prev_rsp < 16 {
+            return err!(ProcessState, "rsp not aligned");
+        }
+        let cfa = prev_rsp - 16; // effective rbp
+        frame.regs.set(RegisterIdx::Cfa, cfa as u64, /*dubious*/ true);
+
+        let prev_rbp = match special {
+            SpecialUnwindLocation::None | SpecialUnwindLocation::PreludeMiddle => memory.read_usize(cfa)?,
+            SpecialUnwindLocation::PreludeStart | SpecialUnwindLocation::EpilogueMiddle => rbp,
+            SpecialUnwindLocation::SigReturn => panic!("huh"),
+        };
+
+        let mut new_regs = Registers::default();
+        let prev_rip = memory.read_usize(cfa + 8)?;
+        frame.regs.set(RegisterIdx::Ret, prev_rip as u64, /*dubious*/ true);
+        new_regs.set(RegisterIdx::Rip, prev_rip as u64, /*dubious*/ true);
+        new_regs.set(RegisterIdx::Rsp, prev_rsp as u64, /*dubious*/ true);
+        if prev_rbp > cfa { // don't get stuck in infinite loop if unwinding through garbage
+            new_regs.set(RegisterIdx::Rbp, prev_rbp as u64, /*dubious*/ true);
+        }
+        Ok(new_regs)
+    }
+
+    fn step_using_dwarf(&self, memory: &mut CachedMemReader, binary: &Binary, scratch: &mut UnwindScratchBuffer, pseudo_addr: usize, frame: &mut StackFrame) -> Result<Option<(Registers, /*is_signal_trampoline*/ bool)>> {
+        let Some((fde, row, cfa, cfa_dubious, section, unwind_source)) = self.find_row_and_eval_cfa(memory, binary, scratch, pseudo_addr, &frame.regs)? else { return Ok(None) };
         frame.regs.set(RegisterIdx::Cfa, cfa as u64, cfa_dubious);
         frame.fde_initial_address = fde.initial_address() as usize;
         frame.lsda = fde.lsda().clone();
+        frame.unwind_source = unwind_source;
 
         let mut new_regs = Registers::default();
         let mut seen_regs = 0usize; // to distinguish registers that were explicitly set to RegisterRule::Undefined from ones that weren't specified
@@ -308,53 +412,81 @@ impl UnwindInfo {
             // Typically the return address register is just RIP, and for the root stack frame there's no RIP in new_regs.
             if new_regs.has(reg) {
                 let (v, dubious) = new_regs.get(reg).unwrap();
-                new_regs.set(RegisterIdx::Ret, v, dubious);
+                frame.regs.set(RegisterIdx::Ret, v, dubious);
             }
         }
 
-        Ok((new_regs, fde.is_signal_trampoline()))
+        Ok(Some((new_regs, fde.is_signal_trampoline())))
     }
 
-    fn step_through_sig_return(&self, memory: &mut CachedMemReader, binary: &Binary, regs: &mut Registers) -> Result<Option<Registers>> {
+    // Look at machine code near the instruction pointer and recognize a few common patterns.
+    fn recognize_special_location(&self, memory: &mut CachedMemReader, binary: &Binary, addr: usize) -> SpecialUnwindLocation {
         // Recognize signal trampoline machine code, like GDB does. Because some libc implementations (musl) don't have correct DWARF unwind information for this function.
-        const CODE: [u8; 9] = [
-            0x48u8, 0xc7, 0xc0, 0x0f, 0x00, 0x00, 0x00, // mov rax, 15
-            0x0f, 0x05                                  // syscall
+        const SIG_RETURN_CODE: [u8; 9] = [
+            0x48, 0xc7, 0xc0, 0x0f, 0x00, 0x00, 0x00, // mov rax, 15
+            0x0f, 0x05                                // syscall
         ];
-        const MID: usize = 7usize; // size of the first instruction
+        const SIG_RETURN_MID: usize = 7; // size of the first instruction
 
-        let addr = regs.get(RegisterIdx::Rip).unwrap().0 as usize;
+        // There are two equivalent encodings of these instructions, and of course different compilers use different ones.
+        const PRELUDE_CODE_A: [u8; 4] = [
+            0x55,            // push rbp
+            // PreludeMiddle
+            0x48, 0x89, 0xe5 // mov rbp, rsp
+        ];
+        const PRELUDE_CODE_B: [u8; 4] = [
+            0x55,            // push rbp
+            // PreludeMiddle
+            0x48, 0x8b, 0xec // mov rbp, rsp
+        ];
+        const PRELUDE_MID: usize = 1;
+
+        const EPILOGUE_CODE: [u8; 2] = [
+            0x5d, // pop rbp
+            // EpilogueMiddle
+            0xc3  // ret
+        ];
+        const EPILOGUE_MID: usize = 1;
+
+        const MAX_MID: usize = 7;
+        const MAX_LEN: usize = 9;
+        // Rust moment.
+        debug_assert!(MAX_MID == SIG_RETURN_MID.max(PRELUDE_MID).max(EPILOGUE_MID));
+        debug_assert!(MAX_LEN == SIG_RETURN_CODE.len().max(PRELUDE_CODE_A.len()).max(EPILOGUE_CODE.len()));
+
         // Prefer to read the machine code from file rather than memory to avoid our breakpoint instructions. And it's probably faster because we have it mmapped.
-        let mut data_buf = [MaybeUninit::<u8>::uninit(); MID + CODE.len()];
+        let mut data_buf = [MaybeUninit::<u8>::uninit(); MAX_MID + MAX_LEN];
         let elf = &self.elves[0];
-        let (data, pos) = if let &Some(section_idx) = &elf.text_section {
+        let (data, offset) = if let &Some(section_idx) = &elf.text_section {
             let pc = binary.addr_map.dynamic_to_static(addr);
             let section = &elf.sections[section_idx];
-            if pc < section.address || pc >= section.address + section.size {
-                return Ok(None);
+            let data = elf.section_data(section_idx);
+            if pc < section.address || pc >= section.address + data.len() {
+                return SpecialUnwindLocation::None;
             }
             (elf.section_data(section_idx), pc - section.address)
         } else {
             // (This fallback is currently unnecessary, we always expect to have .text section. Even for binaries reconstructed from core dump we add a fake .text section, for convenience.)
-            (match memory.read_uninit(addr.saturating_sub(MID), &mut data_buf) {
+            let offset = MAX_MID.min(addr);
+            (match memory.read_uninit(addr - offset, &mut data_buf[..offset+MAX_LEN]) {
                 Ok(x) => &*x,
-                Err(_) => return Ok(None),
-            }, MID)
+                Err(_) => return SpecialUnwindLocation::None,
+            }, offset)
         };
 
-        let matches = match data[pos] {
-            x if x == CODE[0] => pos + CODE.len() <= data.len() && &CODE == &data[pos..pos+CODE.len()],
-            x if x == CODE[MID] => pos >= MID && pos-MID+CODE.len() <= data.len() && &CODE == &data[pos-MID..pos-MID+CODE.len()],
-            _ => false,
-        };
-        if !matches {
-            return Ok(None);
+        match data[offset] {
+            // (Compare first byte first for speed.)
+            x if x == SIG_RETURN_CODE[0] && data[offset..].starts_with(&SIG_RETURN_CODE) => SpecialUnwindLocation::SigReturn,
+            x if x == SIG_RETURN_CODE[SIG_RETURN_MID] && offset >= SIG_RETURN_MID && data[offset-SIG_RETURN_MID..].starts_with(&SIG_RETURN_CODE) => SpecialUnwindLocation::SigReturn,
+            x if x == PRELUDE_CODE_A[0] && (data[offset..].starts_with(&PRELUDE_CODE_A) || data[offset..].starts_with(&PRELUDE_CODE_B)) => SpecialUnwindLocation::PreludeStart,
+            x if x == PRELUDE_CODE_A[PRELUDE_MID] && offset >= PRELUDE_MID && (data[offset-PRELUDE_MID..].starts_with(&PRELUDE_CODE_A) || data[offset-PRELUDE_MID..].starts_with(&PRELUDE_CODE_B)) => SpecialUnwindLocation::PreludeMiddle,
+            x if x == EPILOGUE_CODE[EPILOGUE_MID] && offset >= EPILOGUE_MID && data[offset-EPILOGUE_MID..].starts_with(&EPILOGUE_CODE) => SpecialUnwindLocation::EpilogueMiddle,
+            _ => SpecialUnwindLocation::None,
         }
-        if !regs.has(RegisterIdx::Rsp) {
-            return Ok(None);
-        }
+    }
 
-        let offset = regs.get(RegisterIdx::Rsp).unwrap().0 as usize + offsetof!(libc::ucontext_t, uc_mcontext);
+    fn step_through_sig_return(&self, memory: &mut CachedMemReader, regs: &mut Registers) -> Result<Registers> {
+        let offset = regs.get(RegisterIdx::Rsp)?.0 as usize + offsetof!(libc::ucontext_t, uc_mcontext);
         let mut mcontext: libc::mcontext_t;
         unsafe {
             mcontext = mem::zeroed();
@@ -370,7 +502,7 @@ impl UnwindInfo {
         // Is there a way to get simd registers too? I couldn't figure it out. mcontext.fpregs points to fpstate,
         // which contains xmm registers, but doesn't seem to be followed by the rest of xsave data.
 
-        Ok(Some(new_regs))
+        Ok(new_regs)
     }
 }
 

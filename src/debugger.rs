@@ -1378,13 +1378,37 @@ impl Debugger {
             }
 
             step.cfa = frame.regs.get(RegisterIdx::Cfa)?.0 as usize;
+
+            if step.internal_kind == StepKind::Out {
+                // Check if caller frame's cfa is equal to this frame's cfa. Such nonsense happens in .plt for some reason, and it breaks step-out.
+                if let Some(caller_frame) = stack.frames.get(subframe.frame_idx + 1) {
+                    if let Some((caller_cfa, _)) = caller_frame.regs.get_option(RegisterIdx::Cfa) {
+                        if caller_cfa as usize == step.cfa {
+                            eprintln!("warning: two stack frames have equal cfa; step-out may be janky");
+                            // Make step-out complete on next stop. Normally that's the stop at return address, as desired.
+                            // But if there's a spurious stop before that, the step will finish early.
+                            step.cfa -= 1;
+                        }
+                    }
+                }
+            }
         }
 
         if breakpoint_types.contains(&StepBreakpointType::AfterRet) {
-            match frame.regs.get(RegisterIdx::Ret) {
-                Ok((addr, _dubious)) => breakpoints_to_add.push((StepBreakpointType::AfterRet, addr as usize)),
-                Err(e) if step.internal_kind == StepKind::Out => return err!(ProcessState, "no return address"),
-                Err(_) => (),
+            let return_addr = match frame.regs.get_option(RegisterIdx::Ret) {
+                Some((x, _)) => Some(x),
+                None => match stack.frames.get(subframe.frame_idx + 1) {
+                    Some(caller_frame) => match caller_frame.regs.get_option(RegisterIdx::Rip) {
+                        Some((x, _)) => Some(x),
+                        None => None,
+                    }
+                    None => None,
+                }
+            };
+            match return_addr {
+                Some(addr) => breakpoints_to_add.push((StepBreakpointType::AfterRet, addr as usize)),
+                None if step.internal_kind == StepKind::Out => return err!(ProcessState, "no return address"),
+                None => (),
             }
         }
 
@@ -2433,7 +2457,16 @@ impl Debugger {
                 eprintln!("warning: no frame for addr 0x{:x} (when determining cfa for step): {}", addr, e);
                 return None;
             }
-            Ok((_, _, cfa, _, _)) => Some(cfa),
+            Ok(None) => {
+                if let Some((x, _)) = regs.get_option(RegisterIdx::Rbp) {
+                    Some(x as usize)
+                } else {
+                    log!(log, "no frame for addr 0x{:x}: no unwind info and no rbp", addr);
+                    eprintln!("warning: no frame for addr 0x{:x} (when determining cfa for step): no unwind info and no rbp", addr);
+                    return None;
+                }
+            }
+            Ok(Some((_, _, cfa, _, _, _))) => Some(cfa),
         }
     }
     
