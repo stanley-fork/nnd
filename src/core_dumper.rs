@@ -324,8 +324,8 @@ impl CoreDumper {
             //  * SIGTRAP when the thread hits the int3 after the syscall. Now we can restore and detach.
             //    (Then why do we need PTRACE_O_TRACEFORK at all? To make ptrace attach+stop the newly forked process,
             //    instead of letting it run and immediately die on the int3.)
-            //  * There's also ptrace stop event for the newly forked process, but we don't need it and don't
-            //    waitpid the new process.
+            //  * There's also ptrace stop event for the newly forked process, but we don't need it and don't call
+            //    waitpid() for the new process.
             loop {
                 let mut wstatus = 0i32;
                 let r = unsafe {libc::waitpid(tid, &mut wstatus, 0)};
@@ -351,13 +351,13 @@ impl CoreDumper {
                             ptrace(libc::PTRACE_GETEVENTMSG, tid, 0, &mut new_pid as *mut _ as u64)?;
                             eprintln!("(forked pid: {})", new_pid);
                             if self.forked_pid.is_some() {
-                                eprintln!("error: multiple forks were reported somehow");
+                                eprintln!("error: multiple fork events were reported by ptrace");
                                 // Keep going, can't stop+restore in this state.
                             }
                             self.forked_pid = Some(new_pid as pid_t);
                             unsafe {ptrace(libc::PTRACE_CONT, tid, 0, 0)}?;
                         }
-                        0 if self.forked_pid.is_none() => return err!(ProcessState, "hijacked thread got unexpected SIGTRAP before fork"),
+                        0 if self.forked_pid.is_none() => return err!(ProcessState, "fork failed"),
                         _ if self.forked_pid.is_none() => return err!(ProcessState, "hijacked thread got unexpected ptrace stop before fork"),
                         0 => break,
                         _ => {
@@ -366,11 +366,11 @@ impl CoreDumper {
                         }
                     }
                 } else if libc::WIFEXITED(wstatus) {
-                    return err!(ProcessState, "hijacked thread exited with code {} before calling fork", libc::WEXITSTATUS(wstatus));
+                    return err!(ProcessState, "hijacked thread exited with code {}", libc::WEXITSTATUS(wstatus));
                 } else if libc::WIFSIGNALED(wstatus) {
-                    return err!(ProcessState, "hijacked thread was terminated by signal {} before calling fork", signal_name(libc::WTERMSIG(wstatus)));
+                    return err!(ProcessState, "hijacked thread was terminated by signal {}", signal_name(libc::WTERMSIG(wstatus)));
                 } else if libc::WIFSTOPPED(wstatus) {
-                    return err!(ProcessState, "hijacked thread stopped in unexpected way (status=0x{:x}) before calling fork", wstatus);
+                    return err!(ProcessState, "hijacked thread stopped in unexpected way (status=0x{:x})", wstatus);
                 } else {
                     return err!(Internal, "waitpid() returned unexpected status: {}", wstatus);
                 }
