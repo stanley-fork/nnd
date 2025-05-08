@@ -235,17 +235,23 @@ fn main() {
         process::exit(1);
     }
 
+    // This redirects stderr to the log file, so we have to do it early.
+    let persistent = PersistentState::init();
+    settings.debuginfod_cache_path = persistent.debuginfod_cache_path.clone();
+    let (log_file_path, original_stderr_fd) = (persistent.log_file_path.clone(), persistent.original_stderr_fd);
+
     let supplementary_binaries = match SymbolsRegistry::open_supplementary_binaries(&settings) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("{}", e);
+            if let &Some(fd) = &original_stderr_fd {
+                let mut original_stderr = std::mem::ManuallyDrop::new(unsafe {std::fs::File::from_raw_fd(fd)});
+                let _ = writeln!(original_stderr, "error: {}", e);
+                let _ = original_stderr.flush();
+            }
             process::exit(1);
         }
     };
-
-    // This redirects stderr to the log file, so we have to do it early.
-    let persistent = PersistentState::init();
-    settings.debuginfod_cache_path = persistent.debuginfod_cache_path.clone();
 
     // There are two pieces of best-effort cleanup we need to do on panic:
     //  * Remove breakpoints and detach from the process, if attached with -p.
@@ -259,7 +265,6 @@ fn main() {
     //  E.g. maybe some destructor anywhere in the code base inadvertently expects the struct to be in certain clean state -
     //  usually no one will ever notice that until it happens in practice. Or maybe some destructor does something unnecessary and slow,
     //  e.g. wait for background work to complete. In contrast, the panic handler is small and doesn't make many assumptions.)
-    let (log_file_path, original_stderr_fd) = (persistent.log_file_path.clone(), persistent.original_stderr_fd);
     unsafe {*MAIN_THREAD_ID.get() = Some(thread::current().id())}; // assign before spawning any threads
     {
         let default_hook = panic::take_hook();
