@@ -326,7 +326,9 @@ pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) -> /*binaries_add
                 };
                 // glibc/include/link.h seems to imply that values 0, -1, and -2 can all be used as missing value marker.
                 let tls_offset = if tls_offset == 0 || tls_offset >= usize::MAX - 1 {
-                    eprintln!("warning: binary has dynamic or missing tls_offset ({}): '{}'", tls_offset, bin.locator.path);
+                    if !bin.tls_offset.as_ref().is_err_and(|e| e.is_not_implemented()) {
+                        eprintln!("info: binary has dynamic or missing tls_offset ({}): '{}'", tls_offset, bin.locator.path);
+                    }
                     err!(NotImplemented, "dynamic TLS models are not supported")
                 } else {
                     Ok(tls_offset)

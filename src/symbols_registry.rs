@@ -124,7 +124,7 @@ impl SymbolsRegistry {
             }
         }
 
-        let mut binary = Binary {locator: locator.clone(), build_id: build_id.clone(), id, elves: err!(Loading, "loading symbols"), symbols: err!(Loading, "loading symbols"), unwind: err!(Loading, "loading symbols"), is_mapped: false, addr_map: AddrMap::default(), tls_offset: err!(Loading, "loading"), mmap_idx: 0, priority_idx: 0, notices: Vec::new(), warnings: Vec::new()};
+        let mut binary = Binary {locator: locator.clone(), build_id: build_id.clone(), id, elves: err!(Loading, "loading symbols"), symbols: err!(Loading, "loading symbols"), unwind: err!(Loading, "loading symbols"), is_mapped: false, addr_map: AddrMap::default(), tls_offset: err!(Loading, "TLS offset not known"), mmap_idx: 0, priority_idx: 0, notices: Vec::new(), warnings: Vec::new()};
 
         if let Some(id) = &build_id {
             binary.notices.push(format!("build id: {}", hexdump(id, 1000)));

@@ -72,6 +72,7 @@ impl Error {
     pub fn is_no_variable(&self) -> bool { match &self.error { ErrorEnum::Code(ErrorCode::NoVariable) => true, _ => false, } }
     pub fn is_not_container(&self) -> bool { match &self.error { ErrorEnum::Code(ErrorCode::NotContainer) => true, _ => false, } }
     pub fn is_type_mismatch(&self) -> bool { match &self.error { ErrorEnum::Code(ErrorCode::TypeMismatch) => true, _ => false, } }
+    pub fn is_not_implemented(&self) -> bool { match &self.error { ErrorEnum::Code(ErrorCode::NotImplemented) => true, _ => false, } }
 }
 
 impl From<io::Error> for Error {
