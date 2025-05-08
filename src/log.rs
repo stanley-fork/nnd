@@ -85,6 +85,7 @@ impl Drop for ProfileScope {
         let mut secs = self.start.elapsed().as_secs_f64();
         if self.multi {
             let end_tsc = rdtsc();
+            let end_tsc = end_tsc.max(self.start_tsc + 1);
             secs = secs * (self.total_tsc as f64 / ((end_tsc - self.start_tsc) as f64));
         }
         if self.threshold_secs <= 0.0 || secs >= self.threshold_secs {
@@ -103,7 +104,7 @@ impl TscScope {
 
     pub fn restart(&mut self) -> u64 {
         let t = rdtsc();
-        t - mem::replace(&mut self.start, t)
+        t.saturating_sub(mem::replace(&mut self.start, t))
     }
 
     pub fn finish(mut self) -> u64 {
@@ -120,8 +121,7 @@ impl TscScopeExcludingSyscalls {
 
     pub fn restart(&mut self, prof: &ProfileBucket) -> u64 {
         let t = prof.syscall_tsc;
-        assert!(t >= self.prev_syscall_tsc, "syscall tsc went backwards: {} {}", self.prev_syscall_tsc, t);
-        self.scope.restart().saturating_sub(t - mem::replace(&mut self.prev_syscall_tsc, t))
+        self.scope.restart().saturating_sub(t.saturating_sub(mem::replace(&mut self.prev_syscall_tsc, t)))
     }
     pub fn finish(mut self, prof: &ProfileBucket) -> u64 {
         self.restart(prof)
@@ -176,8 +176,8 @@ impl ProfileBucket {
 
     pub fn finish(&mut self, end_time: Instant, end_tsc: u64) {
         assert!(self.start_tsc != 0);
-        // It's probably in principle possible for rdtsc to decrease or stay the same. But if it fails to increase over periodic_timer period (currently 250ms by default) then for sure something's broken (possibly the cpu).
-        assert!(end_tsc > self.start_tsc);
+        // rdtsc may go backwards e.g. after hibernation.
+        let end_tsc = end_tsc.max(self.start_tsc + 1);
         self.end_tsc = end_tsc;
         self.end_time = end_time;
         self.s_per_tsc = (end_time - self.start_time).as_secs_f64() / (end_tsc - self.start_tsc) as f64;

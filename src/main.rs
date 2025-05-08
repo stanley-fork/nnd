@@ -287,7 +287,7 @@ fn main() {
             // Print something to the console, otherwise it'll be left confusingly empty, as if the debugger just quit silently.
             if let &Some(fd) = &original_stderr_fd {
                 let mut original_stderr = std::mem::ManuallyDrop::new(unsafe {std::fs::File::from_raw_fd(fd)});
-                let _ = writeln!(original_stderr, "panic! this usually indicates a bug, please report (to #debugger in slack, or to mk.al13n@gmail.com)");
+                let _ = writeln!(original_stderr, "panic! this usually indicates a bug, please report (create an issue at https://github.com/al13n321/nnd/issues or send an email to mk.al13n+nnd@gmail.com)");
                 if let Some(p) = &log_file_path {
                     let _ = writeln!(original_stderr, "there should be an error message and stack trace at the end of {} - please include them in the report", p.display());
                 }
