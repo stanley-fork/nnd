@@ -308,6 +308,12 @@ impl MemReader {
         self.read(offset, &mut buf)?;
         Ok(u64::from_le_bytes(buf))
     }
+
+    pub fn read_u8(&self, offset: usize) -> Result<u8> {
+        let mut buf = [0u8; 1];
+        self.read(offset, &mut buf)?;
+        Ok(buf[0])
+    }
 }
 
 #[derive(Clone)]

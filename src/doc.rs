@@ -64,6 +64,7 @@ When running the debugger for the first time, notice:
     The active window can be selected using digit keys (window numbers are shown in their titles), or using alt+arrows, or with the mouse.
  2. The 'controls' window in top left lists (almost) all available key combinations.
     Some of them are global, others depend on the active window.
+ 3. Press control-q to quit.
 
 This information should be enough to discover most features by trial and error, which is recommended. Additionally, reading --help-known-problems and --help-watches is recommended.
 
@@ -78,28 +79,29 @@ UI tips:
  * If you use tmux, the escape key is unreliable, consider using ctrl-g instead. Tmux adds 0.5s delay before passing the escape key through, and if you press another key during that time,
    the two key presses get incorrectly interpreted as alt+keypress (that's how ansi escape codes work, unfortunately).
  * Windows can be resized by dragging the boundaries with the mouse. Rearranging windows is not implemented yet.
- * Press 'tab' (default) to open a tooltip. Supported in tables (binaries, stack, etc) and watches window. Useful for long values or paths, and might contain additional information. Also available in search dialogs.
+ * Press 'tab' to open a tooltip. Supported in tables (binaries, stack, etc) and watches window. Useful for copying long values or paths, and might contain additional information. Also available in search dialogs.
 
 Debugging tips:
  * The highlighted characters in the source code window are locations of statements and inlined function calls, as listed in the debug info.
    These are all the places where the control can stop, e.g. if you step repeatedly or add a breakpoint.
- * 'Step over column' ('m' key by default) runs until the control moves to a different line+column location. Similar to how 'step over line' runs until the control moves to a different line.
+ * 'Step over column' ('m' key) runs until the control moves to a different line+column location. Similar to how 'step over line' runs until the control moves to a different line.
    Useful for stepping into a function call when its arguments are nontrivial expressions - you'd do step-over-column to skip over evaluating the arguments,
    then step-into when the current column is at the function call you're interested in.
+   (Is there a way to put a breakpoint on a column? Not directly, but you can put breakpoint on the disassembly instruction corresponding to the column. Find it by cycling through line's disassembly locations by pressing '.'/',' in code window.)
  * Steps are stack-frame-dependent: step-out steps out of the *currently selected* stack frame (as seen in the threads window on the right), not the innermost stack frame.
    Step-over steps over the calls inside the currently selected stack frame, i.e. it may involve an internal step-out.
    (This may seem like an unnecessary feature, but if you think through how stepping interacts with inlined functions, it's pretty much required, things get very confusing otherwise.)
  * While a step is in progress, breakpoints are automatically disabled for the duration of the step.
- * Stepping can be interrupted with the suspend key ('p' by default). Useful e.g. if you try to step-over a function, but the function turns out to be too slow.
+ * Stepping can be interrupted with the suspend key ('p' key). Useful e.g. if you try to step-over a function, but the function turns out to run forever.
  * Run-to-cursor works like a step: it runs until the selected (not any) thread hits the requested line, and it disables other breakpoints for the duration of the step.
- * To start the program and run to start of main(), press step-into ('s' by default) when the program is not running (e.g. after killing it with 'k' key).
- * Step-into-instruction ('S' key by default) works no matter what, even if there's no debug info or if disassembly or stack unwinding fails. Use it when other steps fail.
+ * To start the program and run to start of main(), press step-into ('s' key) when the program is not running (e.g. after killing it with 'C-k' key).
+ * Step-into-instruction ('S' key) works no matter what, even if there's no debug info or if disassembly or stack unwinding fails. Use it when other steps fail.
  * Breakpoints are preserved across debugger restarts, but they're put into disabled state on startup. Use Enter key in breakpoints window to reactivate.
- * To make a conditional breakpoint, press M-enter (by default) on a regular breakpoint and edit the condition expression (in breakpoints window).
+ * To make a conditional breakpoint, press M-enter on a regular breakpoint and edit the condition expression (in breakpoints window).
    Conditional breakpoint stops the program if the condition expression evaluates to nonzero or fails to evaluate.
    If you don't want to stop on evaluation error, wrap the expression in 'try(...)' (it returns 0 on if evaluation failed for any reason).
    E.g.: 'try(abstract_class_ptr.concrete_class_field)' will stop only if abstract_class_ptr was auto-downcast to a class that has the given field, and the field is nonzero.
- * The function search (in disassembly window, 'o' key by default) currently does fuzzy search over *mangled* function names (for peformance reasons).
+ * The function search (in disassembly window, 'o' key) currently does fuzzy search over *mangled* function names, for peformance reasons.
    The search results display demangled names, i.e. slightly different from what's actually searched. Press tab to see mangled name.
  * In watches window, on non-root tree nodes press Enter to add a corresponding watch. E.g. for local variable or struct field or array element.
  * Expect debugger's memory usage around 3x the size of the executable. E.g. ~7 GB for 2.3 GB clickhouse, release build. This is mostly debug information.
@@ -114,8 +116,9 @@ Create an issue at https://github.com/al13n321/nnd/issues or send an email to mk
    E.g. `std::vector<int>` doesn't work, you have to write `std::__1::vector<int, std::__1::allocator<int> >` (whitespace matters).
    The plan is to add a fuzzy search dialog for type names, similar to file and function search.
    (There is no plan to actually parse the template type names into their component parts; doing it correctly would be crazy complicated like everything else in C++.)
- * Can't assign to the debugged program's variables or registers
- * No data breakpoints, whole-file breakpoints, special breakpoints (signals, exceptions/panics, except for always-on stop on fatal signals). (For exceptions/panics, you can set breakpoint manually: in disassembly window press 'o' to search for function, find __cxa_throw or rustc_panic, and put a breakpoint at the start.)
+ * No custom pretty-printers, only the built-in ones for C++ and Rust standard libraries.
+ * Can't assign to the debugged program's variables or registers.
+ * No data breakpoints, whole-file breakpoints, special breakpoints (signals, exceptions/panics, except for always-on stop on fatal signals). But for exceptions or panics you can set breakpoint manually: in disassembly window press 'o' to search for function, find __cxa_throw or rustc_panic, and put a breakpoint at the start.
  * Conditional breakpoints are not super fast: a few thousand evaluations per second.
  * Inside libraries that were dlopen()ed at runtime, breakpoints get disabled on program restart. Manually disable-enable the breakpoint after the dlopen() to reactivate it.
  * The disassembly window can only open functions that appear in .symtab or debug info. Can't disassemble arbitrary memory, e.g. JIT-generated code or code from binaries without .symtab or debug info.
@@ -152,7 +155,7 @@ Gotchas:
  * If a global variable has the same name as a local variable, use :: prefix to refer to the global variable: '::foo'.
  * Currently only fully-qualified type names and global variable names are recognized.
  * Currently types and global variables nested inside functions are difficult to access. The recognized "fully-qualified" name has a "_" instead of the function name.
-   Use variable search (watches window, 'o' key by default); optionally, start the query with '@' to search by filename, add ":<number>" to filter by line number.
+   Use variable search (watches window, 'o' key); optionally, start the query with '@' to search by filename, add ":<number>" to filter by line number.
  * Be careful with operator precedence when combining casts and pointer arithmetic (casts have higher precedence):
    'offset + (my_u64_ptr as *u8)' and 'offset + my_u64_ptr as *u8' produce different result.
 

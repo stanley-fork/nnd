@@ -72,12 +72,16 @@ pub struct Thread {
     //  (2) we get a non-SIGTRAP signal (e.g. an unrelated group-stop), then
     //  (3) we do CONT, then
     //  (4) we maybe get a SIGTRAP out of nowhere, even if instruction pointer didn't change.
-    // See singlestep_vs_group_stop.cpp for repro. We can't allow spurious SIGTRAPs.
+    // See singlestep_vs_group_stop.cpp for repro.
     //
     // We prevent this scenario by preventing part (3). After doing one SINGLESTEP, we keep doing SINGLESTEP until we get a SIGTRAP.
     // This way the spurious SIGTRAP gets correctly interpreted as relating to a SINGLESTEP, with no ambiguity.
     // To this end, the single_stepping flag is unset only when we get SIGTRAP, and while it's set we always do SINGLESTEP instead of CONT.
     single_stepping: bool,
+
+    // If true, we're standing just after an int3 instruction in the program (not injected by the debugger).
+    // For UI and stepping, we should pretend that we're standing on the int3 instead, i.e. that the thread's RIP is 1 less than info.regs says.
+    is_after_user_debug_trap_instruction: bool,
 
     // This serves two purposes:
     //  * When a software breakpoint is hit, we convert it to hardware breakpoint. After we resume the thread that hit the sw breakpoint,
@@ -97,7 +101,7 @@ pub struct Thread {
     // (It's stored here instead of being passed-through immediately because of a corner case: if the signal arrived at the same time when we decided to suspend
     //  the process for unrelated reasons, we don't want to resume the thread right away, so the signal injection needs to wait until the next time we resume the thread.)
     //
-    // Be careful with this. `man ptrace` says:
+    // `man ptrace` says:
     //  > Restarting ptrace commands issued in ptrace-stops other than signal-delivery-stop are not guaranteed to inject a signal, even if sig is nonzero.
     //  > No error is reported; a nonzero sig may simply be ignored.  Ptrace users should not try to "create a new signal" this way: use tgkill(2) instead.
     // So, this field should only be assigned when a thread is stopped by a signal, and should always be delivered next time the thread is resumed.
@@ -362,25 +366,28 @@ impl Breakpoint {
 #[derive(PartialEq, Eq, Clone, Debug)]
 pub enum StopReason {
     Breakpoint(BreakpointId),
+    DebugTrap, // int3 instruction in the program, e.g. __builtin_debugtrap()
     Step,
     Signal(i32),
     Exception,
 }
 impl StopReason {
     // If different threads simultaneously stopped for different reasons, the ui should switch to the one with highest-priority reason.
+    // (Currently this probably never comes into play because we don't report simultaneous breakpoint hits, see ignore_breakpoints in handle_breakpoint_trap.)
     pub fn priority(&self) -> isize /* >= 0 */ {
         match self {
-            Self::Breakpoint(_) => 0,
-            Self::Step => 1,
-            Self::Exception => 2,
-            Self::Signal(_) => 3,
+            Self::DebugTrap => 0,
+            Self::Breakpoint(_) => 1,
+            Self::Step => 2,
+            Self::Exception => 3,
+            Self::Signal(_) => 4,
         }
     }
 }
 
 impl Thread {
     fn new(idx: usize, tid: pid_t, state: ThreadState) -> Self {
-        Thread {idx: idx, tid: tid, state: state, single_stepping: false, ignore_next_hw_breakpoint_hit_at_addr: None, stop_reasons: Vec::new(), info: ThreadInfo::default(), pending_signal: None, waiting_for_initial_stop: true, sent_interrupt: false, stop_count: 0, attached_late: false, exiting: false, subframe_to_select: None}
+        Thread {idx: idx, tid: tid, state: state, single_stepping: false, ignore_next_hw_breakpoint_hit_at_addr: None, stop_reasons: Vec::new(), info: ThreadInfo::default(), pending_signal: None, waiting_for_initial_stop: true, sent_interrupt: false, stop_count: 0, attached_late: false, exiting: false, subframe_to_select: None, is_after_user_debug_trap_instruction: false}
     }
 }
 
@@ -682,6 +689,11 @@ impl Debugger {
                         continue;
                     }
                 }
+
+                // Process an event returned by waitpid().
+                // Warning: the code path between here and the call to handle_breakpoint_trap() should be kept simple and safe;
+                // if we fail to handle a SIGTRAP, the debuggee thread may be left in a broken state after we detach; see shutdown().
+
                 self.prof.bucket.debugger_count += 1;
                 let thread = thread.unwrap();
                 thread.sent_interrupt = false;
@@ -796,12 +808,18 @@ impl Debugger {
                             _ => return err!(Internal, "unexpected ptrace event: {}", wstatus >> 16),
                         }
                     } else if signal == libc::SIGTRAP { // hit a breakpoint
-                        if self.context.settings.trace_logging { eprintln!("trace: thread {} got SIGTRAP", tid); }
+                        let mut si: libc::siginfo_t;
+                        unsafe {
+                            si = mem::zeroed();
+                            ptrace(libc::PTRACE_GETSIGINFO, tid, 0, &mut si as *mut _ as u64)?;
+                        }
+
+                        if self.context.settings.trace_logging { eprintln!("trace: thread {} got SIGTRAP ({}) at 0x{:x}", tid, trap_si_code_name(si.si_code), si.si_addr() as usize); }
 
                         let thread_single_stepping = mem::take(&mut thread.single_stepping);
                         let thread_ignore_next_hw_breakpoint_hit_at_addr = mem::take(&mut thread.ignore_next_hw_breakpoint_hit_at_addr);
 
-                        let (hit, regs, stack_digest_to_select) = self.handle_breakpoint_trap(tid, thread_single_stepping, thread_ignore_next_hw_breakpoint_hit_at_addr)?;
+                        let (hit, _regs, stack_digest_to_select) = self.handle_breakpoint_trap(tid, si.si_code, thread_single_stepping, thread_ignore_next_hw_breakpoint_hit_at_addr)?;
 
                         if hit || self.stopping_to_handle_breakpoints {
                             if hit || self.target_state == ProcessState::Running || self.stepping.as_ref().is_some_and(|s| !s.keep_other_threads_suspended || s.tid != tid) {
@@ -1102,7 +1120,7 @@ impl Debugger {
 
         Ok(())
     }
-    
+
     fn make_instruction_decoder<'a>(&self, range: Range<usize>, buf: &'a mut Vec<u8>) -> Result<iced_x86::Decoder<'a>> {
         if range.len() > 100_000_000 { return err!(Sanity, "{} MB code range, suspiciously long", range.len() / 1_000_000); }
         buf.resize(range.len(), 0);
@@ -1161,6 +1179,7 @@ impl Debugger {
         let mut step = StepState {tid, keep_other_threads_suspended: true, disable_breakpoints: true, internal_kind: kind, by_instructions, ..StepState::default()};
         let mut breakpoint_types: Vec<StepBreakpointType> = Vec::new();
         let mut unwind: Option<(Arc<UnwindInfo>, AddrMap)> = None;
+        let thread_is_after_user_debug_trap_instruction = thread.is_after_user_debug_trap_instruction;
 
         // There are 2 things that can be missing:
         //  * Debug symbols (.debug_info).
@@ -1210,7 +1229,12 @@ impl Debugger {
             // Doesn't require debug symbols, stack unwinding, or even reading the machine code.
             // Also instruction-level step-over, which requires only unwind information.
 
-            let addr = frame.addr;
+            let mut addr = frame.addr;
+            if thread_is_after_user_debug_trap_instruction {
+                // Pretend to step over the int3 instruction.
+                addr = frame.pseudo_addr;
+            }
+            
             // Decode one instruction to check if it's a call/syscall, just as an optimization to avoid suspending other threads unnecessarily.
             // (This read will incorrectly fail if we're <15 bytes before end of mmap.)
             match self.make_instruction_decoder(addr..addr+MAX_X86_INSTRUCTION_BYTES, &mut buf) {
@@ -1336,7 +1360,7 @@ impl Debugger {
                     return err!(MissingSymbols, "no line number for current address");
                 }
             }
-            
+
             // Clean up overlapping ranges.
             let mut events: Vec<(usize, isize)> = Vec::new();
             for r in &static_addr_ranges {
@@ -1466,13 +1490,22 @@ impl Debugger {
         }
 
         if step.internal_kind == StepKind::Into && step.by_instructions {
-            if step.keep_other_threads_suspended {
+            if thread_is_after_user_debug_trap_instruction {
+                // Weird special case: we're pretending to stand on an int3 instruction (e.g. __builtin_debugtrap in the program),
+                // but actually we're on the next instruction.
+                // So if we proceed it'll appear that we stepped through 2 instructions: int3 and the next one.
+                // Instead, we'd like the thread to stop after resume_thread() increments RIP but before any instructions execute.
+                // So we add a hardware breakpoint that will be hit immediately after PTRACE_SINGLESTEP, before RIP advances.
+                if !step.addr_ranges.is_empty() {
+                    breakpoints_to_add.push((StepBreakpointType::AfterRange, step.addr_ranges[0].end));
+                }
+            } else if step.keep_other_threads_suspended {
                 // For single-instruction-step, stop after one PTRACE_SINGLESTEP, even if instruction pointer doesn't change.
                 // Useful in case of recursive `call` immediately followed by `ret`.
                 step.addr_ranges.clear();
             } else {
-                // PTRACE_SINGLESTEP produces spurious traps when stepping from syscall instruction, i.e. when pre-step ip is on or after syscall instruction.
-                // Leave addr_ranges nonempty to ignore such stops until ip moves. This doesn't interfere with the case of recursive call followed by ret (above).
+                // PTRACE_SINGLESTEP produces incorrect TRAP_BRKPT instead of TRAP_TRACE after stepping from syscall instruction.
+                // Leave addr_ranges nonempty to not rely on trap type. This doesn't interfere with the case of recursive call followed by ret (above).
             }
         }
 
@@ -1494,11 +1527,11 @@ impl Debugger {
             // Interaction between SINGLESTEP and breakpoints.
             //
             // We need to be careful to avoid single-stepping while standing on a software breakpoint.
-            // Otherwise on SIGTRAP we won't be able to tell whether we stopped because of the
-            // breakpoint or because of a SINGLESTEP that jumped to the address just *after* the breakpoint.
+            // Otherwise on SIGTRAP we won't be able to tell whether we single-stepped from the breakpoint
+            // or from some different instruction that *jumped* to the address just after the breakpoint.
             // So when single-stepping from a software breakpoint, we make sure handle_breakpoints() is called first, which will convert it to a hardware breakpoint.
             //
-            // There's a corresponding problem when adding a breakpoint while single-stepping. We solve it in a similar way: by making sure handle_breakpoints() happens
+            // There's a corresponding problem when adding a breakpoint while single-stepping. We solve it the same way: by making sure handle_breakpoints() happens
             // before the new breakpoint is activated (all threads are suspended first, including the single-stepping thread).
             if let Some(idx) = self.find_breakpoint_location(stack.frames[0].addr) {
                 if !self.breakpoint_locations[idx].hardware {
@@ -1627,6 +1660,7 @@ impl Debugger {
         unsafe {ptrace(op, tid, 0, sig as u64)?};
         thread.state = ThreadState::Running;
         thread.stop_reasons.clear();
+        thread.is_after_user_debug_trap_instruction = false;
 
         if refresh_info {
             refresh_thread_info(self.pid, thread, &mut self.prof.bucket, &self.context.settings);
@@ -1670,6 +1704,10 @@ impl Debugger {
         let mut scratch = UnwindScratchBuffer::default();
         let mut pseudo_addr = regs.get(RegisterIdx::Rip)?.0 as usize;
         let mut memory = CachedMemReader::new(self.memory.clone());
+
+        if thread.is_after_user_debug_trap_instruction {
+            pseudo_addr -= 1;
+        }
 
         loop {
             let idx = stack.frames.len();
@@ -2103,7 +2141,16 @@ impl Debugger {
         if idx < self.breakpoint_locations.len() && self.breakpoint_locations[idx].addr == addr {
             self.breakpoint_locations[idx].breakpoints.push(breakpoint);
         } else {
-            self.breakpoint_locations.insert(idx, BreakpointLocation {addr, original_byte: 0, hardware: false, active: false, breakpoints: vec![breakpoint], error: None});
+            // Read a byte of machine code at the breakpoint address to make it easier to check whether it's int3 (e.g. a __builtin_debugtrap() in user's code).
+            let original_byte = match self.memory.read_u8(addr) {
+                Ok(x) => x,
+                Err(e) => {
+                    eprintln!("warning: failed to read original byte for breakpoint at 0x{:x}: {}", addr, e);
+                    0
+                }
+            };
+
+            self.breakpoint_locations.insert(idx, BreakpointLocation {addr, original_byte, hardware: false, active: false, breakpoints: vec![breakpoint], error: None});
         }
     }
 
@@ -2134,7 +2181,14 @@ impl Debugger {
             let byte_idx = addr % 8;
             let bit_idx = byte_idx * 8;
             let word = self.memory.read_u64(addr - byte_idx)?;
-            self.breakpoint_locations[idx].original_byte = ((word >> bit_idx) & 0xff) as u8;
+
+            let original_byte = ((word >> bit_idx) & 0xff) as u8;
+            let orig = &mut self.breakpoint_locations[idx].original_byte;
+            if *orig != original_byte {
+                eprintln!("warning: original byte for breakpoint at 0x{:x} changed from 0x{:x} to 0x{:x}", addr, orig, original_byte);
+                *orig = original_byte;
+            }
+
             let word = word & !(0xff << bit_idx) | (0xcc << bit_idx);
             // PTRACE_POKETEXT is dumb. It requires the provided thread to be suspended, but doesn't care if other threads are running.
             // Presumably this requirement was added just in case, back when threads didn't exist.
@@ -2208,29 +2262,50 @@ impl Debugger {
         // Convert between hardware and software breakpoints as needed:
         // if any thread is standing at a breakpoint, make it hardware, otherwise make it software.
 
-        let mut thread_addresses: HashMap<usize, pid_t> = HashMap::new();
+        let mut thread_addresses: HashMap<usize, Vec<pid_t>> = HashMap::new();
         for (tid, t) in self.threads.iter() {
             if t.info.regs.has(RegisterIdx::Rip) {
-                let addr = t.info.regs.get(RegisterIdx::Rip)?.0 as usize;
-                thread_addresses.insert(addr, *tid);
+                let addr = t.info.regs.get(RegisterIdx::Rip).unwrap().0 as usize;
+                let tids = thread_addresses.entry(addr).or_default();
+                if !t.is_after_user_debug_trap_instruction {
+                    tids.push(*tid);
+                } else {
+                    // Don't set ignore_next_hw_breakpoint_hit_at_addr in this case.
+                    // When single-instruction-stepping from is_after_user_debug_trap_instruction state,
+                    // we want the new hw breakpoint to be immediately hit without making progress.
+                }
             }
         }
 
         for idx in 0..self.breakpoint_locations.len() {
             let loc = &self.breakpoint_locations[idx];
-            if loc.hardware && !thread_addresses.contains_key(&loc.addr) {
-                self.deactivate_breakpoint_location(idx, self.pid)?;
-                self.breakpoint_locations[idx].hardware = false;
-            }
-        }
-        for idx in 0..self.breakpoint_locations.len() {
-            let loc = &self.breakpoint_locations[idx];
             let addr = loc.addr;
-            let tid = thread_addresses.get(&loc.addr);
-            if !loc.hardware && tid.is_some() {
-                self.deactivate_breakpoint_location(idx, self.pid)?;
-                self.breakpoint_locations[idx].hardware = true;
-                self.threads.get_mut(tid.unwrap()).unwrap().ignore_next_hw_breakpoint_hit_at_addr = Some(addr);
+            let tids = thread_addresses.get(&loc.addr);
+            if loc.hardware {
+                if tids.is_none() {
+                    self.deactivate_breakpoint_location(idx, self.pid)?;
+                    self.breakpoint_locations[idx].hardware = false;
+                }
+            } else {
+                if let Some(tids) = tids {
+                    self.deactivate_breakpoint_location(idx, self.pid)?;
+                    self.breakpoint_locations[idx].hardware = true;
+
+                    for tid in tids {
+                        // The thread is stopped at a sw breakpoint address. After we convert it to hw breakpoint,
+                        // the thread may immediately hit it. Ignore such hit. Possible situations:
+                        //  * We've already handled this sw breakpoint hit. Don't want to handle it again.
+                        //  * This breakpoint was added when this thread was already stopped. I.e. the user added a breakpoint on the current line ("current" for some thread).
+                        //    We shouldn't report a breakpoint hit before the thread even starts moving.
+                        //  * Race condition: the thread happened to stop at the breakpoint address, but not because of the breakpoint.
+                        //    We currently don't handle this correctly. It's probably possible for a breakpoint hit to be missed.
+                        //    E.g. scenario: one thread hit a conditional breakpoint; the condition evaluated to false; we did PTRACE_INTERRUPT of all other threads (to call handle_breakpoints());
+                        //    one of those threads happened to be interrupted at the same breakpoint address (just *before* executing the int3 instruction, so no SIGTRAP);
+                        //    that thread then incorrectly ignores the breakpoint hit.
+                        //    Maybe we should check for breakpoint hits when thread stops for any reason. Or maybe we should assign ignore_next_hw_breakpoint_hit_at_addr only on SIGTRAP and when adding breakpoint. TODO: Probably the latter.
+                        self.threads.get_mut(tid).unwrap().ignore_next_hw_breakpoint_hit_at_addr = Some(addr);
+                    }
+                }
             }
         }
 
@@ -2274,7 +2349,7 @@ impl Debugger {
     }
 
     // Returns whether the step completed.
-    fn handle_step_stop(&mut self, spurious_stop: bool, hit_step_breakpoint: bool, regs: &Registers) -> bool {
+    fn handle_step_stop(&mut self, hit_step_breakpoint: bool, single_stepped: bool, regs: &Registers) -> bool {
         let step = self.stepping.as_ref().unwrap();
         if step.internal_kind == StepKind::Cursor {
             return hit_step_breakpoint;
@@ -2283,8 +2358,7 @@ impl Debugger {
         let i = step.addr_ranges.partition_point(|r| r.end <= addr);
         let in_ranges = i < step.addr_ranges.len() && step.addr_ranges[i].start <= addr;
         if step.internal_kind == StepKind::Into && step.by_instructions {
-            if step.addr_ranges.is_empty() && spurious_stop {
-                if self.context.settings.trace_logging { eprintln!("trace: ignoring spurious stop on hw breakpoint {:x} (stepping)", addr); }
+            if step.addr_ranges.is_empty() && !single_stepped {
                 return false;
             }
             return !in_ranges;
@@ -2473,23 +2547,33 @@ impl Debugger {
     // Returns true if any breakpoint was actually hit, so we should switch to ProcessState::Suspended.
     // May also set stopping_to_handle_breakpoints to true, in which case the caller should stop all threads.
     // Otherwise treat it as a spurious wakeup and continue (e.g. breakpoint is for a different thread, or conditional breakpoint's condition evaluated to false, or something).
-    fn handle_breakpoint_trap(&mut self, tid: pid_t, single_stepping: bool, ignore_next_hw_breakpoint_hit_at_addr: Option<usize>) -> Result<(/*hit*/ bool, Registers, Option<(Vec<usize>, bool, u16)>)> {
+    fn handle_breakpoint_trap(&mut self, tid: pid_t, si_code: i32, single_stepping: bool, ignore_next_hw_breakpoint_hit_at_addr: Option<usize>) -> Result<(/*hit*/ bool, Registers, Option<(Vec<usize>, bool, u16)>)> {
         let mut regs = ptrace_getregs(tid)?;
         let mut addr = regs.get(RegisterIdx::Rip).unwrap().0 as usize;
 
-        // There's a very unfortunate detail in how the 0xcc (INT 3) instruction is handled (at least in Linux). After hitting 0xcc at address X,
-        // the thread is stopped with its RIP = X+1, not X. When we see a SIGTRAP and RIP = X+1, it can mean two things:
+        // Some weird nonsense is needed to interpret SIGTRAPs correctly.
+        // Suppose there's a software breakpoint (int3 instruction, 0xcc) at addrss X. When we see a SIGTRAP and RIP = X+1, it can mean two things:
         //  (a) The 0xcc instruction was hit. We're stopped at breakpoint X. When resuming the thread, we must remove the breakpoint *and decrement RIP*.
         //  (b) The thread jumped to X+1, then got a SIGTRAP unrelated to our breakpoint. When resuming the thread we must *leave RIP unchanged*.
-        // (In contrast, if 0xcc suspended with RIP = X, there would be no such ambiguity. There also wouldn't be any of the "Interaction between
-        // SINGLESTEP and breakpoints" nonsense. Ugh.)
+        //
+        // It sure would make sense if the kernel just told us what caused SIGTRAP. It has that information. There's even already an API for reporting it:
+        // siginfo.si_code == TRAP_BRKPT for int3 hit, TRAP_TRACE for PTRACE_SINGLESTEP.
+        // But ptrace intentionally (?) often doesn't use these values and instead reports si_code == SI_KERNEL. I'm not sure what the idea is.
+        // To add insult to injury, sometimes TRAP_BRKPT is reported after PTRACE_SINGLESTEP, with no int3 in sight. So we should mostly ignore TRAP_BRKPT and TRAP_TRACE even when they're present.
         //
         // So we have to do some guesswork to distinguish (a) and (b). We do it by elimination. A thread may receive SIGTRAP (with no PTRACE_EVENT_*) if:
         //  (1) It did a PTRACE_SINGLESTEP. We check for this by keeping track of our own calls to ptrace(PTRACE_SINGLESTEP).
         //      But see "Interaction between SINGLESTEP and breakpoints" about extra difficulties with this.
         //  (2) It hit a hardware breakpoint. We check for this by inspecting the debug register.
-        //  (3) It hit a software breakpoint. We assume this if none of the above are the case.
-        //  (4) Someone sent a SIGTRAP manually at just the wrong moment. This will break things, there's not much we can do about it, AFAICT.
+        //  (3) Someone sent a SIGTRAP manually using kill/tgkill/etc or using a timer. Then si_code != SI_KERNEL.
+        //  (4) It hit a software breakpoint. We assume this if none of the above are the case.
+        //  (5) Some other kernel-generated SIGTRAP. We would incorrectly treat it as int3 hit, and it would break things.
+        //
+        // We could also check whether the byte at RIP-1 is actually 0xcc or contains a breakpoint, but we'd need to be extra careful to avoid race condition with activating/deactivating breakpoint locations.
+        // E.g. suppose two threads hit the same breakpoint at the same time, and when handling the first SIGTRAP we deactivate the breakpoint (e.g. because it's obsolete) and revert the 0xcc byte to its original value;
+        // then the second thread's SIGTRAP won't see 0xcc at RIP-1, incorrectly won't decrement RIP, and debuggee will break.
+        // So currently we don't check for 0xcc here. If it turns out that we have to do it, we'll have to ensure that the original_byte <-> 0xcc memory writes only happen when all threads are stopped (likely in handle_breakpoints()).
+        // Possibly even that would be insufficient because maybe a SIGTRAP may be queued behind another type of stop, then get delivered after we resume threads; or maybe that's impossible, I haven't checked.
 
         let dr6 = unsafe { ptrace(libc::PTRACE_PEEKUSER, tid, offsetof!(libc::user, u_debugreg) as u64 + 6*8, 0)? };
         let stopped_on_hw_breakpoint = dr6 & 15 != 0;
@@ -2500,37 +2584,79 @@ impl Debugger {
             unsafe { ptrace(libc::PTRACE_POKEUSER, tid, (offsetof!(libc::user, u_debugreg) + 6 * 8) as u64, (dr6 & !15) as u64)? };
         }
 
-        let mut stopped_on_sw_breakpoint = false;
-        if !single_stepping && !stopped_on_hw_breakpoint {
-            // Supposedly, we can only get here by hitting a software breakpoint (INT3 instruction) at addr-1 (or if someone sent a SIGTRAP manually).
-            // But this is so precarious that who knows.
-            // Should we decrement addr unconditionally or should we check that there's INT3 at addr-1?
-            // Currently we do it unconditionally because it's in principle possible to get a delayed SIGTRAP after we already removed the INT3 (and the corresponding breakpoint location).
-            // But we also print a warning (below) in this case, so hopefully we'll be able to hunt down all cases where this breaks.
-            stopped_on_sw_breakpoint = true;
+        let spurious_stop = stopped_on_hw_breakpoint && ignore_next_hw_breakpoint_hit_at_addr == Some(addr);
+
+        let stopped_on_sw_breakpoint = (si_code == libc::TRAP_BRKPT || si_code == libc::SI_KERNEL) && !stopped_on_hw_breakpoint && !single_stepping;
+        if stopped_on_sw_breakpoint {
             addr -= 1;
-            regs.set(RegisterIdx::Rip, addr as u64, false);
-            unsafe { ptrace(libc::PTRACE_POKEUSER, tid, offsetof!(libc::user, regs.rip) as u64, addr as u64)? };
         }
 
-        let spurious_stop = stopped_on_hw_breakpoint && ignore_next_hw_breakpoint_hit_at_addr == Some(addr);
+        // More ptrace jank: after PTRACE_SINGLESTEP we may get a TRAP_BRKPT (!) before the single-step step happens (i.e. still at original address).
+        // We ignore it and do another PTRACE_SINGLESTEP, which then actually stepa and generates a TRAP_TRACE.
+        let single_stepped = (si_code == libc::TRAP_TRACE || si_code == libc::SI_KERNEL) && single_stepping && !spurious_stop;
 
         let mut hit = false;
         let mut request_single_step = false;
+        let mut is_active_breakpoint_location = false;
         let mut stop_reasons: Vec<StopReason> = Vec::new();
         let mut stack_digest_to_select: Option<(Vec<usize>, bool, u16)> = None;
         let mut hit_step_breakpoint: Option<StepBreakpointType> = None;
 
-        if let Some(idx) = self.find_breakpoint_location(addr) {
+        let breakpoint_location_idx = self.find_breakpoint_location(addr);
+
+        // Check if there's int3 instruction in the actual program, i.e. not injected by the debugger.
+        let original_instruction_byte = match &breakpoint_location_idx {
+            &Some(idx) => self.breakpoint_locations[idx].original_byte,
+            None => match self.memory.read_u8(addr) {
+                Ok(x) => x,
+                Err(e) => {
+                    eprintln!("warning: failed to read instruction byte at 0x{:x}: {}", addr, e);
+                    0
+                }
+            }
+        };
+        let is_debug_trap = original_instruction_byte == 0xcc; // even if we stopped for a different reason
+
+        if stopped_on_sw_breakpoint && !is_debug_trap {
+            // Revert RIP to the start of the instruction that we overwrote with 0xcc.
+            regs.set(RegisterIdx::Rip, addr as u64, false);
+            unsafe { ptrace(libc::PTRACE_POKEUSER, tid, offsetof!(libc::user, regs.rip) as u64, addr as u64)? };
+        }
+
+        let ignore_breakpoints =
+            // Ignore regular breakpoints when stepping.
+            // (It would be better for performance to also deactivate them as we go, then reactivate after the step completes.)
+            self.stepping.as_ref().is_some_and(|s| s.disable_breakpoints) ||
+            self.pending_step.is_some() ||
+            // Solves this race condition:
+            //  1. A step completes. It's added to thread's stop_reasons. Other threads are requested to suspend.
+            //  2. The UI sees the stepped thread's stop_reasons.
+            //  3. Just before suspending, some other thread hits a breakpoint. It's added to stop_reasons (because self.stepping is already unset).
+            //  4. The UI sees the breakpoint hit in stop_reasons and switches to that thread.
+            //     Very confusing because breakpoints are supposed to be disabled when stepping.
+            //
+            // As an undesired side effect, this check also prevents reporting simultaneous breakpoint hits by multiple threads.
+            // If this turns out to be a problem, replace this with a different mechanism (maybe a flag in Thread saying "ignore breakpoints in this thread until it's suspended").
+            self.target_state == ProcessState::Suspended;
+
+        if (!stopped_on_sw_breakpoint && !stopped_on_hw_breakpoint && !single_stepping && !is_debug_trap) ||
+            (stopped_on_sw_breakpoint && breakpoint_location_idx.is_none() && !is_debug_trap) {
+            eprintln!("warning: unexpected SIGTRAP ({}) in thread {} at 0x{:x}", trap_si_code_name(si_code), tid, addr);
+        }
+
+        if let Some(idx) = breakpoint_location_idx {
             let location = &mut self.breakpoint_locations[idx];
 
-            if stopped_on_sw_breakpoint && location.hardware {
-                eprintln!("warning: got unexpected SIGTRAP in thread {} at {:x} (just after a hw breakpoint)", tid, addr + 1);
+            if stopped_on_sw_breakpoint && location.hardware && !is_debug_trap {
+                // Maybe this is normal, if the sw breakpoint was recently converted to hw, and this SIGTRAP was queued up before that.
+                eprintln!("warning: unexpected sw breakpoint SIGTRAP on hw breakpoint in thread {} at {:x}", tid, addr);
             }
 
             if location.breakpoints.is_empty() {
                 // Lazily deactivate obsolete breakpoint location if we hit it. This is just for performance, to avoid repeatedly hitting+ignoring a deleted hot breakpoint.
                 self.deactivate_breakpoint_location(idx, tid)?;
+            } else {
+                is_active_breakpoint_location = true;
             }
 
             for bp_i in 0..self.breakpoint_locations[idx].breakpoints.len() {
@@ -2558,26 +2684,7 @@ impl Debugger {
                             if self.context.settings.trace_logging { eprintln!("trace: ignoring spurious stop on hw breakpoint {:x}", addr); }
                             continue;
                         }
-                        if let Some(step) = &self.stepping {
-                            if step.disable_breakpoints {
-                                // Ignore regular breakpoints when stepping.
-                                // (It would be better for performance to also deactivate them as we go, then reactivate after the step completes.)
-                                continue;
-                            }
-                        }
-                        if self.pending_step.is_some() {
-                            continue;
-                        }
-                        if self.target_state == ProcessState::Suspended {
-                            // Solves this race condition:
-                            //  1. A step completes. It's added to thread's stop_reasons. Other threads are requested to suspend.
-                            //  2. The UI sees the stepped thread's stop_reasons.
-                            //  3. Just before suspending, some other thread hits a breakpoint. It's added to stop_reasons (because self.stepping is already unset).
-                            //  4. The UI sees the breakpoint hit in stop_reasons and switches to that thread.
-                            //     Very confusing because breakpoints are supposed to be disabled when stepping.
-                            //
-                            // As a side effect, this check also prevents reporting simultaneous breakpoint hits by multiple threads.
-                            // If this turns out to be a problem, replace this with a different mechanism (maybe a flag in Thread saying "ignore breakpoints in this thread until it's suspended").
+                        if ignore_breakpoints {
                             continue;
                         }
                         if let Some((_, Ok(_), _)) = &bp.condition {
@@ -2610,14 +2717,20 @@ impl Debugger {
                 // If this turns out too slow, we could hook the current instruction instead (maybe won't work for all instructions).
                 self.stopping_to_handle_breakpoints = true;
             }
-        } else if stopped_on_sw_breakpoint {
-            eprintln!("warning: got unexpected SIGTRAP in thread {} at {:x}", tid, addr + 1);
+        }
+
+        if is_debug_trap && !is_active_breakpoint_location && !ignore_breakpoints {
+            // Hit something like __builtin_debugtrap, and there's no debugger breakpoint at the same location.
+            // The !is_active_breakpoint_location condition makes debugger breakpoints override __builtin_debugtrap,
+            // which allows e.g. using a conditional breakpoint to make the trap conditional.
+            hit = true;
+            stop_reasons.push(StopReason::DebugTrap);
         }
 
         if let Some(step) = &self.stepping {
             if hit {
                 self.cancel_stepping();
-            } else if tid == step.tid && self.handle_step_stop(spurious_stop, hit_step_breakpoint.is_some(), &regs) {
+            } else if tid == step.tid && self.handle_step_stop(hit_step_breakpoint.is_some(), single_stepped, &regs) {
                 let step = self.stepping.as_mut().unwrap();
                 if step.internal_kind != StepKind::Cursor {
                     stack_digest_to_select = Some((mem::take(&mut step.stack_digest), step.internal_kind == StepKind::Into, u16::MAX));
@@ -2635,6 +2748,10 @@ impl Debugger {
 
         if !stop_reasons.is_empty() {
             self.threads.get_mut(&tid).unwrap().stop_reasons.append(&mut stop_reasons);
+        }
+
+        if is_debug_trap {
+            self.threads.get_mut(&tid).unwrap().is_after_user_debug_trap_instruction = true;
         }
 
         Ok((hit, regs, stack_digest_to_select))
@@ -2751,6 +2868,8 @@ impl Debugger {
                 eprintln!("info: got event {} for unknown thread {} during detach", wstatus, tid);
                 continue;
             }
+
+            // TODO: Do a subset of handle_breakpoint_trap() logic here, to decrement RIP after hitting our breakpoint instruction.
 
             if !libc::WIFEXITED(wstatus) && !libc::WIFSIGNALED(wstatus) {
                 detach_thread(tid);

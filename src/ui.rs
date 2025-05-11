@@ -2379,6 +2379,7 @@ impl WindowContent for StatusWindow {
                 match stop_reason.1 {
                     None => ui_writeln!(ui, state_suspended, "{}", state),
                     Some(StopReason::Breakpoint(_)) => ui_writeln!(ui, state_suspended, "{} (hit breakpoint)", state),
+                    Some(StopReason::DebugTrap) => ui_writeln!(ui, state_suspended, "{} (debug trap)", state),
                     Some(StopReason::Step) => ui_writeln!(ui, state_suspended, "{} (stepped)", state),
                     Some(StopReason::Exception) => ui_writeln!(ui, state_suspended, "{} (exception during step)", state),
                     Some(StopReason::Signal(s)) => styled_writeln!(ui.text, ui.palette.thread_crash.apply(ui.palette.state_suspended), "{} (signal {})", state, signal_name(s)),
@@ -3065,7 +3066,7 @@ impl WindowContent for ThreadsWindow {
                         style_adjustment = ui.palette.thread_crash;
                         break;
                     }
-                    StopReason::Breakpoint(_) => style_adjustment = ui.palette.thread_breakpoint_hit,
+                    StopReason::Breakpoint(_) | StopReason::DebugTrap => style_adjustment = ui.palette.thread_breakpoint_hit,
                     StopReason::Step | StopReason::Exception => (),
                 }
             }
