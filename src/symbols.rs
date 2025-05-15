@@ -1622,7 +1622,8 @@ impl SymbolsLoader {
                 self.sym.points_of_interest.entry(*p).or_default().extend(addrs.iter().copied());
             }
         }
-        // (A separate loop to make sure the function with DW_AT_main_subprogram takes precedence over the function named "main", if both are present.)
+        // TODO: __cxa_throw, _ZN3std9panicking20rust_panic_with_hook17.{17}E, test that it works with regular panics and overflow checks, with and without handler, with and without catch, and for uncaught C++ exceptions
+        /*
         for shard in &mut self.shards {
             let mut find_function = |name: &[u8], p: PointOfInterest, sym: &mut Symbols| {
                 let v = &shard.get_mut().sym.mangled_name_to_function;
@@ -1634,11 +1635,8 @@ impl SymbolsLoader {
                     }
                 }
             };
-            if !self.sym.points_of_interest.contains_key(&PointOfInterest::MainFunction) {
-                find_function(b"main", PointOfInterest::MainFunction, &mut self.sym);
-            }
-            // TODO: __cxa_throw, _ZN3std9panicking20rust_panic_with_hook17.{17}E, test that it works with regular panics and overflow checks, with and without handler, with and without catch, and for uncaught C++ exceptions
-        }
+            find_function(b"__cxa_throw", PointOfInterest::..., &mut self.sym);
+        }*/
         self.sym.vtables.sort_unstable_by_key(|v| v.start);
         for v in &mut self.sym.vtables {
             for shard in &mut self.shards {
@@ -2530,7 +2528,20 @@ impl<'a> DwarfLoader<'a> {
                                 self.shard.max_function_end = self.shard.max_function_end.max(range.end as usize);
                             }
 
-                            if attrs.main_subprogram {
+                            // (Suboptimal to slow down loading by comparing each function's name to "main", especially if it's cache misses because names live at random memory addresses e.g. in .debug_str.
+                            //  The hope is that cache misses is mostly avoided by checking string length before checking contents, since very few functions have 4-character names.)
+                            let is_main_function =
+                                attrs.main_subprogram ||
+                                // Often compilers don't emit DW_AT_main_subprogram and we have to guess by name.
+                                attrs.linkage_name == "main" ||
+                                // Zig compiler emits debug info for main function like this:
+                                //  * no DW_AT_main_subprogram (https://github.com/ziglang/zig/issues/23896)
+                                //  * DW_AT_name = "main"
+                                //  * DW_AT_linkage_name = "<module_name>.main"
+                                // (There may also be functions named "main" nested e.g. inside structs, which are nearly indistinguishable from the main function;
+                                //  we don't try to distinguish them, it's ok to add all their addresses as MainFunction.)
+                                (attrs.name == "main" && (attrs.linkage_name.is_empty() || attrs.linkage_name.ends_with(".main")));
+                            if is_main_function {
                                 self.shard.points_of_interest.entry(PointOfInterest::MainFunction).or_default().push(entry_pc);
                             }
                         }
