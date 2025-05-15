@@ -343,7 +343,7 @@ pub fn run_input_echo_tool() -> Result<()> {
 
         // Render.
         commands.clear();
-        write!(commands, "{}\x1B[{};{}H{}", CURSOR_HIDE, 1, 1, "input echo tool; showing key presses, as can be used in keys config file").unwrap();
+        write!(commands, "{}\x1B[{};{}H{}", CURSOR_HIDE, 1, 1, "input echo tool; press some keys, and their names will show up here, in a format suitable for the keys config file").unwrap();
         write!(commands, "\x1B[{};{}H{}", 2, 1, "some key combinations are indistinguishable due to ANSI escape codes, e.g. ctrl-j and enter").unwrap();
         write!(commands, "\x1B[{};{}H{}", 3, 1, "press 'q' to exit").unwrap();
         for (y, key) in keys.iter().rev().enumerate() {

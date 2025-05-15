@@ -1,6 +1,6 @@
 #!/bin/sh
 set -e
-set -x
+#set -x
 
 BASEDIR=$(dirname "$0")
 
@@ -9,25 +9,47 @@ then
     mkdir "$BASEDIR/build"
 fi
 
-for name in `ls "$BASEDIR" | grep -P '\.c$'`
-do
-    name_without_extension="${name%.*}"
-    #echo $name_without_extension
-    clang -g -O1 -std=c23 -pthread -mavx -mavx2 -o "$BASEDIR/build/$name_without_extension" "$BASEDIR/$name"
-done
+build_file() {
+    local file="$1"
+    local name_without_extension="${file%.*}"
+    local extension="${file##*.}"
 
-FLAGS="-g -O1 -std=c++20 -Wno-vla-cxx-extension -mavx -mavx2"
-for name in `ls "$BASEDIR" | grep -P '\.cpp$'`
-do
-    name_without_extension="${name%.*}"
-    #echo $name_without_extension
-    clang++ -stdlib=libc++ $FLAGS -o "$BASEDIR/build/$name_without_extension-libc++" "$BASEDIR/$name"
-    clang++ -stdlib=libstdc++ $FLAGS -o "$BASEDIR/build/$name_without_extension" "$BASEDIR/$name"
-done
+    case "$extension" in
+        c)
+            echo "$file"
+            clang -g -O1 -std=c23 -pthread -mavx -mavx2 -o "$BASEDIR/build/$name_without_extension" "$BASEDIR/$file"
+            ;;
+        cpp)
+            echo "$file"
+            FLAGS="-g -O1 -std=c++20 -Wno-vla-cxx-extension -mavx -mavx2"
+            clang++ -stdlib=libc++ $FLAGS -o "$BASEDIR/build/$name_without_extension-libc++" "$BASEDIR/$file"
+            clang++ -stdlib=libstdc++ $FLAGS -o "$BASEDIR/build/$name_without_extension" "$BASEDIR/$file"
+            ;;
+        rs)
+            echo "$file"
+            rustc --edition=2021 -g -o "$BASEDIR/build/$name_without_extension" "$BASEDIR/$file"
+            ;;
+        zig)
+            echo "$file"
+            zig build-exe -femit-bin="$BASEDIR/build/$name_without_extension" "$BASEDIR/$file"
+            rm -f "$BASEDIR/build/${name_without_extension}.o"
+            ;;
+    esac
+}
 
-for name in `ls "$BASEDIR" | grep -P '\.rs$'`
-do
-    name_without_extension="${name%.*}"
-    #echo $name_without_extension
-    rustc --edition=2021 -g -o "$BASEDIR/build/$name_without_extension" "$BASEDIR/$name"
-done
+if [ $# -gt 0 ]; then
+    for filename in "$@"; do
+        p="$BASEDIR/$filename"
+        if ! [ -f "$p" ]
+        then
+            echo "file $p not found"
+            exit 1
+        fi
+        build_file "$(basename "$filename")"
+    done
+else
+    for file in "$BASEDIR"/*; do
+        filename=$(basename "$file")
+        build_file "$filename"
+    done
+fi
