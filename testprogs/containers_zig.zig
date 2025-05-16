@@ -1,5 +1,36 @@
 const std = @import("std");
 
+const Shape = union(enum) {
+    circle: f32,
+    rectangle: struct {
+        width: f32,
+        height: f32,
+    },
+    hyperrectangle: std.ArrayList(f32),
+};
+
+fn shapeArea(shape: Shape) f32 {
+    return switch (shape) {
+        .circle => |radius| std.math.pi * radius * radius,
+        .rectangle => |rect| rect.width * rect.height,
+        .hyperrectangle => |sides| {
+            var p: f32 = 1.0;
+            for (sides.items) |s| {
+                p *= s;
+            }
+            return p;
+        }
+    };
+}
+
+fn optionalShapeArea(maybeShape: ?Shape) f32 {
+    if (maybeShape) |shape| {
+        return shapeArea(shape);
+    } else {
+        return 0.0;
+    }
+}
+
 fn lessThan(context: void, a: u32, b: u32) std.math.Order {
     _ = context;
     return std.math.order(a, b);
@@ -9,6 +40,20 @@ pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
+
+    // Optional and discriminated union.
+    var shapes: [4]?Shape = undefined;
+    var list = std.ArrayList(f32).init(allocator);
+    try list.appendSlice(&[_]f32{ 1.1, 2.5, 3.14, 4.2, 5.0 });
+    shapes[0] = Shape{ .circle = 5.0 };
+    shapes[1] = Shape{ .rectangle = .{ .width = 4.0, .height = 6.0 } };
+    shapes[2] = Shape{ .hyperrectangle = list };
+    shapes[3] = null;
+    
+    var total_area: f32 = 0.0;
+    for (shapes) |maybeShape| {
+        total_area += optionalShapeArea(maybeShape);
+    }
 
     // Initialize empty containers
     var array = std.ArrayList(u32).init(allocator);
@@ -98,7 +143,8 @@ pub fn main() !void {
         @as(u32, @truncate(sll.first.?.data)) +
         @as(u32, @intFromBool(buf_set.contains("item1"))) +
         @as(u32, @intFromBool(bit_set.isSet(1))) +
-        @as(u32, @intCast(seg_list.at(0).*))
+        @as(u32, @intCast(seg_list.at(0).*)) +
+        @as(u32, @intFromFloat(total_area))
     );
 
     // Debug trap
