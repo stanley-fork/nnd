@@ -74,6 +74,8 @@ impl SliceReader {
         ptr - base_ptr
     }
 
+    pub fn as_slice(&self) -> &'static [u8] { unsafe {std::slice::from_raw_parts(self.p, self.n)} }
+
     #[inline]
     unsafe fn read_bytes_unchecked(&mut self, len: usize) -> &'static [u8] { let r = std::slice::from_raw_parts(self.p, len); self.p = self.p.add(len); self.n -= len; r }
     #[inline]

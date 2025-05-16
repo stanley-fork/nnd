@@ -455,7 +455,10 @@ fn resolve_discriminated_union(val: &AddrOrValueBlob, substruct: &mut Substruct,
                 return Ok(false);
             }
 
-            let t = unsafe {&*field.type_};
+            let mut t = unsafe {&*field.type_};
+            if let Type::Enum(e) = &t.t {
+                t = unsafe {&*e.type_};
+            }
 
             let (size, signed) = match &t.t {
                 Type::Primitive(p) => (t.size, p.contains(PrimitiveFlags::SIGNED)),

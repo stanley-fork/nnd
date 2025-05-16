@@ -2309,19 +2309,20 @@ impl<'a> DwarfLoader<'a> {
         let mut prev_has_children = true;
         let mut skip_subtree = usize::MAX;
         loop {
-            // Check if we're done.
             let offset = DebugInfoOffset(cursor.offset_from(self.section_slice.slice()));
-            if cursor.is_empty() {
-                if self.main_stack.len != 2 { // expected stack contents: fake root, DW_TAG_compile_unit (which doesn't have a DW_TAG_null terminator at the end, for some reason)
-                    return err!(Dwarf, "tree ended early @0x{:x}", offset.0);
-                }
-                return Ok(());
-            }
 
             // Pop from the stack if needed.
             if !prev_has_children {
+                // Expected stack contents: fake root, DW_TAG_compile_unit, ...
                 if self.main_stack.len < 2 {
-                    return err!(Dwarf, "tree underflow");
+                    if cursor.as_slice().iter().find(|c| **c != 0u8).is_some() {
+                        return err!(Dwarf, "tree stack underflow");
+                    } else {
+                        // Zig compiler sometimes outputs extra null bytes at the end of a unit: https://github.com/ziglang/zig/issues/22949
+                        // gdb and llvm-dwarfdump silently ignore them for some reason, so let's do the same.
+                        if self.shard.warn.check(line!()) { eprintln!("warning: unexpected null bytes at the end of unit @0x{:x}", offset.0 - 1); }
+                        return Ok(());
+                    }
                 }
                 let top = self.main_stack.pop();
 
@@ -2351,6 +2352,14 @@ impl<'a> DwarfLoader<'a> {
                 } else if self.main_stack.len < skip_subtree {
                     skip_subtree = usize::MAX;
                 }
+            }
+
+            // Check if we ran out of bytes.
+            if cursor.is_empty() {
+                if self.main_stack.len != 1 { // expected stack contents: fake root
+                    return err!(Dwarf, "tree ended early @0x{:x}", offset.0);
+                }
+                return Ok(());
             }
 
             // Read next DIE.
@@ -2647,7 +2656,7 @@ impl<'a> DwarfLoader<'a> {
                     }
 
                     if attrs.fields & DwarfReference::HAS_SPECIFICATION_OR_ABSTRACT_ORIGIN != 0 {
-                        if self.shard.warn.check(line!()) { eprintln!("warning: DW_AT_specification/DW_AT_abstract_origin on {} is not supported", abbrev.tag()); }
+                        if self.shard.warn.check(line!()) { eprintln!("warning: DW_AT_specification/DW_AT_abstract_origin on {} is not supported (@0x{:x})", abbrev.tag(), offset.0); }
                     }
 
                     if attrs.fields & TypeAttributes::type_ != 0 {
@@ -2656,7 +2665,7 @@ impl<'a> DwarfLoader<'a> {
                             Type::Enum(e) => e.type_ = type_,
                             Type::Pointer(p) => p.type_ = type_,
                             Type::Array(a) => a.type_ = type_,
-                            _ => if self.shard.warn.check(line!()) { eprintln!("warning: DW_AT_type on {} is not supported", abbrev.tag()); }
+                            _ => if self.shard.warn.check(line!()) { eprintln!("warning: DW_AT_type on {} is not supported (@0x{:x})", abbrev.tag(), offset.0); }
                         }
                     } else {
                         match &mut info.t {
@@ -2784,7 +2793,7 @@ impl<'a> DwarfLoader<'a> {
                     let top = self.main_stack.top();
                     if !top.flags.contains(StackFlags::IS_TYPE_SCOPE | StackFlags::IS_VALID_SCOPE) {
                         if !top.flags.contains(StackFlags::IS_TYPE_SCOPE) {
-                            if self.shard.warn.check(line!()) { eprintln!("warning: {} in {} is not supported", abbrev.tag(), self.main_stack.top2().tag); }
+                            if self.shard.warn.check(line!()) { eprintln!("warning: {} in {} is not supported (@0x{:x})", abbrev.tag(), self.main_stack.top2().tag, offset.0); }
                         }
                     } else {
                         let type_top = self.type_stack.top_mut();
