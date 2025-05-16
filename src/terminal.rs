@@ -132,8 +132,6 @@ fn terminal_size(_prof: &mut ProfileBucket) -> Result<(/*rows*/ u16, /*columns*/
 }
 
 // Some ANSI escape codes.
-const CURSOR_BLINKING_BLOCK: &'static str = "\x1B[\x31 q";
-const CURSOR_BLINKING_BAR: &'static str = "\x1B[\x35 q";
 pub const CURSOR_HIDE: &'static str = "\x1B[?25l";
 const CURSOR_SHOW: &'static str = "\x1B[?25h";
 const SCREEN_ALTERNATE: &'static str = "\x1B[?1049h";
@@ -174,7 +172,7 @@ pub fn configure_terminal(mouse_mode: MouseMode) -> Result<()> {
             MouseMode::NoHover => (MOUSE_ENABLE_COMMON, MOUSE_BUTTON_EVENT_MODE),
             MouseMode::Full => (MOUSE_ENABLE_COMMON, MOUSE_ANY_EVENT_MODE),
         };
-        write!(io::stdout(), "{}{}{}{}", SCREEN_ALTERNATE, CURSOR_BLINKING_BAR, mouse1, mouse2)?;
+        write!(io::stdout(), "{}{}{}", SCREEN_ALTERNATE, mouse1, mouse2)?;
         io::stdout().flush()?;
         Ok(())
     }
@@ -191,7 +189,7 @@ pub fn restore_terminal() {
             return;
         }
         // Set the cursor style to blinking block because it's the most common one. Would be better to restore the original style that the cursor had on startup, but there appears to be no way to query or save that style.
-        let _ = write!(io::stdout(), "{}{}{}{}\n", MOUSE_DISABLE, CURSOR_BLINKING_BLOCK, CURSOR_SHOW, SCREEN_MAIN).unwrap_or(());
+        let _ = write!(io::stdout(), "{}{}{}\n", MOUSE_DISABLE, CURSOR_SHOW, SCREEN_MAIN).unwrap_or(());
         let _ = io::stdout().flush().unwrap_or(());
 
         let termios = TERMINAL_STATE_TO_RESTORE.get();
