@@ -32,7 +32,8 @@ build_file() {
         zig)
             echo "$file"
             zig build-exe -femit-bin="$BASEDIR/build/$name_without_extension" "$BASEDIR/$file"
-            rm -f "$BASEDIR/build/${name_without_extension}.o"
+            zig build-exe -fno-llvm -fno-lld -femit-bin="$BASEDIR/build/${name_without_extension}-nollvm" "$BASEDIR/$file"
+            rm -f "$BASEDIR/build/${name_without_extension}.o" "$BASEDIR/build/${name_without_extension}-nollvm.o"
             ;;
     esac
 }
