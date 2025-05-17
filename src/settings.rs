@@ -100,10 +100,16 @@ pub struct Palette {
     pub state_suspended: Style,
     pub state_other: Style,
 
+    pub hint_global: Style,
+    pub hint_state_dependent: Style,
+    pub hint_window_dependent: Style,
+
     // How to highlight things like selected table row or selected code line.
     pub selected: StyleAdjustment,
     // How to highlight clickable widgets on mouse hover.
     pub hovered: StyleAdjustment,
+    // Line with instruction pointer in code or disassembly window.
+    pub ip_line: StyleAdjustment,
     // How to draw widgets with REDRAW_IF_VISIBLE flag, as a sort of loading indicator. It should be visible very rarely and only for one frame.
     pub placeholder_fill: Option<(char, Style)>,
     // What to prepend/append when text is truncated on the left/right. E.g. '…'.
@@ -209,8 +215,13 @@ impl Default for Palette {
             state_suspended: Style {bg: light_green, fg: black, ..D!()},
             state_other: Style {bg: yellow, fg: black, ..D!()},
 
+            hint_global: Style {fg: white.darker(), ..D!()},
+            hint_state_dependent: Style {fg: Color(120, 80, 120), ..D!()},
+            hint_window_dependent: Style {fg: Color(80, 120, 80), ..D!()},
+
             selected: StyleAdjustment {add_fg: (50, 50, 50), add_bg: (50, 50, 50), ..D!()},
             hovered: StyleAdjustment {add_fg: (20, 20, 20), add_bg: (25, 25, 25), ..D!()},
+            ip_line: StyleAdjustment {add_fg: (5, 50, 5), add_bg: (5, 50, 5), ..D!()},
 
             table_header: Style {fg: white.darker(), ..D!()},
             //striped_table: StyleAdjustment {add_fg: (0, 0, 0), add_bg: (20, 20, 20), ..D!()},
@@ -672,6 +683,6 @@ impl Default for KeyBinds {
             (Key::Char('v').ctrl(), KeyAction::Paste),
             (Key::Char('\n').alt(), KeyAction::NewLine),
         ]);
-        KeyBinds {normal, text_input, vscroll_sensitivity: 8, hscroll_sensitivity: 20}
+        KeyBinds {normal, text_input, vscroll_sensitivity: 4, hscroll_sensitivity: 20}
     }
 }

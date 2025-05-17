@@ -264,6 +264,7 @@ impl Widget {
     pub fn set_fixed_height(&mut self, s: usize) -> &mut Self { self.axes[1].set_fixed_size(s); self }
 
     // Copy and clear all fields related to being already part of the tree. The resulting Widget can be add()ed to the tree.
+    // ("Questionable" because I'm not sure it's a good idea to allow this, and am not sure it'll work well.)
     pub fn make_questionable_copy(&self) -> Self {
         let mut r = Self {
             identity: self.identity, source_line: self.source_line, axes: self.axes.clone(), flags: self.flags, draw_text: self.draw_text.clone(), style_adjustment: self.style_adjustment, draw_fill: self.draw_fill.clone(), draw_progress_bar: self.draw_progress_bar.clone(), draw_frame: self.draw_frame.clone(),

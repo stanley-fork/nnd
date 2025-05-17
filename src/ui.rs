@@ -46,11 +46,13 @@ pub struct UIState {
 pub struct KeyHint {
     pub key_ranges: Vec<[KeyAction; 2]>,
     pub hint: &'static str,
+    pub state_dependent: bool,
+    pub window_dependent: bool,
 }
 impl KeyHint {
-    fn key(key: KeyAction, hint: &'static str) -> Self { Self {key_ranges: vec![[key, key]], hint} }
-    fn keys(keys: &[KeyAction], hint: &'static str) -> Self { Self {key_ranges: keys.iter().map(|k| [*k, *k]).collect(), hint} }
-    fn ranges(ranges: &[[KeyAction; 2]], hint: &'static str) -> Self { Self {key_ranges: ranges.iter().cloned().collect(), hint} }
+    fn key(key: KeyAction, hint: &'static str) -> Self { Self {key_ranges: vec![[key, key]], hint, ..Self::default()} }
+    fn keys(keys: &[KeyAction], hint: &'static str) -> Self { Self {key_ranges: keys.iter().map(|k| [*k, *k]).collect(), hint, ..Self::default()} }
+    fn ranges(ranges: &[[KeyAction; 2]], hint: &'static str) -> Self { Self {key_ranges: ranges.iter().cloned().collect(), hint, ..Self::default()} }
 }
 
 struct SourceScrollTarget {
@@ -317,6 +319,7 @@ impl DebuggerUI {
         hints.push(KeyHint::ranges(&[[KeyAction::Window0, KeyAction::Window9], [KeyAction::WindowLeft, KeyAction::WindowDown]], "switch window"));
         hints.push(KeyHint::keys(&[KeyAction::NextTab, KeyAction::PreviousTab], "switch tab"));
         hints.push(KeyHint::keys(&[KeyAction::PreviousStackFrame, KeyAction::NextStackFrame, KeyAction::PreviousThread, KeyAction::NextThread], "switch frame/thread"));
+        let start = hints.len();
         match debugger.target_state {
             ProcessState::Running => hints.push(
                 KeyHint::key(KeyAction::Suspend, "suspend")),
@@ -336,10 +339,16 @@ impl DebuggerUI {
         if debugger.mode == RunMode::Run && debugger.target_state.process_ready() {
             hints.push(KeyHint::key(KeyAction::Kill, "kill"));
         }
+        for h in &mut hints[start..] {
+            h.state_dependent = true;
+        }
         if let &Some(id) = &self.layout.active_window {
             if let Some(w) = self.layout.windows.try_get(id) {
-                hints.push(KeyHint::keys(&[], "")); // spacer
+                let start = hints.len();
                 w.content.get_key_hints(&mut hints, debugger);
+                for h in &mut hints[start..] {
+                    h.window_dependent = true;
+                }
             }
         }
         self.state.key_hints = hints;
@@ -2138,6 +2147,7 @@ impl WindowContent for DisassemblyWindow {
 
         with_parent!(ui, content, {
             let line_range = visible_y.start.max(0) as usize .. (visible_y.end.max(0) as usize).min(disas.lines.len());
+            let mut main_ip_line: Option<usize> = None;
             for i in line_range.clone() {
                 let line = &disas.lines[i];
 
@@ -2149,6 +2159,7 @@ impl WindowContent for DisassemblyWindow {
                     if ip_idx == ip_lines.len() || ip_lines[ip_idx].0 != i {
                         ui_write!(ui, default, "  ");
                     } else if ip_lines[ip_idx].1 {
+                        main_ip_line = Some(i);
                         ui_write!(ui, instruction_pointer, "⮕ ");
                     } else {
                         ui_write!(ui, additional_instruction_pointer, "⮕ ");
@@ -2204,6 +2215,9 @@ impl WindowContent for DisassemblyWindow {
                 if i == tab.area_state.cursor {
                     w.style_adjustment.update(ui.palette.selected);
                 }
+                if &main_ip_line == &Some(i) {
+                    w.style_adjustment.update(ui.palette.ip_line);
+                }
                 ui.add(w);
             }
 
@@ -2238,6 +2252,9 @@ impl WindowContent for DisassemblyWindow {
                         // Manually highlight selected row because there's no transparency.
                         if i == tab.area_state.cursor {
                             s = ui.palette.selected.apply(s);
+                        }
+                        if &main_ip_line == &Some(i) {
+                            s = ui.palette.ip_line.apply(s);
                         }
                         styled_writeln!(ui.text, s, "{}", symbol);
                     }
@@ -2433,7 +2450,7 @@ struct HintsWindow {
 }
 
 impl HintsWindow {
-    const NORMAL_HEIGHT: usize = 10;
+    const NORMAL_HEIGHT: usize = 12; // just enough to fit everything on a laptop-width screen (width affects height because of line wrap)
     const PROFILER_HEIGHT: usize = 17;
 
     fn build_profiling_charts(&mut self, debugger: &mut Debugger, ui: &mut UI) {
@@ -2590,22 +2607,33 @@ impl WindowContent for HintsWindow {
         }
 
         let start = ui.text.num_lines();
+        let mut column_breaks: Vec<usize> = Vec::new();
+        column_breaks.push(start);
         for hint in &state.key_hints {
-            if hint.key_ranges.is_empty() { // spacer
-                ui.text.close_line();
-                continue;
-            }
+            let style = if hint.window_dependent {
+                // Currently we just put all non-window-specific hints in the left column and all window-specific ones in the right one,
+                // it happens to fit just right for the current set of hints.
+                if column_breaks.len() == 1 {
+                    column_breaks.push(ui.text.num_lines());
+                }
+
+                ui.palette.hint_window_dependent
+            } else if hint.state_dependent {
+                ui.palette.hint_state_dependent
+            } else {
+                ui.palette.hint_global
+            };
             for (i, range) in hint.key_ranges.iter().enumerate() {
                 if i != 0 {
-                    ui_write!(ui, default_dim, "/");
+                    styled_write!(ui.text, style, "/");
                 }
-                styled_write!(ui.text, ui.palette.hotkey.apply(ui.palette.default_dim), "{}", ui.key_binds.normal.action_to_key_name(range[0]));
+                styled_write!(ui.text, ui.palette.hotkey.apply(style), "{}", ui.key_binds.normal.action_to_key_name(range[0]));
                 if range[0] != range[1] {
-                    ui_write!(ui, default_dim, "…");
-                    styled_write!(ui.text, ui.palette.hotkey.apply(ui.palette.default_dim), "{}", ui.key_binds.normal.action_to_key_name(range[1]));
+                    styled_write!(ui.text, style, "…");
+                    styled_write!(ui.text, ui.palette.hotkey.apply(style), "{}", ui.key_binds.normal.action_to_key_name(range[1]));
                 }
             }
-            ui_writeln!(ui, default_dim, " - {}", hint.hint);
+            styled_writeln!(ui.text, style, " - {}", hint.hint);
         }
         let end = ui.text.num_lines();
 
@@ -2622,9 +2650,7 @@ impl WindowContent for HintsWindow {
                 if i != 0 {
                     ui.add(widget!().fixed_width(1).fixed_height(0));
                 }
-                let mut range = start + i*lines_per_column .. start + (i+1)*lines_per_column;
-                range.end = range.end.min(end);
-                range.start = range.start.min(range.end);
+                let range = *column_breaks.get(i).unwrap_or(&end)..*column_breaks.get(i+1).unwrap_or(&end);
                 ui.add(widget!().width(AutoSize::Remainder(2.0)).height(AutoSize::Text).text_lines(range).flags(WidgetFlags::LINE_WRAP));
             }
             ui.layout_children(Axis::X);
@@ -2649,8 +2675,7 @@ impl WindowContent for BinariesWindow {
             Column::new("name", AutoSize::Remainder(1.0), false),
             Column::new("offset", AutoSize::Fixed(12), false),
             Column::new("file", AutoSize::Fixed(PrettySize::MAX_LEN), false),
-            // Hidden column only visible in the tooltip.
-            Column::new("", AutoSize::Fixed(0), false).with_spacing(0),
+            Column::new("", AutoSize::Fixed(0), false).hide(),
         ]);
         table.hide_cursor_if_unfocused = true;
         for binary in debugger.symbols.iter() {
@@ -2877,14 +2902,14 @@ impl WindowContent for ThreadsWindow {
         });
         ui.layout_children(Axis::Y);
 
-        let have_stats = (debugger.mode != RunMode::CoreDump) as usize;
+        let have_stats = debugger.mode != RunMode::CoreDump;
         let mut table = with_parent!(ui, table_widget, {
             Table::new(mem::take(&mut self.table_state), ui, vec![
                 Column::new("idx", AutoSize::Fixed(5), true),
                 Column::new("tid", AutoSize::Fixed(10), true),
                 Column::new("name", AutoSize::Fixed(15), true),
-                Column::new("s", AutoSize::Fixed(2*have_stats), true).with_spacing(have_stats),
-                Column::new("cpu", AutoSize::Fixed(4*have_stats), true).with_spacing(have_stats),
+                Column::new("s", AutoSize::Fixed(2), true).with_hidden(!have_stats),
+                Column::new("cpu", AutoSize::Fixed(4), true).with_hidden(!have_stats),
                 Column::new("function", AutoSize::Remainder(1.0), false),
                 Column::new("addr", AutoSize::Fixed(12), true),
                 Column::new("bin", AutoSize::Fixed(3), false),
@@ -3194,8 +3219,7 @@ impl WindowContent for StackWindow {
             Column::new("location", AutoSize::Remainder(1.0), false),
             Column::new("address", AutoSize::Fixed(12), false),
             Column::new("bin", AutoSize::Fixed(3), false),
-            // Hidden column only visible in the tooltip.
-            Column::new("", AutoSize::Fixed(0), false).with_spacing(0),
+            Column::new("unwind info", AutoSize::Fixed(0), false).hide(),
         ]);
 
         let write_stack_truncated_error = |e: &Error, ui: &mut UI| -> usize {
@@ -3261,7 +3285,7 @@ impl WindowContent for StackWindow {
             }
             table.text_cell(ui);
 
-            ui_writeln!(ui, default_dim, "unwind info: {:?}", frame.unwind_source);
+            ui_writeln!(ui, default_dim, "{:?}", frame.unwind_source);
             table.text_cell(ui);
         }
         if state.stack.subframes.is_empty() {
@@ -4102,12 +4126,14 @@ impl WindowContent for CodeWindow {
             let mut adjustments: Vec<(Range<usize>, StyleAdjustment)> = Vec::new();
             for i in line_range.clone() {
                 let mut column_number = 0usize;
+                let mut is_main_ip = false;
 
                 match instruction_pointers.get(&(&tab.path_in_symbols, i + 1)) {
                     None => ui_write!(ui, default, "  "),
-                    Some(&(col, is_selected, is_top)) => {
+                    Some(&(col, is_selected, _is_top)) => {
                         column_number = col;
                         let style = if is_selected {ui.palette.instruction_pointer} else {ui.palette.additional_instruction_pointer};
+                        is_main_ip = is_selected;
                         styled_write!(ui.text, style, "⮕ ");
                     }
                 };
@@ -4144,6 +4170,9 @@ impl WindowContent for CodeWindow {
                 let mut w = widget!().fixed_height(1).fixed_y(i as isize).text(l).fill(' ', ui.palette.default).flags(WidgetFlags::HSCROLL_INDICATOR_RIGHT).highlight_on_hover();
                 if i == tab.area_state.cursor {
                     w.style_adjustment.update(ui.palette.selected);
+                }
+                if is_main_ip {
+                    w.style_adjustment.update(ui.palette.ip_line);
                 }
                 ui.add(w);
             }

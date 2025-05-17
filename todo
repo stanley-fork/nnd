@@ -29,11 +29,7 @@ test with watches window filled with long arrays (I saw 50ms frames when there a
 investigate unresponsive ui when conditional breakpoint is hit at a high rate
 
 todo:
-decrease default scroll wheel sensitivity to 4
 M-k to send SIGINT to the program
-highlight ip line more prominently
-investigate empty second line in binaries window
-colors in hints window to indicate window-specific keys
 help dialog
 support gnu_debugaltlink, as found in zsh in debuginfod
 get debuglink binaries from debuginfod

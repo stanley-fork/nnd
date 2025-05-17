@@ -225,13 +225,14 @@ pub struct Column {
     pub title: &'static str,
     pub auto_width: AutoSize, // Fixed, Text, Children, Remainder are supported
     pub sortable: bool,
-    pub spacing: usize, // horizontal gap betwen end of previous column and start of this one; ignored for first column
+    pub hidden: bool, // only visible in tooltip
     width: usize,
     pos: isize,
 }
 impl Column {
-    pub fn new(title: &'static str, auto_width: AutoSize, sortable: bool) -> Self { Self {auto_width, title, sortable, width: str_width(title) + sortable as usize, pos: 0, spacing: 1} }
-    pub fn with_spacing(mut self, spacing: usize) -> Self { self.spacing = spacing; self }
+    pub fn new(title: &'static str, auto_width: AutoSize, sortable: bool) -> Self { Self {auto_width, title, sortable, width: str_width(title) + sortable as usize, pos: 0, hidden: false} }
+    pub fn hide(mut self) -> Self { self.hidden = true; self }
+    pub fn with_hidden(mut self, hidden: bool) -> Self { self.hidden = hidden; self }
 }
 
 #[derive(Default, Clone)]
@@ -438,7 +439,13 @@ impl Table {
         let i = ui.get(w).children.len();
         assert!(i < self.columns.len());
         with_parent!(ui, w, {
-            ui.add(widget!().width(self.columns[i].auto_width).height(AutoSize::Children))
+            let cell = ui.add(widget!().width(self.columns[i].auto_width).height(AutoSize::Children));
+            if self.columns[i].hidden {
+                ui.get_mut(cell).axes[Axis::X].max_size = 0;
+                // Prevent this cell from affecting row height.
+                ui.get_mut(cell).axes[Axis::Y].max_size = 0;
+            }
+            cell
         })
     }
 
@@ -468,6 +475,10 @@ impl Table {
         let mut remainder_helper = RemainderFractionHelper::new(ui.get(self.rows_container).axes[Axis::X].size);
         remainder_helper.declare_fixed_part(reserved);
         for (col_idx, col) in self.columns.iter_mut().enumerate() {
+            if col.hidden {
+                col.width = 0;
+                continue;
+            }
             match col.auto_width {
                 AutoSize::Remainder(f) => remainder_helper.declare_remainder_fraction(f, col_idx),
                 AutoSize::Children | AutoSize::Text => remainder_helper.declare_fixed_part(col.width),
@@ -478,13 +489,16 @@ impl Table {
                 _ => panic!("unexpected auto_width for column {}", col.title),
             }
             if col_idx > 0 {
-                remainder_helper.declare_fixed_part(col.spacing);
+                remainder_helper.declare_fixed_part(1);
             }
         }
         let mut pos = 0isize;
         for (col_idx, col) in self.columns.iter_mut().enumerate() {
+            if col.hidden {
+                continue;
+            }
             if col_idx > 0 {
-                pos += col.spacing as isize;
+                pos += 1;
             }
             match col.auto_width {
                 AutoSize::Remainder(f) => col.width = remainder_helper.calculate_remainder_fraction(f, col_idx),
@@ -642,6 +656,8 @@ impl Table {
             w.parent = to;
             if from == cell {
                 w.axes[Axis::X].auto_size = AutoSize::Parent;
+                w.axes[Axis::X].max_size = usize::MAX;
+                w.axes[Axis::Y].max_size = usize::MAX;
             }
             let new_to = ui.add(w);
             for c in ui.get(from).children.iter().rev() {
@@ -1376,7 +1392,7 @@ impl SearchDialog {
             let mut columns = vec![Column::new("", AutoSize::Remainder(1.0), false)];
             if properties.have_mangled_names {
                 // Hidden column only visible in tooltip.
-                columns.push(Column::new("mangled name", AutoSize::Fixed(0), false).with_spacing(0));
+                columns.push(Column::new("mangled name", AutoSize::Fixed(0), false).hide());
             }
             let mut table = Table::new(mem::take(&mut self.table_state), ui, columns);
             let range = table.lazy(res.results.len(), lines_per_result, ui);

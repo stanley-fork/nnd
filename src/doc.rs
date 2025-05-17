@@ -43,7 +43,7 @@ Limitations:
  * TUI only (no REPL, no GUI)
  * no remote debugging (but works fine over ssh)
  * single process (doesn't follow forks)
- * no rr or other backwards stepping
+ * no record-replay or other backwards stepping
 
 Properties:
  * Not based on gdb or lldb, implemented mostly from scratch.
