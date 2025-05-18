@@ -29,9 +29,11 @@ test with watches window filled with long arrays (I saw 50ms frames when there a
 investigate unresponsive ui when conditional breakpoint is hit at a high rate
 
 todo:
-M-k to send SIGINT to the program
 help dialog
+try with odin
+zig pretty-printers
 support gnu_debugaltlink, as found in zsh in debuginfod
+output window (plain text)
 get debuglink binaries from debuginfod
 "Expected an attribute value to be a string form" on zsh
 buffer input when program is quitting, especially k+r and steps
@@ -94,6 +96,8 @@ handle partially-optimized-out struct values (common in rust)
 read color scheme from file
 color threads based on stack hash
 search in watches window
+assigning to debuggee variables and registers, including rip
+key to teleport ip to current line
 
 watches, expressions
   first, implement simple expression watches
@@ -136,7 +140,6 @@ disassembly: show basic block boundaries (jump destinations)
 disassembly: show current jump destination like in perf
 maybe handle tail calls somehow, for step-over/step-out purposes; probably show it in ui
 if a step is interrupted, focus on the stack frame of the step, not the top frame
-allow writing to registers and memory
 allow calling functions
 refactor loader stack to not contain leaves
 snapshots and "step back"; probably don't actually revert the process state, just allow inspecting snapshot of memory+registers

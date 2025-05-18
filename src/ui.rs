@@ -268,7 +268,11 @@ impl DebuggerUI {
                     report_result(&mut self.state, &r);
                 }
                 Some(KeyAction::Kill) => {
-                    let r = debugger.murder();
+                    let r = debugger.murder(libc::SIGKILL);
+                    report_result(&mut self.state, &r);
+                }
+                Some(KeyAction::SendSigint) => {
+                    let r = debugger.murder(libc::SIGINT);
                     report_result(&mut self.state, &r);
                 }
 
@@ -337,7 +341,7 @@ impl DebuggerUI {
             _ => (),
         }
         if debugger.mode == RunMode::Run && debugger.target_state.process_ready() {
-            hints.push(KeyHint::key(KeyAction::Kill, "kill"));
+            hints.push(KeyHint::keys(&[KeyAction::Kill, KeyAction::SendSigint], "kill/sigint"));
         }
         for h in &mut hints[start..] {
             h.state_dependent = true;
@@ -2418,6 +2422,7 @@ impl WindowContent for StatusWindow {
         ui_writeln!(ui, default_dim, "nnd pid: {} cpu {:.0}% mem {}", my_pid(), debugger.my_resource_stats.cpu_percentage(debugger.context.settings.periodic_timer_ns), PrettySize(debugger.my_resource_stats.latest.rss_bytes()));
         match &debugger.persistent.path {
             Ok(p) => ui_writeln!(ui, default_dim, "{}/", p.display()),
+            Err(e) if e.is_disabled() => ui_writeln!(ui, default_dim, "{}", e),
             Err(e) => ui_writeln!(ui, error, "{}", e),
         };
 

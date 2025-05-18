@@ -21,33 +21,42 @@ impl Default for PersistentState { fn default() -> Self { Self {path: err!(Inter
 impl PersistentState {
     // Finds/creates a directory ~/.nnd/0, and flock()s ~/.nnd/0/lock to prevent other debugger processes from using this directory.
     // If ~/.nnd/0 is already locked, tries ~/.nnd/1, etc. The lock is released when debugger exits or dies.
-    // If anything fails, fall back to sending everything to /dev/null: debugger's log, debuggee's stdout and stderr.
-    pub fn init() -> Self {
-        let r = match Self::try_init() {
-            Ok(x) => x,
+    // If anything fails, fall back to sending everything to /dev/null: debugger's log, debuggee's stdout and stderr, etc.
+    pub fn init(settings: &Settings) -> Result<Self> {
+        if settings.session_name.is_none() {
+            return Self::fallback_init(error!(Disabled, ""));
+        }
+        match Self::try_init(settings) {
+            Ok(x) => Ok(x),
+            Err(e) if settings.session_name.is_name() => Err(e),
+            // If the user doesn't care about sessions, don't require ~/.nnd to be writable etc.
             Err(e) => Self::fallback_init(e),
-        };
-        r
+        }
     }
 
-    pub fn open_or_create_file(&self, name: &str) -> fs::File {
+    pub fn open_or_create_file(&self, name: &str) -> Result<fs::File> {
         if let Some(d) = &self.dir {
             match d.open_or_create_file(Path::new(name)) {
-                Ok(f) => return f,
+                Ok(f) => return Ok(f),
                 Err(e) => eprintln!("error: failed to open {}: {}", name, e),
             }
         }
-        open_dev_null().unwrap()
+        open_dev_null()
     }
 
-    fn try_init() -> Result<Self> {
+    fn try_init(settings: &Settings) -> Result<Self> {
         let home = std::env::var("HOME")?;
         let mut parent_path = PathBuf::from(home);
         parent_path.push(".nnd");
         let _ = DirFd::open_or_create(&parent_path)?;
         for i in 0..100 {
             let mut path = parent_path.clone();
-            path.push(format!("{}", i));
+            match &settings.session_name {
+                SessionName::Auto => path.push(format!("{}", i)),
+                SessionName::Temp => path.push(format!("temp-{}", i)),
+                SessionName::None => panic!("huh"),
+                SessionName::Name(name) => path.push(format!("sess-{}", name)),
+            }
             let dir = DirFd::open_or_create(&path)?;
             let lock = dir.open_or_create_file(Path::new("lock"))?;
             loop {
@@ -61,11 +70,19 @@ impl PersistentState {
                     let log = dir.open_or_create_file(Path::new(log_file_name))?;
                     let original_stderr_fd = redirect_stderr(&log)?;
                     let log_file_path = Some(path.join(log_file_name));
+                    match dir.remove_file(Path::new("state")) {
+                        Ok(()) => (),
+                        Err(e) if e.is_io_not_found() => (),
+                        Err(e) => eprintln!("warning: {}", e),
+                    }
                     return Ok(Self {path: Ok(path), configs_path: Some(parent_path), debuginfod_cache_path: Some(debuginfod_cache_path), dir: Some(dir), lock: Some(lock), log_file_path, original_stderr_fd, ..Default::default()});
                 }
                 let e = io::Error::last_os_error();
                 match e.kind() {
-                    io::ErrorKind::WouldBlock => break,
+                    io::ErrorKind::WouldBlock => match &settings.session_name {
+                        SessionName::Name(name) => return err!(Usage, "session name {} is already used by another running nnd process", name),
+                        _ => break, // try another name
+                    }
                     io::ErrorKind::Interrupted => continue,
                     _ => return Err(e.into()),
                 }
@@ -74,9 +91,9 @@ impl PersistentState {
         err!(Sanity, "there appear to be >99 nnd processes running")
     }
 
-    fn fallback_init(err: Error) -> Self {
-        let original_stderr_fd = redirect_stderr(&open_dev_null().unwrap()).unwrap();
-        Self {path: Err(err), original_stderr_fd, ..Default::default()}
+    fn fallback_init(err: Error) -> Result<Self> {
+        let original_stderr_fd = redirect_stderr(&open_dev_null()?)?;
+        Ok(Self {path: Err(err), original_stderr_fd, ..Default::default()})
     }
 
     pub fn try_to_save_state_if_changed(debugger: &mut Debugger, ui: &mut DebuggerUI) {
@@ -93,7 +110,7 @@ impl PersistentState {
     }
 
     fn save_state_if_changed(debugger: &mut Debugger, ui: &mut DebuggerUI) -> Result<()> {
-        if debugger.persistent.dir.is_none() {
+        if debugger.persistent.dir.is_none() || debugger.context.settings.session_name.is_temp() {
             return Ok(());
         }
         let mut buf: Vec<u8> = Vec::new();
@@ -314,6 +331,17 @@ fn redirect_stderr(file: &fs::File) -> Result<Option<RawFd>> {
     Ok(original_stderr_fd)
 }
 
+pub fn unredirect_stderr(original_stderr_fd: &Option<RawFd>) {
+    let fd = match original_stderr_fd {
+        None => return,
+        &Some(x) => x,
+    };
+    let r = unsafe {libc::dup2(fd.as_raw_fd(), 2)};
+    if r < 0 {
+        eprintln!("warning: failed to un-redirect stderr: {}", io::Error::last_os_error());
+    }
+}
+
 struct DirFd {
     fd: OwnedFd,
 }
@@ -357,6 +385,15 @@ impl DirFd {
         let r = unsafe {libc::renameat(self.fd.as_raw_fd(), c_old_path.as_bytes().as_ptr() as *const i8, new_dirfd, c_new_path.as_bytes().as_ptr() as *const i8)};
         if r == -1 {
             return errno_err!("failed to rename file {} to {}", old_path.display(), new_path.display());
+        }
+        Ok(())
+    }
+
+    fn remove_file(&self, relative_path: &Path) -> Result<()> {
+        let c_path = CString::new(relative_path.as_os_str().as_bytes()).unwrap();
+        let r = unsafe {libc::unlinkat(self.fd.as_raw_fd(), c_path.as_bytes().as_ptr() as *const i8, 0)};
+        if r == -1 {
+            return errno_err!("failed to remove file {}", relative_path.display());
         }
         Ok(())
     }

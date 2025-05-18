@@ -539,7 +539,7 @@ impl Debugger {
                 }
             };
             let stdout_file = match &self.context.settings.stdout_file {
-                None => self.persistent.open_or_create_file("stdout"),
+                None => self.persistent.open_or_create_file("stdout")?,
                 Some(path) => match fs::File::create(path) {
                     Ok(x) => x,
                     Err(e) => {
@@ -550,7 +550,7 @@ impl Debugger {
                 }
             };
             let stderr_file = match &self.context.settings.stderr_file {
-                None => self.persistent.open_or_create_file("stderr"),
+                None => self.persistent.open_or_create_file("stderr")?,
                 Some(path) => match fs::File::create(path) {
                     Ok(x) => x,
                     Err(e) => {
@@ -1027,12 +1027,12 @@ impl Debugger {
         Ok(n)
     }
 
-    pub fn murder(&mut self) -> Result<()> {
+    pub fn murder(&mut self, signal: i32) -> Result<()> {
         if self.mode == RunMode::Attach { return err!(Usage, "not killing attached process"); }
         if !self.target_state.process_ready() { return err!(Usage, "no process"); }
         eprintln!("info: kill");
         unsafe {
-            let r = libc::kill(self.pid, libc::SIGKILL);
+            let r = libc::kill(self.pid, signal);
             if r != 0 {
                 return errno_err!("kill failed");
             }

@@ -115,6 +115,12 @@ fn main() {
                     process::exit(1);
                 }
             };
+        } else if let Some(s) = parse_arg(&mut args, &mut seen_args, "--session", "", false, false) {
+            settings.session_name = match &s[..] {
+                "-" => SessionName::Temp,
+                "--" => SessionName::None,
+                name => SessionName::Name(name.to_string()),
+            };
         } else if let Some(_) = parse_arg(&mut args, &mut seen_args, "--echo-input", "", true, false) {
             match run_input_echo_tool() {
                 Ok(()) => (),
@@ -236,7 +242,14 @@ fn main() {
     }
 
     // This redirects stderr to the log file, so we have to do it early.
-    let persistent = PersistentState::init();
+    let persistent = match PersistentState::init(&settings) {
+        Ok(x) => x,
+        Err(e) => {
+            // (This only happens if session name was provided on the command line. Otherwise PersistentState has fallback behavior if directory couldn't be created.)
+            eprintln!("error: {}", e);
+            process::exit(1);
+        }
+    };
     settings.debuginfod_cache_path = persistent.debuginfod_cache_path.clone();
     let (log_file_path, original_stderr_fd) = (persistent.log_file_path.clone(), persistent.original_stderr_fd);
 

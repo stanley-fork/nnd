@@ -23,6 +23,7 @@ Additional arguments:
 --module path   - path to executable or dynamic library from which to load debug symbols; useful if the running executable is stripped and you have an unstripped version on the side; can be specified multiple times to provide multiple dynamic libraries (they'll be automatically matched by build id)
 -o   - try to get debug info from debuginfod server at https://debuginfod.elfutils.org/ ; alternatively, set environment variable DEBUGINFOD_URLS to a space-separated list of URLs to use
 --mouse full|no-hover|disabled   - mouse mode; 'no-hover' to react only to clicking and dragging, 'disabled' to disable mouse altogether; default is 'full' (if it doesn't work, check if mouse reporting is enabled in the terminal application)
+--session name   - project name to identify saved state like open files and breakpoints; "-" for temporary session that doesn't save state; "--" to avoid touching any files at all (at ~/.nnd/)
 --help   - show this help message; see below for more help pages
 
 Documentation chapters:
@@ -216,19 +217,25 @@ It doesn't create any other files or make any other changes to your system.
 
 Key bindings can be customized by creating ~/.nnd/keys . Read the comments in ~/.nnd/keys.default to get started.
 
-Each nnd process uses a subdirectory of ~/.nnd/ . When only one nnd is started, it'll use ~/.nnd/0/ . If a second nnd is started while the first is still running, it'll get ~/.nnd/1/ , etc.
-After an nnd process ends, the directory can be reused.
-E.g. if you start a few instances of nnd, then quit them all, then start them again in the same order, they'll use the same directories in the same order.
-
-When using `sudo nnd -p`, keep in mind that the ~/.nnd` will be in the home directory of the root user, not the current user.
-
-Files inside ~/.nnd/<number>/:
- * stdout, stderr - redirected stdout and stderr of the debugged program, unless overridden with --stdout/--stderr/--tty.
+Things like watches, breakpoints, open files, etc persist when closing and reopening the debugger. Such state is associated with a "session" and is saved at '~/.nnd/<session-name>/state'.
+Each session can have at most one debugger process running at any given time (synchronized by '~/.nnd/<session-name>/lock').
+The session directory also contains these files:
+ * 'stdout', 'stderr' - redirected stdout and stderr of the debugged program, unless overridden with --stdout/--stderr/--tty.
    (stdin is redirected to /dev/null by default.)
- * state - saved lists of watches, breakpoints, open files, open functions.
- * log - some messages from the debugger itself. Sometimes useful for debugging the debugger. Sometimes there are useful stats about debug info.
-   On crash, error message and stack trace goes to this file. Please include this file when reporting bugs, especially crashes.
- * lock - prevents multiple nnd processes from using the same directory simultaneously."###),
+ * 'log' - some messages from the debugger itself. Sometimes useful for debugging the debugger. Sometimes there are useful stats about debug info.
+   On crash, error message and stack trace go to this file. Please include this file when reporting bugs, especially crashes.
+
+On startup, the debugger picks the session-name to use, which can be controlled using `--session` command line argument:
+ * If --session=name is provided, this name is used (with prefix "sess-" prepended to avoid name collisions with non-session files).
+ * If no --session is provided, a numeric session-name is picked automatically. When only one nnd is started, it'll use '~/.nnd/0'. If a second nnd is started while the first is still running, it'll get '~/.nnd/1/', etc.
+   After an nnd process exits, the directory can be reused.
+   E.g. if you start a few instances of nnd, then quit them all, then start them again in the same order, they'll reuse the same sessions in the same order.
+ * If --session=-, a "temporary" session is used, named "temp-<number>". The only difference from default mode is that state is not saved.
+ * If --session=--, the debugger won't touch any files at all (won't create `~/.nnd` etc). The debugged program's stdout and stderr are redirected to /dev/null. The log file is not written.
+
+Session directory path is shown in UI in the status window (on the left).
+
+When using `sudo nnd -p`, keep in mind that the ~/.nnd` will be in the home directory of the root user, not the current user."###),
         "--help-tty" => println!(r###"The debugger occupies the whole terminal with its TUI. But what if the debugged program also wants to use the terminal in an interactive way?
 E.g. how to use nnd to debug itself?
 

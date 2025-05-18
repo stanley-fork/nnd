@@ -24,6 +24,8 @@ pub struct Settings {
     // The `false` mode is more likely to overstep.
     pub steps_stop_only_on_statements: bool,
 
+    pub session_name: SessionName,
+    
     pub debuginfod_urls: Vec<String>,
     pub debuginfod_cache_path: Option<PathBuf>,
 
@@ -39,7 +41,6 @@ pub struct Settings {
     pub fixed_fps: bool, // render `fps` times per second even if nothing changes
     pub trace_logging: bool, // verbose logging, e.g. log every signal passed-through to the process
 }
-
 impl Default for Settings {
     fn default() -> Self { Settings {
         tab_width: 2,
@@ -54,6 +55,8 @@ impl Default for Settings {
         exception_aware_steps: true,
         steps_stop_only_on_statements: true,
 
+        session_name: SessionName::Auto,
+        
         debuginfod_urls: Vec::new(), // populated by get_debuginfod_urls() later
         debuginfod_cache_path: None,
 
@@ -66,6 +69,23 @@ impl Default for Settings {
         fixed_fps: false,
         trace_logging: false,
     } }
+}
+
+// Which directory under ~/.nnd/ to use for things like log, redirected stdout and stderr, saved state, etc.
+pub enum SessionName {
+    // Pick the smallest available name "0", "1", ...
+    Auto,
+    // Pick a directory like "temp-0" and clear it at the start.
+    Temp,
+    // Do not create or touch any files. Log, stdout, etc all go to /dev/null. On crash, you get no stack trace.
+    None,
+    // Use the given name. If we fail to use it, refuse to start (in other modes we fall back to /dev/null).
+    Name(String),
+}
+impl SessionName {
+    pub fn is_temp(&self) -> bool { match self {Self::Temp => true, _ => false} }
+    pub fn is_none(&self) -> bool { match self {Self::None => true, _ => false} }
+    pub fn is_name(&self) -> bool { match self {Self::Name(_) => true, _ => false} }
 }
 
 pub fn get_debuginfod_urls(default: bool) -> Vec<String> {
@@ -301,6 +321,7 @@ pub enum KeyAction {
     Continue,
     Suspend,
     Kill,
+    SendSigint,
 
     StepIntoLine,
     StepIntoInstruction,
@@ -612,6 +633,7 @@ impl Default for KeyBinds {
             (Key::Char('p').plain(), KeyAction::Suspend),
             (Key::Char('c').ctrl(), KeyAction::Suspend),
             (Key::Char('k').ctrl(), KeyAction::Kill),
+            (Key::Char('k').alt(), KeyAction::SendSigint),
             (Key::Up.alt(), KeyAction::WindowUp),
             (Key::Down.alt(), KeyAction::WindowDown),
             (Key::Left.alt(), KeyAction::WindowLeft),
