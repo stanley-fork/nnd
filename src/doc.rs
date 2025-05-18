@@ -18,12 +18,12 @@ Additional arguments:
 --stdin/--stdout/--stderr path   - redirect stdin/stdout/stderr to file
 --tty path   - redirect both stdin and stdout to path, see --help-tty
 -s   - stop on main() (only applies to the first time the program starts; when starting it again from UI, press 'step' key instead of 'run' to stop on main())
--ss  - stop early in process startup sequence (long before main(), but after loading dynamic libraries)
+-S   - stop early in process startup sequence (long before main(), but after loading dynamic libraries)
 -d path   - directory in which to look for source code; if specified multiple times, multiple directories will be searched; default: current directory
 --module path   - path to executable or dynamic library from which to load debug symbols; useful if the running executable is stripped and you have an unstripped version on the side; can be specified multiple times to provide multiple dynamic libraries (they'll be automatically matched by build id)
 -o   - try to get debug info from debuginfod server at https://debuginfod.elfutils.org/ ; alternatively, set environment variable DEBUGINFOD_URLS to a space-separated list of URLs to use
 --mouse full|no-hover|disabled   - mouse mode; 'no-hover' to react only to clicking and dragging, 'disabled' to disable mouse altogether; default is 'full' (if it doesn't work, check if mouse reporting is enabled in the terminal application)
---session name   - project name to identify saved state like open files and breakpoints; "-" for temporary session that doesn't save state; "--" to avoid touching any files at all (at ~/.nnd/)
+-n name   - session name, to identify saved state like open files and breakpoints; "-" for temporary session that doesn't save state; "--" to avoid touching any files at all (at ~/.nnd/)
 --help   - show this help message; see below for more help pages
 
 Documentation chapters:

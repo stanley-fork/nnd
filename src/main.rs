@@ -103,7 +103,7 @@ fn main() {
             settings.stderr_file = Some(v);
         } else if let Some(_) = parse_arg(&mut args, &mut seen_args, "--stop", "-s", true, false) {
             settings.stop_on_main = true;
-        } else if let Some(_) = parse_arg(&mut args, &mut seen_args, "--stop-early", "-ss", true, false) {
+        } else if let Some(_) = parse_arg(&mut args, &mut seen_args, "--stop-early", "-S", true, false) {
             settings.stop_on_initial_exec = true;
         } else if let Some(m) = parse_arg(&mut args, &mut seen_args, "--mouse", "", false, false) {
             settings.mouse_mode = match &m.to_lowercase()[..] {
@@ -115,7 +115,7 @@ fn main() {
                     process::exit(1);
                 }
             };
-        } else if let Some(s) = parse_arg(&mut args, &mut seen_args, "--session", "", false, false) {
+        } else if let Some(s) = parse_arg(&mut args, &mut seen_args, "--session", "-n", false, false) {
             settings.session_name = match &s[..] {
                 "-" => SessionName::Temp,
                 "--" => SessionName::None,
