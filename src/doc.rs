@@ -225,7 +225,7 @@ The session directory also contains these files:
  * 'log' - some messages from the debugger itself. Sometimes useful for debugging the debugger. Sometimes there are useful stats about debug info.
    On crash, error message and stack trace go to this file. Please include this file when reporting bugs, especially crashes.
 
-On startup, the debugger picks the session-name to use, which can be controlled using `--session` command line argument:
+On startup, the debugger picks the session-name to use, which can be controlled using `--session` (aka `-n`) command line argument:
  * If --session=name is provided, this name is used (with prefix "sess-" prepended to avoid name collisions with non-session files).
  * If no --session is provided, a numeric session-name is picked automatically. When only one nnd is started, it'll use '~/.nnd/0'. If a second nnd is started while the first is still running, it'll get '~/.nnd/1/', etc.
    After an nnd process exits, the directory can be reused.
