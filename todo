@@ -54,7 +54,6 @@ do something for downcasts in conditional breakpoints (coalesce()? maybe()? ?()?
 edit breakpoint condition on click
 `in` operator, e.g. x in [1, 2, 3]
 make names in MetaType etc unexpandable as array
-scroll code to next breakpoint when deleting breakpoint in breakpoints window
 make '^' apply to expressions instead of variable names, e.g. ^(this.query_context)
 allow adding unconditional breakpoint on the same line as conditional one, somehow
 global variables from .symtab, maybe from .debug_pubnames (maybe also look into .debug_pubtypes)

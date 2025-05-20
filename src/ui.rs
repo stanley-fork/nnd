@@ -4294,7 +4294,10 @@ impl WindowContent for BreakpointsWindow {
                 None => continue,
                 Some(x) => x };
             match action {
-                KeyAction::DeleteRow => {debugger.remove_breakpoint(id);}
+                KeyAction::DeleteRow => {
+                    debugger.remove_breakpoint(id);
+                    table.state.scroll_to_cursor = true; // to auto-update the code window
+                }
                 KeyAction::Enter | KeyAction::EditCondition if self.condition_input.as_ref().is_some_and(|(idd, _)| *idd == id) => {
                     let text = mem::take(&mut self.condition_input).unwrap().1.text;
                     let condition = if text.is_empty() {None} else {Some(text)};
