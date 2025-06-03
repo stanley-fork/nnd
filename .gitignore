@@ -4,5 +4,6 @@
 /testprogs/build
 /testprogs/absl/build
 /testprogs/absl/lib
+/testprogs/dlopen/build
 /strategy_post_draft.txt
 /temp_post.txt
