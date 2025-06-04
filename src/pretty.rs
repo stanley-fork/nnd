@@ -358,21 +358,13 @@ fn unravel_struct(substruct: &mut Substruct) {
                     inlined = true;
                     changed = true;
 
-                    // This code merged the sets of nested names between the parent and the field, but that's not good
-                    // because e.g. Option::Some(String) breaks because nested name 'T' is inherited from Option into
-                    // String, and the String pretty-printer thinks it's the element type.
-                    // For now we just discard parent's nested_names, but it's not obvious to me whether there are cases
-                    // that want the union; if so, can change this to take the union but set a flag telling which names
-                    // are from the innermost field.
-                    /*
                     if !field_type.nested_names.is_empty() {
                         if substruct.nested_names.is_empty() {
                             substruct.nested_names = Cow::Borrowed(field_type.nested_names);
                         } else {
                             substruct.nested_names.to_mut().extend_from_slice(field_type.nested_names);
                         }
-                    }*/
-                    substruct.nested_names = Cow::Borrowed(field_type.nested_names);
+                    }
 
                     if !field_type.name.is_empty() {
                         substruct.additional_names.push(field_type.name);
@@ -523,10 +515,16 @@ fn resolve_discriminated_union(val: &AddrOrValueBlob, substruct: &mut Substruct,
 // Or this may represent part of the original struct (e.g. its struct field) at offset `bit_offset` within the original struct.
 struct Substruct<'a> {
     type_: *const TypeInfo,
-    // When we unwrap a struct, we keep the outer struct and discard the inner one. The fields, nested names (typedefs and constants), and the name of the inner struct get added to these arrays.
-    // Useful if e.g. we unwrapped a struct containing a vector, and the pretty-printer needs to find `value_type` typedef in the vector.
+    // When we unwrap a struct, we keep the outer struct and discard the inner one. The fields of the inner structs are added to `fields`.
     fields: Cow<'a, [StructField]>,
+    // Nested names (typedefs and constants) of all unwrapped structs, in order from outer to inner.
+    // We search them in reverse, so that inner typedefs take precedence. Examples:
+    //  * For Rust `Option<Vec<i32>>`, both Option and Vec have typedef (template argument) "T": the inner T is i32, the outer T is Vec<i32>.
+    //    Vec's pretty printer must use the inner T. Hence searching in reverse order.
+    //  * For C++ `std::map<...>`, the std::map itself has typedef "value_type" that we need, and inner structs also have typedefs that we need (e.g. "__base").
+    //    Hence searching the merged list rather than just the innermost struct.
     nested_names: Cow<'a, [(&'static str, NestedName)]>,
+    // Names of the inner unwrapped structs.
     additional_names: Vec<&'static str>,
 
     bit_offset: usize, // if this represents part of a bigger struct, at this offset
@@ -678,7 +676,8 @@ fn find_array_field(names: &[&str], substruct: &mut Substruct, inner_type: &mut 
 }
 
 fn find_nested_type(name: &str, nested_names: &[(&'static str, NestedName)]) -> Result<*const TypeInfo> {
-    for &(nn, n) in nested_names {
+    // Search in reverse, see comment next to nested_names declaration.
+    for &(nn, n) in nested_names.iter().rev() {
         if nn == name {
             match n {
                 NestedName::Type(t) => return Ok(t),
@@ -690,7 +689,7 @@ fn find_nested_type(name: &str, nested_names: &[(&'static str, NestedName)]) -> 
 }
 
 fn find_nested_usize_constant(name: &str, nested_names: &[(&'static str, NestedName)]) -> Result<usize> {
-    for &(nn, n) in nested_names {
+    for &(nn, n) in nested_names.iter().rev() {
         if nn == name {
             match n {
                 NestedName::Variable(v) => {

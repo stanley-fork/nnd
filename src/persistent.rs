@@ -48,6 +48,7 @@ impl PersistentState {
         let home = std::env::var("HOME")?;
         let mut parent_path = PathBuf::from(home);
         parent_path.push(".nnd");
+        let parent_path = parent_path;
         let _ = DirFd::open_or_create(&parent_path)?;
         for i in 0..100 {
             let mut path = parent_path.clone();
@@ -70,10 +71,12 @@ impl PersistentState {
                     let log = dir.open_or_create_file(Path::new(log_file_name))?;
                     let original_stderr_fd = redirect_stderr(&log)?;
                     let log_file_path = Some(path.join(log_file_name));
-                    match dir.remove_file(Path::new("state")) {
-                        Ok(()) => (),
-                        Err(e) if e.is_io_not_found() => (),
-                        Err(e) => eprintln!("warning: {}", e),
+                    if let &SessionName::Temp = &settings.session_name {
+                        match dir.remove_file(Path::new("state")) {
+                            Ok(()) => (),
+                            Err(e) if e.is_io_not_found() => (),
+                            Err(e) => eprintln!("warning: {}", e),
+                        }
                     }
                     return Ok(Self {path: Ok(path), configs_path: Some(parent_path), debuginfod_cache_path: Some(debuginfod_cache_path), dir: Some(dir), lock: Some(lock), log_file_path, original_stderr_fd, ..Default::default()});
                 }
