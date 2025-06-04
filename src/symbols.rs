@@ -1614,6 +1614,31 @@ impl SymbolsLoader {
         self.sym.base_types.sort_unstable();
     }
 
+    // Some glue code to compensate for style differences between cpp_demangle output and our synthesized type names.
+    // Replace "(anonymous namespace)" with "_".
+    // This is far from sufficient to cover all cases. That would probably require a crazy amount of code that understands the whole C++ type system
+    // and actually parses type names and compares them structurally. (E.g. C++ template argument may be an expression, or a type of a labmda, etc.)
+    fn adjust_vtable_type_name<'a>(name: &'a str, out: &'a mut String) -> &'a str {
+        out.clear();
+        const NEEDLE: &str = "(anonymous namespace)::";
+        const REPLACEMENT: &str = "_::";
+
+        let mut last_end = 0;
+        while let Some(pos) = name[last_end..].find(NEEDLE) {
+            let absolute_pos = last_end + pos;
+            out.push_str(&name[last_end..absolute_pos]);
+            out.push_str(REPLACEMENT);
+            last_end = absolute_pos + NEEDLE.len();
+        }
+
+        if last_end == 0 {
+            name
+        } else {
+            out.push_str(&name[last_end..]);
+            &out[..]
+        }
+    }
+
     fn collect_vtables_and_points_of_interest(&mut self) {
         // There are usually only tens of thousands of vtables, so it's ok to process them in one thread.
         for shard in &mut self.shards {
@@ -1638,9 +1663,12 @@ impl SymbolsLoader {
             find_function(b"__cxa_throw", PointOfInterest::..., &mut self.sym);
         }*/
         self.sym.vtables.sort_unstable_by_key(|v| v.start);
+
+        let mut adjusted_name = String::new();
         for v in &mut self.sym.vtables {
             for shard in &mut self.shards {
-                if let Some(t) = shard.get_mut().sym.types.find_by_name(v.name) {
+                let adjusted_name = Self::adjust_vtable_type_name(v.name, &mut adjusted_name);
+                if let Some(t) = shard.get_mut().sym.types.find_by_name(adjusted_name) {
                     v.type_ = Some(t);
                     break;
                 }
