@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
 #![allow(unused_imports)]
-use nnd::{*, elf::*, error::*, debugger::*, util::*, ui::*, log::*, process_info::*, symbols::*, symbols_registry::*, procfs::*, unwind::*, range_index::*, settings::*, context::*, executor::*, persistent::*, doc::*, terminal::*, common_ui::*, core_dumper::*};
+use nnd::{*, elf::*, error::*, debugger::*, util::*, ui::*, log::*, process_info::*, symbols::*, symbols_registry::*, procfs::*, unwind::*, range_index::*, settings::*, context::*, executor::*, persistent::*, doc::*, terminal::*, common_ui::*, core_dumper::*, version::*};
 use std::{rc::Rc, mem, fs, os::fd::{FromRawFd}, io::Read, io, io::Write, panic, process, thread, thread::ThreadId, cell::UnsafeCell, ptr, pin::Pin, sync::Arc, str::FromStr, path::PathBuf, collections::HashSet};
 use libc::{self, STDIN_FILENO, pid_t};
 
@@ -196,6 +196,10 @@ fn main() {
             let path = parts[1].to_string();
 
             settings.breakpoints.push(LineBreakpoint {path: path.into(), file_version: FileVersionInfo::default(), line: line, adjusted_line: None});
+        } else if let Some(_) = parse_arg(&mut args, &mut seen_args, "--version", "", true, false) {
+            println!("nnd {}", VERSION_STRING);
+            println!("built at {}", BUILD_TIME);
+            process::exit(0);
         } else if print_help_chapter(&args[0], &all_args[0]) {
             process::exit(0);
         } else {

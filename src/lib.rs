@@ -41,3 +41,4 @@ pub mod imgui;
 pub mod terminal;
 pub mod dwarf;
 pub mod core_dumper;
+pub mod version;
