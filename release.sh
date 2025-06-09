@@ -49,7 +49,7 @@ scp target/x86_64-unknown-linux-musl/dbgo/nnd dev:bin/new-nnd && scp target/x86_
 cp target/x86_64-unknown-linux-musl/dbgo/nnd ../../nnd-release/nnd-new && mv ../../nnd-release/nnd-new ../../nnd-release/nnd && cp target/x86_64-unknown-linux-musl/release/nnd ../../nnd-release/nnd-release-new && mv ../../nnd-release/nnd-release-new ../../nnd-release/nnd-release
 
 # Push to itch.
-butler push target/x86_64-unknown-linux-musl/release/nnd al13n/nnd:linux
+#butler push target/x86_64-unknown-linux-musl/release/nnd al13n/nnd:linux
 
 # Push to github.
 

@@ -273,7 +273,11 @@ impl DebuggerUI {
                 }
                 Some(KeyAction::SendSigint) => {
                     let r = debugger.murder(libc::SIGINT);
-                    report_result(&mut self.state, &r);
+                    if r.is_ok() {
+                        log!(debugger.log, "sent SIGINT");
+                    } else {
+                        report_result(&mut self.state, &r);
+                    }
                 }
 
                 Some(KeyAction::DropCaches) => {
