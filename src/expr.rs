@@ -722,7 +722,7 @@ fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut Form
                 Ok(val) => Ok(Value {val, type_: field.type_, flags: flags.inherit()}),
                 Err(e) => Err(e),
             };
-            ValueChildInfo {identity: field_idx, name_line, kind: ValueChildKind::StructField, deref: 0, value}
+            ValueChildInfo {identity: hash(&(field_idx, field.name)), name_line, kind: ValueChildKind::StructField, deref: 0, value}
         }).collect()
     };
 

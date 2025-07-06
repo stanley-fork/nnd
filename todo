@@ -7,6 +7,7 @@ investigate why many types are not deduped, e.g. there's DB::Block#441
 make stack unwinding work when control is in .plt or .plt.got, see "Recognise PLT entries such as" in libunwind code
 fix incorrect column numbers with tab indentation (tabs should be counted as 1 column, but we turn them into multiple spaces)
 fix line-wrapped copy-paste (seems to copy only the first line of selection) and line-wrapped C-k (deletes only to the end of post-wrapping line, should use pre-wrapping line)
+make auto-downcast check that the types are in the same language, to avoid downcasting C++ type to Rust type with same name (e.g. "parquet::format::PageHeader"); check if type decl/def matching has the same problem
 
 performance:
 optimize symbols loading

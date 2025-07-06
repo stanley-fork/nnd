@@ -864,9 +864,12 @@ fn recognize_slice_or_vec(substruct: &mut Substruct, val: &mut Cow<Value>, warni
 
     // If start/end are char*, and there's typedef value_type, cast the pointers to it. This covers clickhouse PODArray in particular.
     if inner_size == 1 {
-        if let Some(t) = optional_field(find_nested_type("value_type", &substruct.nested_names))? {
-            inner_type = t;
-            inner_size = (unsafe {&*inner_type}).calculate_size();
+        for name in ["value_type", "T"] {
+            if let Some(t) = optional_field(find_nested_type(name, &substruct.nested_names))? {
+                inner_type = t;
+                inner_size = (unsafe {&*inner_type}).calculate_size();
+                break;
+            }
         }
     };
 
@@ -1255,7 +1258,7 @@ fn recognize_libstdcpp_deque(substruct: &mut Substruct, val: &mut Cow<Value>, st
         return err!(NotContainer, "");
     }
     let block_bytes = start_last - start_first;
-    if block_bytes % value_size != 0 || block_bytes != finish_last - finish_first || block_bytes == 0 {
+    if block_bytes % value_size != 0 || finish_last < finish_first || block_bytes != finish_last - finish_first || block_bytes == 0 {
         return err!(NotContainer, "");
     }
     if finish_node < start_node || (finish_node - start_node) % 8 != 0 || start_cur < start_first || start_cur > start_last || (start_cur - start_first) % value_size != 0 || finish_cur < finish_first || finish_cur > finish_last || (finish_cur - finish_first) % value_size != 0 {

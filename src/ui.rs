@@ -796,14 +796,16 @@ impl WatchesWindow {
             }
             let mut pushed_children_to_stack = false;
             if node.expanded {
+                let name_line_wrap_width = self.name_width.saturating_sub(node.depth.min(self.max_indent) * self.indent_width + 2);
+                if node.line_wrapped_name.is_some() {
+                    assert_eq!(node.name_line_wrap_width, name_line_wrap_width);
+                } else {
+                    node.name_line_wrap_width = name_line_wrap_width;
+                    node.line_wrapped_name = Some(self.tree.text.line_wrap(node.name.clone(), name_line_wrap_width, self.row_height_limit, &palette.line_wrap_indicator, &palette.truncation_indicator, None));
+                }
                 if !node.is_text_input {
-                    let name_line_wrap_width = self.name_width.saturating_sub(node.depth.min(self.max_indent) * self.indent_width + 2);
-                    if node.line_wrapped_name.is_some() {
-                        assert_eq!(node.name_line_wrap_width, name_line_wrap_width);
-                    } else {
-                        node.name_line_wrap_width = name_line_wrap_width;
-                        node.line_wrapped_name = Some(self.tree.text.line_wrap(node.name.clone(), name_line_wrap_width, self.row_height_limit, &palette.line_wrap_indicator, &palette.truncation_indicator, None));
-                    }
+                    // (Note: we do line_wrapped_name calculation above even if is_text_input is true, because the name may be rendered for one frame when the text input loses focus.
+                    //  In that case `height` may be incorrect for one frame, in theory causing visible artifact for one frame, but (1) meh, (2) I tried it and couldn't see it, maybe it's too fast or maybe it doesn't happen for some reason.)
                     height.set_max(node.line_wrapped_name.clone().unwrap().len());
                 }
 
@@ -1368,9 +1370,12 @@ impl WindowContent for WatchesWindow {
             self.build_widgets(visible_y, &mut eval_context, suspended, state, ui);
         });
 
-        if self.text_input.is_some() && !self.text_input_built {
-            self.text_input = None;
-            ui.should_redraw = true;
+        if let &Some((identity, _, _)) = &self.text_input {
+            // (The second condition is not required because the text input will lose focus on next frame if cursor_path moved away from it. But it saves one frame of latency + one unnecessary redraw.)
+            if !self.text_input_built || self.cursor_path.last() != Some(&identity) {
+                self.text_input = None;
+                ui.should_redraw = true;
+            }
         }
         if self.scroll_to_cursor {
             ui.should_redraw = true;
