@@ -885,7 +885,6 @@ impl WatchesWindow {
                     } else if &node.special != &Some(SpecialWatch::AddWatch) {
                         self.expanded_nodes.insert(node.identity);
                     }
-                    self.scroll_to_cursor = true;
                     ui.should_redraw = true;
                 }
 
