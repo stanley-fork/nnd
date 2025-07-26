@@ -1331,7 +1331,7 @@ pub fn make_dialog_frame(create: bool, width: AutoSize, height: AutoSize, style_
 
 pub struct SearchDialog {
     input: TextInput,
-    search: SymbolSearcher,
+    pub search: SymbolSearcher,
     table_state: TableState,
 
     pub should_open_document: Option<SearchResultInfo>,
@@ -1368,6 +1368,8 @@ impl SearchDialog {
         ui_writeln!(ui, default_dim, "fuzzy search{}",
                     if properties.have_files && properties.have_names {
                         ", use '@filename' to search by file, add ':number' to filter by line number"
+                    } else if properties.can_go_to_line {
+                        ", add ':number' to go to line"
                     } else {""});
         if self.search.waiting_for_symbols {
             ui_writeln!(ui, warning, "waiting for symbols to load (see 'binaries' window for progress)")

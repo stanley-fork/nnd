@@ -15,7 +15,7 @@ pub struct SymbolSearcher {
     seen_query: String,
     seen_num_symbols: usize,
 
-    query: SearchQuery,
+    pub query: SearchQuery,
 }
 
 const MAX_RESULTS: usize = 1000;
@@ -89,16 +89,24 @@ impl PaddedString {
 pub struct SearchQuery {
     pub s: PaddedString,
     pub case_sensitive: bool,
+    // The original unparsed search string was empty.
+    pub is_empty: bool,
 
+    // "s:@filename:search_line"
     pub filename: PaddedString,
-    pub line: Option<usize>,
+    pub search_line: Option<usize>,
+    // "s:go_to_line"
+    pub go_to_line: Option<usize>,
 }
 impl SearchQuery {
-    pub fn parse(s: &str, can_have_file: bool) -> Self {
+    pub fn parse(s: &str, can_have_file: bool, can_go_to_line: bool) -> Self {
+        let is_empty = s.is_empty();
         let case_sensitive = s.chars().any(|c| c.is_ascii_uppercase());
         let mut query = s;
         let mut filename = "";
-        let mut line = None;
+        let mut search_line = None;
+        let mut go_to_line = None;
+        assert!(!can_have_file || !can_go_to_line);
         if can_have_file {
             // "query@file:line"
             if let Some(i) = s.find('@') {
@@ -107,18 +115,26 @@ impl SearchQuery {
                 if let Some(j) = filename.find(':') {
                     if let Ok(n) = filename[j+1..].parse::<usize>() {
                         filename = &filename[..j];
-                        line = Some(n);
+                        search_line = Some(n);
                     } else if filename[j+1..].is_empty() {
                         filename = &filename[..j];
                     }
                 }
             }
         }
-        Self {s: PaddedString::new(query), case_sensitive, filename: PaddedString::new(filename), line}
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.s.get().is_empty() && self.filename.get().is_empty() && self.line.is_none()
+        if can_go_to_line {
+            //asdqwe find last instead
+            if let Some(i) = s.find(':') {
+                let line_str = &s[i+1..];
+                if let Ok(n) = line_str.parse::<usize>() {
+                    query = &s[..i];
+                    go_to_line = Some(n);
+                } else if line_str.is_empty() {
+                    query = &s[..i]; // don't blink out search results between typing ':' and typing the first digit of the number
+                }
+            }
+        }
+        Self {s: PaddedString::new(query), case_sensitive, is_empty, filename: PaddedString::new(filename), search_line, go_to_line}
     }
 }
 
@@ -226,7 +242,7 @@ impl SymbolSearcher {
         self.seen_num_symbols = self.symbols.len();
 
         let properties = self.searcher.properties();
-        self.query = SearchQuery::parse(query_str, /*can_have_file*/ properties.have_files && properties.have_names);
+        self.query = SearchQuery::parse(query_str, /*can_have_file*/ properties.have_files && properties.have_names, properties.can_go_to_line);
         if properties.have_files && !properties.have_names {
             self.query.filename = mem::take(&mut self.query.s);
         }
@@ -275,9 +291,13 @@ pub type SearchCallback<'a> = dyn FnMut(Vec<SearchResult>, /*delta_items_done*/ 
 
 #[derive(Clone, Debug)]
 pub struct SearcherProperties {
+    // Results have non-file names. E.g. function search results have function names.
     pub have_names: bool,
+    // Results have source code locations. E.g. function search results have function definition locations (if known), and file search results are files.
     pub have_files: bool,
     pub have_mangled_names: bool,
+    // If the query has suffix ":number", don't use it for the search and put the number into query.go_to_line instead.
+    pub can_go_to_line: bool,
     // If true, we schedule one task per SymbolsShard, otherwise one task per Symbols.
     pub parallel: bool,
 }
@@ -319,7 +339,7 @@ impl Searcher for FileSearcher {
         res
     }
 
-    fn properties(&self) -> SearcherProperties { SearcherProperties {have_names: false, have_files: true, have_mangled_names: false, parallel: false} }
+    fn properties(&self) -> SearcherProperties { SearcherProperties {have_names: false, have_files: true, have_mangled_names: false, can_go_to_line: true, parallel: false} }
 }
 
 pub struct FunctionSearcher;
@@ -343,14 +363,14 @@ impl Searcher for FunctionSearcher {
                 continue;
             }
             let mut add_score = 0usize;
-            if full_query.line.is_some() || file_scores.is_some() {
+            if full_query.search_line.is_some() || file_scores.is_some() {
                 let sf = match symbols.root_subfunction(function) {
                     None => continue,
                     Some((x, _)) => x };
                 let file_idx = match sf.call_line.file_idx() {
                     None => continue,
                     Some(x) => x };
-                if let Some(n) = full_query.line.clone() {
+                if let Some(n) = full_query.search_line.clone() {
                     if sf.call_line.line() != n {
                         continue;
                     }
@@ -397,12 +417,12 @@ impl Searcher for FunctionSearcher {
         res
     }
 
-    fn properties(&self) -> SearcherProperties { SearcherProperties {have_names: true, have_files: true, have_mangled_names: true, parallel: true} }
+    fn properties(&self) -> SearcherProperties { SearcherProperties {have_names: true, have_files: true, have_mangled_names: true, can_go_to_line: false, parallel: true} }
 }
 
 fn modify_query_for_mangled_search(query: &SearchQuery) -> SearchQuery {
     let s: String = query.s.get().chars().filter(|&c| c.is_ascii_alphanumeric() || c == '_').collect();
-    SearchQuery::parse(&s, /*can_have_file*/ false)
+    SearchQuery::parse(&s, /*can_have_file*/ false, /*can_go_to_line*/ false)
 }
 
 pub struct GlobalVariableSearcher;
@@ -421,7 +441,7 @@ impl Searcher for GlobalVariableSearcher {
             }
 
             let mut add_score = 0usize;
-            if query.line.is_some() || file_scores.is_some() {
+            if query.search_line.is_some() || file_scores.is_some() {
                 let var = unsafe {&*(name.id as *const Variable)};
                 let file_idx = match var.line.file_idx() {
                     None => continue,
@@ -432,7 +452,7 @@ impl Searcher for GlobalVariableSearcher {
                         continue;
                     }
                 }
-                if let Some(n) = query.line.clone() {
+                if let Some(n) = query.search_line.clone() {
                     if var.line.line() != n {
                         continue;
                     }
@@ -467,7 +487,7 @@ impl Searcher for GlobalVariableSearcher {
         res
     }
 
-    fn properties(&self) -> SearcherProperties { SearcherProperties {have_names: true, have_files: true, have_mangled_names: false, parallel: true} }
+    fn properties(&self) -> SearcherProperties { SearcherProperties {have_names: true, have_files: true, have_mangled_names: false, can_go_to_line: false, parallel: true} }
 }
 
 pub struct TypeSearcher;
@@ -488,7 +508,7 @@ impl Searcher for TypeSearcher {
                 }
 
                 let mut add_score = 0usize;
-                if query.line.is_some() || file_scores.is_some() {
+                if query.search_line.is_some() || file_scores.is_some() {
                     let type_ = unsafe {&*(name.id as *const TypeInfo)};
                     let file_idx = match type_.line.file_idx() {
                         None => continue,
@@ -499,7 +519,7 @@ impl Searcher for TypeSearcher {
                             continue;
                         }
                     }
-                    if let Some(n) = query.line.clone() {
+                    if let Some(n) = query.search_line.clone() {
                         if type_.line.line() != n {
                             continue;
                         }
@@ -540,7 +560,7 @@ impl Searcher for TypeSearcher {
         res
     }
 
-    fn properties(&self) -> SearcherProperties { SearcherProperties {have_names: true, have_files: true, have_mangled_names: false, parallel: true} }
+    fn properties(&self) -> SearcherProperties { SearcherProperties {have_names: true, have_files: true, have_mangled_names: false, can_go_to_line: false, parallel: true} }
 }
 
 fn fuzzy_match(haystack: &[u8], needle_padded: &PaddedString, case_sensitive: bool, match_ranges: &mut Vec<Range<usize>>) -> Option<usize> {

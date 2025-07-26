@@ -136,6 +136,7 @@ pub struct Debugger {
 
     // Stages of starting the child process that need some special handling.
     waiting_for_initial_sigstop: bool,
+    initial_exec_failed: bool,
 
     // We're suspending all threads to do something with breakpoints. Once all threads are stopped, we do the thing and resume (if target_state says so).
     pub stopping_to_handle_breakpoints: bool,
@@ -393,7 +394,7 @@ impl Thread {
 
 impl Debugger {
     fn new(mode: RunMode, command_line: Vec<String>, context: Arc<Context>, symbols: SymbolsRegistry, breakpoints: Pool<Breakpoint>, persistent: PersistentState, my_resource_stats: ResourceStats, prof: Profiling) -> Self {
-        Debugger {mode, command_line, context, pid: 0, target_state: ProcessState::NoProcess, log: Log::new(), prof, threads: HashMap::new(), pending_wait_events: VecDeque::new(), next_thread_idx: 1, info: ProcessInfo::default(), my_resource_stats, symbols, memory: MemReader::Invalid, waiting_for_initial_sigstop: false, stepping: None, pending_step: None, breakpoint_locations: Vec::new(), breakpoints, stopping_to_handle_breakpoints: false, stopped_until_symbols_are_loaded: None, hardware_breakpoints: std::array::from_fn(|_| HardwareBreakpoint {active: false, thread_specific: None, addr: 0}), persistent}
+        Debugger {mode, command_line, context, pid: 0, target_state: ProcessState::NoProcess, log: Log::new(), prof, threads: HashMap::new(), pending_wait_events: VecDeque::new(), next_thread_idx: 1, info: ProcessInfo::default(), my_resource_stats, symbols, memory: MemReader::Invalid, waiting_for_initial_sigstop: false, initial_exec_failed: false, stepping: None, pending_step: None, breakpoint_locations: Vec::new(), breakpoints, stopping_to_handle_breakpoints: false, stopped_until_symbols_are_loaded: None, hardware_breakpoints: std::array::from_fn(|_| HardwareBreakpoint {active: false, thread_specific: None, addr: 0}), persistent}
     }
 
     pub fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {
@@ -709,7 +710,11 @@ impl Debugger {
                     if libc::WIFEXITED(wstatus) {
                         let exit_code = libc::WEXITSTATUS(wstatus);
                         eprintln!("info: thread {} exited with status {}", tid, exit_code);
-                        if tid == self.pid || exit_code != 0 || stepping_this_thread {
+                        if tid == self.pid && self.initial_exec_failed {
+                            // Exited before initial execve(). Probably the user made a typo in the executable path.
+                            // Maybe we should quit the whole debugger in this case, if this is the first attempt to start the process?
+                            log!(self.log, "exec failed (incorrect executable path?)");
+                        } else if tid == self.pid || exit_code != 0 || stepping_this_thread {
                             log!(self.log, "{} {} exited with status {}", if tid == self.pid {"process"} else {"thread"}, tid, exit_code);
                         }
                     } else {
@@ -803,6 +808,7 @@ impl Debugger {
                                     // Make sure we don't try to read things like /proc/<pid>/maps when the pid may not exist anymore.
                                     self.target_state = ProcessState::Exiting;
                                     self.stepping = None;
+                                    self.initial_exec_failed = true;
                                 }
                             }
                             _ => return err!(Internal, "unexpected ptrace event: {}", wstatus >> 16),

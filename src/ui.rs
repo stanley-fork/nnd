@@ -3426,13 +3426,13 @@ struct CodeSearch {
 impl CodeSearch {
     // Does the search if needed, moves the cursor if needed.
     fn update(&mut self, tab: &mut CodeTab, text: &StyledText, mut select_match: isize) {
-        let query = SearchQuery::parse(&self.bar.text.text, /*can_have_file*/ false);
+        let query = SearchQuery::parse(&self.bar.text.text, /*can_have_file*/ false, /*can_go_to_line*/ false);
         let query_changed = self.query != query;
         if (&self.query, self.tab_identity) != (&query, tab.identity) {
             (self.query, self.tab_identity) = (query, tab.identity);
             self.match_ranges.clear();
             self.matches.clear();
-            if !self.query.is_empty() {
+            if !self.query.is_empty {
                 for line_idx in 0..text.num_lines() {
                     let start = self.match_ranges.len();
                     let s = text.get_line_str(line_idx).as_bytes();
@@ -3469,7 +3469,7 @@ impl CodeSearch {
     }
 
     fn needs_update(&mut self, tab: &CodeTab) -> bool {
-        (&self.query, self.tab_identity, (self.match_idx, self.cursor_is_on_a_match)) != (&SearchQuery::parse(&self.bar.text.text, /*can_have_file*/ false), tab.identity, self.calculate_match_idx(tab.area_state.cursor))
+        (&self.query, self.tab_identity, (self.match_idx, self.cursor_is_on_a_match)) != (&SearchQuery::parse(&self.bar.text.text, /*can_have_file*/ false, /*can_go_to_line*/ false), tab.identity, self.calculate_match_idx(tab.area_state.cursor))
     }
 
     fn calculate_match_idx(&self, cursor: usize) -> (usize, bool) {
@@ -3920,8 +3920,13 @@ impl CodeWindow {
 
         if let Some(res) = mem::take(&mut d.should_open_document) {
             let file = &res.symbols.files[res.id];
+            let go_to_line = d.search.query.go_to_line.clone();
             self.switch_to_file(&res.file, &file.version, debugger);
-            self.tabs[self.tabs_state.selected].ephemeral = false;
+            let tab = &mut self.tabs[self.tabs_state.selected];
+            tab.ephemeral = false;
+            if let Some(n) = go_to_line {
+                tab.area_state.select(n.saturating_sub(1));
+            }
         }
     }
 }
@@ -4024,7 +4029,7 @@ impl WindowContent for CodeWindow {
             self.search.update(tab, &file.text, search_select_match);
 
             let l = ui_writeln!(ui, default, "find: ");
-            let r = if self.search.query.is_empty() {
+            let r = if self.search.query.is_empty {
                 None
             } else if self.search.matches.is_empty() {
                 Some(ui_writeln!(ui, default_dim, "no results"))
