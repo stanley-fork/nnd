@@ -3000,7 +3000,7 @@ impl<'a> DwarfLoader<'a> {
                         } else if attrs.fields & SubrangeTypeAttributes::count_expr != 0 {
                             if self.shard.warn.check(line!()) { eprintln!("warning: variable-length arrays are not supported (have one @0x{:x})", offset.0); }
                         } else if attrs.fields & SubrangeTypeAttributes::upper_bound != 0 {
-                            if attrs.lower_bound > attrs.upper_bound {
+                            if attrs.lower_bound > attrs.upper_bound || attrs.upper_bound - attrs.lower_bound == usize::MAX {
                                 if self.shard.warn.check(line!()) { eprintln!("warning: array has lower bound {} > upper bound {} @0x{:x}", attrs.lower_bound, attrs.upper_bound, offset.0); }
                             } else {
                                 array.len = (attrs.upper_bound - attrs.lower_bound + 1) as usize;

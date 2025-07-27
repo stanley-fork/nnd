@@ -30,7 +30,7 @@ test with watches window filled with long arrays (I saw 50ms frames when there a
 investigate unresponsive ui when conditional breakpoint is hit at a high rate
 
 todo:
-help dialog
+don't decompress all elf sections when just extracting build id on startup (otherwise we get stuck on startup for a while on starrocks prebuilt separate debug info)
 try with odin
 zig pretty-printers
 support gnu_debugaltlink, as found in zsh in debuginfod

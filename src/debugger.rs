@@ -805,10 +805,13 @@ impl Debugger {
                                 force_resume = true;
                                 if self.threads.iter().all(|(_, t)| t.exiting) {
                                     eprintln!("info: process exiting");
+                                    if self.target_state == ProcessState::Starting {
+                                        // Exited before PTRACE_EVENT_EXEC.
+                                        self.initial_exec_failed = true;
+                                    }
                                     // Make sure we don't try to read things like /proc/<pid>/maps when the pid may not exist anymore.
                                     self.target_state = ProcessState::Exiting;
                                     self.stepping = None;
-                                    self.initial_exec_failed = true;
                                 }
                             }
                             _ => return err!(Internal, "unexpected ptrace event: {}", wstatus >> 16),
