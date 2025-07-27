@@ -1,18 +1,102 @@
-use crate::{error::*, terminal::*, log::*};
-use std::{io, io::Write};
+use crate::{error::*, terminal::*, log::*, common_ui::*, settings::*, imgui::*, ui::*, *};
+use std::{io, io::Write, mem, ops::Range};
 
-pub fn print_help_chapter(arg: &str, executable_name: &str) -> bool {
-    match arg {
-        "--help" => println!(r###"Hi, I'm a debugger.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum HelpParagraph {
+    Greeting,
+    CliUsage,
+    CliChapterList,
+    Overview,
+    DialogIntro,
+    KeyBinds,
+    KnownProblems,
+    Watches,
+    Files,
+    Tty,
+    Features,
+}
+
+pub struct HelpChapter {
+    // Name of command line flag. Empty if not available from command line (help dialog only).
+    cli: &'static str,
+    // Name of help dialog tab. Empty if not available from help dialog (command line only).
+    dialog: &'static str,
+    // Description to use in the list of chapters (both in cli and dialog). Empty to omit from the list.
+    description: &'static str,
+    // Paragraphs to concatenate to form this chapter.
+    paragraphs: &'static [HelpParagraph],
+}
+
+static HELP_CHAPTERS: &'static [HelpChapter] = &[
+    HelpChapter {cli: "--help", dialog: "", description: "", paragraphs: &[HelpParagraph::Greeting, HelpParagraph::CliUsage, HelpParagraph::CliChapterList]},
+    HelpChapter {cli: "", dialog: "controls", description: "", paragraphs: &[HelpParagraph::Greeting, HelpParagraph::DialogIntro, HelpParagraph::KeyBinds]},
+    HelpChapter {cli: "--help-overview", dialog: "overview", description: "general information and first steps, start here", paragraphs: &[HelpParagraph::Overview]},
+    HelpChapter {cli: "--help-known-problems", dialog: "known problems", description: "some known bugs and missing features", paragraphs: &[HelpParagraph::KnownProblems]},
+    HelpChapter {cli: "--help-watches", dialog: "watch expressions", description: "watch expression language documentation", paragraphs: &[HelpParagraph::Watches]},
+    HelpChapter {cli: "--help-files", dialog: "files", description: "files in ~/.nnd/ - keys config, log file, default stdout/stderr redirects, saved state", paragraphs: &[HelpParagraph::Files]},
+    HelpChapter {cli: "--help-tty", dialog: "tty", description: "how to debug interactive programs that require a terminal (e.g. using this debugger to debug itself)", paragraphs: &[HelpParagraph::Tty]},
+    HelpChapter {cli: "--help-features", dialog: "appendix: feature dump", description: "raw list of features (not very readable)", paragraphs: &[HelpParagraph::Features]},
+];
+
+pub fn get_cli_help_chapter(name: &str) -> Option<String> {
+    let mut text = StyledText::default();
+    let palette = Palette::default(); // we'll remove the styles from the text anyway
+    for chapter in HELP_CHAPTERS {
+        if chapter.cli == name {
+            for (i, paragraph) in chapter.paragraphs.iter().copied().enumerate() {
+                if i != 0 {
+                    styled_write!(text, palette.default, "\n\n");
+                }
+                write_help_paragraph(paragraph, &palette, None, &[], &mut text);
+            }
+            return Some(mem::take(&mut text.chars));
+        }
+    }
+    None
+}
+
+#[derive(Default)]
+pub struct HelpDialogContents {
+    pub text: StyledText,
+    pub tabs: Vec<(/*title*/ &'static str, /*lines*/ Range<usize>)>,
+}
+
+pub fn get_help_dialog_contents(key_hints: &[KeyHint], ui: &mut UI) -> HelpDialogContents {
+    let mut r = HelpDialogContents::default();
+    for chapter in HELP_CHAPTERS {
+        if chapter.dialog.is_empty() {
+            continue;
+        }
+        for (i, paragraph) in chapter.paragraphs.iter().copied().enumerate() {
+            if i != 0 {
+                styled_write!(r.text, ui.palette.default, "\n\n");
+            }
+            write_help_paragraph(paragraph, &ui.palette, Some(&ui.key_binds), key_hints, &mut r.text);
+        }
+        let line_idx = r.text.close_line();
+        let lines = r.text.split_by_newline_character(line_idx, None);
+        r.tabs.push((chapter.dialog, lines));
+    }
+    r
+}
+
+// Appends to current "line" in the text.
+fn write_help_paragraph(paragraph: HelpParagraph, palette: &Palette, key_binds: Option<&KeyBinds>, key_hints: &[KeyHint], text: &mut StyledText) {
+    // TODO: Add a function to write text with inline style markers, like "{default}foo {default_dim}(btw, bar){default}". Figure out a naming system to be usable for both this and loading palette from file.
+    //       Then add much more styling throughout this text.
+    match paragraph {
+        HelpParagraph::Greeting => {
+            styled_write!(text, palette.default, r###"Hi, I'm a debugger.
 
 Please (pretty please!) report all bugs, usability issues, slowness, first impressions, improvement ideas, feature requests, etc.
-Create an issue at https://github.com/al13n321/nnd/issues or send an email to mk.al13n+nnd@gmail.com
-
-Usage:
-{0} command [args...]   - run a program under the debugger (i.e. just prepend {0} to the command line)
-sudo {0} -p pid   - attach to an existing process
-{0} -c core_dump_path [executable_path]   - open core dump; -o flag (see below) is recommended if the core was produced on a different machine (with different version of libc than available locally)
-{0} --dump-core [--mode=direct|live|fork] -p pid > out   - instead of running the debugger, make a core dump snapshot of a running program, similar to gdump
+Create an issue at https://github.com/al13n321/nnd/issues"###);
+            styled_write!(text, palette.default_dim, " or send an email to mk.al13n+nnd@gmail.com");
+        }
+        HelpParagraph::CliUsage => styled_write!(text, palette.default, r###"Usage:
+nnd command [args...]   - run a program under the debugger (i.e. just prepend 'nnd' to the command line)
+sudo nnd -p pid   - attach to an existing process
+nnd -c core_dump_path [executable_path]   - open core dump; -o flag (see below) is recommended if the core was produced on a different machine (with different version of libc than available locally)
+nnd --dump-core [--mode=direct|live|fork] -p pid > out   - instead of running the debugger, make a core dump snapshot of a running program, similar to gdump
 
 Additional arguments:
 --stdin/--stdout/--stderr path   - redirect stdin/stdout/stderr to file
@@ -25,17 +109,48 @@ Additional arguments:
 --mouse full|no-hover|disabled   - mouse mode; 'no-hover' to react only to clicking and dragging, 'disabled' to disable mouse altogether; default is 'full' (if it doesn't work, check if mouse reporting is enabled in the terminal application)
 -n name   - session name, to identify saved state like open files and breakpoints; "-" for temporary session that doesn't save state; "--" to avoid touching any files at all (at ~/.nnd/)
 --breakpoint path:line   - set a breakpoint at the specified source file and line number (e.g. src/main.c:42); repeat the parameter to set multiple breakpoints; the path must exactly match a path appearing in debug info
---help   - show this help message; see below for more help pages
+--help   - show this help message; see below for more help pages"###),
+        HelpParagraph::CliChapterList => {
+            styled_write!(text, palette.default, "Documentation chapters (also available inside the UI by pressing '?'):");
+            for chapter in HELP_CHAPTERS {
+                if chapter.cli.is_empty() || chapter.description.is_empty() {
+                    continue;
+                }
+                styled_write!(text, palette.default, "\n{} - {}", chapter.cli, chapter.description);
+            }
+        }
+        HelpParagraph::DialogIntro => {
+            let binds = key_binds.clone().unwrap();
+            styled_write!(text, palette.default, r###"Tabs at the top of this dialog are documentation chapters. Use keys {}/{} (or mouse) to switch tabs, up/down/etc keys to scroll."###, binds.normal.action_to_key_name(KeyAction::NextTab), binds.normal.action_to_key_name(KeyAction::PreviousTab));
+        }
+        HelpParagraph::KeyBinds => {
+            let binds = key_binds.clone().unwrap();
+            styled_write!(text, palette.default, "Full controls below. C- means ctrl key, M- means alt key, S- or capital letter means shift key. E.g. C-R means ctrl+shift+r.\nControls are configurable, see 'files' tab.");
+            let mut hints: Vec<KeyHint> = key_hints.iter().cloned().collect();
+            // Global, then window-specific, then additional hidden hotkeys.
+            let key_func = |h: &KeyHint| (h.window.is_none() && h.hidden && h.condition.is_empty(), h.window);
+            hints.sort_by_key(&key_func); // might be the first time in my life when stable sort is useful
+            let mut prev_key = None;
+            for hint in hints {
+                let key = key_func(&hint);
+                if &prev_key != &Some(key) {
+                    styled_write!(text, palette.default, "\n\n");
+                    if key.0 {
+                        styled_write!(text, palette.default, "Additional hotkeys:");
+                    } else if let Some(window_type) = key.1 {
+                        styled_write!(text, palette.default, "In {} window:", window_type.title());
+                    } else {
+                        styled_write!(text, palette.default, "Global hotkeys:");
+                    }
 
-Documentation chapters:
---help-overview - general information and first steps, start here
---help-known-problems - list of known bugs and missing features to look out for
---help-watches - watch expression language documentation
---help-files - files in ~/.nnd/ - keys config, log file, default stdout/stderr redirects, saved state
---help-tty - how to debug interactive programs that require a terminal (e.g. using this debugger to debug itself)
---help-features - raw list of features (not very readable)"###,
-                             executable_name),
-        "--help-overview" => println!(r###"nnd is a debugger that has a TUI and is meant to be fast and enjoyable to use, and work well on large executables.
+                    prev_key = Some(key);
+                }
+
+                styled_write!(text, palette.default, "\n");
+                format_key_hint(&hint, text, palette, binds, /*with_condition*/ true);
+            }
+        }
+        HelpParagraph::Overview => styled_write!(text, palette.default, r###"nnd is a debugger that has a TUI and is meant to be fast and enjoyable to use, and work well on large executables.
 ('nnd' stands for 'no-nonsense debugger', but it doesn't quite live up to this name at the moment)
 
 Limitations:
@@ -67,6 +182,7 @@ When running the debugger for the first time, notice:
  2. The 'controls' window in top left lists (almost) all available key combinations.
     Some of them are global, others depend on the active window.
  3. Press control-q to quit.
+ 4. Press '?' to show help (also available through --help-* command line flags).
 
 This information should be enough to discover most features by trial and error, which is recommended. Additionally, reading --help-known-problems and --help-watches is recommended.
 
@@ -108,11 +224,8 @@ Debugging tips:
  * In watches window, on non-root tree nodes press Enter to add a corresponding watch. E.g. for local variable or struct field or array element.
  * Expect debugger's memory usage around 3x the size of the executable. E.g. ~7 GB for 2.3 GB clickhouse, release build. This is mostly debug information.
    (If you're curious, see ~/.nnd/<number>/log for a breakdown of which parts of the debug info take how much memory and take how long to load.)
- * For clickhouse server, use CLICKHOUSE_WATCHDOG_ENABLE=0. Otherwise it forks on startup, and the debugger doesn't follow forks.
-
-Please (pretty please!) report all bugs, usability issues, slowness, first impressions, improvement ideas, feature requests, etc.
-Create an issue at https://github.com/al13n321/nnd/issues or send an email to mk.al13n+nnd@gmail.com"###),
-        "--help-known-problems" =>             println!(r###"Current limitations:
+ * For clickhouse server, use CLICKHOUSE_WATCHDOG_ENABLE=0. Otherwise it forks on startup, and the debugger doesn't follow forks."###),
+        HelpParagraph::KnownProblems => styled_write!(text, palette.default, r###"Current limitations:
  * Thread filter ('/' in the threads window) is too limited: just a substring match in function name, file name, and thread name. Need to extend it enough to be able to e.g. filter out idle threads waiting for work or epoll.
  * In watch expressions, type names (for casts or type info) have to be spelled *exactly* the same way as they appear in the debug info.
    E.g. `std::vector<int>` doesn't work, you have to write `std::__1::vector<int, std::__1::allocator<int> >` (whitespace matters).
@@ -133,7 +246,7 @@ Create an issue at https://github.com/al13n321/nnd/issues or send an email to mk
    (I'm not sure what exactly to do about this. Fully separating the debugger-agent from UI+debuginfo would increase the code complexity a lot and make performance worse.
     Maybe I'll instead run the ~whole debugger on the server and have a thin client that just streams the rendered 'image' (text) from the server and sends the source code files on demand.
     This removes the need to scp the source code to the server, but leaves all the other problems.)"###),
-        "--help-watches" => println!(r###"In the watches window, you can enter expressions to be evaluated. It uses a custom scripting language, documented here.
+        HelpParagraph::Watches => styled_write!(text, palette.default, r###"In the watches window, you can enter expressions to be evaluated. It uses a custom scripting language, documented here.
 
 Currently the language has no loops or conditionals, just expressions. The syntax is C-like/Rust-like.
 
@@ -213,7 +326,7 @@ Value modifiers:
  * Modifiers propagate to descendants. E.g. 'my_struct.#x' will print all struct's fields as hexadecimal.
  * Modifiers propagate through most operations. E.g. 'my_array.#x as [u8]' is the same as '(my_array as [u8]).#x'.
  * 'value.#p' is the opposite of '.#r'. Can be useful with field access: 'my_struct.#r.my_field.#p' re-enables pretty-printing after disabling it to access a raw field."###),
-        "--help-files" => println!(r###"The debugger creates directory ~/.nnd/ and stores a few things there, such as log file and saved state (watches, breakpoints, open tabs).
+        HelpParagraph::Files => styled_write!(text, palette.default, r###"The debugger creates directory ~/.nnd/ and stores a few things there, such as log file and saved state (watches, breakpoints, open tabs).
 It doesn't create any other files or make any other changes to your system.
 
 Key bindings can be customized by creating ~/.nnd/keys . Read the comments in ~/.nnd/keys.default to get started.
@@ -237,7 +350,7 @@ On startup, the debugger picks the session-name to use, which can be controlled 
 Session directory path is shown in UI in the status window (on the left).
 
 When using `sudo nnd -p`, keep in mind that the ~/.nnd` will be in the home directory of the root user, not the current user."###),
-        "--help-tty" => println!(r###"The debugger occupies the whole terminal with its TUI. But what if the debugged program also wants to use the terminal in an interactive way?
+        HelpParagraph::Tty => styled_write!(text, palette.default, r###"The debugger occupies the whole terminal with its TUI. But what if the debugged program also wants to use the terminal in an interactive way?
 E.g. how to use nnd to debug itself?
 
 One way is to just attach using -p <pid>.
@@ -257,7 +370,7 @@ But what if you need to set breakpoints before the program starts, e.g. to debug
 The latter approach is often more convenient than -p, even when both approaches are viable.
 
 (This can even be chained multiple levels deep: `nnd --tty /dev/pts/1 nnd --tty /dev/pts/2 my_program`. The longest chain I've used in practice is 4 nnd-s + 1 other program.)"###),
-        "--help-features" => println!(r###"Appendix: raw list of features (optional reading) (a little outdated)
+        HelpParagraph::Features => styled_write!(text, palette.default, r###"Appendix: raw list of features (optional reading) (a little outdated)
 
 loading debug info
   progress bar in the binaries window (top right)
@@ -318,9 +431,7 @@ removing breakpoints on exit
   otherwise the detached process will get SIGTRAP and crash as soon as it hits one of the leftover breakpoints
   nnd correctly removes breakpoints when exiting normally, or exiting with an error, or exiting with a panic (e.g. failed assert)
   but it doesn't remove breakpoints if the debugger receives a fatal signal (e.g. SIGSEGV or SIGKILL)"###),
-        _ => return false,
     }
-    true
 }
 
 pub fn run_input_echo_tool() -> Result<()> {

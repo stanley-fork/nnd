@@ -195,12 +195,13 @@ fn main() {
             };
             let path = parts[1].to_string();
 
-            settings.breakpoints.push(LineBreakpoint {path: path.into(), file_version: FileVersionInfo::default(), line: line, adjusted_line: None});
+            settings.initial_breakpoints.push(LineBreakpoint {path: path.into(), file_version: FileVersionInfo::default(), line: line, adjusted_line: None});
         } else if let Some(_) = parse_arg(&mut args, &mut seen_args, "--version", "", true, false) {
             println!("nnd {}", VERSION_STRING);
             println!("built at {}", BUILD_TIME);
             process::exit(0);
-        } else if print_help_chapter(&args[0], &all_args[0]) {
+        } else if let Some(help) = get_cli_help_chapter(&args[0]) {
+            println!("{}", help);
             process::exit(0);
         } else {
             eprintln!("unrecognized argument: '{}' (if it's the command to run, prepend '\\' to escape)", args[0]);
@@ -448,7 +449,7 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, core_dump_path: Option<Str
         render_timer.set(1, frame_ns);
     }
 
-    for line_breakpoint in &context.settings.breakpoints {
+    for line_breakpoint in &context.settings.initial_breakpoints {
         let existing_id = debugger.find_line_breakpoint_fuzzy(&line_breakpoint);
         if let Some(id) = existing_id {
             let _ = debugger.set_breakpoint_enabled(id, true);

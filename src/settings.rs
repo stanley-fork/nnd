@@ -3,7 +3,7 @@ use std::{collections::{HashMap, hash_map::Entry}, path::PathBuf, fmt, fmt::Writ
 
 pub struct Settings {
     pub tab_width: usize,
-    // TODO: Make these two special breakpoints (visible/editable in breakpoints window) instead of settings.
+    // TODO: Make these two special breakpoints visible/editable in breakpoints window instead of settings.
     pub stop_on_initial_exec: bool,
     pub stop_on_main: bool,
     pub fps: f64,
@@ -41,7 +41,7 @@ pub struct Settings {
     pub fixed_fps: bool, // render `fps` times per second even if nothing changes
     pub trace_logging: bool, // verbose logging, e.g. log every signal passed-through to the process
 
-    pub breakpoints: Vec<LineBreakpoint>,
+    pub initial_breakpoints: Vec<LineBreakpoint>,
 }
 impl Default for Settings {
     fn default() -> Self { Settings {
@@ -71,7 +71,7 @@ impl Default for Settings {
         fixed_fps: false,
         trace_logging: false,
 
-        breakpoints: Vec::new(),
+        initial_breakpoints: Vec::new(),
     } }
 }
 
@@ -386,6 +386,7 @@ pub enum KeyAction {
 
     DuplicateRow,
 
+    Help,
     DropCaches,
     ToggleProfiler,
 
@@ -697,6 +698,8 @@ impl Default for KeyBinds {
             (Key::Char('/').plain(), KeyAction::Find),
             (Key::Char('g').plain(), KeyAction::GoToLine),
             (Key::Char('d').plain(), KeyAction::DuplicateRow),
+            (Key::Char('?').plain(), KeyAction::Help),
+            (Key::Char('h').plain(), KeyAction::Help),
             (Key::Char('l').ctrl(), KeyAction::DropCaches),
             (Key::Char('p').ctrl(), KeyAction::ToggleProfiler),
         ]);

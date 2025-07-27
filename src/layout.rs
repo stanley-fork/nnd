@@ -1,6 +1,8 @@
 use crate::{*, ui::*, widgets::*, pool::*, settings::*, imgui::*, common_ui::*, util::*};
 use std::{mem, collections::HashSet, hash::{Hash, Hasher}, ops::Range};
 
+// (This file is about the UI panes, not layout in a general sense.)
+
 // TODO: Drag and drop windows.
 // TODO: Save state.
 pub struct Layout {
@@ -213,8 +215,8 @@ impl Layout {
         self.windows.get_mut(win_id).region = Some(leaf_id);
     }
 
-    pub fn new_window(&mut self, parent: Option<RegionId>, type_: WindowType, required: bool, title: String, content: Box<dyn WindowContent>) -> WindowId {
-        let win = Window {type_, region: parent.clone(), visible: false, area: Rect::default(), widget: WidgetIdx::invalid(), required, title, content, hotkey_number: None, fixed_size: [None; 2]};
+    pub fn new_window(&mut self, parent: Option<RegionId>, type_: WindowType, required: bool, content: Box<dyn WindowContent>) -> WindowId {
+        let win = Window {type_, region: parent.clone(), visible: false, area: Rect::default(), widget: WidgetIdx::invalid(), required, title: type_.title().to_string(), content, hotkey_number: None, fixed_size: [None; 2]};
         let win_id = self.windows.add(win).0;
         if let Some(id) = parent {
             self.regions.get_mut(id).content.as_leaf_mut().tabs.push(win_id);

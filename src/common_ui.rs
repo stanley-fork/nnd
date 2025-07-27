@@ -145,6 +145,7 @@ pub fn str_suffix_with_width(s: &str, width: usize) -> (/*start_byte_idx*/ usize
 
 // Text. Consists of lines. Each line consists of spans. Each span has one Style.
 // We usually use this struct as a sort of arena that contains many unrelated pieces of text, each piece identified by range of line numbers (Range<usize>).
+// Note that a "line" is allowed to contain '\n' characters, and `styled_write[ln]!()` doesn't automatically split by newline character. See split_by_newline_character() if you need that.
 // There are num_lines() "closed" lines, and an "unclosed" line at the end (which may be empty).
 // The unclosed line is used only as a staging area for building a new line; by convention, it should be closed before the line is used, and before anyone else tries to append other lines to the StyledText.
 // Use styled_write!(text, style, "...", ...) to add spans to the unclosed line. Or append to `chars` and call close_span().
@@ -163,7 +164,7 @@ pub struct StyledText {
 macro_rules! styled_write {
     ($out:expr, $style:expr, $($arg:tt)*) => {{
         use std::fmt::Write as f;
-        let _ = write!(FmtString {s: &mut ($out).chars}, $($arg)*);
+        let _ = write!(crate::util::FmtString {s: &mut ($out).chars}, $($arg)*);
         ($out).close_span($style);
     }};
 }

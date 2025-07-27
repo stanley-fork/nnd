@@ -139,6 +139,8 @@ pub struct WidgetFlags: u32 {
 
     // This widget's identity won't be hashed into children identities. Instead, the nearest ancestor without this flag will be hashed. As if this widget didn't exist and its children were its parent's children.
     const SKIP_IDENTITY = 0x2000;
+    // When adding this widget, don't update its identity with parent's identity. This allows moving it to a different place in the tree without losing focus.
+    const DETACHED_IDENTITY = 0x4000;
 }}
 
 bitflags! {
@@ -522,10 +524,11 @@ impl UI {
             }
         }
 
-        if w.identity == 0 {
-            w.identity = parent.children.len();
-        }
-        {
+        if !w.flags.contains(WidgetFlags::DETACHED_IDENTITY) {
+            if w.identity == 0 {
+                w.identity = parent.children.len();
+            }
+
             let mut idx = w.parent;
             while idx.is_valid() {
                 let p = &self.tree[idx.0];

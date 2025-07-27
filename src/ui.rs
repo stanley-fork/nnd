@@ -1,4 +1,4 @@
-use crate::{*, debugger::*, error::*, log::*, symbols::*, symbols_registry::*, util::*, registers::*, procfs::*, unwind::*, disassembly::*, pool::*, layout::*, settings::*, context::*, types::*, expr::*, widgets::*, search::*, arena::*, interp::*, imgui::*, common_ui::*, terminal::*};
+use crate::{*, debugger::*, error::*, log::*, symbols::*, symbols_registry::*, util::*, registers::*, procfs::*, unwind::*, disassembly::*, pool::*, layout::*, settings::*, context::*, types::*, expr::*, widgets::*, search::*, arena::*, interp::*, imgui::*, common_ui::*, terminal::*, doc::*};
 use std::{io::{self, Write, BufRead, BufReader, Read}, mem::{self, take}, collections::{HashSet, HashMap, hash_map::Entry}, os::fd::AsRawFd, path, path::{Path, PathBuf}, fs::File, fmt::Write as FmtWrite, borrow::Cow, ops::Range, str, os::unix::ffi::OsStrExt, sync::{Arc}, time::Duration};
 use libc::{self, pid_t};
 use rand::random;
@@ -13,6 +13,8 @@ pub struct DebuggerUI {
     // These are assigned by build(), to be checked and acted on by the caller.
     pub should_quit: bool,
     pub should_drop_caches: bool,
+
+    help_dialog: HelpDialog,
 }
 
 #[derive(Default)]
@@ -42,17 +44,23 @@ pub struct UIState {
     should_edit_breakpoint_condition: Option<BreakpointId>,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct KeyHint {
     pub key_ranges: Vec<[KeyAction; 2]>,
     pub hint: &'static str,
-    pub state_dependent: bool,
-    pub window_dependent: bool,
+    pub condition: &'static str, // hint applicable only if this case, e.g. "if the process is running"
+    pub window: Option<WindowType>,
+    // Show only in the big help window, not in the hints corner pane.
+    pub hidden: bool,
+    pub if_not_core_dump: bool, // not applicable if debugging a core dump
 }
 impl KeyHint {
     fn key(key: KeyAction, hint: &'static str) -> Self { Self {key_ranges: vec![[key, key]], hint, ..Self::default()} }
     fn keys(keys: &[KeyAction], hint: &'static str) -> Self { Self {key_ranges: keys.iter().map(|k| [*k, *k]).collect(), hint, ..Self::default()} }
     fn ranges(ranges: &[[KeyAction; 2]], hint: &'static str) -> Self { Self {key_ranges: ranges.iter().cloned().collect(), hint, ..Self::default()} }
+    fn hide(mut self) -> Self { self.hidden = true; self }
+    fn conditional(mut self, show: bool, cond: &'static str) -> Self { self.hidden = !show; self.condition = cond; self }
+    fn if_not_core_dump(mut self) -> Self { self.if_not_core_dump = true; self }
 }
 
 struct SourceScrollTarget {
@@ -103,6 +111,23 @@ pub enum WindowType {
 
     Status = 10,
 }
+impl WindowType {
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Binaries => "binaies",
+            Self::Breakpoints => "breakpoints",
+            Self::Threads => "threads",
+            Self::Stack => "stack",
+            Self::Code => "code",
+            Self::Disassembly => "disassembly",
+            Self::Locations => "locations",
+            Self::Watches => "watches",
+            Self::Hints => "controls",
+            Self::Other => "other",
+            Self::Status => "status",
+        }
+    }
+}
 
 impl DebuggerUI {
     pub fn new() -> Self {
@@ -111,7 +136,7 @@ impl DebuggerUI {
         //state.profiler_enabled = true;
         let layout = Self::default_layout(&state);
 
-        Self {terminal: Terminal::new(), input: InputReader::new(), layout, ui, state, should_drop_caches: false, should_quit: false}
+        Self {terminal: Terminal::new(), input: InputReader::new(), layout, ui, state, help_dialog: Default::default(), should_drop_caches: false, should_quit: false}
     }
 
     pub fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {
@@ -163,21 +188,21 @@ impl DebuggerUI {
         let cols = layout.split(layout.root, Axis::X, vec![0.3, 0.75]);
 
         let rows = layout.split(cols[0], Axis::Y, vec![0.3, 0.4]);
-        let hints_window = layout.new_window(Some(rows[0]), WindowType::Hints, true, "cheat sheet".to_string(), Box::new(HintsWindow::default()));
-        let status_window = layout.new_window(Some(rows[1]), WindowType::Status, true, "status".to_string(), Box::new(StatusWindow::default()));
+        let hints_window = layout.new_window(Some(rows[0]), WindowType::Hints, true, Box::new(HintsWindow::default()));
+        let status_window = layout.new_window(Some(rows[1]), WindowType::Status, true, Box::new(StatusWindow::default()));
         layout.set_fixed_size(status_window, Axis::Y, 7);
-        let watches_window = layout.new_window(Some(rows[2]), WindowType::Watches, true, "watches".to_string(), Box::new(WatchesWindow::default()));
-        layout.new_window(Some(rows[2]), WindowType::Locations, true, "locations".to_string(), Box::new(LocationsWindow::default()));
+        let watches_window = layout.new_window(Some(rows[2]), WindowType::Watches, true, Box::new(WatchesWindow::default()));
+        layout.new_window(Some(rows[2]), WindowType::Locations, true, Box::new(LocationsWindow::default()));
 
         let rows = layout.split(cols[1], Axis::Y, vec![0.4]);
-        let disassembly_window = layout.new_window(Some(rows[0]), WindowType::Disassembly, true, "disassembly".to_string(), Box::new(DisassemblyWindow::default()));
-        let code_window = layout.new_window(Some(rows[1]), WindowType::Code, true, "code".to_string(), Box::new(CodeWindow::default()));
+        let disassembly_window = layout.new_window(Some(rows[0]), WindowType::Disassembly, true, Box::new(DisassemblyWindow::default()));
+        let code_window = layout.new_window(Some(rows[1]), WindowType::Code, true, Box::new(CodeWindow::default()));
 
         let rows = layout.split(cols[2], Axis::Y, vec![0.25, 0.75]);
-        layout.new_window(Some(rows[0]), WindowType::Binaries, true, "binaries".to_string(), Box::new(BinariesWindow::default()));
-        let breakpoints_window = layout.new_window(Some(rows[0]), WindowType::Breakpoints, true, "breakpoints".to_string(), Box::new(BreakpointsWindow::default()));
-        let stack_window = layout.new_window(Some(rows[1]), WindowType::Stack, true, "stack".to_string(), Box::new(StackWindow::default()));
-        let threads_window = layout.new_window(Some(rows[2]), WindowType::Threads, true, "threads".to_string(), Box::new(ThreadsWindow::default()));
+        layout.new_window(Some(rows[0]), WindowType::Binaries, true, Box::new(BinariesWindow::default()));
+        let breakpoints_window = layout.new_window(Some(rows[0]), WindowType::Breakpoints, true, Box::new(BreakpointsWindow::default()));
+        let stack_window = layout.new_window(Some(rows[1]), WindowType::Stack, true, Box::new(StackWindow::default()));
+        let threads_window = layout.new_window(Some(rows[2]), WindowType::Threads, true, Box::new(ThreadsWindow::default()));
 
         layout.set_hotkey_number(watches_window, 1);
         layout.set_hotkey_number(disassembly_window, 2);
@@ -248,6 +273,7 @@ impl DebuggerUI {
         let keys = w.keys.clone();
 
         // Handle some of the global hotkeys. Windows may also handle their global hotkeys by attaching them to the content_root widget, e.g. threads window handling global hotkeys for switching threads.
+        let mut open_help = false;
         for key in &keys {
             match self.ui.key_binds.normal.key_to_action.get(key) {
                 Some(KeyAction::Quit) => {
@@ -279,6 +305,7 @@ impl DebuggerUI {
                         report_result(&mut self.state, &r);
                     }
                 }
+                Some(KeyAction::Help) => open_help = true,
 
                 Some(KeyAction::DropCaches) => {
                     self.terminal.clear()?; // do this only on hotkey, not when drop_caches is initiated by e.g. symbols loading
@@ -316,7 +343,8 @@ impl DebuggerUI {
         // Draw lines around windows, determine which window is active.
         self.layout.build(&mut self.ui);
 
-        // Hints window content. Keep it brief, there's not much space.
+        // Hints for all key binds. Used for both hints window and help dialog.
+        // Keep it brief, there's not much space.
         let mut hints = Vec::new();
         hints.push(KeyHint::key(KeyAction::Quit, match debugger.mode {
             RunMode::CoreDump => "quit",
@@ -324,38 +352,31 @@ impl DebuggerUI {
             RunMode::Run => "kill and quit",
             RunMode::Attach => "detach and quit",
         }));
+        hints.push(KeyHint::key(KeyAction::Help, "help"));
+        hints.push(KeyHint::key(KeyAction::Cancel, "close dialog (like this one) or search bar").conditional(false, "if any"));
         hints.push(KeyHint::ranges(&[[KeyAction::Window0, KeyAction::Window9], [KeyAction::WindowLeft, KeyAction::WindowDown]], "switch window"));
-        hints.push(KeyHint::keys(&[KeyAction::NextTab, KeyAction::PreviousTab], "switch tab"));
+        hints.push(KeyHint::keys(&[KeyAction::NextTab, KeyAction::PreviousTab], "switch tab").conditional(true, "if there are tabs"));
         hints.push(KeyHint::keys(&[KeyAction::PreviousStackFrame, KeyAction::NextStackFrame, KeyAction::PreviousThread, KeyAction::NextThread], "switch frame/thread"));
-        let start = hints.len();
-        match debugger.target_state {
-            ProcessState::Running => hints.push(
-                KeyHint::key(KeyAction::Suspend, "suspend")),
-            ProcessState::Stepping => hints.extend([
-                KeyHint::key(KeyAction::Suspend, "suspend"),
-                KeyHint::key(KeyAction::Continue, "continue")]),
-            ProcessState::Suspended => hints.extend([
-                KeyHint::key(KeyAction::Continue, "continue"),
-                KeyHint::keys(&[KeyAction::StepIntoLine, KeyAction::StepOverLine, KeyAction::StepOut, KeyAction::StepOverColumn], "step into/over/out/column"),
-                KeyHint::keys(&[KeyAction::StepIntoInstruction, KeyAction::StepOverInstruction], "step into/over instruction")]),
-            ProcessState::NoProcess if debugger.mode == RunMode::Run => hints.extend([
-                KeyHint::key(KeyAction::Run, "start"),
-                KeyHint::key(KeyAction::StepIntoLine, "run to main()"),
-                KeyHint::key(KeyAction::StepIntoInstruction, "run to early start")]),
-            _ => (),
-        }
-        if debugger.mode == RunMode::Run && debugger.target_state.process_ready() {
-            hints.push(KeyHint::keys(&[KeyAction::Kill, KeyAction::SendSigint], "kill/sigint"));
-        }
-        for h in &mut hints[start..] {
-            h.state_dependent = true;
-        }
-        if let &Some(id) = &self.layout.active_window {
-            if let Some(w) = self.layout.windows.try_get(id) {
-                let start = hints.len();
-                w.content.get_key_hints(&mut hints, debugger);
-                for h in &mut hints[start..] {
-                    h.window_dependent = true;
+        hints.push(KeyHint::key(KeyAction::ToggleProfiler, "profiler").hide());
+        hints.push(KeyHint::key(KeyAction::DropCaches, "drop caches and redraw").hide());
+        let state = debugger.target_state;
+        hints.push(KeyHint::key(KeyAction::Suspend, "suspend").conditional(state == ProcessState::Running || state == ProcessState::Stepping, "if running or stepping"));
+        hints.push(KeyHint::key(KeyAction::Continue, "continue").conditional(state == ProcessState::Suspended || state == ProcessState::Stepping, "if suspended or stepping"));
+        hints.push(KeyHint::keys(&[KeyAction::StepIntoLine, KeyAction::StepOverLine, KeyAction::StepOut, KeyAction::StepOverColumn], "step into/over/out/column").conditional(state == ProcessState::Suspended, "if suspended"));
+        hints.push(KeyHint::keys(&[KeyAction::StepIntoInstruction, KeyAction::StepOverInstruction], "step into/over instruction").conditional(state == ProcessState::Suspended, "if suspended"));
+        let startable = state == ProcessState::NoProcess && debugger.mode == RunMode::Run;
+        let startable_text = "if no process";
+        hints.push(KeyHint::key(KeyAction::Run, "start").conditional(startable, startable_text));
+        hints.push(KeyHint::key(KeyAction::StepIntoLine, "run to main()").conditional(startable, startable_text));
+        hints.push(KeyHint::key(KeyAction::StepIntoInstruction, "run to early start").conditional(startable, startable_text));
+        hints.push(KeyHint::keys(&[KeyAction::Kill, KeyAction::SendSigint], "kill/sigint").conditional(debugger.mode == RunMode::Run && debugger.target_state.process_ready(), "if child exists"));
+        for (id, win) in self.layout.sorted_windows() {
+            let start = hints.len();
+            win.content.get_key_hints(&mut hints, debugger);
+            for h in &mut hints[start..] {
+                h.window = Some(win.type_);
+                if &Some(id) != &self.layout.active_window {
+                    h.hidden = true;
                 }
             }
         }
@@ -365,6 +386,16 @@ impl DebuggerUI {
         for (_, win) in self.layout.sorted_windows_mut() {
             with_parent!(self.ui, win.widget, {
                 win.content.build(&mut self.state, debugger, &mut self.ui);
+            });
+        }
+
+        if let Some(widget_idx) = make_dialog_frame(open_help, AutoSize::Remainder(0.75), AutoSize::Remainder(0.83), self.ui.palette.dialog, self.ui.palette.default, "halp!", &mut self.ui) {
+            with_parent!(self.ui, widget_idx, {
+                if !self.ui.check_keys(&[KeyAction::Help, KeyAction::Cancel]).is_empty() {
+                    self.ui.close_dialog();
+                } else {
+                    self.help_dialog.build(&mut self.state, &mut self.ui);
+                }
             });
         }
 
@@ -402,6 +433,7 @@ impl DebuggerUI {
         for (win_id, win) in self.layout.windows.iter_mut() {
             win.content.drop_caches();
         }
+        self.help_dialog.drop_caches();
     }
 }
 
@@ -2298,13 +2330,9 @@ impl WindowContent for DisassemblyWindow {
             KeyHint::key(KeyAction::GoToLine, "go to address"),
             KeyHint::key(KeyAction::CloseTab, "close/pin tab"),
             KeyHint::keys(&[KeyAction::PreviousLocation, KeyAction::NextLocation], "select level"),
+            KeyHint::keys(&[KeyAction::Enter, KeyAction::DeleteRow, KeyAction::EditCondition], "breakpoint").if_not_core_dump(),
+            KeyHint::key(KeyAction::StepToCursor, "run to cursor").if_not_core_dump(),
         ]);
-        if debugger.mode != RunMode::CoreDump {
-            out.extend([
-                KeyHint::keys(&[KeyAction::Enter, KeyAction::DeleteRow, KeyAction::EditCondition], "breakpoint"),
-                KeyHint::key(KeyAction::StepToCursor, "run to cursor"),
-            ]);
-        }
     }
 
     fn has_persistent_state(&self) -> bool {
@@ -2602,9 +2630,6 @@ impl HintsWindow {
             draw_hline('╰', '╯', ui);
         });
 
-        let content_height = ui.calculate_size(content_widget, Axis::Y);
-        let viewport_height = ui.calculate_size(viewport, Axis::Y);
-
         let root = ui.cur_parent;
         with_parent!(ui, viewport, {
             ui.focus();
@@ -2623,30 +2648,19 @@ impl WindowContent for HintsWindow {
         let mut column_breaks: Vec<usize> = Vec::new();
         column_breaks.push(start);
         for hint in &state.key_hints {
-            let style = if hint.window_dependent {
-                // Currently we just put all non-window-specific hints in the left column and all window-specific ones in the right one,
-                // it happens to fit just right for the current set of hints.
+            if hint.hidden || (hint.if_not_core_dump && debugger.mode == RunMode::CoreDump) {
+                continue;
+            }
+            if hint.window.is_some() {
+                // Currently we put all non-window-specific hints in the left column and all window-specific ones in the right one.
+                // It happens to fit just right for the current set of hints.
                 if column_breaks.len() == 1 {
                     column_breaks.push(ui.text.num_lines());
                 }
-
-                ui.palette.hint_window_dependent
-            } else if hint.state_dependent {
-                ui.palette.hint_state_dependent
-            } else {
-                ui.palette.hint_global
-            };
-            for (i, range) in hint.key_ranges.iter().enumerate() {
-                if i != 0 {
-                    styled_write!(ui.text, style, "/");
-                }
-                styled_write!(ui.text, ui.palette.hotkey.apply(style), "{}", ui.key_binds.normal.action_to_key_name(range[0]));
-                if range[0] != range[1] {
-                    styled_write!(ui.text, style, "…");
-                    styled_write!(ui.text, ui.palette.hotkey.apply(style), "{}", ui.key_binds.normal.action_to_key_name(range[1]));
-                }
             }
-            styled_writeln!(ui.text, style, " - {}", hint.hint);
+
+            format_key_hint(hint, &mut ui.text, &ui.palette, &ui.key_binds, /*with_condition*/ false);
+            ui.text.close_line();
         }
         let end = ui.text.num_lines();
 
@@ -2674,6 +2688,35 @@ impl WindowContent for HintsWindow {
             ui.focus();
             cursorless_scrolling_navigation(&mut self.scroll, None, root, scroll_bar, ui);
         });
+    }
+}
+
+pub fn format_key_hint(hint: &KeyHint, text: &mut StyledText, palette: &Palette, key_binds: &KeyBinds, with_condition: bool) {
+    let style = if hint.window.is_some() {
+        palette.hint_window_dependent
+    } else if !hint.condition.is_empty() {
+        palette.hint_state_dependent
+    } else {
+        palette.hint_global
+    };
+    for (i, range) in hint.key_ranges.iter().enumerate() {
+        if i != 0 {
+            styled_write!(text, style, "/");
+        }
+        styled_write!(text, palette.hotkey.apply(style), "{}", key_binds.normal.action_to_key_name(range[0]));
+        if range[0] != range[1] {
+            styled_write!(text, style, "…");
+            styled_write!(text, palette.hotkey.apply(style), "{}", key_binds.normal.action_to_key_name(range[1]));
+        }
+    }
+    styled_write!(text, style, " - {}", hint.hint);
+    if with_condition {
+        if !hint.condition.is_empty() {
+            styled_write!(text, palette.default_dim, " ({})", hint.condition);
+        }
+        if hint.if_not_core_dump {
+            styled_write!(text, palette.default_dim, " (if not core dump)");
+        }
     }
 }
 
@@ -3122,12 +3165,8 @@ impl WindowContent for ThreadsWindow {
         out.extend([
             KeyHint::key(KeyAction::Find, "filter"),
             KeyHint::key(KeyAction::Tooltip, "tooltip"),
+            KeyHint::key(KeyAction::ToggleSort, "sort by cpu").if_not_core_dump(),
         ]);
-        if debugger.mode != RunMode::CoreDump {
-            out.extend([
-                KeyHint::key(KeyAction::ToggleSort, "sort by cpu"),
-            ]);
-        }
     }
 }
 
@@ -4206,13 +4245,9 @@ impl WindowContent for CodeWindow {
             KeyHint::key(KeyAction::GoToLine, "go to line"),
             KeyHint::key(KeyAction::Find, "find"),
             KeyHint::keys(&[KeyAction::NextMatch, KeyAction::PreviousMatch], "find next/previous"),
+            KeyHint::keys(&[KeyAction::Enter, KeyAction::DeleteRow, KeyAction::EditCondition], "toggle/delete/edit breakpoint").if_not_core_dump(),
+            KeyHint::key(KeyAction::StepToCursor, "run to cursor").if_not_core_dump(),
         ]);
-        if debugger.mode != RunMode::CoreDump {
-            out.extend([
-                KeyHint::keys(&[KeyAction::Enter, KeyAction::DeleteRow, KeyAction::EditCondition], "toggle/delete/edit breakpoint"),
-                KeyHint::key(KeyAction::StepToCursor, "run to cursor"),
-            ]);
-        }
     }
 
     fn has_persistent_state(&self) -> bool {
@@ -4511,5 +4546,57 @@ impl WindowContent for BreakpointsWindow {
                 }
             }
         }
+    }
+}
+
+#[derive(Default)]
+struct HelpDialog {
+    tabs_state: TabsState,
+    contents: Option<HelpDialogContents>,
+    scroll: Vec<isize>, // parallel to contents.tabs
+}
+impl HelpDialog {
+    fn drop_caches(&mut self) {
+        self.contents = None;
+    }
+
+    fn build(&mut self, state: &mut UIState, ui: &mut UI) {
+        if self.contents.is_none() {
+            self.contents = Some(get_help_dialog_contents(&state.key_hints, ui));
+        }
+        let contents = self.contents.as_ref().unwrap();
+        self.scroll.resize(contents.tabs.len(), 0);
+
+        ui.cur_mut().set_vstack();
+        let tabs_widget = ui.add(widget!().fixed_height(2));
+        let main_widget = ui.add(widget!().height(AutoSize::Remainder(1.0)));
+        ui.layout_children(Axis::Y);
+        with_parent!(ui, tabs_widget, {
+            let mut tabs = Tabs::new(mem::take(&mut self.tabs_state), ui);
+            for &(title, _) in &contents.tabs {
+                tabs.add(Tab {short_title: title.to_string(), ..Default::default()}, ui);
+            }
+            self.tabs_state = tabs.finish(ui);
+        });
+
+        let tab_idx = self.tabs_state.selected;
+        let lines = ui.text.import_lines(&contents.text, contents.tabs[tab_idx].1.clone());
+
+        let viewport;
+        with_parent!(ui, main_widget, {
+            ui.cur_mut().set_hstack();
+            viewport = ui.add(widget!().width(AutoSize::Remainder(1.0)));
+            let scroll_bar = ui.add(widget!().fixed_width(1));
+            ui.layout_children(Axis::X);
+            let content_widget = ui.add(widget!().parent(viewport).fixed_y(0).height(AutoSize::Text).flags(WidgetFlags::LINE_WRAP).text_lines(lines));
+
+            with_parent!(ui, viewport, {
+                ui.focus();
+                cursorless_scrolling_navigation(&mut self.scroll[tab_idx], /*scroll_to*/ None, main_widget, scroll_bar, ui);
+            });
+        });
+
+        with_parent!(ui, main_widget, {ui.multifocus();});
+        with_parent!(ui, tabs_widget, {ui.multifocus();});
     }
 }
