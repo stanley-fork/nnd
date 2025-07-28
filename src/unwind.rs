@@ -180,17 +180,20 @@ fn find_cie_in(offset: u64, cies: &Vec<CommonInformationEntry<DwarfSlice>>) -> g
 impl UnwindInfo {
     pub fn load(elves: Vec<Arc<ElfFile>>) -> Result<Self> {
         // Section data and its static address.
-        let load_section = |name| -> Option<(&'static [u8], u64)> {
+        let load_section = |name| -> Result<Option<(&'static [u8], u64)>> {
             for elf in &elves {
                 let section_idx = match elf.section_by_name.get(name) {
                     None => continue,
                     Some(&idx) => idx,
                 };
-                let data = elf.section_data(section_idx);
+                let data = elf.section_data(section_idx)?;
+                if data.is_empty() {
+                    continue;
+                }
                 let addr = elf.sections[section_idx].address;
-                return Some((unsafe { mem::transmute(data) }, addr as u64));
+                return Ok(Some((unsafe { mem::transmute(data) }, addr as u64)));
             }
-            None
+            Ok(None)
         };
 
         // Addresses in eh_frame may be encoded relative to these sections.
@@ -198,19 +201,19 @@ impl UnwindInfo {
         //  1. The relative addresses of these sections are preserved when the binary is loaded. I.e. dynamic address = static address + const.
         //  2. CIEs don't use BaseAddresses for anything we care about. So we can parse them now once rather than on every stack walk.
         let mut static_base_addresses = BaseAddresses::default();
-        if let Some((_, addr)) = load_section(".text") {
+        if let Some((_, addr)) = load_section(".text")? {
             static_base_addresses = static_base_addresses.set_text(addr);
         }
-        if let Some((_, addr)) = load_section(".got") {
+        if let Some((_, addr)) = load_section(".got")? {
             static_base_addresses = static_base_addresses.set_got(addr);
         };
 
         let mut res = Self {elves: elves.clone(), eh_frame: None, debug_frame: None};
 
-        if let Some((data, addr)) = load_section(".eh_frame") {
+        if let Some((data, addr)) = load_section(".eh_frame")? {
             res.eh_frame = Some(UnwindSectionIndex::load(data, static_base_addresses.clone().set_eh_frame(addr), EhFrame::from(DwarfSlice::new(data)))?);
         }
-        if let Some((data, addr)) = load_section(".debug_frame") {
+        if let Some((data, addr)) = load_section(".debug_frame")? {
             res.debug_frame = Some(UnwindSectionIndex::load(data, static_base_addresses, DebugFrame::from(DwarfSlice::new(data)))?);
         }
         if res.eh_frame.is_none() && res.debug_frame.is_none() {
@@ -460,11 +463,14 @@ impl UnwindInfo {
         let (data, offset) = if let &Some(section_idx) = &elf.text_section {
             let pc = binary.addr_map.dynamic_to_static(addr);
             let section = &elf.sections[section_idx];
-            let data = elf.section_data(section_idx);
+            let data = match elf.section_data(section_idx) {
+                Ok(x) => x,
+                Err(_) => return SpecialUnwindLocation::None,
+            };
             if pc < section.address || pc >= section.address + data.len() {
                 return SpecialUnwindLocation::None;
             }
-            (elf.section_data(section_idx), pc - section.address)
+            (data, pc - section.address)
         } else {
             // (This fallback is currently unnecessary, we always expect to have .text section. Even for binaries reconstructed from core dump we add a fake .text section, for convenience.)
             let offset = MAX_MID.min(addr);

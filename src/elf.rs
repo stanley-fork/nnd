@@ -1,5 +1,5 @@
 use crate::{*, error::*, log::*, util::*, registers::*, procfs::*, process_info::*};
-use std::{fs::{File}, mem, mem::MaybeUninit, io::{self, BufReader, SeekFrom, Seek, Read, BufRead}, sync::Arc, collections::{HashMap, hash_map::Entry}, str, ptr, fmt::Debug, fmt, result, slice, ops::Range};
+use std::{fs::{File}, mem, mem::MaybeUninit, io::{self, BufReader, SeekFrom, Seek, Read, BufRead}, sync::{Arc, OnceLock}, collections::{HashMap, hash_map::Entry}, str, ptr, fmt::Debug, fmt, result, slice, ops::Range};
 use libc::pid_t;
 
 pub struct ElfSection {
@@ -20,7 +20,9 @@ pub struct ElfSection {
 
     pub name_offset_in_strtab: u32,
 
-    pub decompressed_data: Vec<u8>, // if flags has SHF_COMPRESSED
+    // If flags has SHF_COMPRESSED.
+    pub compression_header: Option<libc::Elf64_Chdr>,
+    pub decompressed_data: OnceLock<Result<Vec<u8>>>,
 }
 
 pub struct ElfSegment {
@@ -168,29 +170,46 @@ impl ElfFile {
     }
 
     // The returned reference points either into mmap or into section's decompressed_data.
-    pub fn section_data(&self, idx: usize) -> &[u8] {
+    pub fn section_data(&self, idx: usize) -> Result<&[u8]> {
         let section = &self.sections[idx];
-        if section.flags & SHF_COMPRESSED == 0 {
-            &self.data()[section.offset..section.offset + section.size_in_file()]
-        } else {
-            &section.decompressed_data
-        }
-    }
+        Ok(if let Some(header) = &section.compression_header {
+            // Decompress lazily to cover the case where a binary with big compressed debug info is passed using --module.
+            // We parse ELF headers for such binaries in a blocking way on startup (to get build id), before even showing UI.
+            &section.decompressed_data.get_or_init(|| {
+                let compressed = &self.data()[section.offset..section.offset + section.size_in_file()];
+                let compressed = &compressed[mem::size_of::<libc::Elf64_Chdr>()..];
+                let mut decompressed = vec![0u8; header.ch_size as usize + ELF_PAD_RIGHT];
+                decompressed.truncate(header.ch_size as usize);
 
-    pub fn section_data_by_name<'a>(&'a self, name: &str) -> Option<&'a [u8]> {
-        match self.section_by_name.get(name) {
-            None => None,
-            Some(i) => Some(self.section_data(*i)),
-        }
+                match header.ch_type {
+                    ELFCOMPRESS_ZLIB => {
+                        let mut decoder = flate2::read::ZlibDecoder::new(compressed);
+                        decoder.read_exact(&mut decompressed)?;
+                    }
+                    _ => return err!(UnsupportedExecutable, "ELF compression {} not supported", header.ch_type),
+                };
+
+                Ok(decompressed)
+            }).as_ref_clone_error()?
+        } else {
+            &self.data()[section.offset..section.offset + section.size_in_file()]
+        })
     }
 
     pub fn decompressed_size(&self) -> usize {
-        (0..self.sections.len()).map(|i| self.section_data(i).len()).sum()
+        self.sections.iter().map(|s| s.compression_header.map_or(s.size_in_file(), |h| h.ch_size as usize)).sum()
     }
 
     pub fn has_section_data(&self, name: &str) -> bool {
         match self.section_by_name.get(name) {
             Some(&idx) => self.sections[idx].section_type != SHT_NOBITS,
+            None => false,
+        }
+    }
+
+    pub fn has_text_section_data(&self) -> bool {
+        match &self.text_section {
+            &Some(idx) => self.sections[idx].section_type != SHT_NOBITS,
             None => false,
         }
     }
@@ -633,7 +652,7 @@ pub fn reconstruct_elf_from_mapped_parts(name: String, memory: &Arc<CoreDumpMemR
                     reader.read(eh_frame_addr + prev_len, &mut data[prev_len..])?;
                 }
 
-                let section = ElfSection {idx: elf.sections.len(), name: ".eh_frame".to_string(), section_type: SHT_PROGBITS, flags: 0, address: eh_frame_addr.wrapping_sub(addr_static_to_dynamic), offset: elf.owned.len(), size: data.len(), link: 0, info: 0, alignment: 0, entry_size: 0, name_offset_in_strtab: 0, decompressed_data: Vec::new()};
+                let section = ElfSection {idx: elf.sections.len(), name: ".eh_frame".to_string(), section_type: SHT_PROGBITS, flags: 0, address: eh_frame_addr.wrapping_sub(addr_static_to_dynamic), offset: elf.owned.len(), size: data.len(), link: 0, info: 0, alignment: 0, entry_size: 0, name_offset_in_strtab: 0, compression_header: None, decompressed_data: OnceLock::new()};
                 elf.owned.append(&mut data);
                 elf.sections.push(section);
             }
@@ -658,7 +677,7 @@ pub fn reconstruct_elf_from_mapped_parts(name: String, memory: &Arc<CoreDumpMemR
         }
     }
 
-    let section = ElfSection {idx: elf.sections.len(), name: ".text".to_string(), section_type: SHT_PROGBITS, flags: 0, address: longest_executable_segment.1.wrapping_sub(addr_static_to_dynamic), offset: longest_executable_segment.2, size: longest_executable_segment.0.len(), link: 0, info: 0, alignment: 0, entry_size: 0, name_offset_in_strtab: 0, decompressed_data: Vec::new()};
+    let section = ElfSection {idx: elf.sections.len(), name: ".text".to_string(), section_type: SHT_PROGBITS, flags: 0, address: longest_executable_segment.1.wrapping_sub(addr_static_to_dynamic), offset: longest_executable_segment.2, size: longest_executable_segment.0.len(), link: 0, info: 0, alignment: 0, entry_size: 0, name_offset_in_strtab: 0, compression_header: None, decompressed_data: OnceLock::new()};
     elf.owned.append(&mut longest_executable_segment.0);
     elf.text_section = Some(elf.sections.len());
     elf.sections.push(section);
@@ -678,10 +697,6 @@ pub fn reconstruct_elf_from_mapped_parts(name: String, memory: &Arc<CoreDumpMemR
 }
 
 // Read the ELF headers.
-//
-// If there are compressed sections, decompresses them right here.
-// This is maybe not ideal: maybe we won't need all of them, and maybe decompression can be parallelized.
-// Hopefully this won't be a problem because the huge binaries usually have uncompressed debug symbols.
 fn open_elf(name: String, file: Option<(&File, /*file_len*/ usize)>, mut owned: Vec<u8>) -> Result<ElfFile> {
     let len;
     let mmapped = match file {
@@ -751,7 +766,7 @@ fn open_elf(name: String, file: Option<(&File, /*file_len*/ usize)>, mut owned: 
         sections.push(ElfSection {
             idx, name: String::new(), name_offset_in_strtab: section.sh_name, section_type: section.sh_type, flags: section.sh_flags,
             address: section.sh_addr as usize, offset: section.sh_offset as usize, size: section.sh_size as usize, link: section.sh_link,
-            info: section.sh_info, alignment: section.sh_addralign as usize, entry_size: section.sh_entsize as usize, decompressed_data: Vec::new()});
+            info: section.sh_info, alignment: section.sh_addralign as usize, entry_size: section.sh_entsize as usize, compression_header: None, decompressed_data: OnceLock::new()});
     }
 
     let data: &'static [u8] = unsafe {mem::transmute(data)};
@@ -772,27 +787,7 @@ fn open_elf(name: String, file: Option<(&File, /*file_len*/ usize)>, mut owned: 
 
         if s.flags & SHF_COMPRESSED != 0 {
             let compressed = &elf.data[s.offset..s.offset+s.size_in_file()];
-            let mut reader = io::Cursor::new(compressed);
-            let header = libc::Elf64_Chdr {
-                ch_type: reader.read_u32()?,
-                ch_reserved: reader.read_u32()?,
-                ch_size: reader.read_u64()?,
-                ch_addralign: reader.read_u64()?,
-            };
-            let header_bytes = reader.position();
-            let compressed = &reader.into_inner()[header_bytes as usize..];
-            let mut decompressed = vec![0u8; header.ch_size as usize + ELF_PAD_RIGHT];
-            decompressed.truncate(header.ch_size as usize);
-
-            match header.ch_type {
-                ELFCOMPRESS_ZLIB => {
-                    let mut decoder = flate2::read::ZlibDecoder::new(compressed);
-                    decoder.read_exact(&mut decompressed)?;
-                }
-                _ => return err!(UnsupportedExecutable, "ELF compression {} not supported", header.ch_type),
-            };
-
-            s.decompressed_data = decompressed;
+            s.compression_header = Some(unsafe {memcpy_struct(compressed, "Elf64_Chdr")}?.0);
         }
 
         if s.size_in_file() != 0 {
@@ -825,7 +820,7 @@ fn open_elf(name: String, file: Option<(&File, /*file_len*/ usize)>, mut owned: 
     let mut build_id = None;
     for section_idx in 0..elf.sections.len() {
         if elf.sections[section_idx].section_type == SHT_NOTE {
-            let mut data = elf.section_data(section_idx);
+            let mut data = elf.section_data(section_idx)?;
             while !data.is_empty() {
                 let note;
                 (note, data) = parse_elf_note(data)?;
@@ -843,7 +838,7 @@ fn open_elf(name: String, file: Option<(&File, /*file_len*/ usize)>, mut owned: 
     // Parse .dynamic section.
     let mut r_debug_ptr_addr = None;
     if let Some(&section_idx) = elf.section_by_name.get(".dynamic") {
-        let data = elf.section_data(section_idx);
+        let data = elf.section_data(section_idx)?;
         let mut offset = 0;
         while offset + 16 <= data.len() {
             let tag = usize::from_le_bytes(data[offset..offset+8].try_into().unwrap());
@@ -858,7 +853,7 @@ fn open_elf(name: String, file: Option<(&File, /*file_len*/ usize)>, mut owned: 
 
     let mut interp = None;
     if let Some(&section_idx) = elf.section_by_name.get(".interp") {
-        let data = elf.section_data(section_idx);
+        let data = elf.section_data(section_idx)?;
         let len = data.iter().copied().position(|x| x == b'\0').unwrap_or(data.len());
         interp = Some(str::from_utf8(&data[..len])?.to_string());
     }

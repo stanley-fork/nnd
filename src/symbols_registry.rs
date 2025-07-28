@@ -320,6 +320,16 @@ fn task_load_elf(shared: Arc<Shared>, locator: BinaryLocator, id: usize, status:
         }
     }
 
+    // Make sure elves[0] is an actual executable rather than a debug-info-only file (because some code sites read .text section specifically from elves[0]; perhaps we shouldn't do that).
+    if !elves.is_empty() {
+        for i in 0..elves.len() {
+            if elves[i].has_text_section_data() {
+                elves[..i+1].rotate_right(1);
+                break;
+            }
+        }
+    }
+
     let have_debug_info = elves.iter().any(|elf| elf.has_section_data(".debug_info"));
     if !have_debug_info && !shared.context.settings.debuginfod_urls.is_empty() {
         if let (Some(build_id), Some(debuginfod_cache_path)) = (&build_id, &shared.context.settings.debuginfod_cache_path) {
@@ -414,7 +424,7 @@ fn open_debuglink(elf: Option<&ElfFile>, build_id: &Option<Vec<u8>>) -> Result<O
             None => return Ok(None),
             Some(&x) => x,
         };
-        let debuglink = elf.section_data(section_idx);
+        let debuglink = elf.section_data(section_idx)?;
         if debuglink.len() <= 4 { return err!(Dwarf, ".gnu_debuglink section is too short: {}", debuglink.len()); }
         let (filename, crc32) = debuglink.split_at(debuglink.len()-4);
         let filename = &filename[..filename.iter().position(|&x| x == b'\0').unwrap_or(filename.len())]; // null-terminated string

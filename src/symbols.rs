@@ -138,6 +138,8 @@ impl PointOfInterest {
 }
 
 pub struct Symbols {
+    // Executable and possibly additional binaries with debug info (e.g. from debuglink or --module).
+    // elves[0] is the actual executable, e.g. it should have .text section.
     pub elves: Vec<Arc<ElfFile>>,
 
     // .debug_info, .debug_line, etc - sections describing things in the source code (functions, line numbers, structs and their fields, etc) and how they map to address ranges.
@@ -966,19 +968,19 @@ impl SymbolsLoader {
         assert!(!elves.is_empty());
         let start_time = Instant::now();
 
-        let find_section = |name: &str| -> Option<(&[u8], /*addr*/ usize)> {
+        let find_section = |name: &str| -> Result<Option<(&[u8], /*addr*/ usize)>> {
             for elf in &elves {
                 if let Some(&idx) = elf.section_by_name.get(name) {
-                    let data = elf.section_data(idx);
+                    let data = elf.section_data(idx)?;
                     if !data.is_empty() {
-                        return Some((data, elf.sections[idx].address));
+                        return Ok(Some((data, elf.sections[idx].address)));
                     }
                 }
             }
-            None
+            Ok(None)
         };
-        let load_section = |id: SectionId| -> std::result::Result<DwarfSlice, gimli::Error> {
-            match find_section(id.name()) {
+        let load_section = |id: SectionId| -> Result<DwarfSlice> {
+            match find_section(id.name())? {
                 Some((data, _)) => Ok(DwarfSlice::new(unsafe {mem::transmute(data)})),
                 None => Ok(DwarfSlice::new(&[0u8;0][..])),
             }
@@ -992,14 +994,14 @@ impl SymbolsLoader {
             return err!(Dwarf, ".debug_types not supported");
         }
 
-        let code_addr_range = match find_section(".text") {
+        let code_addr_range = match find_section(".text")? {
             Some((data, addr)) => addr..addr+data.len(),
             None => 0..0,
         };
 
         let mut strtab_symtab: Vec<[&'static [u8]; 2]> = Vec::new();
         for [strtab_name, symtab_name] in [[".strtab", ".symtab"], [".dynstr", ".dynsym"]] {
-            match (find_section(strtab_name), find_section(symtab_name)) {
+            match (find_section(strtab_name)?, find_section(symtab_name)?) {
                 (Some((strtab, _)), Some((symtab, _))) => strtab_symtab.push(unsafe {[mem::transmute(strtab), mem::transmute(symtab)]}),
                 _ => (),
             }

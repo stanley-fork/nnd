@@ -22,7 +22,7 @@ fn main() -> Result<()> {
         match elf.section_by_name.get(id.name()) {
             None => Ok(EndianSlice::new(&[0u8;0][..], LittleEndian::default())),
             Some(&idx) => {
-                let data = elf.section_data(idx);
+                let data = elf.section_data(idx)?;
                 Ok(EndianSlice::new(unsafe {mem::transmute(data)}, LittleEndian::default()))
             }
         }
