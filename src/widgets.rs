@@ -1300,7 +1300,7 @@ pub fn make_dialog_frame(create: bool, width: AutoSize, height: AutoSize, style_
         None => return None,
         Some(x) => x };
     let dialog = with_parent!(ui, dialog_root, {
-        if ui.check_mouse(MouseActions::CLICK) || ui.check_key(KeyAction::Cancel) {
+        if ui.check_mouse(MouseActions::CLICK) || !ui.check_keys(&[KeyAction::Cancel, KeyAction::Quit]).is_empty() {
             None // (can't return from inside with_parent)
         } else {
             let l = ui_writeln!(ui, default, "{}", title);
