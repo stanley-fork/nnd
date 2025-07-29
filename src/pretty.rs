@@ -5,6 +5,8 @@ use bitflags::*;
 // Apply pretty-printers and other transformations to a value. Used both for printing and expression evaluaion.
 // E.g. this function may turn an std::vector<int> into a *[int; 123], making it appear as an array both when printed whole
 // and when used in expression like v[10] (will index the array) or v._M_begin (will fail even if std::vector has field _M_begin).
+// Note: ValueFlags::BIG_ENDIAN is intentionally ignored by pretty-printers (but propagated to elements), on the assumption that big-endianness is only relevant for simple
+//       serialization-related structs that don't need pretty-printers, but such structs can appear inside normal containers; e.g. `std::vector<NetworkPacket>`.
 pub fn prettify_value(val: &mut Cow<Value>, warning: &mut Option<Error>, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
     if val.flags.contains(ValueFlags::NO_UNWRAPPING_INTERNAL) {
         return Ok(());

@@ -217,7 +217,7 @@ Debugging tips:
  * Breakpoints are preserved across debugger restarts, but they're put into disabled state on startup. Use Enter key in breakpoints window to reactivate.
  * To make a conditional breakpoint, press M-enter on a regular breakpoint and edit the condition expression (in breakpoints window).
    Conditional breakpoint stops the program if the condition expression evaluates to nonzero or fails to evaluate.
-   If you don't want to stop on evaluation error, wrap the expression in 'try(...)' (it returns 0 on if evaluation failed for any reason).
+   If you don't want to stop on evaluation error, wrap the expression in 'try(...)' (it returns 0 if evaluation failed for any reason).
    E.g.: 'try(abstract_class_ptr.concrete_class_field)' will stop only if abstract_class_ptr was auto-downcast to a class that has the given field, and the field is nonzero.
  * The function search (in disassembly window, 'o' key) currently does fuzzy search over *mangled* function names, for peformance reasons.
    The search results display demangled names, i.e. slightly different from what's actually searched. Press tab to see mangled name.
@@ -319,13 +319,17 @@ Pretty-printers:
 Value modifiers:
  * 'value.#x' to print in hexadecimal. Affects numbers, strings, and byte arrays.
  * 'value.#b' to print in binary.
+ * 'value.#be' to interpret integers as big-endian. (Doesn't apply to pointers and floats, doesn't affect pretty-printers.)
  * 'value.#r' to disable pretty-printers.
    This applies both to how the value is printed and to field access:
    'foo.bar' will access field 'bar' of the transformed 'foo', i.e. after unwrapping single-field structs, downcasting to concrete type, and inlining base class fields.
    'foo.#r.bar' will access field 'bar' of 'foo' verbatim.
  * Modifiers propagate to descendants. E.g. 'my_struct.#x' will print all struct's fields as hexadecimal.
  * Modifiers propagate through most operations. E.g. 'my_array.#x as [u8]' is the same as '(my_array as [u8]).#x'.
- * 'value.#p' is the opposite of '.#r'. Can be useful with field access: 'my_struct.#r.my_field.#p' re-enables pretty-printing after disabling it to access a raw field."###),
+ * 'value.#p' is the opposite of '.#r'. Can be useful with field access: 'my_struct.#r.my_field.#p' re-enables pretty-printing after disabling it to access a raw field.
+
+Misc:
+ * `try(a, b, ...)` takes any number of expressions and returns the result of the first expression that evaluates without errors. If all expressions fail, returns 0. Useful in breakpoint conditions, e.g. when relying on auto-downcasting to concrete types."###),
         HelpParagraph::Files => styled_write!(text, palette.default, r###"The debugger creates directory ~/.nnd/ and stores a few things there, such as log file and saved state (watches, breakpoints, open tabs).
 It doesn't create any other files or make any other changes to your system.
 

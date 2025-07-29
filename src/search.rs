@@ -123,8 +123,7 @@ impl SearchQuery {
             }
         }
         if can_go_to_line {
-            //asdqwe find last instead
-            if let Some(i) = s.find(':') {
+            if let Some(i) = s.rfind(':') {
                 let line_str = &s[i+1..];
                 if let Ok(n) = line_str.parse::<usize>() {
                     query = &s[..i];

@@ -627,6 +627,10 @@ bitflags! { pub struct ValueFlags: u16 {
     const NO_UNWRAPPING_INTERNAL = 0x8;
     // When formatting value, print struct name. Used after automatic downcasting. Not inherited by fields.
     const SHOW_TYPE_NAME = 0x10;
+
+    // Interpret integers as big-endian.
+    // (The implementation of this is pretty error-prone, it's easy to miss a code site that needs to check this flag and flip endianness. Idk what to do about it.)
+    const BIG_ENDIAN = 0x20;
 }}
 impl ValueFlags {
     pub fn inherit(self) -> Self { self & !Self::SHOW_TYPE_NAME }
@@ -779,6 +783,7 @@ fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut Form
                     }
                 } else if p.contains(PrimitiveFlags::UNSPECIFIED) {
                     write_val_address_if_needed(&v.val, state);
+                    flip_endianness_if_needed(&mut x, size, v.flags);
                     styled_write!(state.out, state.palette.value_misc, "<unspecified type> 0x{:x}", x);
                 } else if p.contains(PrimitiveFlags::CHAR) && !as_number {
                     if size > 4 {
@@ -795,6 +800,7 @@ fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut Form
                         _ => styled_write!(state.out, state.palette.warning, "{}", x),
                     }
                 } else {
+                    flip_endianness_if_needed(&mut x, size, v.flags);
                     // Sign-extend.
                     let signed = p.contains(PrimitiveFlags::SIGNED);
                     if signed && size < 8 && x & 1 << (size*8-1) as u32 != 0 {
@@ -910,6 +916,7 @@ fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut Form
                 if size != 1 && size != 2 && size != 4 && size != 8 {
                     size = 8;
                 }
+                flip_endianness_if_needed(&mut x, size, v.flags);
                 // Sign-extend (for matching with enumerand values below).
                 if signed && size < 8 && x & 1 << (size*8-1) as u32 != 0 {
                     x |= !((1usize << size*8)-1);
@@ -962,7 +969,7 @@ fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut Form
     (!children.is_empty(), children, click_action)
 }
 
-// x0 must be already sign-extended to 8 bytes if signed.
+// x0 must be already sign-extended to 8 bytes if signed, and converted to little-endian if big-endian.
 fn format_integer(x0: usize, size: usize, signed: bool, flags: ValueFlags, out: &mut StyledText, palette: &Palette) {
     assert!(size > 0 && size <= 8);
     let mut x = x0;
@@ -1467,6 +1474,13 @@ pub fn is_value_truthy(val: &Value, memory: &mut CachedMemReader) -> Result<bool
             Ok(v.as_slice()[..size].iter().copied().any(|x| x != 0))
         }
         _ => err!(TypeMismatch, "got value of {} type instead of a boolean", t.t.kind_name()),
+    }
+}
+
+pub fn flip_endianness_if_needed(x: &mut usize, size: usize, flags: ValueFlags) {
+    let size = size.min(8).max(1);
+    if flags.contains(ValueFlags::BIG_ENDIAN) {
+        *x = x.swap_bytes() >> (64 - size*8);
     }
 }
 

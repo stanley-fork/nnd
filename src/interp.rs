@@ -157,6 +157,8 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                     }
                     "#x" => { val.flags.insert(ValueFlags::HEX); return Ok(val); }
                     "#b" => { val.flags.insert(ValueFlags::BIN); return Ok(val); }
+                    "#be" => { val.flags.insert(ValueFlags::BIG_ENDIAN); return Ok(val); }
+                    "#le" => { val.flags.remove(ValueFlags::BIG_ENDIAN); return Ok(val); }
                     _ => (),
                 }
             }
@@ -231,6 +233,9 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                         Type::Primitive(f) => {
                             if f.contains(PrimitiveFlags::UNSPECIFIED) { return err!(TypeMismatch, "can't negate void"); }
                             let size = type_.calculate_size();
+                            if size > 8 || size == 0 {
+                                return err!(TypeMismatch, "unexpected primitive value size: {} bytes", size);
+                            }
                             let mut x = val.val.into_value(size, &mut context.memory)?.get_usize()?;
                             if f.contains(PrimitiveFlags::FLOAT) {
                                 if op == UnaryOperator::Not { return err!(TypeMismatch, "can't bit-negate float"); }
@@ -243,6 +248,7 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                                 if op == UnaryOperator::Neg { return err!(TypeMismatch, "can't negate bool"); }
                                 x ^= 1;
                             } else {
+                                flip_endianness_if_needed(&mut x, size, val.flags);
                                 // No need to sign-extend.
                                 x = !x;
                                 if op == UnaryOperator::Neg {
@@ -253,6 +259,7 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                                 }
                                 x &= usize::MAX >> (64 - size as u32 * 8);
                             }
+                            val.flags.remove(ValueFlags::BIG_ENDIAN);
                             val.val = AddrOrValueBlob::Blob(ValueBlob::new(x));
                         }
                         _ => return err!(TypeMismatch, "can't negate {}", type_.t.kind_name()),
@@ -287,6 +294,7 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                     if let Some(v) = from_basic(b, type_)? {
                         val.val = v;
                         val.type_ = type_;
+                        val.flags.remove(ValueFlags::BIG_ENDIAN); // to_basic converted it to little-endian
                         return Ok(val);
                     }
                 }
@@ -792,6 +800,9 @@ fn to_basic(val: &Value, memory: &mut CachedMemReader, what: &str) -> Result<Bas
     }
     let t = unsafe {&*type_};
     let size = t.calculate_size();
+    if size > 8 || size == 0 {
+        return err!(TypeMismatch, "unexpected primitive value size: {} bytes", size);
+    }
     Ok(match &t.t {
         Type::Primitive(f) => {
             let mut x = val.val.clone().into_value(size, memory)?.get_usize()?;
@@ -801,14 +812,17 @@ fn to_basic(val: &Value, memory: &mut CachedMemReader, what: &str) -> Result<Bas
                     8 => unsafe {mem::transmute::<usize, f64>(x)},
                     _ => return err!(Dwarf, "unexpected float size: {}", size),
                 })
-            } else if f.contains(PrimitiveFlags::SIGNED) {
-                // Sign-extend.
-                if size < 8 && x & 1 << (size*8-1) as u32 != 0 {
-                    x |= !((1usize << size*8)-1);
-                }
-                BasicValue::I(x as isize)
             } else {
-                BasicValue::U(x)
+                flip_endianness_if_needed(&mut x, size, val.flags);
+                if f.contains(PrimitiveFlags::SIGNED) {
+                    // Sign-extend.
+                    if size < 8 && x & 1 << (size*8-1) as u32 != 0 {
+                        x |= !((1usize << size*8)-1);
+                    }
+                    BasicValue::I(x as isize)
+                } else {
+                    BasicValue::U(x)
+                }
             }
         }
         Type::Pointer(_) => BasicValue::U(val.val.clone().into_value(size, memory)?.get_usize()?),
