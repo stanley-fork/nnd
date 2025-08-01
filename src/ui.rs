@@ -114,7 +114,7 @@ pub enum WindowType {
 impl WindowType {
     pub fn title(self) -> &'static str {
         match self {
-            Self::Binaries => "binaies",
+            Self::Binaries => "binaries",
             Self::Breakpoints => "breakpoints",
             Self::Threads => "threads",
             Self::Stack => "stack",
