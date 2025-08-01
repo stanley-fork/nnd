@@ -2642,6 +2642,8 @@ impl Debugger {
             unsafe { ptrace(libc::PTRACE_POKEUSER, tid, offsetof!(libc::user, regs.rip) as u64, addr as u64)? };
         }
 
+        let is_user_signal = si_code <= 0;
+
         let ignore_breakpoints =
             // Ignore regular breakpoints when stepping.
             // (It would be better for performance to also deactivate them as we go, then reactivate after the step completes.)
@@ -2658,7 +2660,7 @@ impl Debugger {
             // If this turns out to be a problem, replace this with a different mechanism (maybe a flag in Thread saying "ignore breakpoints in this thread until it's suspended").
             self.target_state == ProcessState::Suspended;
 
-        if (!stopped_on_sw_breakpoint && !stopped_on_hw_breakpoint && !single_stepping && !is_debug_trap) ||
+        if (!stopped_on_sw_breakpoint && !stopped_on_hw_breakpoint && !single_stepping && !is_debug_trap && !is_user_signal) ||
             (stopped_on_sw_breakpoint && breakpoint_location_idx.is_none() && !is_debug_trap) {
             eprintln!("warning: unexpected SIGTRAP ({}) in thread {} at 0x{:x}", trap_si_code_name(si_code), tid, addr);
         }
@@ -2738,8 +2740,8 @@ impl Debugger {
             }
         }
 
-        if is_debug_trap && !is_active_breakpoint_location && !ignore_breakpoints {
-            // Hit something like __builtin_debugtrap, and there's no debugger breakpoint at the same location.
+        if (is_debug_trap || is_user_signal) && !is_active_breakpoint_location && !ignore_breakpoints {
+            // Hit something like __builtin_debugtrap or raise(SIGTRAP), and there's no debugger breakpoint at the same location.
             // The !is_active_breakpoint_location condition makes debugger breakpoints override __builtin_debugtrap,
             // which allows e.g. using a conditional breakpoint to make the trap conditional.
             hit = true;

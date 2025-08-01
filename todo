@@ -30,6 +30,7 @@ test with watches window filled with long arrays (I saw 50ms frames when there a
 investigate unresponsive ui when conditional breakpoint is hit at a high rate
 
 todo:
+draggable column widths in watches window
 try with odin
 zig pretty-printers
 support gnu_debugaltlink, as found in zsh in debuginfod

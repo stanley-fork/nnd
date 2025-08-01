@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <signal.h>
 
 int main() {
     printf("one\n");
@@ -6,5 +7,7 @@ int main() {
     printf("two\n");
     __asm__ volatile("int3");
     printf("three\n");
+    raise(SIGTRAP);
+    printf("four\n");
     __builtin_trap();
 }
