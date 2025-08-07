@@ -10,7 +10,7 @@ Properties:
  * Fast.
  * TUI.
  * Not based on gdb or lldb, implemented mostly from scratch.
- * Works on large executables. (Tested mostly on 2.5 GB ClickHouse.)
+ * Works on large executables.
 
 What we mean by "fast":
  * Operations that can be instantaneous should be instantaneous. I.e. snappy UI, no random freezes, no long waits.
@@ -21,17 +21,16 @@ Limitations:
  * Linux only
  * x86 only
  * 64-bit only
- * for native code only (e.g. C++ or Rust, not Java or Python)
- * TUI only (no REPL, no GUI)
+ * for native code only (e.g. C++, Rust, Zig, Odin, not Java or Python)
+ * TUI only (no REPL, GUI, or IDE integration)
  * no remote debugging (but works fine over ssh)
  * single process (doesn't follow forks)
  * no record/replay or backwards stepping
 
 Development status:
- * Most standard debugger features are there. E.g. breakpoints, conditional breakpoints (but no data breakpoints yet), stepping, showing code and disassembly, watch expressions, builtin pretty-printers for most of C++ and Rust standard library. Many quality-of-life features are there (e.g. auto-downcasting abstract classes to concrete classes based on vtable). But I'm sure there are lots of missing features that I never needed but other people consider essential. Let me know.
+ * Most standard debugger features are there. E.g. breakpoints, conditional breakpoints (but no data breakpoints yet), stepping, showing code and disassembly, watch expressions, built-in pretty-printers for most of C++ and Rust standard library. Many quality-of-life features are there (e.g. auto-downcasting abstract classes to concrete classes based on vtable). But I'm sure there are lots of missing features that I never needed but other people consider essential; let me know.
  * I use it every day and find it very helpful.
- * Not widely tested - I only tried it on a few machines and a few real executables.
- * Many features are probably not very discoverable. I should make some tutorial videos or something. For now, just play around, check the hints at the top left, and read `--help-*`.
+ * Not in active development right now. I fix reported bugs and add small requested features, but likely won't get around to implementing big features soon (e.g. redesigning the watch expression language to have loops etc, ARM support, Mac OS support, GUI, DAP).
 
 Distributed as a single 6 MB executable file with no dependencies.
 
