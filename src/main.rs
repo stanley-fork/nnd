@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
 #![allow(unused_imports)]
-use nnd::{*, elf::*, error::*, debugger::*, util::*, ui::*, log::*, process_info::*, symbols::*, symbols_registry::*, procfs::*, unwind::*, range_index::*, settings::*, context::*, executor::*, persistent::*, doc::*, terminal::*, common_ui::*, core_dumper::*, version::*};
-use std::{rc::Rc, mem, fs, os::fd::{FromRawFd}, io::Read, io, io::Write, panic, process, thread, thread::ThreadId, cell::UnsafeCell, ptr, pin::Pin, sync::Arc, str::FromStr, path::PathBuf, collections::HashSet};
+use nnd::{*, elf::*, error::*, debugger::*, util::*, ui::*, log::*, process_info::*, symbols::*, symbols_registry::*, procfs::*, unwind::*, range_index::*, settings::*, context::*, executor::*, persistent::*, doc::*, terminal::*, common_ui::*, core_dumper::*};
+use std::{rc::Rc, mem, str, fs, os::fd::{FromRawFd}, io::Read, io, io::Write, panic, process, thread, thread::ThreadId, cell::UnsafeCell, ptr, pin::Pin, sync::Arc, str::FromStr, path::PathBuf, collections::HashSet};
 use libc::{self, STDIN_FILENO, pid_t};
 
 // Pipes written from corresponding signal handlers, read from main loop. We could use one pipe and write signal number to it, but it would break in the unlikely case when one signal fills up the whole pipe before the main loop drains it - then other signals would get lost. Probably not actually important.
@@ -68,8 +68,8 @@ fn parse_arg(args: &mut &[String], seen_args: &mut HashSet<String>, long_name: &
 }
 
 fn main() {
+    unsafe {std::env::set_var("RUST_BACKTRACE", "short")};
     precalc_globals_util();
-    std::env::set_var("RUST_BACKTRACE", "short");
 
     let mut settings = Settings::default();
     let mut attach_pid: Option<pid_t> = None;
@@ -197,8 +197,17 @@ fn main() {
 
             settings.initial_breakpoints.push(LineBreakpoint {path: path.into(), file_version: FileVersionInfo::default(), line: line, adjusted_line: None});
         } else if let Some(_) = parse_arg(&mut args, &mut seen_args, "--version", "", true, false) {
-            println!("nnd {}", VERSION_STRING);
-            println!("built at {}", BUILD_TIME);
+            let v = const { // str::strip_suffix is not supported at compile time
+                let v = env!("CARGO_PKG_VERSION");
+                let n = v.len();
+                assert!(n > 2 && v.as_bytes()[n-2] == b'.' && v.as_bytes()[n-1] == b'0');
+                v
+            };
+            let pretty_version = &v[..v.len()-2];
+            println!("nnd v{}", pretty_version);
+            if let Some(t) = option_env!("NND_BUILD_TIME") {
+                println!("built at {}", t);
+            }
             process::exit(0);
         } else if let Some(help) = get_cli_help_chapter(&args[0]) {
             println!("{}", help);

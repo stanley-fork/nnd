@@ -2013,7 +2013,7 @@ impl Debugger {
     fn determine_locations_for_breakpoint(symbols_registry: &SymbolsRegistry, breakpoint: &mut Breakpoint) {
         assert!(breakpoint.addrs.is_err());
         match &mut breakpoint.on {
-            BreakpointOn::Line(ref mut bp) => {
+            BreakpointOn::Line(bp) => {
                 bp.adjusted_line = None;
                 let mut res: (usize, Vec<(usize, u16)>) = (usize::MAX, Vec::new());
                 let (mut loading, mut found_file) = (false, false);

@@ -1,6 +1,6 @@
 [package]
 name = "nnd"
-version = "0.1.0"
+version = "0.39.0" # [[this version number is written by release.sh]]
 edition = "2021"
 
 [profile.dev]
