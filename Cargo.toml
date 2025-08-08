@@ -1,6 +1,6 @@
 [package]
 name = "nnd"
-licence = "Apache 2.0"
+license = "Apache 2.0"
 licence-file = "LICENCE"
 description = "A fast handmade TUI-based debugger for Linux"
 documentation = "https://github.com/al13n321/nnd"
