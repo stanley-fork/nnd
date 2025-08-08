@@ -1,4 +1,4 @@
-use crate::{*, util::*, error::*, procfs::*, elf::*};
+use crate::{*, util::*, error::*, procfs::*, elf::*, os::*};
 use std::{ptr, process, collections::HashSet, io, io::{Read, Write}, panic, fs, str, os::unix::io::FromRawFd, mem, mem::MaybeUninit, time::{Instant, Duration}, slice};
 use libc::pid_t;
 
@@ -77,7 +77,7 @@ impl CoreDumper {
         if !self.attached_threads.is_empty() {
             eprintln!("(resuming and detaching {} threads)", self.attached_threads.len());
             for &tid in &self.attached_threads {
-                if let Err(e) = unsafe { ptrace(libc::PTRACE_DETACH, tid, 0, 0) } {
+                if let Err(e) = unsafe { ptrace(PTRACE_DETACH, tid, 0, 0) } {
                     eprintln!("warning: failed to detach thread {}: {}", tid, e);
                 }
             }
@@ -90,7 +90,7 @@ impl CoreDumper {
     fn try_dump(&mut self) -> Result<()> {
         let mut seen_threads: HashSet<pid_t> = HashSet::new();
         let mut weird_race_count: usize = 0;
-        let ptrace_seize_flags = if self.mode == CoreDumperMode::Fork {libc::PTRACE_O_TRACEFORK} else {0};
+        let ptrace_seize_flags = if self.mode == CoreDumperMode::Fork {PTRACE_O_TRACEFORK} else {0};
         for round in 0.. {
             if round > 30 {
                 return err!(Sanity, "suspiciously many attach attempts were required, giving up");
@@ -108,14 +108,14 @@ impl CoreDumper {
             eprintln!("(attaching to {} threads)", added_threads.len());
             let mut running_threads: HashSet<pid_t> = HashSet::new();
             for tid in added_threads {
-                match unsafe {ptrace(libc::PTRACE_SEIZE, tid, 0, ptrace_seize_flags as u64)} {
+                match unsafe {ptrace(PTRACE_SEIZE, tid, 0, ptrace_seize_flags as u64)} {
                     Ok(_) => (),
                     Err(e) if e.is_io_permission_denied() => return err!(Usage, "ptrace({}) failed: operation not permitted - missing sudo?", tid),
                     Err(e) => return Err(e),
                 }
                 self.attached_threads.push(tid);
                 running_threads.insert(tid);
-                unsafe {ptrace(libc::PTRACE_INTERRUPT, tid, 0, 0)}?;
+                unsafe {ptrace(PTRACE_INTERRUPT, tid, 0, 0)}?;
             }
 
             eprintln!("(waiting for {} threads to stop)", running_threads.len());
@@ -138,7 +138,7 @@ impl CoreDumper {
                     eprintln!("info: thread {} exited during attach", tid);
                     self.attached_threads.retain(|t| *t != tid);
                     running_threads.remove(&tid);
-                } else if wstatus>>16 == libc::PTRACE_EVENT_STOP {
+                } else if wstatus>>16 == PTRACE_EVENT_STOP {
                     // The expected way for thread to stop after PTRACE_INTERRUPT.
                     running_threads.remove(&tid);
                 } else if libc::WIFSTOPPED(wstatus) {
@@ -157,8 +157,8 @@ impl CoreDumper {
                     }
                     eprintln!("warning: thread {} stopped in unexpected way (signal {}). Resuming and retrying", tid, signal_name(signal));
                     // Deliver the presumably-unrelated signal and re-request a ptrace stop.
-                    unsafe {ptrace(libc::PTRACE_CONT, tid, 0, signal as u64)}?;
-                    unsafe {ptrace(libc::PTRACE_INTERRUPT, tid, 0, 0)}?;
+                    unsafe {ptrace(PTRACE_CONT, tid, 0, signal as u64)}?;
+                    unsafe {ptrace(PTRACE_INTERRUPT, tid, 0, 0)}?;
                 } else {
                     return err!(Internal, "waitpid() returned unexpected status: {}", wstatus);
                 }
@@ -306,14 +306,14 @@ impl CoreDumper {
     fn inject_fork(&mut self, tid: pid_t, addr: usize, code: u64, regs_struct: &libc::user_regs_struct) -> Result<()> {
         unsafe {
             // Write the machine code.
-            ptrace(libc::PTRACE_POKETEXT, tid, addr as u64, code)?;
+            ptrace(PTRACE_POKETEXT, tid, addr as u64, code)?;
 
             // Set thread's registers (rip and rax) to teleport it to our code.
             let mut iov = libc::iovec {iov_base: regs_struct as *const libc::user_regs_struct as *mut libc::c_void, iov_len: mem::size_of::<libc::user_regs_struct>()};
-            ptrace(libc::PTRACE_SETREGSET, tid, NT_PRSTATUS as u64, &mut iov as *mut libc::iovec as u64)?;
+            ptrace(PTRACE_SETREGSET, tid, NT_PRSTATUS as u64, &mut iov as *mut libc::iovec as u64)?;
 
             // Resume the thread.
-            unsafe {ptrace(libc::PTRACE_CONT, tid, 0, 0)}?;
+            unsafe {ptrace(PTRACE_CONT, tid, 0, 0)}?;
 
             // What we expect to happen:
             //  * PTRACE_EVENT_FORK. We get the new process's pid through PTRACE_GETEVENTMSG.
@@ -346,16 +346,16 @@ impl CoreDumper {
                         return err!(ProcessState, "hijacked thread stopped with unexpected signal {}", signal_name(signal));
                     }
                     match wstatus >> 16 {
-                        libc::PTRACE_EVENT_FORK => unsafe {
+                        PTRACE_EVENT_FORK => unsafe {
                             let mut new_pid = 0usize;
-                            ptrace(libc::PTRACE_GETEVENTMSG, tid, 0, &mut new_pid as *mut _ as u64)?;
+                            ptrace(PTRACE_GETEVENTMSG, tid, 0, &mut new_pid as *mut _ as u64)?;
                             eprintln!("(forked pid: {})", new_pid);
                             if self.forked_pid.is_some() {
                                 eprintln!("error: multiple fork events were reported by ptrace");
                                 // Keep going, can't stop+restore in this state.
                             }
                             self.forked_pid = Some(new_pid as pid_t);
-                            unsafe {ptrace(libc::PTRACE_CONT, tid, 0, 0)}?;
+                            unsafe {ptrace(PTRACE_CONT, tid, 0, 0)}?;
                         }
                         0 if self.forked_pid.is_none() => return err!(ProcessState, "fork failed"),
                         _ if self.forked_pid.is_none() => return err!(ProcessState, "hijacked thread got unexpected ptrace stop before fork"),
@@ -384,7 +384,7 @@ impl CoreDumper {
         for RegisterSet {name, id, data} in &state.regsets {
             unsafe {
                 let mut iov = libc::iovec {iov_base: data.as_ptr() as *mut libc::c_void, iov_len: data.len()};
-                match ptrace(libc::PTRACE_SETREGSET, state.tid, *id as u64, &mut iov as *mut libc::iovec as u64) {
+                match ptrace(PTRACE_SETREGSET, state.tid, *id as u64, &mut iov as *mut libc::iovec as u64) {
                     Ok(_) => (),
                     Err(e) => {
                         eprintln!("error: PTRACE_SETREGSET {} failed: {}", name, e);
@@ -393,7 +393,7 @@ impl CoreDumper {
                 }
             }
         }
-        match unsafe { ptrace(libc::PTRACE_POKETEXT, state.tid, state.addr as u64, state.original_code) } {
+        match unsafe { ptrace(PTRACE_POKETEXT, state.tid, state.addr as u64, state.original_code) } {
             Ok(_) => (),
             Err(e) => {
                 eprintln!("error: PTRACE_POKETEXT failed: {}", e);
@@ -424,7 +424,7 @@ impl CoreDumper {
     fn ptrace_getregset<'a>(tid: pid_t, regset: u32, buf: &'a mut [u8]) -> Result<&'a [u8]> {
         unsafe {
             let mut iov = libc::iovec {iov_base: buf.as_mut_ptr() as *mut libc::c_void, iov_len: buf.len()};
-            ptrace(libc::PTRACE_GETREGSET, tid, regset as u64, &mut iov as *mut libc::iovec as u64)?;
+            ptrace(PTRACE_GETREGSET, tid, regset as u64, &mut iov as *mut libc::iovec as u64)?;
             Ok(&buf[..iov.iov_len])
         }
     }
@@ -499,7 +499,7 @@ impl CoreDumper {
             // (Note that we can't just use PTRACE_GETREGSET with NT_PRSTATUS. Despite its name, it outputs user_regs_struct rather than prstatus struct,
             //  same as PTRACE_GETREGS.)
             let mut prstatus: elf_prstatus = mem::zeroed();
-            ptrace(libc::PTRACE_GETREGS, tid, 0, &mut prstatus.pr_reg as *mut _ as u64)?;
+            ptrace(PTRACE_GETREGS, tid, 0, &mut prstatus.pr_reg as *mut _ as u64)?;
             prstatus.pr_pid = tid;
             // (Leaving lots of fields of prstatus zero, they all seem either useless or unfilled by linux's normal core dump code.)
 
@@ -530,7 +530,7 @@ impl CoreDumper {
         self.add_note("CORE", &buf[..sizeof], NT_PRPSINFO);
 
         let sizeof = mem::size_of::<libc::siginfo_t>();
-        unsafe {ptrace(libc::PTRACE_GETSIGINFO, self.pid, 0, buf.as_mut_ptr() as u64)}?;
+        unsafe {ptrace(PTRACE_GETSIGINFO, self.pid, 0, buf.as_mut_ptr() as u64)}?;
         self.add_note("CORE", &buf[..sizeof], NT_SIGINFO);
 
         self.add_note("CORE", &fs::read(format!("/proc/{}/auxv", self.pid))?, NT_AUXV);

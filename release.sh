@@ -39,7 +39,14 @@ sed -i.bak "s/^version = \"0\.[0-9]\+\.0\" # \[\[this version number is written 
 export NND_BUILD_TIME=`date --utc +"%Y-%m-%d %H:%M:%S-%Z"`
 
 # Build.
-RUST_BACKTRACE=1 cargo test && cargo build && cargo build --profile dbgo && cargo build -r && cargo build --examples && cargo build --profile dbgo --examples && cargo build -r --examples
+for target in "" "--target=x86_64-unknown-linux-musl"
+do
+    RUST_BACKTRACE=1 cargo test $target
+    for profile in "" "--profile=dbgo" "-r"
+    do
+        cargo build $target $profile
+    done
+done
 
 # Copy to my machines.
 
@@ -56,5 +63,8 @@ cp target/x86_64-unknown-linux-musl/dbgo/nnd nnd-dbgo
 trap 'rm nnd-dbgo' EXIT
 
 gh release create "$TAG" --notes "" target/x86_64-unknown-linux-musl/release/nnd nnd-dbgo
+
+# Push to crates.io
+cargo publish
 
 echo "all done!"

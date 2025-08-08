@@ -1,4 +1,4 @@
-use crate::{*, error::{*, Result, Error}, util::*, elf::*, procfs::*, range_index::*, registers::*, log::*, arena::*, types::*, expr::{*, Value}, dwarf::*};
+use crate::{*, error::{*, Result, Error}, util::*, elf::*, procfs::*, range_index::*, registers::*, log::*, arena::*, types::*, expr::{*, Value}, dwarf::*, os::*};
 use std::{cmp, str, mem, rc::Rc, fs::File, path::{Path, PathBuf}, sync::atomic::{AtomicUsize, Ordering, AtomicBool}, sync::{Arc, Mutex}, collections::{HashMap, hash_map::{Entry, DefaultHasher}}, hash::{Hash, Hasher}, ffi::OsStr, os::unix::ffi::OsStrExt, io, io::{Read, Write as ioWrite}, fmt::Write, time::{Instant, Duration}, ptr, slice, fmt, borrow::Cow};
 use gimli::*;
 use bitflags::*;

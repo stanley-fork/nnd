@@ -1,40 +1,19 @@
-use crate::{*, error::*, log::*};
+use crate::{*, error::*, log::*, os::*};
 use libc::{pid_t, c_char, c_void};
 use std::{io, io::{Read, BufReader, BufRead, Write}, str::FromStr, ptr, mem, mem::{ManuallyDrop, MaybeUninit}, fmt, fmt::Write as fmtWrite, os::fd::{RawFd, AsRawFd}, ffi::{CStr, OsString, CString}, os::unix::ffi::{OsStringExt, OsStrExt}, arch::asm, cell::UnsafeCell, sync::atomic::{AtomicBool, Ordering}, ops::{Deref, DerefMut, FnOnce}, fs::File, collections::{BinaryHeap, hash_map::DefaultHasher}, hash::{Hash, Hasher}, cmp::Ord, cmp, path::{Path, PathBuf}, slice};
 
-pub fn tgkill(pid: pid_t, tid: pid_t, sig: i32) -> Result<i32> {
-    //eprintln!("trace: tgkill({}, {}, {})", pid, tid, sig);
-    let ret: i32;
-    unsafe {
-        asm!(
-            "syscall",
-            in("rax") libc::SYS_tgkill,
-            in("rdi") pid,
-            in("rsi") tid,
-            in("rdx") sig,
-            out("rcx") _,
-            out("r11") _,
-            lateout("rax") ret,
-            options(nostack)
-        );
-    }
-    if ret < 0 { return errno_err!("tgkill() failed"); }
-    Ok(ret)
-}
-
 pub unsafe fn ptrace(request: i32, pid: pid_t, addr: u64, data: u64) -> Result<i64> {
     (*libc::__errno_location()) = 0;
-    let r = profile_syscall!(libc::ptrace(request, pid, addr, data));
+    let r = profile_syscall!(libc::ptrace(request as _, pid, addr, data));
     //eprintln!("trace: ptrace({}, {}, 0x{:x}, 0x{:x}) -> 0x{:x}", ptrace_request_name(request), pid, addr, data, r);
     if r == -1 {
         if (*libc::__errno_location()) != 0 {
             return errno_err!("ptrace({}) failed", ptrace_request_name(request));
         }
-        assert!([libc::PTRACE_PEEKDATA, libc::PTRACE_PEEKSIGINFO, libc::PTRACE_PEEKTEXT, libc::PTRACE_PEEKUSER].contains(&request));
+        assert!([PTRACE_PEEKDATA, PTRACE_PEEKSIGINFO, PTRACE_PEEKTEXT, PTRACE_PEEKUSER].contains(&request));
     }
     Ok(r)
 }
-
 
 // Epoll fd. Closed in destructor.
 pub struct Epoll {
@@ -271,64 +250,6 @@ macro_rules! offsetof {
     )
 }
 
-// Uuuugh.
-const SIGNAL_NAMES: [&str; 32] = ["[unknown signal number]", "SIGHUP", "SIGINT", "SIGQUIT", "SIGILL", "SIGTRAP", "SIGABRT", "SIGBUS", "SIGFPE", "SIGKILL", "SIGUSR1", "SIGSEGV", "SIGUSR2", "SIGPIPE", "SIGALRM", "SIGTERM", "SIGSTKFLT", "SIGCHLD", "SIGCONT", "SIGSTOP", "SIGTSTP", "SIGTTIN", "SIGTTOU", "SIGURG", "SIGXCPU", "SIGXFSZ", "SIGVTALRM", "SIGPROF", "SIGWINCH", "SIGIO", "SIGPWR", "SIGSYS"];
-const ERRNO_NAMES: [&str; 134] = ["[success]", "EPERM", "ENOENT", "ESRCH", "EINTR", "EIO", "ENXIO", "E2BIG", "ENOEXEC", "EBADF", "ECHILD", "EAGAIN", "ENOMEM", "EACCES", "EFAULT", "ENOTBLK", "EBUSY", "EEXIST", "EXDEV", "ENODEV", "ENOTDIR", "EISDIR", "EINVAL", "ENFILE", "EMFILE", "ENOTTY", "ETXTBSY", "EFBIG", "ENOSPC", "ESPIPE", "EROFS", "EMLINK", "EPIPE", "EDOM", "ERANGE", "EDEADLK", "ENAMETOOLONG", "ENOLCK", "ENOSYS", "ENOTEMPTY", "ELOOP", "[unknown errno]", "ENOMSG", "EIDRM", "ECHRNG", "EL2NSYNC", "EL3HLT", "EL3RST", "ELNRNG", "EUNATCH", "ENOCSI", "EL2HLT", "EBADE", "EBADR", "EXFULL", "ENOANO", "EBADRQC", "EBADSLT", "[unknown errno]", "EBFONT", "ENOSTR", "ENODATA", "ETIME", "ENOSR", "ENONET", "ENOPKG", "EREMOTE", "ENOLINK", "EADV", "ESRMNT", "ECOMM", "EPROTO", "EMULTIHOP", "EDOTDOT", "EBADMSG", "EOVERFLOW", "ENOTUNIQ", "EBADFD", "EREMCHG", "ELIBACC", "ELIBBAD", "ELIBSCN", "ELIBMAX", "ELIBEXEC", "EILSEQ", "ERESTART", "ESTRPIPE", "EUSERS", "ENOTSOCK", "EDESTADDRREQ", "EMSGSIZE", "EPROTOTYPE", "ENOPROTOOPT", "EPROTONOSUPPORT", "ESOCKTNOSUPPORT", "EOPNOTSUPP", "EPFNOSUPPORT", "EAFNOSUPPORT", "EADDRINUSE", "EADDRNOTAVAIL", "ENETDOWN", "ENETUNREACH", "ENETRESET", "ECONNABORTED", "ECONNRESET", "ENOBUFS", "EISCONN", "ENOTCONN", "ESHUTDOWN", "ETOOMANYREFS", "ETIMEDOUT", "ECONNREFUSED", "EHOSTDOWN", "EHOSTUNREACH", "EALREADY", "EINPROGRESS", "ESTALE", "EUCLEAN", "ENOTNAM", "ENAVAIL", "EISNAM", "EREMOTEIO", "EDQUOT", "ENOMEDIUM", "EMEDIUMTYPE", "ECANCELED", "ENOKEY", "EKEYEXPIRED", "EKEYREVOKED", "EKEYREJECTED", "EOWNERDEAD", "ENOTRECOVERABLE", "ERFKILL", "EHWPOISON"];
-
-pub fn signal_name(sig: i32) -> &'static str {
-    // strsignal() is not thread safe, and sigabbrev_np() is not in rust libc bindings.
-    let sig = sig as usize;
-    SIGNAL_NAMES[if sig >= SIGNAL_NAMES.len() {0} else {sig}]
-}
-
-pub fn errno_name(errno: i32) -> &'static str {
-    // There's no errno -> name (not message) function that's consistenly available in C standard library on Linux.
-    let errno = errno as usize;
-    if errno >= ERRNO_NAMES.len() {"[unknown errno]"} else {ERRNO_NAMES[errno]}
-}
-
-pub fn cld_code_name(code: i32) -> &'static str {
-    match code {
-        libc::CLD_CONTINUED => "CLD_CONTINUED",
-        libc::CLD_DUMPED => "CLD_DUMPED",
-        libc::CLD_EXITED => "CLD_EXITED",
-        libc::CLD_KILLED => "CLD_KILLED",
-        libc::CLD_STOPPED => "CLD_STOPPED",
-        libc::CLD_TRAPPED => "CLD_TRAPPED",
-        0 => "[none]",
-        _ => "[unknown code]",
-    }
-}
-
-pub fn ptrace_request_name(c: i32) -> &'static str {
-    match c {
-        libc::PTRACE_TRACEME => "PTRACE_TRACEME", libc::PTRACE_PEEKTEXT => "PTRACE_PEEKTEXT", libc::PTRACE_PEEKDATA => "PTRACE_PEEKDATA", libc::PTRACE_PEEKUSER => "PTRACE_PEEKUSER", libc::PTRACE_POKETEXT => "PTRACE_POKETEXT", libc::PTRACE_POKEDATA => "PTRACE_POKEDATA", libc::PTRACE_POKEUSER => "PTRACE_POKEUSER", libc::PTRACE_CONT => "PTRACE_CONT", libc::PTRACE_KILL => "PTRACE_KILL", libc::PTRACE_SINGLESTEP => "PTRACE_SINGLESTEP", libc::PTRACE_GETREGS => "PTRACE_GETREGS", libc::PTRACE_SETREGS => "PTRACE_SETREGS", libc::PTRACE_GETFPREGS => "PTRACE_GETFPREGS", libc::PTRACE_SETFPREGS => "PTRACE_SETFPREGS", libc::PTRACE_ATTACH => "PTRACE_ATTACH", libc::PTRACE_DETACH => "PTRACE_DETACH", libc::PTRACE_GETFPXREGS => "PTRACE_GETFPXREGS", libc::PTRACE_SETFPXREGS => "PTRACE_SETFPXREGS", libc::PTRACE_SYSCALL => "PTRACE_SYSCALL", libc::PTRACE_SYSEMU => "PTRACE_SYSEMU", libc::PTRACE_SYSEMU_SINGLESTEP => "PTRACE_SYSEMU_SINGLESTEP", libc::PTRACE_SETOPTIONS => "PTRACE_SETOPTIONS", libc::PTRACE_GETEVENTMSG => "PTRACE_GETEVENTMSG", libc::PTRACE_GETSIGINFO => "PTRACE_GETSIGINFO", libc::PTRACE_SETSIGINFO => "PTRACE_SETSIGINFO", libc::PTRACE_GETREGSET => "PTRACE_GETREGSET", libc::PTRACE_SETREGSET => "PTRACE_SETREGSET", libc::PTRACE_SEIZE => "PTRACE_SEIZE", libc::PTRACE_INTERRUPT => "PTRACE_INTERRUPT", libc::PTRACE_LISTEN => "PTRACE_LISTEN", libc::PTRACE_PEEKSIGINFO => "PTRACE_PEEKSIGINFO", /*libc::PTRACE_GET_SYSCALL_INFO => "PTRACE_GET_SYSCALL_INFO", libc::PTRACE_GET_RSEQ_CONFIGURATION => "PTRACE_GET_RSEQ_CONFIGURATION",*/
-        _ => "[unknown request]",
-    }
-}
-
-pub fn trap_si_code_name(c: i32) -> &'static str {
-    match c {
-        libc::TRAP_BRANCH => "TRAP_BRANCH",
-        libc::TRAP_BRKPT => "TRAP_BRKPT",
-        libc::TRAP_HWBKPT => "TRAP_HWBKPT",
-        libc::TRAP_PERF => "TRAP_PERF",
-        libc::TRAP_TRACE => "TRAP_TRACE",
-        libc::TRAP_UNK => "TRAP_UNK",
-        libc::SI_ASYNCIO => "SI_ASYNCIO",
-        libc::SI_ASYNCNL => "SI_ASYNCNL",
-        libc::SI_DETHREAD => "SI_DETHREAD",
-        libc::SI_KERNEL => "SI_KERNEL",
-        libc::SI_MESGQ => "SI_MESGQ",
-        libc::SI_QUEUE => "SI_QUEUE",
-        libc::SI_SIGIO => "SI_SIGIO",
-        libc::SI_TIMER => "SI_TIMER",
-        libc::SI_TKILL => "SI_TKILL",
-        libc::SI_USER => "SI_USER",
-        _ => "[unknown si_code]",
-    }
-}
-
 // A thing for limiting the number of warnings printed from each line of source code.
 // Usage: if limiter.check(line!()) { eprintln!("warning: ...") }
 pub struct Limiter {
@@ -357,8 +278,6 @@ impl Limiter {
         }        
     }
 }
-
-
 
 #[repr(align(128))]
 pub struct CachePadded<T> {
@@ -638,39 +557,6 @@ impl<R: Write> ByteWrite for R {
     fn write_str(&mut self, s: &str) -> io::Result<()> { self.write_slice(s.as_bytes()) }
     fn write_path(&mut self, s: &Path) -> io::Result<()> { self.write_slice(s.as_os_str().as_bytes()) }
     fn write_struct<T>(&mut self, s: &T) -> io::Result<()> { unsafe {self.write_all(slice::from_raw_parts(s as *const T as *const u8, mem::size_of::<T>()))} }
-}
-
-// sysconf(_SC_CLK_TCK), assigned at the start of main().
-static mut SYSCONF_SC_CLK_TCK: usize = 0;
-static mut SYSCONF_PAGE_SIZE: usize = 0;
-static mut MY_PID: pid_t = 0;
-
-#[allow(non_snake_case)]
-pub fn sysconf_SC_CLK_TCK() -> usize {
-    let r = unsafe {SYSCONF_SC_CLK_TCK};
-    debug_assert!(r != 0);
-    r
-}
-#[allow(non_snake_case)]
-pub fn sysconf_PAGE_SIZE() -> usize {
-    let r = unsafe {SYSCONF_PAGE_SIZE};
-    debug_assert!(r != 0);
-    r
-}
-
-pub fn my_pid() -> pid_t {
-    unsafe {MY_PID}
-}
-
-pub fn precalc_globals_util() {
-    let assert_nonzero = |x: usize| -> usize {
-        assert!(x != 0);
-        x
-    };
-    
-    unsafe {SYSCONF_SC_CLK_TCK = assert_nonzero(libc::sysconf(libc::_SC_CLK_TCK) as usize)};
-    unsafe {SYSCONF_PAGE_SIZE = assert_nonzero(libc::sysconf(libc::_SC_PAGE_SIZE) as usize)};
-    unsafe {MY_PID = assert_nonzero(libc::getpid() as usize) as pid_t};
 }
 
 #[macro_export]

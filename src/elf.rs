@@ -1,4 +1,4 @@
-use crate::{*, error::*, log::*, util::*, registers::*, procfs::*, process_info::*};
+use crate::{*, error::*, log::*, util::*, registers::*, procfs::*, process_info::*, os::*};
 use std::{fs::{File}, mem, mem::MaybeUninit, io::{self, BufReader, SeekFrom, Seek, Read, BufRead}, sync::{Arc, OnceLock}, collections::{HashMap, hash_map::Entry}, str, ptr, fmt::Debug, fmt, result, slice, ops::Range};
 use libc::pid_t;
 
@@ -70,46 +70,6 @@ pub struct ElfFile {
     // Length equal to file size.
     data: &'static [u8],
 }
-
-pub const SHT_PROGBITS: u32 = 0x1;
-pub const SHT_SYMTAB: u32 = 0x2;
-pub const SHT_NOTE: u32 = 0x7;
-pub const SHT_NOBITS: u32 = 0x8; // pronounced as "shit! no bits!"
-
-pub const SHF_TLS: u64 = 1 << 10;
-pub const SHF_COMPRESSED: u64 = 1 << 11;
-pub const SHF_STRINGS: u64 = 1 << 5;
-pub const SHF_EXECINSTR: u64 = 1 << 2;
-
-pub const STT_FUNC: u8 = 2;
-pub const STT_OBJECT: u8 = 1;
-
-pub const SHN_UNDEF: u16 = 0;
-
-pub const PT_LOAD: u32 = 1;
-pub const PT_DYNAMIC: u32 = 2;
-pub const PT_NOTE: u32 = 4;
-pub const PT_GNU_EH_FRAME: u32 = 0x60000000 + 0x474e550;
-
-// Segment permissions.
-pub const PF_R: u32 = 0x4;
-pub const PF_W: u32 = 0x2;
-pub const PF_X: u32 = 0x1;
-
-pub const NT_GNU_BUILD_ID: u32 = 3;
-
-// These are used in core dumps.
-pub const NT_PRSTATUS: u32 = 1;
-pub const NT_PRFPREG: u32 = 2;
-pub const NT_PRPSINFO: u32 = 3;
-pub const NT_TASKSTRUCT: u32 = 4;
-pub const NT_AUXV: u32 = 6;
-pub const NT_SIGINFO: u32 = 0x53494749;
-pub const NT_FILE: u32 = 0x46494c45;
-pub const NT_PRXFPREG: u32 = 0x46e62b7f;
-pub const NT_X86_XSTATE: u32 = 0x202;
-
-pub const ELFCOMPRESS_ZLIB: u32 = 1;
 
 pub const ELF_PAD_RIGHT: usize = 4096;
 
@@ -245,49 +205,6 @@ impl ElfSection {
             self.size
         }
     }
-}
-
-// Structs found in core dump notes.
-
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct elf_prstatus {
-	pub si_signo: i32, // signal number
-    // These two seem to be reversed compared to siginfo_t. They also don't seem to be populated by binfmt_elf.c. The real siginfo is in NT_SIGINFO.
-	pub si_code_but_actually_it_is_zero: i32,  // extra code
-	pub si_errno_but_actually_it_is_zero: i32, // errno
-
-    pub pr_cursig: i16, // Current signal
-    pub pr_sigpend: usize, // Set of pending signals
-    pub pr_sighold: usize, // Set of held signals
-    pub pr_pid: pid_t,
-    pub pr_ppid: pid_t,
-    pub pr_pgrp: pid_t,
-    pub pr_sid: pid_t,
-    pub pr_utime: libc::timeval, // User time
-    pub pr_stime: libc::timeval, // System time
-    pub pr_cutime: libc::timeval, // Cumulative user time
-    pub pr_cstime: libc::timeval, // Cumulative system time
-    pub pr_reg: libc::user_regs_struct, // GP registers
-    pub pr_fpvalid: i32, // True if math co-processor being used.
-}
-
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct elf_prpsinfo {
-    pub pr_state: i8, // numeric process state
-    pub pr_sname: i8, // char for pr_state
-    pub pr_zomb: i8, // zombie
-    pub pr_nice: i8, // nice val
-    pub pr_flag: u64, // flags
-    pub pr_uid: u32,
-    pub pr_gid: u32,
-    pub pr_pid: pid_t,
-    pub pr_ppid: pid_t,
-    pub pr_pgrp: pid_t,
-    pub pr_sid: pid_t,
-    pub pr_fname: [u8; 16], // filename of executable
-    pub pr_psargs: [u8; 80], // initial part of arg list
 }
 
 pub fn parse_core_dump(elf: Arc<ElfFile>) -> Result<(CoreDumpMemReader, Vec<(pid_t, ThreadInfo, Option</*signal*/ i32>)>, MemMapsInfo)> {

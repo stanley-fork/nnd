@@ -1,4 +1,4 @@
-use crate::{*, debugger::*, error::*, util::*, symbols::*, symbols_registry::*, procfs::*, unwind::*, registers::*, log::*, settings::*, elf::*};
+use crate::{*, debugger::*, error::*, util::*, symbols::*, symbols_registry::*, procfs::*, unwind::*, registers::*, log::*, settings::*, elf::*, os::*};
 use std::{collections::{HashMap, hash_map::Entry}, time::Instant, fs, os::unix::fs::MetadataExt, sync::Arc, ops::Range, str};
 use std::mem;
 use libc::pid_t;
@@ -441,18 +441,16 @@ pub fn refresh_all_resource_stats(pid: pid_t, my_stats: &mut ResourceStats, debu
 pub fn ptrace_getregs(tid: pid_t) -> Result<Registers> {
     unsafe {
         let mut regs: libc::user_regs_struct = mem::zeroed();
-        ptrace(libc::PTRACE_GETREGS, tid, 0, &mut regs as *mut _ as u64)?;
+        ptrace(PTRACE_GETREGS, tid, 0, &mut regs as *mut _ as u64)?;
         Ok(Registers::from_ptrace(&regs))
     }
 }
-
-pub const NT_X86_XSTATE: u32 = 0x202;
 
 pub fn ptrace_get_extra_regs(tid: pid_t) -> ExtraRegisters {
     unsafe {
         let mut buf = [0u8; XSAVE_MAX_SIZE];
         let mut iov = libc::iovec {iov_base: buf.as_mut_ptr() as *mut libc::c_void, iov_len: buf.len()};
-        if let Err(e) = ptrace(libc::PTRACE_GETREGSET, tid, NT_X86_XSTATE as u64, &mut iov as *mut libc::iovec as u64) {
+        if let Err(e) = ptrace(PTRACE_GETREGSET, tid, NT_X86_XSTATE as u64, &mut iov as *mut libc::iovec as u64) {
             return ExtraRegisters::from_error(e);
         }
         ExtraRegisters::from_xsave(&buf[..iov.iov_len])

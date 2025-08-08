@@ -1,4 +1,4 @@
-use crate::{*, elf::*, error::*, util::*, log::*, symbols::*, process_info::*, symbols_registry::*, unwind::*, procfs::*, registers::*, disassembly::*, pool::*, settings::*, context::*, disassembly::*, expr::*, persistent::*, interp::*};
+use crate::{*, elf::*, error::*, util::*, log::*, symbols::*, process_info::*, symbols_registry::*, unwind::*, procfs::*, registers::*, disassembly::*, pool::*, settings::*, context::*, disassembly::*, expr::*, persistent::*, interp::*, os::*};
 use libc::{pid_t, c_char, c_void};
 use iced_x86::FlowControl;
 use std::{io, ptr, rc::Rc, collections::{HashMap, VecDeque, HashSet}, mem, path::{Path, PathBuf}, sync::Arc, ffi::CStr, ops::Range, os::fd::AsRawFd, fs, time::{Instant, Duration}};
@@ -441,7 +441,7 @@ impl Debugger {
                     continue;
                 }
                 found_new_threads = true;
-                match unsafe {ptrace(libc::PTRACE_SEIZE, tid, 0, (libc::PTRACE_O_TRACECLONE | libc::PTRACE_O_TRACEEXEC | libc::PTRACE_O_TRACEEXIT | libc::PTRACE_O_TRACESYSGOOD) as u64)} {
+                match unsafe {ptrace(PTRACE_SEIZE, tid, 0, (PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC | PTRACE_O_TRACEEXIT | PTRACE_O_TRACESYSGOOD) as u64)} {
                     Ok(_) => (),
                     Err(e) if e.is_io_permission_denied() => return err!(Usage, "ptrace({}) failed: operation not permitted - missing sudo?", tid),
                     Err(e) => return Err(e),
@@ -621,7 +621,7 @@ impl Debugger {
 
             if pid < 0 { return errno_err!("fork() failed"); }
 
-            ptrace(libc::PTRACE_SEIZE, pid, 0, (libc::PTRACE_O_EXITKILL | libc::PTRACE_O_TRACECLONE | libc::PTRACE_O_TRACEEXEC | libc::PTRACE_O_TRACEEXIT | libc::PTRACE_O_TRACESYSGOOD) as u64)?;
+            ptrace(PTRACE_SEIZE, pid, 0, (PTRACE_O_EXITKILL | PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC | PTRACE_O_TRACEEXIT | PTRACE_O_TRACESYSGOOD) as u64)?;
         }
 
         self.pid = pid;
@@ -699,7 +699,7 @@ impl Debugger {
                 let thread = thread.unwrap();
                 thread.sent_interrupt = false;
 
-                if thread.state != ThreadState::Running && !(libc::WIFSTOPPED(wstatus) && libc::WSTOPSIG(wstatus) == libc::SIGTRAP && wstatus >> 16 == libc::PTRACE_EVENT_EXIT) {
+                if thread.state != ThreadState::Running && !(libc::WIFSTOPPED(wstatus) && libc::WSTOPSIG(wstatus) == libc::SIGTRAP && wstatus >> 16 == PTRACE_EVENT_EXIT) {
                     eprintln!("warning: got event {:x} for thread {} that is already stopped", wstatus, tid);
                 }
 
@@ -752,7 +752,7 @@ impl Debugger {
                         assert_eq!(self.target_state, ProcessState::Starting);
                         thread.waiting_for_initial_stop = false;
                         self.set_debug_registers_for_thread(tid)?;
-                    } else if wstatus>>16 == libc::PTRACE_EVENT_STOP { // group-stop, PTRACE_INTERRUPT, or newly created thread
+                    } else if wstatus>>16 == PTRACE_EVENT_STOP { // group-stop, PTRACE_INTERRUPT, or newly created thread
                         if thread.waiting_for_initial_stop {
                             // The `signal` value in this case for newly created thread is inconsistent: sometimes SIGSTOP, sometimes SIGTRAP.
                             if self.context.settings.trace_logging { eprintln!("trace: thread {} got initial stop {} {}", tid, signal, signal_name(signal)); }
@@ -764,7 +764,7 @@ impl Debugger {
                         }
                     } else if signal == libc::SIGTRAP && wstatus>>16 != 0 { // various ptrace stops
                         match wstatus>>16 {
-                            libc::PTRACE_EVENT_EXEC => {
+                            PTRACE_EVENT_EXEC => {
                                 eprintln!("info: exec tid {}", tid);
                                 assert!(!self.waiting_for_initial_sigstop);
 
@@ -777,11 +777,11 @@ impl Debugger {
                                     // See "execve(2) under ptrace" section in `man ptrace`. This is currently not implemented.
                                 }
                             }
-                            libc::PTRACE_EVENT_CLONE => {
+                            PTRACE_EVENT_CLONE => {
                                 let new_tid;
                                 {
                                     let mut t: pid_t = 0;
-                                    ptrace(libc::PTRACE_GETEVENTMSG, tid, 0, &mut t as *mut pid_t as u64)?;
+                                    ptrace(PTRACE_GETEVENTMSG, tid, 0, &mut t as *mut pid_t as u64)?;
                                     new_tid = t;
                                 }
                                 if let Some(existing_thread) = self.threads.get(&new_tid) {
@@ -796,7 +796,7 @@ impl Debugger {
                                     self.threads.insert(new_tid, thread);
                                 }
                             }
-                            libc::PTRACE_EVENT_EXIT => {
+                            PTRACE_EVENT_EXIT => {
                                 eprintln!("info: thread {} exiting", tid);
                                 if thread.exiting {
                                     eprintln!("warning: got multiple PTRACE_EVENT_EXIT for tid {}", tid);
@@ -820,7 +820,7 @@ impl Debugger {
                         let mut si: libc::siginfo_t;
                         unsafe {
                             si = mem::zeroed();
-                            ptrace(libc::PTRACE_GETSIGINFO, tid, 0, &mut si as *mut _ as u64)?;
+                            ptrace(PTRACE_GETSIGINFO, tid, 0, &mut si as *mut _ as u64)?;
                         }
 
                         if self.context.settings.trace_logging { eprintln!("trace: thread {} got SIGTRAP ({}) at 0x{:x}", tid, trap_si_code_name(si.si_code), si.si_addr() as usize); }
@@ -856,7 +856,7 @@ impl Debugger {
                             let mut si: libc::siginfo_t;
                             unsafe {
                                 si = mem::zeroed();
-                                ptrace(libc::PTRACE_GETSIGINFO, tid, 0, &mut si as *mut _ as u64)?;
+                                ptrace(PTRACE_GETSIGINFO, tid, 0, &mut si as *mut _ as u64)?;
                             }
 
                             thread.stop_reasons.push(StopReason::Signal(signal));
@@ -1027,7 +1027,7 @@ impl Debugger {
         for (tid, t) in &mut self.threads {
             if t.state == ThreadState::Running && !t.exiting {
                 if !t.sent_interrupt {
-                    unsafe {ptrace(libc::PTRACE_INTERRUPT, *tid, 0, 0)?};
+                    unsafe {ptrace(PTRACE_INTERRUPT, *tid, 0, 0)?};
                     t.sent_interrupt = true;
                 }
                 n += 1;
@@ -1664,7 +1664,7 @@ impl Debugger {
                 Some(step) if step.tid == tid && step.single_steps => thread.single_stepping = true,
                 _ => () };
         }
-        let op = if thread.single_stepping {libc::PTRACE_SINGLESTEP} else {libc::PTRACE_CONT};
+        let op = if thread.single_stepping {PTRACE_SINGLESTEP} else {PTRACE_CONT};
         let sig = thread.pending_signal.take().unwrap_or(0);
         unsafe {ptrace(op, tid, 0, sig as u64)?};
         thread.state = ThreadState::Running;
@@ -2213,7 +2213,7 @@ impl Debugger {
             // Presumably this requirement was added just in case, back when threads didn't exist.
             // So we need to semi-artificially propagate a TID of any suspended thread into here, and we can't add/remove breakpoints
             // while all threads are running. I wish process_vm_writev() had a flag to allow writing to read-only memory (.text is usually mapped as read-only).
-            unsafe { ptrace(libc::PTRACE_POKETEXT, any_suspended_tid, (addr - byte_idx) as u64, word)?; }
+            unsafe { ptrace(PTRACE_POKETEXT, any_suspended_tid, (addr - byte_idx) as u64, word)?; }
         }
         self.breakpoint_locations[idx].active = true;
         Ok(())
@@ -2236,7 +2236,7 @@ impl Debugger {
             // Other threads may be running, but it's fine.
             let word = self.memory.read_u64(location.addr - byte_idx)?;
             let word = word & !(0xff << bit_idx) | ((location.original_byte as u64) << bit_idx);
-            unsafe { ptrace(libc::PTRACE_POKETEXT, any_suspended_tid, (location.addr - byte_idx) as u64, word)?; }
+            unsafe { ptrace(PTRACE_POKETEXT, any_suspended_tid, (location.addr - byte_idx) as u64, word)?; }
         }
         location.active = false;
         Ok(())
@@ -2353,10 +2353,10 @@ impl Debugger {
             if !b.active || b.thread_specific.is_some_and(|x| x != tid) {
                 continue;
             }
-            unsafe { ptrace(libc::PTRACE_POKEUSER, tid, (offsetof!(libc::user, u_debugreg) + i * 8) as u64, b.addr as u64)? };
+            unsafe { ptrace(PTRACE_POKEUSER, tid, (offsetof!(libc::user, u_debugreg) + i * 8) as u64, b.addr as u64)? };
             dr7 |= 1 << (i*2);
         }
-        unsafe { ptrace(libc::PTRACE_POKEUSER, tid, (offsetof!(libc::user, u_debugreg) + 7*8) as u64, dr7)? };
+        unsafe { ptrace(PTRACE_POKEUSER, tid, (offsetof!(libc::user, u_debugreg) + 7*8) as u64, dr7)? };
         Ok(())
     }
 
@@ -2594,13 +2594,13 @@ impl Debugger {
         // So currently we don't check for 0xcc here. If it turns out that we have to do it, we'll have to ensure that the original_byte <-> 0xcc memory writes only happen when all threads are stopped (likely in handle_breakpoints()).
         // Possibly even that would be insufficient because maybe a SIGTRAP may be queued behind another type of stop, then get delivered after we resume threads; or maybe that's impossible, I haven't checked.
 
-        let dr6 = unsafe { ptrace(libc::PTRACE_PEEKUSER, tid, offsetof!(libc::user, u_debugreg) as u64 + 6*8, 0)? };
+        let dr6 = unsafe { ptrace(PTRACE_PEEKUSER, tid, offsetof!(libc::user, u_debugreg) as u64 + 6*8, 0)? };
         let stopped_on_hw_breakpoint = dr6 & 15 != 0;
         if stopped_on_hw_breakpoint {
             // In case it's a stale breakpoint.
             self.set_debug_registers_for_thread(tid)?;
             // Clear the 'breakpoint was hit' bits because neither the CPU nor Linux will do it for us.
-            unsafe { ptrace(libc::PTRACE_POKEUSER, tid, (offsetof!(libc::user, u_debugreg) + 6 * 8) as u64, (dr6 & !15) as u64)? };
+            unsafe { ptrace(PTRACE_POKEUSER, tid, (offsetof!(libc::user, u_debugreg) + 6 * 8) as u64, (dr6 & !15) as u64)? };
         }
 
         let spurious_stop = stopped_on_hw_breakpoint && ignore_next_hw_breakpoint_hit_at_addr == Some(addr);
@@ -2639,7 +2639,7 @@ impl Debugger {
         if stopped_on_sw_breakpoint && !is_debug_trap {
             // Revert RIP to the start of the instruction that we overwrote with 0xcc.
             regs.set(RegisterIdx::Rip, addr as u64, false);
-            unsafe { ptrace(libc::PTRACE_POKEUSER, tid, offsetof!(libc::user, regs.rip) as u64, addr as u64)? };
+            unsafe { ptrace(PTRACE_POKEUSER, tid, offsetof!(libc::user, regs.rip) as u64, addr as u64)? };
         }
 
         let is_user_signal = si_code <= 0;
@@ -2845,17 +2845,17 @@ impl Debugger {
                         continue;
                     } };
                 let word = word & !(0xff << bit_idx) | ((byte as u64) << bit_idx);
-                if let Err(e) = unsafe { ptrace(libc::PTRACE_POKETEXT, tid, (addr - byte_idx) as u64, word) } {
+                if let Err(e) = unsafe { ptrace(PTRACE_POKETEXT, tid, (addr - byte_idx) as u64, word) } {
                     eprintln!("warning: detach failed to remove breakpoint at 0x{:x}: PTRACE_POKETEXT failed: {}", addr, e);
                 }
             }
 
             // Disable hardware breakpoints for this thread. (Do this unconditionally because threads may have leftover breakpoints that are not in self.hardware_breakpoints or self.breakpoint_locations anymore.)
-            if let Err(e) = unsafe { ptrace(libc::PTRACE_POKEUSER, tid, (offsetof!(libc::user, u_debugreg) + 7*8) as u64, 1u64 << 10) } {
+            if let Err(e) = unsafe { ptrace(PTRACE_POKEUSER, tid, (offsetof!(libc::user, u_debugreg) + 7*8) as u64, 1u64 << 10) } {
                 eprintln!("warning: detach failed to clear hardware breakpoints for thread {}: {}", tid, e);
             }
 
-            if let Err(e) = unsafe { ptrace(libc::PTRACE_DETACH, tid, 0, 0) } {
+            if let Err(e) = unsafe { ptrace(PTRACE_DETACH, tid, 0, 0) } {
                 eprintln!("warning: detach failed for thread {}: {}", tid, e);
             }
         };
@@ -2863,7 +2863,7 @@ impl Debugger {
         for (tid, thread) in &self.threads {
             if thread.state == ThreadState::Suspended {
                 detach_thread(*tid);
-            } else if let Err(e) = unsafe {ptrace(libc::PTRACE_INTERRUPT, *tid, 0, 0)} {
+            } else if let Err(e) = unsafe {ptrace(PTRACE_INTERRUPT, *tid, 0, 0)} {
                 eprintln!("warning: detach failed to stop thread {}: {}", tid, e);
             } else {
                 running_threads.insert(*tid);

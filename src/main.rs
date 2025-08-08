@@ -1,7 +1,47 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
 #![allow(unused_imports)]
-use nnd::{*, elf::*, error::*, debugger::*, util::*, ui::*, log::*, process_info::*, symbols::*, symbols_registry::*, procfs::*, unwind::*, range_index::*, settings::*, context::*, executor::*, persistent::*, doc::*, terminal::*, common_ui::*, core_dumper::*};
+// This is only needed on the 'use gimli::*' statements (for constants like DW_AT_name), but it doesn't work there.
+#![allow(non_upper_case_globals)]
+// For the offsetof macro in util.rs, because Rust doesn't support attaching an [allow()] on an individual unsafe{} block (which in turn is only needed because Rust doesn't have offsetof, ugh).
+#![allow(unused_unsafe)]
+
+pub mod error;
+pub mod elf;
+pub mod debugger;
+pub mod util;
+pub mod ui;
+pub mod log;
+pub mod process_info;
+pub mod symbols;
+pub mod symbols_registry;
+pub mod procfs;
+pub mod unwind;
+pub mod range_index;
+pub mod registers;
+pub mod disassembly;
+pub mod pool;
+pub mod layout;
+pub mod settings;
+pub mod types;
+pub mod expr;
+pub mod search;
+pub mod widgets;
+pub mod arena;
+pub mod executor;
+pub mod context;
+pub mod interp;
+pub mod pretty;
+pub mod persistent;
+pub mod doc;
+pub mod common_ui;
+pub mod imgui;
+pub mod terminal;
+pub mod dwarf;
+pub mod core_dumper;
+pub mod os;
+
+use crate::{elf::*, error::*, debugger::*, util::*, ui::*, log::*, process_info::*, symbols::*, symbols_registry::*, procfs::*, unwind::*, range_index::*, settings::*, context::*, executor::*, persistent::*, doc::*, terminal::*, common_ui::*, core_dumper::*, os::*};
 use std::{rc::Rc, mem, str, fs, os::fd::{FromRawFd}, io::Read, io, io::Write, panic, process, thread, thread::ThreadId, cell::UnsafeCell, ptr, pin::Pin, sync::Arc, str::FromStr, path::PathBuf, collections::HashSet};
 use libc::{self, STDIN_FILENO, pid_t};
 
@@ -69,7 +109,7 @@ fn parse_arg(args: &mut &[String], seen_args: &mut HashSet<String>, long_name: &
 
 fn main() {
     unsafe {std::env::set_var("RUST_BACKTRACE", "short")};
-    precalc_globals_util();
+    precalc_globals_os();
 
     let mut settings = Settings::default();
     let mut attach_pid: Option<pid_t> = None;

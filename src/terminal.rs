@@ -1,4 +1,4 @@
-use crate::{*, common_ui::*, error::*, log::*, util::*};
+use crate::{*, common_ui::*, error::*, log::*, util::*, os::*};
 use std::{result, io, mem, sync::atomic::{AtomicBool, Ordering}, cell::UnsafeCell, io::Write, str, str::FromStr, fmt, fmt::{Display, Formatter}};
 use bitflags::*;
 use unicode_segmentation::UnicodeSegmentation;
@@ -150,7 +150,7 @@ const MOUSE_BUTTON_EVENT_MODE: &'static str = "\x1b[?1002h";
 const MOUSE_ANY_EVENT_MODE: &'static str = "\x1b[?1003h";
 const MOUSE_DISABLE: &'static str = "\x1b[?1003l\x1b[?1002l\x1b[?1007l\x1b[?1006l\x1b[?1004l";
 
-static TERMINAL_STATE_TO_RESTORE: SyncUnsafeCell<libc::termios> = SyncUnsafeCell::new(/*rust, why doesn't mem::zeroed() just work here*/ libc::termios{c_iflag:0,c_oflag:0,c_cflag:0,c_lflag:0,c_line:0,c_cc:[0;32],__c_ispeed:0,__c_ospeed:0});
+static TERMINAL_STATE_TO_RESTORE: SyncUnsafeCell<[u8; mem::size_of::<libc::termios>()]> = SyncUnsafeCell::new([0u8; mem::size_of::<libc::termios>()]);
 static TERMINAL_STATE_RESTORED: AtomicBool = AtomicBool::new(true);
 
 // Changes terminal state to raw mode, alternate screen, and bar cursor.
@@ -158,12 +158,17 @@ static TERMINAL_STATE_RESTORED: AtomicBool = AtomicBool::new(true);
 pub fn configure_terminal(mouse_mode: MouseMode) -> Result<()> {
     unsafe {
         assert!(TERMINAL_STATE_RESTORED.load(Ordering::SeqCst));
-        let original_termios = TERMINAL_STATE_TO_RESTORE.get();
-        let r = libc::tcgetattr(libc::STDOUT_FILENO, original_termios);
+        let mut termios: libc::termios = mem::zeroed();
+        let r = libc::tcgetattr(libc::STDOUT_FILENO, &mut termios);
+
+        // (We can't just make TERMINAL_STATE_TO_RESTORE use libc::termios type because we can't initialize it because neither mem::zeroed() nor Default::default() are allowed in const context.
+        //  And we can't just initialize it by listing its fields because some of those fields are different between musl and glibc versions of the libc crate.)
+        let bytes = TERMINAL_STATE_TO_RESTORE.get();
+        ptr::copy_nonoverlapping(&termios as *const libc::termios as *const u8, bytes as *mut [u8; mem::size_of::<libc::termios>()] as *mut u8, mem::size_of::<libc::termios>());
+
         if r != 0 { return errno_err!("tcgetarrt() failed"); }
-        let mut new_termios = (*original_termios).clone();
-        libc::cfmakeraw(&mut new_termios);
-        let r = libc::tcsetattr(libc::STDOUT_FILENO, libc::TCSANOW, &new_termios);
+        libc::cfmakeraw(&mut termios);
+        let r = libc::tcsetattr(libc::STDOUT_FILENO, libc::TCSANOW, &termios);
         if r != 0 { return errno_err!("tcsetattr() failed"); }
         TERMINAL_STATE_RESTORED.store(false, Ordering::SeqCst);
 
@@ -192,8 +197,10 @@ pub fn restore_terminal() {
         let _ = write!(io::stdout(), "{}{}{}\n", MOUSE_DISABLE, CURSOR_SHOW, SCREEN_MAIN).unwrap_or(());
         let _ = io::stdout().flush().unwrap_or(());
 
-        let termios = TERMINAL_STATE_TO_RESTORE.get();
-        let _ = libc::tcsetattr(libc::STDOUT_FILENO, libc::TCSANOW, termios);
+        let bytes = TERMINAL_STATE_TO_RESTORE.get();
+        let mut termios: libc::termios = mem::zeroed();
+        ptr::copy_nonoverlapping(bytes as *const [u8; mem::size_of::<libc::termios>()] as *const u8, &mut termios as *mut libc::termios as *mut u8, mem::size_of::<libc::termios>());
+        let _ = libc::tcsetattr(libc::STDOUT_FILENO, libc::TCSANOW, &termios as *const libc::termios);
     }
 }
 

@@ -1,4 +1,4 @@
-use crate::{*, error::*, elf::*, util::*, log::*};
+use crate::{*, error::*, elf::*, util::*, log::*, os::*};
 use std::io::{BufReader, BufRead};
 use std::{fs, fs::File, os::fd::{OwnedFd, AsRawFd}, str::FromStr, ops::Range, cmp::Ordering, collections::HashSet, mem::MaybeUninit, sync::Arc};
 use bitflags::*;
