@@ -35,6 +35,11 @@ fi
 BASEDIR=$(dirname "$0")
 sed -i.bak "s/^version = \"0\.[0-9]\+\.0\" # \[\[this version number is written by release\.sh\]\]$/version = \"0.$TAG_NUM.0\" # [[this version number is written by release.sh]]/" "$BASEDIR/Cargo.toml" && rm "$BASEDIR/Cargo.toml.bak"
 
+# Commit.
+git add "$BASEDIR/Cargo.toml"
+git commit -m "bump version number to $TAG_NUM"
+git push
+
 # This is read by env!() in main.rs, passed-through by cargo.
 export NND_BUILD_TIME=`date --utc +"%Y-%m-%d %H:%M:%S-%Z"`
 
