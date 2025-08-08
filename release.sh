@@ -39,7 +39,7 @@ sed -i.bak "s/^version = \"0\.[0-9]\+\.0\" # \[\[this version number is written 
 export NND_BUILD_TIME=`date --utc +"%Y-%m-%d %H:%M:%S-%Z"`
 
 # Build.
-RUST_BACKTRACE=1 cargo test && cargo build --profile dbgo && cargo build -r
+RUST_BACKTRACE=1 cargo test && cargo build && cargo build --profile dbgo && cargo build -r && cargo build --examples && cargo build --profile dbgo --examples && cargo build -r --examples
 
 # Copy to my machines.
 

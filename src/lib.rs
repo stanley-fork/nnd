@@ -1,3 +1,6 @@
+#![doc(hidden)]
+//! Consider this crate executable-only. It's currently published as if it's also a library, but that's only because I don't know how to use cargo. Don't actually use it as a library please.
+
 #![allow(dead_code)]
 #![allow(unused_variables)]
 #![allow(unused_imports)]
