@@ -7,7 +7,7 @@ documentation = "https://github.com/al13n321/nnd"
 repository = "https://github.com/al13n321/nnd"
 keywords = ["debugger", "tui"]
 categories = ["development-tools::debugging"]
-version = "0.41.0" # [[this version number is written by release.sh]]
+version = "0.42.0" # [[this version number is written by release.sh]]
 edition = "2021" # I tried updating to 2024, but it just makes build 10% slower without making the resulting executable any faster
 
 [profile.dev]
