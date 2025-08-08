@@ -4,7 +4,7 @@ use nnd::{*, error::*, elf::*, log::*, symbols::*, types::*, arena::*, util::*};
 use std::{fs::{File}, io::{self, Write}, sync::Arc, mem, sync::atomic::{AtomicBool, Ordering}, cell::UnsafeCell, thread, thread::JoinHandle};
 
 fn main() -> Result<()> {
-    std::env::set_var("RUST_BACKTRACE", "1");
+    unsafe {std::env::set_var("RUST_BACKTRACE", "1")};
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!("Usage: {} binary", args[0]);

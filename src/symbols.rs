@@ -181,6 +181,10 @@ pub struct Symbols {
 
     // Addresses of things like main() and __cxa_throw().
     pub points_of_interest: HashMap<PointOfInterest, Vec<usize>>,
+
+    // How long it took to load the symbols and how much memory it used.
+    pub loading_duration_ns: usize,
+    pub loading_memory_usage: Option<usize>,
 }
 
 // Data structures for functions and inlined function calls.
@@ -1108,7 +1112,7 @@ impl SymbolsLoader {
 
         prepare_time_per_stage_ns[0] = start_time.elapsed().as_nanos() as usize;
         Ok(SymbolsLoader {
-            num_shards: shards.len(), binary_id, sym: Symbols {elves, dwarf, units, files: Vec::new(), file_paths: StringTable::new(), path_to_used_file: HashMap::new(), functions: Vec::new(), shards: Vec::new(), builtin_types: BuiltinTypes::invalid(), base_types: Vec::new(), vtables: Vec::new(), points_of_interest: HashMap::new(), code_addr_range},
+            num_shards: shards.len(), binary_id, sym: Symbols {elves, dwarf, units, files: Vec::new(), file_paths: StringTable::new(), path_to_used_file: HashMap::new(), functions: Vec::new(), shards: Vec::new(), builtin_types: BuiltinTypes::invalid(), base_types: Vec::new(), vtables: Vec::new(), points_of_interest: HashMap::new(), loading_duration_ns: 0, loading_memory_usage: None, code_addr_range},
             shards: shards.into_iter().map(|s| SyncUnsafeCell::new(CachePadded::new(s))).collect(), die_to_function_shards: (0..num_shards).map(|_| SyncUnsafeCell::new(CachePadded::new(Vec::new()))).collect(), types: types_loader, send_global_variable_names, strtab_symtab, status, progress_per_stage,
             abbreviations_shared, prepare_time_per_stage_ns, run_time_per_stage_ns, shard_progress_ppm: (0..num_shards).map(|_| CachePadded::new(AtomicUsize::new(0))).collect(), stage: 0, types_before_dedup: 0, type_offsets: 0, type_offset_maps_bytes: 0, type_dedup_maps_bytes: 0})
     }
@@ -1748,10 +1752,11 @@ impl SymbolsLoader {
         }
     }
 
-    fn log_timing_and_stats(&self) {
+    fn log_timing_and_stats(&mut self) {
         let prepare_ns: usize = self.prepare_time_per_stage_ns.iter().copied().sum();
         let total_cpu_ns  = prepare_ns + self.run_time_per_stage_ns.iter().map(|v| v.iter().map(|t| t.load(Ordering::Relaxed)).sum::<usize>()).sum::<usize>();
         let total_wall_ns = prepare_ns + self.run_time_per_stage_ns.iter().map(|v| v.iter().map(|t| t.load(Ordering::Relaxed)).max().unwrap()).sum::<usize>();
+        self.sym.loading_duration_ns = total_wall_ns;
         if total_wall_ns > 500_000_000 {
             let funcs_before_dedup: usize = self.shards.iter().map(|s| unsafe {(*s.get()).functions_before_dedup}).sum();
             let subfunctions_needed_fixup: usize = self.shards.iter().map(|s| unsafe {(*s.get()).subfunctions_need_fixup.len()}).sum();
@@ -1795,8 +1800,12 @@ impl SymbolsLoader {
             }
 
             let peak_mem_str = match peak_memory_usage_of_current_process() {
-                Ok(x) => format!("{}", PrettySize(x)),
-                Err(e) => format!("<{}>", e) };
+                Ok(x) => {
+                    self.sym.loading_memory_usage = Some(x);
+                    format!("{}", PrettySize(x))
+                }
+                Err(e) => format!("<{}>", e),
+            };
 
             let mut time_breakdown = String::new();
             if true {

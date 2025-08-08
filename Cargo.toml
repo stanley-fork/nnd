@@ -1,7 +1,7 @@
 [package]
 name = "nnd"
 version = "0.39.0" # [[this version number is written by release.sh]]
-edition = "2021"
+edition = "2021" # (I tried updating to 2024, but it just makes build 10% slower without making the resulting executable any faster)
 
 [profile.dev]
 panic = 'abort'
