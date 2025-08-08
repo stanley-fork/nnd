@@ -35,23 +35,25 @@ fi
 BASEDIR=$(dirname "$0")
 sed -i.bak "s/^version = \"0\.[0-9]\+\.0\" # \[\[this version number is written by release\.sh\]\]$/version = \"0.$TAG_NUM.0\" # [[this version number is written by release.sh]]/" "$BASEDIR/Cargo.toml" && rm "$BASEDIR/Cargo.toml.bak"
 
-# Commit.
-git add "$BASEDIR/Cargo.toml"
-git commit -m "bump version number to $TAG_NUM"
-git push
-
 # This is read by env!() in main.rs, passed-through by cargo.
 export NND_BUILD_TIME=`date --utc +"%Y-%m-%d %H:%M:%S-%Z"`
 
 # Build.
 for target in "" "--target=x86_64-unknown-linux-musl"
 do
+    echo "target: $target"
     RUST_BACKTRACE=1 cargo test $target
     for profile in "" "--profile=dbgo" "-r"
     do
+        echo "profile: $profile"
         cargo build $target $profile
     done
 done
+
+# Commit.
+git add "$BASEDIR/Cargo.toml" "$BASEDIR/Cargo.lock"
+git commit -m "bump version number to $TAG_NUM"
+git push
 
 # Copy to my machines.
 
@@ -68,6 +70,9 @@ cp target/x86_64-unknown-linux-musl/dbgo/nnd nnd-dbgo
 trap 'rm nnd-dbgo' EXIT
 
 gh release create "$TAG" --notes "" target/x86_64-unknown-linux-musl/release/nnd nnd-dbgo
+
+rm nnd-dbgo
+trap - EXIT
 
 # Push to crates.io
 cargo publish
