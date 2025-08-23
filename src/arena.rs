@@ -96,7 +96,7 @@ impl Arena {
                 let c = &mut self.chunks[i];
                 if end == c.data.add(c.used) && c.used + size <= c.capacity {
                     // Fast path.
-                    unsafe {*(c.data.add(c.used) as *mut T) = add};
+                    *(c.data.add(c.used) as *mut T) = add;
                     c.used += size;
                     *len += 1;
                     return;
@@ -104,7 +104,7 @@ impl Arena {
             }
             if let Some(c) = self.chunks.last_mut() {
                 if end == c.data.add(c.used) && c.used + size <= c.capacity {
-                    unsafe {*(c.data.add(c.used) as *mut T) = add};
+                    *(c.data.add(c.used) as *mut T) = add;
                     c.used += size;
                     *len += 1;
                     return;

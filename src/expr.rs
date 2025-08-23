@@ -777,8 +777,8 @@ fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut Form
                 let as_number = v.flags.intersects(ValueFlags::RAW | ValueFlags::HEX | ValueFlags::BIN);
                 if p.contains(PrimitiveFlags::FLOAT) {
                     match size {
-                        4 => styled_write!(state.out, state.palette.value, "{:?}", unsafe {mem::transmute::<u32, f32>(x as u32)}),
-                        8 => styled_write!(state.out, state.palette.value, "{:?}", unsafe {mem::transmute::<usize, f64>(x)}),
+                        4 => styled_write!(state.out, state.palette.value, "{:?}", f32::from_bits(x as u32)),
+                        8 => styled_write!(state.out, state.palette.value, "{:?}", f64::from_bits(x as u64)),
                         _ => styled_write!(state.out, state.palette.error, "<bad size: {}>", size),
                     }
                 } else if p.contains(PrimitiveFlags::UNSPECIFIED) {
@@ -980,10 +980,9 @@ fn format_integer(x0: usize, size: usize, signed: bool, flags: ValueFlags, out: 
         styled_write!(out, palette.value, "0x{:x}", x);
     } else if flags.contains(ValueFlags::BIN) {
         styled_write!(out, palette.value, "0b{:b}", x);
-    } else if !signed {
-        styled_write!(out, palette.value, "{}", x);
+    } else if signed {
+        styled_write!(out, palette.value, "{}", x0 as isize);
     } else {
-        let x: isize = unsafe {mem::transmute(x0)};
         styled_write!(out, palette.value, "{}", x);
     }
 }
@@ -1359,8 +1358,8 @@ pub fn eval_dwarf_expression(mut expression: Expression<DwarfSlice>, context: &m
         let val = match piece.location {
             Location::Empty => return err!(OptimizedAway, "optimized away"),
             Location::Value{value: v} => AddrOrValueBlob::Blob(ValueBlob::new(match v {
-                gimli::read::Value::F32(x) => unsafe {mem::transmute::<f32, u32>(x) as usize},
-                gimli::read::Value::F64(x) => unsafe {mem::transmute(x)},
+                gimli::read::Value::F32(x) => f32::to_bits(x) as usize,
+                gimli::read::Value::F64(x) => f64::to_bits(x) as usize,
                 _ => v.to_u64(!0)? as usize })),
             Location::Bytes{value: b} => {
                 blob_bytes = b.len();

@@ -366,7 +366,7 @@ impl PackedVariableLocation {
     pub fn const_slice(x: &'static [u8]) -> Self { Self::LongConst {ptr: x.as_ptr(), len: x.len().min(u32::MAX as usize) as u32} }
     pub fn const_usize(x: usize) -> Self { let mut a = [0u8; 12]; a[..8].copy_from_slice(&x.to_le_bytes()); Self::ShortConst(a) }
 
-    pub fn unpack(&self) -> VariableLocation {
+    pub fn unpack(&self) -> VariableLocation<'_> {
         match self {
             Self::ShortConst(a) => VariableLocation::Const(a),
             &Self::LongConst {ptr, len} => VariableLocation::Const(unsafe {slice::from_raw_parts(ptr, len as usize)}),

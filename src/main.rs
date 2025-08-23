@@ -3,8 +3,10 @@
 #![allow(unused_imports)]
 // This is only needed on the 'use gimli::*' statements (for constants like DW_AT_name), but it doesn't work there.
 #![allow(non_upper_case_globals)]
-// For the offsetof macro in util.rs, because Rust doesn't support attaching an [allow()] on an individual unsafe{} block (which in turn is only needed because Rust doesn't have offsetof, ugh).
+// For the offsetof macro in util.rs when invoked from another unsafe block. Because Rust doesn't support attaching an [allow()] on an individual unsafe{} block.
 #![allow(unused_unsafe)]
+// Allow unsafe {(*p).x.y} instead of unsafe {(&(*p).x).y}
+#![allow(dangerous_implicit_autorefs)]
 
 pub mod error;
 pub mod elf;

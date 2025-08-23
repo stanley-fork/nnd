@@ -154,7 +154,7 @@ pub struct StructType {
     pub fields_ptr: *const StructField,
     pub fields_len: usize,
 }
-impl Default for StructType { fn default() -> Self { let p: &'static [StructField] = &[]; Self {flags: StructFlags::empty(), fields_ptr: unsafe {p.as_ptr()}, fields_len: 0} } }
+impl Default for StructType { fn default() -> Self { let p: &'static [StructField] = &[]; Self {flags: StructFlags::empty(), fields_ptr: p.as_ptr(), fields_len: 0} } }
 impl Hash for StructType { fn hash<H: Hasher>(&self, state: &mut H) { self.flags.hash(state); self.fields().hash(state); } }
 impl PartialEq for StructType { fn eq(&self, other: &Self) -> bool { (self.flags, self.fields()).eq(&(other.flags, other.fields())) } }
 impl StructType {
@@ -398,7 +398,7 @@ impl Types {
                         field_names[i].write((fs[i].name, i));
                     }
                     let field_names: *mut MaybeUninit<(&str, usize)> = field_names.as_mut_ptr();
-                    let field_names: &mut [(&str, usize)] = unsafe {std::slice::from_raw_parts_mut(field_names as _, fs.len())};
+                    let field_names: &mut [(&str, usize)] = std::slice::from_raw_parts_mut(field_names as _, fs.len());
                     field_names.sort_unstable();
                     let mut repeats = 0usize;
                     for i in 0..fs.len() {
@@ -428,7 +428,7 @@ impl Types {
                             ee.name = self.misc_arena.add_str(ee.name);
                         }
                     }
-                    e.enumerands = unsafe {mem::transmute(es)};
+                    e.enumerands = mem::transmute(es);
                 }
                 _ => (),
             }
@@ -1200,7 +1200,7 @@ impl TypesLoader {
                 Some(p) => *p,
                 None => {
                     let p = final_types.types_arena.add_mut(info.clone());
-                    let special = TypeSpecialInfo::extract(unsafe {&*p});
+                    let special = TypeSpecialInfo::extract(p);
                     ptr = Some((p, special));
                     (p, special)
                 }

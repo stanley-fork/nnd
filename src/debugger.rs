@@ -818,10 +818,8 @@ impl Debugger {
                         }
                     } else if signal == libc::SIGTRAP { // hit a breakpoint
                         let mut si: libc::siginfo_t;
-                        unsafe {
-                            si = mem::zeroed();
-                            ptrace(PTRACE_GETSIGINFO, tid, 0, &mut si as *mut _ as u64)?;
-                        }
+                        si = mem::zeroed();
+                        ptrace(PTRACE_GETSIGINFO, tid, 0, &mut si as *mut _ as u64)?;
 
                         if self.context.settings.trace_logging { eprintln!("trace: thread {} got SIGTRAP ({}) at 0x{:x}", tid, trap_si_code_name(si.si_code), si.si_addr() as usize); }
 
@@ -854,10 +852,8 @@ impl Debugger {
 
                         if [libc::SIGSEGV, libc::SIGABRT, libc::SIGILL, libc::SIGFPE].contains(&signal) {
                             let mut si: libc::siginfo_t;
-                            unsafe {
-                                si = mem::zeroed();
-                                ptrace(PTRACE_GETSIGINFO, tid, 0, &mut si as *mut _ as u64)?;
-                            }
+                            si = mem::zeroed();
+                            ptrace(PTRACE_GETSIGINFO, tid, 0, &mut si as *mut _ as u64)?;
 
                             thread.stop_reasons.push(StopReason::Signal(signal));
                             log!(self.log, "thread {} got {} at 0x{:x}", tid, signal_name(signal), si.si_addr() as usize);

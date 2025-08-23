@@ -87,11 +87,11 @@ impl<T> Pool<T> {
     pub fn get(&self, id: Id) -> &T { self.try_get(id).unwrap() }
     pub fn get_mut(&mut self, id: Id) -> &mut T { self.try_get_mut(id).unwrap() }
 
-    pub fn iter(&self) -> PoolIter<T> {
+    pub fn iter(&self) -> PoolIter<'_, T> {
         PoolIter {pool: self, slot: 0}
     }
 
-    pub fn iter_mut(&mut self) -> PoolIterMut<T> {
+    pub fn iter_mut(&mut self) -> PoolIterMut<'_, T> {
         PoolIterMut {iter: self.slots.iter_mut(), idx: 0, slot: 0}
     }
 }

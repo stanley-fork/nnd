@@ -313,7 +313,7 @@ impl CoreDumper {
             ptrace(PTRACE_SETREGSET, tid, NT_PRSTATUS as u64, &mut iov as *mut libc::iovec as u64)?;
 
             // Resume the thread.
-            unsafe {ptrace(PTRACE_CONT, tid, 0, 0)}?;
+            ptrace(PTRACE_CONT, tid, 0, 0)?;
 
             // What we expect to happen:
             //  * PTRACE_EVENT_FORK. We get the new process's pid through PTRACE_GETEVENTMSG.
@@ -328,7 +328,7 @@ impl CoreDumper {
             //    waitpid() for the new process.
             loop {
                 let mut wstatus = 0i32;
-                let r = unsafe {libc::waitpid(tid, &mut wstatus, 0)};
+                let r = libc::waitpid(tid, &mut wstatus, 0);
                 if r < 0 {
                     let err = io::Error::last_os_error();
                     if err.kind() == io::ErrorKind::Interrupted {
@@ -346,7 +346,7 @@ impl CoreDumper {
                         return err!(ProcessState, "hijacked thread stopped with unexpected signal {}", signal_name(signal));
                     }
                     match wstatus >> 16 {
-                        PTRACE_EVENT_FORK => unsafe {
+                        PTRACE_EVENT_FORK => {
                             let mut new_pid = 0usize;
                             ptrace(PTRACE_GETEVENTMSG, tid, 0, &mut new_pid as *mut _ as u64)?;
                             eprintln!("(forked pid: {})", new_pid);
@@ -355,7 +355,7 @@ impl CoreDumper {
                                 // Keep going, can't stop+restore in this state.
                             }
                             self.forked_pid = Some(new_pid as pid_t);
-                            unsafe {ptrace(PTRACE_CONT, tid, 0, 0)}?;
+                            ptrace(PTRACE_CONT, tid, 0, 0)?;
                         }
                         0 if self.forked_pid.is_none() => return err!(ProcessState, "fork failed"),
                         _ if self.forked_pid.is_none() => return err!(ProcessState, "hijacked thread got unexpected ptrace stop before fork"),

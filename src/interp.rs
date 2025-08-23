@@ -240,8 +240,8 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                             if f.contains(PrimitiveFlags::FLOAT) {
                                 if op == UnaryOperator::Not { return err!(TypeMismatch, "can't bit-negate float"); }
                                 match size {
-                                    4 => x = unsafe {mem::transmute::<f32, u32>(-mem::transmute::<u32, f32>(x as u32))} as usize,
-                                    8 => x = unsafe {mem::transmute(-mem::transmute::<usize, f64>(x))},
+                                    4 => x = f32::to_bits(-f32::from_bits(x as u32)) as usize,
+                                    8 => x = f64::to_bits(-f64::from_bits(x as u64)) as usize,
                                     _ => return err!(Dwarf, "bad float size: {}", size),
                                 }
                             } else if f.contains(PrimitiveFlags::BOOL) {
@@ -784,7 +784,7 @@ enum BasicValue {
     // (Can add wide or simd types here.)
 }
 impl BasicValue {
-    fn transmute_to_usize(&self) -> usize { match *self { Self::I(x) => x as usize, Self::U(x) => x, Self::F(x) => unsafe {mem::transmute(x)} } }
+    fn transmute_to_usize(&self) -> usize { match *self { Self::I(x) => x as usize, Self::U(x) => x, Self::F(x) => f64::to_bits(x) as usize } }
     fn cast_to_isize(&self) -> isize { match *self { Self::I(x) => x, Self::U(x) => x as isize, Self::F(x) => x as isize } }
     fn cast_to_usize(&self) -> usize { match *self { Self::I(x) => x as usize, Self::U(x) => x, Self::F(x) => x as usize } }
     fn cast_to_f64(&self) -> f64 { match *self { Self::I(x) => x as f64, Self::U(x) => x as f64, Self::F(x) => x } }
@@ -808,8 +808,8 @@ fn to_basic(val: &Value, memory: &mut CachedMemReader, what: &str) -> Result<Bas
             let mut x = val.val.clone().into_value(size, memory)?.get_usize()?;
             if f.contains(PrimitiveFlags::FLOAT) {
                 BasicValue::F(match size {
-                    4 => unsafe {mem::transmute::<u32, f32>(x as u32) as f64},
-                    8 => unsafe {mem::transmute::<usize, f64>(x)},
+                    4 => f32::from_bits(x as u32) as f64,
+                    8 => f64::from_bits(x as u64),
                     _ => return err!(Dwarf, "unexpected float size: {}", size),
                 })
             } else {
@@ -841,8 +841,8 @@ fn from_basic(b: BasicValue, type_: *const TypeInfo) -> Result<Option<AddrOrValu
         Type::Primitive(f) if f.contains(PrimitiveFlags::FLOAT) => {
             let x = b.cast_to_f64();
             match size {
-                4 => unsafe {mem::transmute::<f32, u32>(x as f32) as usize},
-                8 => unsafe {mem::transmute::<f64, usize>(x)},
+                4 => f32::to_bits(x as f32) as usize,
+                8 => f64::to_bits(x) as usize,
                 _ => return err!(Dwarf, "unexpected float size: {}", size),
             }
         }

@@ -1,9 +1,16 @@
 #!/bin/bash
 set -e
 
-# Check uncommitted changes.
-if [ "$1" != "allow-uncommitted" ]
+COMMIT_MESSAGE='.'
+if [ "$1" == "-m" ]
 then
+    if [ "$2" == "" ]
+    then
+        echo "commit message required after -m"
+        exit 1
+    fi
+    COMMIT_MESSAGE="$2"
+else
     status="$(git status --porcelain)"
     if [ "$status" != "" ]
     then
@@ -35,10 +42,10 @@ fi
 BASEDIR=$(dirname "$0")
 sed -i.bak "s/^version = \"0\.[0-9]\+\.0\" # \[\[this version number is written by release\.sh\]\]$/version = \"0.$TAG_NUM.0\" # [[this version number is written by release.sh]]/" "$BASEDIR/Cargo.toml" && rm "$BASEDIR/Cargo.toml.bak"
 
-# This is read by env!() in main.rs, passed-through by cargo.
+# Pass build time to the env!() in main.rs, passed-through by cargo.
 export NND_BUILD_TIME=`date --utc +"%Y-%m-%d %H:%M:%S-%Z"`
 
-# Build.
+# Build in all the modes, with musl and glibc.
 for target in "" "--target=x86_64-unknown-linux-musl"
 do
     echo "target: $target"
@@ -50,9 +57,9 @@ do
     done
 done
 
-# Commit.
-git add "$BASEDIR/Cargo.toml" "$BASEDIR/Cargo.lock"
-git commit -m "bump version number to $TAG_NUM"
+# Commit the version number bump. This is required by crates.io. We usually piggyback it to some useful commit.
+git status
+git commit -am "$COMMIT_MESSAGE"
 git push
 
 # Copy to my machines.

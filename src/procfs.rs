@@ -336,7 +336,7 @@ impl PidMemReader {
             let mut remote_iov = libc::iovec {iov_base: addr as *mut c_void, iov_len: buf.len()};
             let r = libc::process_vm_readv(self.pid, &local_iov as *const libc::iovec, 1, &mut remote_iov as *mut libc::iovec, 1, 0);
             if r < 0 {
-                if unsafe {*libc::__errno_location()} == libc::EFAULT {
+                if *libc::__errno_location() == libc::EFAULT {
                     return err!(ProcessState, "bad address: 0x{:x}", addr); // shorter message for common error (e.g. null pointer dereference in watch expression)
                 } else {
                     return errno_err!("process_vm_readv failed");
