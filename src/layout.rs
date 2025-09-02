@@ -622,7 +622,7 @@ impl Layout {
             }
             with_parent!(ui, walls[i].0, {
                 ui.cur_mut().flags.insert(WidgetFlags::HIGHLIGHT_ON_HOVER);
-                if let Some(p) = ui.check_drag() {
+                if let Some(p) = ui.check_drag_out(DragWhat::NoDrop) {
                     let p = p[axis];
                     if p != 0 {
                         let (fixed_left, fixed) = (cumsum[i].0, cumsum.last().unwrap().0);

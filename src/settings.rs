@@ -391,6 +391,8 @@ pub enum KeyAction {
 
     DuplicateRow,
     AddValueRefWatch,
+    ReorderRowUp,
+    ReorderRowDown,
 
     Help,
     DropCaches,
@@ -704,6 +706,8 @@ impl Default for KeyBinds {
             (Key::Char('g').plain(), KeyAction::GoToLine),
             (Key::Char('d').plain(), KeyAction::DuplicateRow),
             (Key::Char('D').plain(), KeyAction::AddValueRefWatch),
+            (Key::PageUp.ctrl(), KeyAction::ReorderRowUp),
+            (Key::PageDown.ctrl(), KeyAction::ReorderRowDown),
             (Key::Char('?').plain(), KeyAction::Help),
             (Key::Char('h').plain(), KeyAction::Help),
             (Key::Char('l').ctrl(), KeyAction::DropCaches),

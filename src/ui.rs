@@ -607,6 +607,7 @@ struct WatchesWindow {
     scroll_to_cursor: bool,
 
     // Layout information. We do layout and line wrapping manually to avoid creating widgets for invisible rows.
+    name_relative_width: f64,
     name_width: usize,
     value_width: usize,
     row_height_limit: usize,
@@ -635,7 +636,7 @@ struct WatchesWindow {
 }
 impl Default for WatchesWindow {
     fn default() -> Self {
-        let mut r = Self {tree: ValueTree::default(), expanded_nodes: HashSet::new(), cursor_path: Vec::new(), cursor_idx: 0, scroll: 0, scroll_to_cursor: false, name_width: 0, value_width: 0, row_height_limit: 0, indent_width: 0, max_indent: 0, seen: (0, usize::MAX, usize::MAX, ProcessState::NoProcess), have_good_cached_values: false, expressions: Vec::new(), text_input: None, text_input_built: false, eval_state: EvalState::new(), data_breakpoints: HashMap::new(), variable_search_dialog: None, type_search_dialog: None };
+        let mut r = Self {tree: ValueTree::default(), expanded_nodes: HashSet::new(), cursor_path: Vec::new(), cursor_idx: 0, scroll: 0, scroll_to_cursor: false, name_relative_width: 0.4, name_width: 0, value_width: 0, row_height_limit: 0, indent_width: 0, max_indent: 0, seen: (0, usize::MAX, usize::MAX, ProcessState::NoProcess), have_good_cached_values: false, expressions: Vec::new(), text_input: None, text_input_built: false, eval_state: EvalState::new(), data_breakpoints: HashMap::new(), variable_search_dialog: None, type_search_dialog: None };
 
         let locals_identity: usize = random();
         r.expanded_nodes.insert(locals_identity);
@@ -1340,7 +1341,7 @@ impl WindowContent for WatchesWindow {
         // Keyboard input.
         let mut refresh_data = self.tree.roots.is_empty();
         let (mut open_variable_search, mut open_type_search) = (false, false);
-        for action in ui.check_keys(&[KeyAction::Cancel, KeyAction::CursorRight, KeyAction::CursorLeft, KeyAction::Enter, KeyAction::DeleteRow, KeyAction::DuplicateRow, KeyAction::AddValueRefWatch, KeyAction::Open, KeyAction::FindType, KeyAction::DataWriteBreakpoint, KeyAction::DataReadWriteBreakpoint, KeyAction::ConditionalDataWriteBreakpoint, KeyAction::ConditionalDataReadWriteBreakpoint]) {
+        for action in ui.check_keys(&[KeyAction::Cancel, KeyAction::CursorRight, KeyAction::CursorLeft, KeyAction::Enter, KeyAction::DeleteRow, KeyAction::DuplicateRow, KeyAction::AddValueRefWatch, KeyAction::ReorderRowUp, KeyAction::ReorderRowDown, KeyAction::Open, KeyAction::FindType, KeyAction::DataWriteBreakpoint, KeyAction::DataReadWriteBreakpoint, KeyAction::ConditionalDataWriteBreakpoint, KeyAction::ConditionalDataReadWriteBreakpoint]) {
             self.scroll_to_cursor = true;
 
             if action == KeyAction::Cancel {
@@ -1410,6 +1411,15 @@ impl WindowContent for WatchesWindow {
                     };
                     if let Some(s) = s {
                         self.add_watch(s, &mut refresh_data);
+                    }
+                }
+                KeyAction::ReorderRowUp | KeyAction::ReorderRowDown => if let &Some(i) = &expr_idx {
+                    if self.expressions[i].special.is_none() {
+                        let j = i as isize + if action == KeyAction::ReorderRowUp {-1} else {1};
+                        if j >= 0 && j < self.expressions.len() as isize && self.expressions[j as usize].special.is_none() {
+                            self.expressions.swap(i, j as usize);
+                            refresh_data = true;
+                        }
                     }
                 }
                 KeyAction::DeleteRow if expr_idx.is_some_and(|i| self.expressions[i].special.is_none()) => {
@@ -1487,8 +1497,11 @@ impl WindowContent for WatchesWindow {
         let scroll_bar = ui.add(widget!().fixed_width(1));
         ui.layout_children(Axis::X);
         let viewport_width = ui.calculate_size(header_and_viewport, Axis::X);
-        let name_width = viewport_width * 4 / 10;
-        let value_width = viewport_width.saturating_sub(name_width + Self::COLUMN_SPACING);
+        let calculate_name_width = |viewport_width: usize, name_relative_width: f64| -> usize {
+            (viewport_width as f64 * name_relative_width + 0.5) as usize
+        };
+        let mut name_width = calculate_name_width(viewport_width, self.name_relative_width);
+        let value_width;
         let viewport;
         with_parent!(ui, header_and_viewport, {
             if !ui.check_focus() {
@@ -1498,7 +1511,24 @@ impl WindowContent for WatchesWindow {
 
             with_parent!(ui, ui.add(widget!().fixed_height(1)), {
                 let l = ui_writeln!(ui, table_header, "  name");
-                ui.add(widget!().text(l).fixed_width(name_width));
+                let name_header = ui.add(widget!().text(l).fixed_width(name_width));
+
+                let l = ui_writeln!(ui, default_dim, "|");
+                with_parent!(ui, ui.add(widget!().text(l).fixed_width(1).fixed_x(name_width as isize + 1)), {
+                    ui.cur_mut().flags.insert(WidgetFlags::HIGHLIGHT_ON_HOVER);
+                    if let Some(p) = ui.check_drag_out(DragWhat::NoDrop) {
+                        // Update name_width and move widgets right here. Can't just use should_redraw
+                        // as that would cause flicker because drag_out would use coordinates one frame out of date.
+                        name_width = ((name_width as isize + p[Axis::X]).max(0) as usize).min(viewport_width.saturating_sub(Self::COLUMN_SPACING));
+                        self.name_relative_width = name_width as f64 / viewport_width.max(1) as f64;
+                        assert_eq!(calculate_name_width(viewport_width, self.name_relative_width), name_width as usize);
+
+                        ui.cur_mut().axes[Axis::X].rel_pos = name_width as isize + 1;
+                        ui.get_mut(name_header).axes[Axis::X].size = name_width;
+                    }
+                });
+
+                value_width = viewport_width.saturating_sub(name_width + Self::COLUMN_SPACING);
                 let l = ui_writeln!(ui, table_header, "value");
                 ui.add(widget!().text(l).fixed_width(value_width).fixed_x((name_width + Self::COLUMN_SPACING) as isize));
             });
@@ -1579,6 +1609,7 @@ impl WindowContent for WatchesWindow {
         out.extend([
             KeyHint::key(KeyAction::Enter, "edit/add"),
             KeyHint::keys(&[KeyAction::DuplicateRow, KeyAction::AddValueRefWatch], "copy/ref"),
+            KeyHint::keys(&[KeyAction::ReorderRowUp, KeyAction::ReorderRowDown], "reorder"),
             KeyHint::key(KeyAction::DeleteRow, "delete"),
             KeyHint::keys(&[KeyAction::CursorRight, KeyAction::CursorLeft], "expand/collapse"),
             KeyHint::keys(&[KeyAction::Open, KeyAction::FindType], "find variable/type"),

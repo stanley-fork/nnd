@@ -1,4 +1,4 @@
-use crate::{*, common_ui::*, terminal::*, settings::*, util::*, log::*};
+use crate::{*, common_ui::*, terminal::*, settings::*, util::*, log::*, pool::*};
 use std::{mem, ops::Range, collections::HashMap, time::{Instant, Duration}, hash::Hash};
 use bitflags::*;
 
@@ -152,14 +152,30 @@ pub struct MouseActions : u8 {
     const HOVER = 0x4;
     // Scroll wheel movement while the cursor is inside this Widget's rectangle, not captured by descendant, not obstructed.
     const SCROLL = 0x1;
-    // If a CLICK happened in this widget and then the mouse is moved without releasing the left mouse button, a DRAG event will be dispatched to this widget (even if the cursor leaves it) on each frame until the button is released.
-    // If both CLICK and DRAG are requested then both are delivered on the same frame when dragging starts.
-    const DRAG = 0x8;
+    // If a CLICK happened in this widget and then the mouse is moved without releasing the left mouse button, a DRAG_OUT event will be dispatched to this widget (even if the cursor leaves it) on each frame until the button is released.
+    // If both CLICK and DRAG_OUT are requested then both are delivered on the same frame when dragging starts.
+    // At most one widget may receive DRAG_OUT on each frame.
+    const DRAG_OUT = 0x8;
+    // If mouse was left-clicked in any DRAG_OUT widget, then moved over this widget (which may be the same one), this widget will receive a DRAG_IN event each frame.
+    // At most one widget may receive DRAG_IN on each frame; there's normally a corresponding DRAG_OUT on the same frame, but it's not guaranteed (e.g. maybe the DRAG_OUT widget disappeared on this frame).
+    const DRAG_IN = 0x10;
+    // If DRAG_IN happened, then the mouse button was released, a DROP will be reported together with the final DRAG_IN. A corresponding DRAG_OUT is reported on that frame as well.
+    // Required DRAG_IN.
+    const DROP = 0x20;
     // CLICK on this Widget or any descendant. E.g. for focusing a window on click, even if the click is also processed by some button inside the window.
-    const CLICK_SUBTREE = 0x10;
+    const CLICK_SUBTREE = 0x40;
     // HOVER on this Widget or any descendant. E.g. for highlighting a table row even when hovering over some button inside that row.
-    const HOVER_SUBTREE = 0x20;
+    const HOVER_SUBTREE = 0x80;
 }}
+
+// Identifies a thing that is being drag'n'dropped.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum DragWhat {
+    NoDrop, // draggable but not droppable, e.g. scroll bar
+    Window(Id),
+    Tab {tabs_identity: usize, tab_idx: usize},
+}
+impl Default for DragWhat { fn default() -> Self { Self::NoDrop } }
 
 #[derive(Default)]
 pub struct Widget {
@@ -218,8 +234,10 @@ pub struct Widget {
     pub capture_mouse: MouseActions,
     // Mouse events dispatched to this Widget on this frame.
     pub mouse: MouseActions,
-    pub scroll: isize, // scroll amount if `mouse` contains SCROLL
+    pub scroll: isize, // scroll amount, if `mouse` contains SCROLL
     pub mouse_pos: [isize; 2], // mouse position, relative to this widget, if `mouse` is not empty
+    pub drag_out_what: DragWhat, // if `capture_mouse` contains DRAG_OUT
+    pub drag_in_what: DragWhat, // if `mouse` contains DRAG_IN or DROP
 
     // Miscellaneous.
     pub scroll_bar_drag_offset: isize, // used only by scroll bar widgets
@@ -270,7 +288,7 @@ impl Widget {
     pub fn make_questionable_copy(&self) -> Self {
         let mut r = Self {
             identity: self.identity, source_line: self.source_line, axes: self.axes.clone(), flags: self.flags, draw_text: self.draw_text.clone(), style_adjustment: self.style_adjustment, draw_fill: self.draw_fill.clone(), draw_progress_bar: self.draw_progress_bar.clone(), draw_frame: self.draw_frame.clone(),
-            parent: WidgetIdx::invalid(), depth: 0, children: Vec::new(), position_next_to: None, focus_children: Vec::new(), capture_keys: Vec::new(), keys: Vec::new(), capture_mouse: MouseActions::empty(), mouse: MouseActions::empty(), scroll: 0, mouse_pos: [0, 0], scroll_bar_drag_offset: 0, line_wrapped_text: None, draw_cursor_if_focused: None, focus_frame_idx: 0};
+            parent: WidgetIdx::invalid(), depth: 0, children: Vec::new(), position_next_to: None, focus_children: Vec::new(), capture_keys: Vec::new(), keys: Vec::new(), capture_mouse: MouseActions::empty(), mouse: MouseActions::empty(), scroll: 0, mouse_pos: [0, 0], drag_out_what: DragWhat::default(), drag_in_what: DragWhat::default(), scroll_bar_drag_offset: 0, line_wrapped_text: None, draw_cursor_if_focused: None, focus_frame_idx: 0};
         r.flags.remove(WidgetFlags::REDRAW_IF_FOCUS_CHANGES);
         for axis in &mut r.axes {
             axis.flags.remove(AxisFlags::POS_KNOWN | AxisFlags::SIZE_KNOWN);
@@ -376,7 +394,8 @@ pub struct UI {
     mouse_pos: [isize; 2],
     mouse_click: Option<[isize; 2]>, // coordinates separate from mouse_pos, to be precise if a click happened in the middle of a fast motion
     mouse_scroll: isize,
-    mouse_drag_widget: Option<usize>,
+    mouse_drag_out_widget: Option<usize>,
+    mouse_drop_pos: Option<[isize; 2]>, // mouse coordinates when mouse button was released, if mouse_drag_out_widget is Some
 
     // Other state.
 
@@ -390,13 +409,18 @@ impl UI {
             let mut significant = true;
             match e {
                 Event::Key(key) => self.input_buffer.push(key.clone()),
-                Event::FocusIn | Event::FocusOut => self.mouse_drag_widget = None,
+                Event::FocusIn | Event::FocusOut => {
+                    self.mouse_drag_out_widget = None;
+                }
                 Event::Mouse(MouseEventEx {pos, button, event, ..}) => {
                     if button == &MouseButton::Left && event == &MouseEvent::Press {
                         self.mouse_click = Some(pos.clone());
                     } else if button == &MouseButton::Left && event == &MouseEvent::Release {
-                        significant = self.mouse_drag_widget.is_some();
-                        self.mouse_drag_widget = None;
+                        if self.mouse_drag_out_widget.is_some() {
+                            self.mouse_drop_pos = Some(pos.clone());
+                        } else {
+                            significant = false;
+                        }
                     } else if event == &MouseEvent::ScrollUp {
                         self.mouse_scroll -= 1;
                     } else if event == &MouseEvent::ScrollDown {
@@ -624,6 +648,7 @@ impl UI {
             w.mouse = mem::take(&mut prev.mouse);
             w.scroll = mem::take(&mut prev.scroll);
             w.mouse_pos = mem::take(&mut prev.mouse_pos);
+            w.drag_in_what = mem::take(&mut prev.drag_in_what);
             w.scroll_bar_drag_offset = mem::take(&mut prev.scroll_bar_drag_offset);
             w.focus_frame_idx = mem::take(&mut prev.focus_frame_idx);
         }        
@@ -739,11 +764,21 @@ impl UI {
         w.capture_mouse.insert(MouseActions::SCROLL);
         w.scroll
     }
-    pub fn check_drag(&mut self) -> Option<[isize; 2]> {
+    pub fn check_drag_out(&mut self, what: DragWhat) -> Option<[isize; 2]> {
         let w = &mut self.tree[self.cur_parent.0];
-        w.capture_mouse.insert(MouseActions::DRAG);
-        if w.mouse.contains(MouseActions::DRAG) {
+        w.capture_mouse.insert(MouseActions::DRAG_OUT);
+        w.drag_out_what = what;
+        if w.mouse.contains(MouseActions::DRAG_OUT) {
             Some(w.mouse_pos)
+        } else {
+            None
+        }
+    }
+    pub fn check_drag_in(&mut self) -> Option<(DragWhat, [isize; 2], /*drop*/ bool)> {
+        let w = &mut self.tree[self.cur_parent.0];
+        w.capture_mouse.insert(MouseActions::DRAG_IN | MouseActions::DROP);
+        if w.mouse.contains(MouseActions::DRAG_IN) {
+            Some((w.drag_in_what, w.mouse_pos, w.mouse.contains(MouseActions::DROP)))
         } else {
             None
         }
@@ -1241,8 +1276,11 @@ impl UI {
             w.mouse_pos = [pos[0] - w.axes[0].abs_pos, pos[1] - w.axes[1].abs_pos];
         };
         let hovered_idx = self.find_widget_at_cursor(self.mouse_pos);
+        let mut scroll = mem::take(&mut self.mouse_scroll);
+
+        // Dispatch click, which may also start a drag.
         if let Some(click_pos) = mem::take(&mut self.mouse_click) {
-            self.mouse_drag_widget = None;
+            self.mouse_drag_out_widget = None;
             let mut idx = if click_pos == self.mouse_pos {
                 hovered_idx
             } else {
@@ -1256,8 +1294,8 @@ impl UI {
                         report_event(w, MouseActions::CLICK, click_pos);
                         dispatched = true;
                     }
-                    if w.capture_mouse.contains(MouseActions::DRAG) {
-                        self.mouse_drag_widget = Some(w.identity);
+                    if w.capture_mouse.contains(MouseActions::DRAG_OUT) {
+                        self.mouse_drag_out_widget = Some(w.identity);
                         dispatched = true;
                     }
                 }
@@ -1268,30 +1306,59 @@ impl UI {
             }
         }
 
-        let mut scroll = mem::take(&mut self.mouse_scroll);
-        if let Some(identity) = self.mouse_drag_widget.clone() {
+        // Dispatch DRAG_OUT, DRAG_IN, and DROP.
+        if let Some(identity) = mem::take(&mut self.mouse_drag_out_widget) {
             if let Some(idx) = self.prev_map.get(&identity) {
-                let w = &mut self.prev_tree[idx.0];
-                if w.capture_mouse.contains(MouseActions::DRAG) {
-                    report_event(w, MouseActions::DRAG, self.mouse_pos);
+                let out_w = &mut self.prev_tree[idx.0];
+                if out_w.capture_mouse.contains(MouseActions::DRAG_OUT) {
+                    report_event(out_w, MouseActions::DRAG_OUT, self.mouse_pos);
 
-                    if w.capture_mouse.contains(MouseActions::SCROLL) {
-                        report_event(w, MouseActions::SCROLL, self.mouse_pos);
-                        w.scroll = mem::take(&mut scroll);
+                    // Scroll in the correct widget when dragging a scroll bar.
+                    if out_w.capture_mouse.contains(MouseActions::SCROLL) {
+                        report_event(out_w, MouseActions::SCROLL, self.mouse_pos);
+                        out_w.scroll = mem::take(&mut scroll);
                     }
-                } else {
-                    self.mouse_drag_widget = None;
+
+                    if self.mouse_drop_pos.is_none() {
+                        // Keep dragging.
+                        self.mouse_drag_out_widget = Some(identity);
+                    }
+
+                    let what = out_w.drag_out_what;
+                    if what != DragWhat::NoDrop {
+                        // DRAG_IN and DROP.
+                        let in_pos = self.mouse_drop_pos.clone().unwrap_or(self.mouse_pos.clone());
+                        let mut in_idx = if in_pos == self.mouse_pos {
+                            hovered_idx
+                        } else {
+                            self.find_widget_at_cursor(in_pos)
+                        };
+
+                        while in_idx.is_valid() {
+                            let in_w = &mut self.prev_tree[in_idx.0];
+                            if in_w.capture_mouse.contains(MouseActions::DRAG_IN) {
+                                in_w.drag_in_what = what;
+                                report_event(in_w, MouseActions::DRAG_IN, in_pos);
+
+                                if self.mouse_drop_pos.is_some() {
+                                    report_event(in_w, MouseActions::DROP, in_pos);
+                                }
+
+                                // This may become a problem: maybe under the cursor there are multiple widgets with DRAG_IN,
+                                // but only one of them is interested in this DragWhat. We may have to add something like
+                                // a bitmask in DragWhat to determine which DRAG_IN widgets are interested in which DragWhat values.
+                                break;
+                            }
+
+                            in_idx = in_w.parent;
+                        }
+                    }
                 }
-            } else {
-                self.mouse_drag_widget = None;
             }
         }
+        self.mouse_drop_pos = None;
 
-        let mut hover = true;
-        if self.mouse_drag_widget.is_some() {
-            scroll = 0;
-            hover = false;
-        }
+        let mut hover = self.mouse_drag_out_widget.is_none();
         let mut idx = hovered_idx;
         while idx.is_valid() {
             let w = &mut self.prev_tree[idx.0];
@@ -1299,7 +1366,7 @@ impl UI {
                 report_event(w, MouseActions::HOVER, self.mouse_pos);
                 hover = false;
             }
-            if self.mouse_drag_widget.is_none() && w.capture_mouse.contains(MouseActions::HOVER_SUBTREE) {
+            if self.mouse_drag_out_widget.is_none() && w.capture_mouse.contains(MouseActions::HOVER_SUBTREE) {
                 report_event(w, MouseActions::HOVER_SUBTREE, self.mouse_pos);
             }
             if scroll != 0 && w.capture_mouse.contains(MouseActions::SCROLL) {

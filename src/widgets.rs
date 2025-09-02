@@ -109,7 +109,7 @@ pub fn scrolling_navigation(scroll: &mut isize, scroll_to: Option<Range<isize>>,
                 assert!(slider_y >= 0 && slider_y <= slider_range);
 
                 let clicked = ui.check_mouse(MouseActions::CLICK);
-                if let Some([_, y]) = ui.check_drag() {
+                if let Some([_, y]) = ui.check_drag_out(DragWhat::NoDrop) {
                     let a = ui.palette.selected;
                     let w = ui.cur_mut();
                     w.style_adjustment.update(a);
@@ -974,7 +974,7 @@ impl TextInput {
             ui.focus();
 
             let clicked = ui.check_mouse(MouseActions::CLICK);
-            if let Some(pos) = ui.check_drag() {
+            if let Some(pos) = ui.check_drag_out(DragWhat::NoDrop) {
                 self.cursor = self.coordinates_to_offset(pos);
                 if clicked {
                     self.mark = self.cursor;
@@ -1274,7 +1274,7 @@ impl TextInput {
         ui.get_mut(content_widget).draw_cursor_if_focused = Some(cursor_pos);
 
         // Vertical and horizontal scrolling.
-        let scroll_wheel_widget = content_widget; // same widget where MouseEvent::DRAG is captured, to make scrolling work while dragging
+        let scroll_wheel_widget = content_widget; // same widget where MouseEvent::DRAG_OUT is captured, to make scrolling work while dragging
         if self.multiline {
             let scroll_to = if self.scroll_to_cursor {
                 Some(cursor_pos[1]..cursor_pos[1]+1)

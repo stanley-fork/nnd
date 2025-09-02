@@ -339,7 +339,7 @@ Misc:
  * `my_array_or_slice.#len` is the number of elements in an array or slice. `&my_array_or_slice[0]` is the start address. (Slice is a built-in type that can only be produced by pretty-printers.)
  * `try(a, b, ...)` takes any number of expressions and returns the result of the first expression that evaluates without errors. If all expressions fail, returns 0. Useful in breakpoint conditions, e.g. when relying on auto-downcasting to concrete types."###),
         HelpParagraph::Files => styled_write!(text, palette.default, r###"The debugger creates directory ~/.nnd/ and stores a few things there, such as log file and saved state (watches, breakpoints, open tabs).
-It doesn't create any other files or make any other changes to your system.
+It doesn't create files anywhere else or make any other changes to your system.
 
 Key bindings can be customized by creating ~/.nnd/keys . Read the comments in ~/.nnd/keys.default to get started.
 
@@ -353,7 +353,7 @@ The session directory also contains these files:
 
 On startup, the debugger picks the session-name to use, which can be controlled using `--session` (aka `-n`) command line argument:
  * If --session=name is provided, this name is used (with prefix "sess-" prepended to avoid name collisions with non-session files).
- * If no --session is provided, a numeric session-name is picked automatically. When only one nnd is started, it'll use '~/.nnd/0'. If a second nnd is started while the first is still running, it'll get '~/.nnd/1/', etc.
+ * If no --session is provided, a numeric session-name is picked automatically. When only one nnd is started, it'll use '~/.nnd/0/'. If a second nnd is started while the first is still running, it'll use '~/.nnd/1/', etc.
    After an nnd process exits, the directory can be reused.
    E.g. if you start a few instances of nnd, then quit them all, then start them again in the same order, they'll reuse the same sessions in the same order.
  * If --session=-, a "temporary" session is used, named "temp-<number>". The only difference from default mode is that state is not saved.
@@ -361,7 +361,7 @@ On startup, the debugger picks the session-name to use, which can be controlled 
 
 Session directory path is shown in UI in the status window (on the left).
 
-When using `sudo nnd -p`, keep in mind that the ~/.nnd` will be in the home directory of the root user, not the current user."###),
+When using `sudo nnd -p`, keep in mind that the `~/.nnd` will be in the home directory of the root user, not the current user."###),
         HelpParagraph::Tty => styled_write!(text, palette.default, r###"The debugger occupies the whole terminal with its TUI. But what if the debugged program also wants to use the terminal in an interactive way?
 E.g. how to use nnd to debug itself?
 
