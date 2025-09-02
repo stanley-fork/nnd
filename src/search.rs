@@ -622,6 +622,7 @@ fn fuzzy_match(haystack: &[u8], needle_padded: &PaddedString, case_sensitive: bo
     Some((case << 61) | (extra << 32) | haystack.len())
 }
 
+// If case sensitive is false, `needle` must be in lower case.
 pub fn memmem_maybe_case_sensitive(haystack: &[u8], needle: &PaddedString, case_sensitive: bool) -> Option<usize> {
     // Check at runtime if AVX2 is supported.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -746,7 +747,7 @@ fn memmem_maybe_case_sensitive_fallback(haystack: &[u8], needle: &PaddedString, 
     } else {
         'outer: for i in 0..=haystack.len() - needle.len() {
             for j in 0..needle.len() {
-                if !haystack[i + j].eq_ignore_ascii_case(&needle[j]) {
+                if haystack[i + j].to_ascii_lowercase() != needle[j] {
                     continue 'outer;
                 }
             }
