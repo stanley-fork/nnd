@@ -297,8 +297,9 @@ fn main() {
     }
 
     if let Some(v) = tty_file {
-        settings.stdin_file = Some(v.clone());
-        settings.stdout_file = Some(v);
+        if settings.stdin_file.is_none() { settings.stdin_file = Some(v.clone()); }
+        if settings.stdout_file.is_none() { settings.stdout_file = Some(v.clone()); }
+        if settings.stderr_file.is_none() { settings.stderr_file = Some(v.clone()); }
     }
 
     if attach_pid.is_none() && command_line.is_none() && core_dump_path.is_none() {

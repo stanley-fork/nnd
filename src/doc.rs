@@ -100,7 +100,7 @@ nnd --dump-core [--mode=direct|live|fork] -p pid > out   - instead of running th
 
 Additional arguments:
 --stdin/--stdout/--stderr path   - redirect stdin/stdout/stderr to file
---tty path   - redirect both stdin and stdout to path, see --help-tty
+--tty path   - redirect stdin, stdout, and stderr to path, see --help-tty
 -s   - stop on main() (only applies to the first time the program starts; when starting it again from UI, press 'step' key instead of 'run' to stop on main())
 -S   - stop early in process startup sequence (long before main(), but after loading dynamic libraries)
 -d path   - directory in which to look for source code; if specified multiple times, multiple directories will be searched; default: current directory
@@ -340,7 +340,7 @@ Each session can have at most one debugger process running at any given time (sy
 The session directory also contains these files:
  * 'stdout', 'stderr' - redirected stdout and stderr of the debugged program, unless overridden with --stdout/--stderr/--tty.
    (stdin is redirected to /dev/null by default.)
- * 'log' - some messages from the debugger itself. Sometimes useful for debugging the debugger. Sometimes there are useful stats about debug info.
+ * 'log' - diagnostic messages from the debugger itself. Sometimes useful for debugging the debugger. Sometimes there are useful stats about debug info.
    On crash, error message and stack trace go to this file. Please include this file when reporting bugs, especially crashes.
 
 On startup, the debugger picks the session-name to use, which can be controlled using `--session` (aka `-n`) command line argument:
@@ -365,13 +365,15 @@ But what if you need to set breakpoints before the program starts, e.g. to debug
      $ ls -l /proc/$$/fd | grep /dev/pts/
     For example, suppose this outputs /dev/pts/2 . You can also double-check this with: `echo henlo > /dev/pts/2` - if the text appears in the correct terminal then it's the correct path.
  3. Pacify the shell in this terminal window (to prevent it from eating input):
-     $ sleep 1000000000
+     $ sleep inf
  4. In another terminal window (B) run the debugger:
      $ nnd --tty /dev/pts/2 the_program_to_debug
  5. Now you have the debugger running in window B while the debugged program inhabits the terminal in window A
     (which will come to life when you resume the program in the debugger, `sleep` notwithstanding).
 
 The latter approach is often more convenient than -p, even when both approaches are viable.
+
+This doesn't work if the program uses /dev/tty, which doesn't get redirected.
 
 (This can even be chained multiple levels deep: `nnd --tty /dev/pts/1 nnd --tty /dev/pts/2 my_program`. The longest chain I've used in practice is 4 nnd-s + 1 other program.)"###),
         HelpParagraph::Features => styled_write!(text, palette.default, r###"Appendix: raw list of features (optional reading) (a little outdated)
