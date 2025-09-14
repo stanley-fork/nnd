@@ -35,6 +35,7 @@ zig pretty-printers
 support gnu_debugaltlink, as found in zsh in debuginfod
 output window (plain text)
 get debuglink binaries from debuginfod
+reverse --tty mode: run debugger in another window and the debuggee in current window
 "Expected an attribute value to be a string form" on zsh
 buffer input when program is quitting, especially k+r and steps
 test with breakpad minidumps

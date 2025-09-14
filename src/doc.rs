@@ -1,5 +1,5 @@
 use crate::{error::*, terminal::*, log::*, common_ui::*, settings::*, imgui::*, ui::*, *};
-use std::{io, io::Write, mem, ops::Range};
+use std::{io, io::Write, mem, ops::Range, fmt::Write as fmtWrite};
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub enum HelpParagraph {
@@ -445,25 +445,42 @@ pub fn run_input_echo_tool() -> Result<()> {
     configure_terminal(MouseMode::Disabled)?;
 
     let mut reader = InputReader::new();
-    let mut keys: Vec<KeyEx> = Vec::new();
+    let mut lines: Vec<String> = Vec::new();
     let mut prof = ProfileBucket::invalid();
     let mut commands: Vec<u8> = Vec::new();
     loop {
         // Read keys.
         let mut evs: Vec<Event> = Vec::new();
-        reader.read(&mut evs, &mut prof)?;
+        let mut raw: Vec<(Vec<u8>, /*skipped*/ bool)> = Vec::new();
+        reader.read(&mut evs, &mut prof, Some(&mut raw))?;
 
-        // Exit on 'q'.
-        for ev in evs {
-            if let Event::Key(key) = ev {
-                if key.key == Key::Char('q') && key.mods.is_empty() {
-                    return Ok(());
-                }
-                keys.push(key);
+        let mut evs_idx = 0;
+        for (bytes, skipped) in raw {
+            let mut line;
+            if skipped {
+                line = "unknown".to_string();
+            } else {
+                line = match evs[evs_idx] {
+                    Event::Key(key) => {
+                        // Exit on 'q'.
+                        if key.key == Key::Char('q') && key.mods.is_empty() {
+                            return Ok(());
+                        }
+                        format!("{}", key)
+                    }
+                    Event::Mouse(mouse) => format!("{:?}", mouse),
+                    Event::FocusIn => "focus in".to_string(),
+                    Event::FocusOut => "focus out".to_string(),
+                };
+                evs_idx += 1;
             }
+            write!(line, "  0x{}", hexdump(&bytes, 100)).unwrap();
+            lines.push(line);
         }
-        if keys.len() > 200 {
-            keys.drain(..keys.len()-200);
+        assert_eq!(evs_idx, evs.len());
+
+        if lines.len() > 200 {
+            lines.drain(..lines.len()-200);
         }
 
         // Render.
@@ -471,8 +488,8 @@ pub fn run_input_echo_tool() -> Result<()> {
         write!(commands, "{}\x1B[{};{}H{}", CURSOR_HIDE, 1, 1, "input echo tool; press some keys, and their names will show up here, in a format suitable for the keys config file").unwrap();
         write!(commands, "\x1B[{};{}H{}", 2, 1, "some key combinations are indistinguishable due to ANSI escape codes, e.g. ctrl-j and enter").unwrap();
         write!(commands, "\x1B[{};{}H{}", 3, 1, "press 'q' to exit").unwrap();
-        for (y, key) in keys.iter().rev().enumerate() {
-            write!(commands, "\x1B[{};{}H\x1B[K{}", y + 4 + 1, 1, key).unwrap();
+        for (y, line) in lines.iter().rev().enumerate() {
+            write!(commands, "\x1B[{};{}H\x1B[K{}", y + 4 + 1, 1, line).unwrap();
         }
 
         // Output.

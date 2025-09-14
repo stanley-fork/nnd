@@ -555,7 +555,7 @@ impl InputReader {
     pub fn new() -> Self { Self {start: 0, end: 0, buf: [0; 128], saw_extra_escape: false} }
 
     // Reads readily available input from stdin, doesn't block.
-    pub fn read(&mut self, out: &mut Vec<Event>, prof: &mut ProfileBucket) -> Result<usize> {
+    pub fn read(&mut self, out: &mut Vec<Event>, prof: &mut ProfileBucket, mut out_raw_bytes: Option<&mut Vec<(Vec<u8>, /*skipped*/ bool)>>) -> Result<usize> {
         let mut bytes_read = 0usize;
         loop {
             if self.start * 2 > self.buf.len() {
@@ -572,11 +572,11 @@ impl InputReader {
             bytes_read += n;
 
             loop {
-                let start = self.start;
+                let mut start = self.start;
                 let mut e = self.parse_event();
 
                 // Fix up weird escape sequences like <esc><esc>[5~ , where the extra <esc> means ALT key.
-                // Apply this only to few keys where I was this behavior (in iTerm2).
+                // Apply this only to few keys where I saw this behavior (in iTerm2).
                 if self.saw_extra_escape {
                     if let Ok(e) = &mut e {
                         if let Event::Key(k) = e {
@@ -587,13 +587,26 @@ impl InputReader {
                         }
                     }
                 }
-                if mem::take(&mut self.saw_extra_escape) {
+                if mem::take(&mut self.saw_extra_escape) && e != Err(true) {
                     out.push(Event::Key(Key::Escape.plain()));
+                    if let Some(ref mut raw) = out_raw_bytes {
+                        raw.push((self.buf[start..start+1].to_owned(), false));
+                    }
+                    start += 1;
                 }
 
                 match e {
-                    Ok(e) => out.push(e),
-                    Err(false) => (), // quietly skip unrecognized escape sequence
+                    Ok(e) => {
+                        out.push(e);
+                        if let Some(ref mut raw) = out_raw_bytes {
+                            raw.push((self.buf[start..self.start].to_owned(), false));
+                        }
+                    }
+                    Err(false) => { // quietly skip unrecognized escape sequence
+                        if let Some(ref mut raw) = out_raw_bytes {
+                            raw.push((self.buf[start..self.start].to_owned(), true));
+                        }
+                    }
                     Err(true) => {
                         // Do rollback here so that parse_event() can just eat chars and not worry about peek/advance.
                         self.start = start;

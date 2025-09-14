@@ -218,7 +218,7 @@ impl DebuggerUI {
 
     pub fn buffer_input(&mut self, prof: &mut ProfileBucket) -> Result<bool> {
         let mut evs: Vec<Event> = Vec::new();
-        let bytes = self.input.read(&mut evs, prof)?;
+        let bytes = self.input.read(&mut evs, prof, None)?;
         prof.ui_input_bytes += bytes;
 
         let mut significant = false;
