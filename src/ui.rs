@@ -1946,6 +1946,7 @@ impl WindowContent for DisassemblyWindow {
         let go_to_address_bar = ui.add(widget!().fixed_height(0));
         let content_root = ui.add(widget!().height(AutoSize::Remainder(1.0)));
 
+        let mut autoscroll_source_even_after_scrolling_disassembly = false;
         with_parent!(ui, go_to_address_bar, {
             ui.multifocus();
             if self.go_to_address_bar.editing {
@@ -1957,6 +1958,7 @@ impl WindowContent for DisassemblyWindow {
                         match self.find_address(&self.go_to_address_bar.text.text, debugger) {
                             Ok(target) => {
                                 state.should_scroll_disassembly = Some((Ok(target), /*only_if_on_error_tab*/ false));
+                                autoscroll_source_even_after_scrolling_disassembly = true;
                                 close = true;
                             }
                             Err(e) => self.go_to_address_error = Some(e),
@@ -1988,7 +1990,7 @@ impl WindowContent for DisassemblyWindow {
         ui.layout_children(Axis::Y);
 
         let mut scroll_to_addr: Option<(usize, u16)> = None;
-        let suppress_code_autoscroll = state.should_scroll_disassembly.is_some();
+        let suppress_code_autoscroll = state.should_scroll_disassembly.is_some() && !autoscroll_source_even_after_scrolling_disassembly;
         if let Some((target, only_if_on_error_tab)) = mem::take(&mut state.should_scroll_disassembly) {
             let mut tab_to_restore: Option<usize> = None;
             if only_if_on_error_tab {
