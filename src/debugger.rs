@@ -1280,7 +1280,7 @@ impl Debugger {
             //  even if is_stmt flag is not set.)
             if self.context.settings.steps_stop_only_on_statements && !use_line_number_with_column {
                 step.stop_only_on_statements = true;
-                step.binary_id = frame.binary_id.clone().unwrap();
+                step.binary_id = frame.binary_id.clone()?;
                 step.start_line = match &subframe.line {
                     Some(l) => Some(l.line),
                     None => None,
@@ -1289,7 +1289,7 @@ impl Debugger {
             }
 
             let function_idx = stack.subframes[frame.subframes.end - 1].function_idx.clone()?;
-            let binary = match self.symbols.get(frame.binary_id.clone().unwrap()) {
+            let binary = match self.symbols.get(frame.binary_id.clone()?) {
                 None => return err!(Internal, "binary was unloaded after generating backtrace"),
                 Some(x) => x };
             let symbols = binary.symbols.as_ref_clone_error()?;
@@ -1728,8 +1728,14 @@ impl Debugger {
 
             // Would be nice to fall back to unwinding using some default ABI (rbp and callee cleanup, or something).
             // But for now we just stop if we can't find the binary (may be a problem for JIT-generated code) or .eh_frame section in it.
-            let (_, mut static_pseudo_addr, binary, _) = self.addr_to_binary(pseudo_addr)?;
-            frame.binary_id = Some(binary.id);
+            let (_, mut static_pseudo_addr, binary, _) = match self.addr_to_binary(pseudo_addr) {
+                Err(e) => {
+                    frame.binary_id = Err(e.clone());
+                    return Err(e);
+                }
+                Ok(x) => x,
+            };
+            frame.binary_id = Ok(binary.id);
             frame.addr_static_to_dynamic = binary.addr_map.static_to_dynamic(static_pseudo_addr).wrapping_sub(static_pseudo_addr);
 
             // This populates CFA "register", so needs to happen before symbolizing the frame (because frame_base expression might use CFA).

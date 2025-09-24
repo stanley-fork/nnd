@@ -509,7 +509,7 @@ impl EvalState {
             *found = true;
             if meta {
                 let type_ = dwarf_context.symbols.clone().unwrap().builtin_types.meta_variable;
-                let blob = ValueBlob::from_two_usizes([frame.binary_id.clone().unwrap(), v as *const Variable as usize]);
+                let blob = ValueBlob::from_two_usizes([frame.binary_id.clone()?, v as *const Variable as usize]);
                 return Ok(Value {val: AddrOrValueBlob::Blob(blob), type_, flags: ValueFlags::empty()});
             }
             if only_type {
@@ -581,10 +581,7 @@ impl EvalContext<'_> {
         let selected_frame = subframe.frame_idx;
         let frame = &self.stack.frames[selected_frame];
         let function_idx = self.stack.subframes[frame.subframes.end-1].function_idx.clone()?;
-        let binary_id = match frame.binary_id.clone() {
-            None => return err!(ProcessState, "no binary for address {:x}", frame.pseudo_addr),
-            Some(b) => b,
-        };
+        let binary_id = frame.binary_id.clone()?;
         let subfunction_idx = match &subframe.subfunction_idx {
             None => return err!(Dwarf, "function has no debug info"),
             Some(x) => *x,

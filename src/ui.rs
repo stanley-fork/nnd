@@ -2033,7 +2033,7 @@ impl WindowContent for DisassemblyWindow {
         state.selected_addr = state.stack.frames.get(state.selected_frame).and_then(|f| {
             let sf = &state.stack.subframes[f.subframes.end-1];
             match (&f.binary_id, &sf.function_idx) {
-                (Some(b), Ok(function_idx)) => Some((*b, *function_idx, f.pseudo_addr)),
+                (Ok(b), Ok(function_idx)) => Some((*b, *function_idx, f.pseudo_addr)),
                 _ => None,
             }
         });
@@ -2160,7 +2160,7 @@ impl WindowContent for DisassemblyWindow {
 
         let mut ip_lines: Vec<(usize, /*selected*/ bool)> = Vec::new();
         for (idx, frame) in state.stack.frames.iter().enumerate() {
-            if frame.binary_id.as_ref() == Some(&binary.id) {
+            if frame.binary_id.as_ref().is_ok_and(|b| b == &binary.id) {
                 let static_pseudo_addr = frame.pseudo_addr.wrapping_sub(frame.addr_static_to_dynamic);
                 let (line, found) = disas.static_pseudo_addr_to_line(static_pseudo_addr);
                 if found {
@@ -2464,6 +2464,8 @@ impl WindowContent for StatusWindow {
 
         if state.last_error != "" {
             ui_writeln!(ui, error, "{}", state.last_error);
+        } else {
+            ui.text.close_line();
         }
         ui.text.close_line();
         let end = ui.text.num_lines();
@@ -3120,8 +3122,8 @@ impl WindowContent for ThreadsWindow {
                     table.text_cell(ui);
 
                     match &f.binary_id {
-                        Some(binary_id) => ui_writeln!(ui, default_dim, "{}", debugger.symbols.get(*binary_id).unwrap().priority_idx + 1),
-                        None => ui_writeln!(ui, default_dim, "?"),
+                        Ok(binary_id) => ui_writeln!(ui, default_dim, "{}", debugger.symbols.get(*binary_id).unwrap().priority_idx + 1),
+                        Err(_) => ui_writeln!(ui, default_dim, "?"),
                     };
                     table.text_cell(ui);
                 }
@@ -3329,12 +3331,13 @@ impl WindowContent for StackWindow {
             table.text_cell(ui);
 
             if is_inlined {
-                ui.text.close_line();
-            } else if let Some(b) = &frame.binary_id {
-                ui_writeln!(ui, default_dim, "{}", debugger.symbols.get(*b).unwrap().priority_idx + 1);
+                ui.text.close_line()
             } else {
-                ui_writeln!(ui, default_dim, "?");
-            }
+                match &frame.binary_id {
+                    Ok(b) => ui_writeln!(ui, default_dim, "{}", debugger.symbols.get(*b).unwrap().priority_idx + 1),
+                    Err(_) => ui_writeln!(ui, default_dim, "?"),
+                }
+            };
             table.text_cell(ui);
 
             ui_writeln!(ui, default_dim, "{:?}", frame.unwind_source);
@@ -3374,10 +3377,12 @@ impl WindowContent for StackWindow {
             scroll_source_and_disassembly |= cur != self.seen;
             if scroll_source_and_disassembly || rerequest_scroll {
                 state.should_scroll_source = Some((subframe.line.as_ref().map(|line| SourceScrollTarget {path: line.path.clone(), version: line.version.clone(), line: line.line.line()}), !scroll_source_and_disassembly));
-                state.should_scroll_disassembly = Some((match &state.stack.subframes[frame.subframes.end - 1].function_idx {
-                    &Ok(function_idx) => Ok(DisassemblyScrollTarget {binary_id: frame.binary_id.clone().unwrap(), function_idx, static_pseudo_addr: frame.pseudo_addr.wrapping_sub(frame.addr_static_to_dynamic),
-                                                                         subfunction_level: (frame.subframes.end - state.selected_subframe - 1) as u16}),
-                    Err(e) => Err(e.clone()),
+                state.should_scroll_disassembly = Some((match (&frame.binary_id, &state.stack.subframes[frame.subframes.end - 1].function_idx) {
+                    (Err(e), _) => Err(e.clone()),
+                    (_, Err(e)) => Err(e.clone()),
+                    (&Ok(binary_id), &Ok(function_idx)) => Ok(DisassemblyScrollTarget {
+                        binary_id, function_idx, static_pseudo_addr: frame.pseudo_addr.wrapping_sub(frame.addr_static_to_dynamic),
+                        subfunction_level: (frame.subframes.end - state.selected_subframe - 1) as u16}),
                 }, !scroll_source_and_disassembly));
             }
             self.seen = cur;

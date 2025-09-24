@@ -46,7 +46,7 @@ pub struct StackFrame {
     pub lsda: Option<gimli::Pointer>,
 
     // If we found a mapped binary corresponding to this address, these two are set.
-    pub binary_id: Option<usize>,
+    pub binary_id: Result<usize>,
     pub addr_static_to_dynamic: usize,
 
     // Indices in StackTrace.subframes, from innermost to outermost inlined functions. Last one represents the frame. Not empty.
@@ -55,7 +55,7 @@ pub struct StackFrame {
     // How we stepped from this stack frame to the next. Just to show in UI.
     pub unwind_source: UnwindInfoSource,
 }
-impl Default for StackFrame { fn default() -> Self { Self {addr: 0, pseudo_addr: 0, regs: Registers::default(), frame_base: err!(Dwarf, "no frame base"), binary_id: None, addr_static_to_dynamic: 0, subframes: 0..0, fde_initial_address: 0, lsda: None, unwind_source: UnwindInfoSource::None} } }
+impl Default for StackFrame { fn default() -> Self { Self {addr: 0, pseudo_addr: 0, regs: Registers::default(), frame_base: err!(Dwarf, "no frame base"), binary_id: err!(ProcessState, "address not mapped to a binary"), addr_static_to_dynamic: 0, subframes: 0..0, fde_initial_address: 0, lsda: None, unwind_source: UnwindInfoSource::None} } }
 
 #[derive(Clone)]
 pub struct StackSubframe {
@@ -106,7 +106,7 @@ pub struct FileLineInfo {
 #[derive(Copy, Clone, Eq, PartialEq)]
 enum SpecialUnwindLocation {
     None,
-    
+
     // Signal trampoline:
     //   mov rax, 15
     //   syscall
