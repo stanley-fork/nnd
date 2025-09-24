@@ -771,9 +771,11 @@ fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut Form
             styled_write!(state.out, state.palette.value_misc, "0x{:x} ", value.get_usize_prefix());
             styled_write!(state.out, state.palette.error, "<unknown type>");
         }
-        Type::Primitive(p) => match value.get_usize() {
-            Ok(_) if size == 0 => styled_write!(state.out, state.palette.value_misc, "()"), // covers things like void, decltype(nullptr), rust empty tuple, rust `!` type
-            Ok(mut x) if size <= 8 => {
+        // `value` can be longer than the type's `size` e.g. if a 4-byte value is stored in an 8-byte register.
+        // It can even be longer than 8 bytes if it's stored in a wider register, e.g. float stored in zmm0 (aka xmm0 or ymm0).
+        Type::Primitive(p) => match value.get_usize_prefix() {
+            _ if size == 0 => styled_write!(state.out, state.palette.value_misc, "()"), // covers things like void, decltype(nullptr), rust empty tuple, rust `!` type
+            mut x if size <= 8 => {
                 let as_number = v.flags.intersects(ValueFlags::RAW | ValueFlags::HEX | ValueFlags::BIN);
                 if p.contains(PrimitiveFlags::FLOAT) {
                     match size {
@@ -809,8 +811,7 @@ fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut Form
                     format_integer(x, size, signed, v.flags, state.out, state.palette);
                 }
             }
-            Ok(_) => styled_write!(state.out, state.palette.error, "<bad size: {}>", size),
-            Err(e) => styled_write!(state.out, state.palette.error, "<{}>", e),
+            _ => styled_write!(state.out, state.palette.error, "<bad size: {}>", size),
         }
         Type::Pointer(p) => match value.get_usize() {
             Ok(x) => if p.flags.contains(PointerFlags::REFERENCE) {

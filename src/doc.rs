@@ -313,8 +313,8 @@ Pretty-printers:
    newer or older than mine - please report and I'll probably make pretty-printers work for it too.
  * Currently no support for custom pretty-printers.
  * All of the above transformations can be disabled by adding ".#r" to the expression.
- * Pretty-printers apply to intermediate values as well. E.g. 'my_vector[42]' uses a pretty-printer to turn the vector into array before applying the [] operator to it;
-   to access fields of the original struct, use #r: 'my_vector.#r.__M_begin'.
+ * Pretty-printers apply to intermediate values as well. E.g. 'my_vector[42]' uses a pretty-printer to turn the vector into a slice before applying the [] operator to it.
+   Fields of the original struct are accessible too: `my_vector.__M_begin` works, as does `my_vector.#r.__M_begin` if you want to be more explicit.
 
 Value modifiers:
  * 'value.#x' to print in hexadecimal. Affects numbers, strings, and byte arrays.
@@ -329,6 +329,7 @@ Value modifiers:
  * 'value.#p' is the opposite of '.#r'. Can be useful with field access: 'my_struct.#r.my_field.#p' re-enables pretty-printing after disabling it to access a raw field.
 
 Misc:
+ * `my_array_or_slice.#len` is the number of elements in an array or slice. `&my_array_or_slice[0]` is the start address. (Slice is a built-in type that can only be produced by pretty-printers.)
  * `try(a, b, ...)` takes any number of expressions and returns the result of the first expression that evaluates without errors. If all expressions fail, returns 0. Useful in breakpoint conditions, e.g. when relying on auto-downcasting to concrete types."###),
         HelpParagraph::Files => styled_write!(text, palette.default, r###"The debugger creates directory ~/.nnd/ and stores a few things there, such as log file and saved state (watches, breakpoints, open tabs).
 It doesn't create any other files or make any other changes to your system.

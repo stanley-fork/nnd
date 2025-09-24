@@ -138,6 +138,7 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
         AST::Field {name, quoted} => {
             let mut val = eval_expression(expr, node.children[0], state, context, false)?; // disable only_type here so that pretty-printers don't have to support it
             if !quoted {
+                let mut found = true;
                 match name.as_str() {
                     "#r" => {
                         if val.flags.contains(ValueFlags::PRETTY) {
@@ -145,7 +146,6 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                         } else {
                             val.flags.insert(ValueFlags::RAW);
                         }
-                        return Ok(val);
                     }
                     "#p" => {
                         if val.flags.contains(ValueFlags::RAW) {
@@ -153,36 +153,72 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                         } else {
                             val.flags.insert(ValueFlags::PRETTY);
                         }
-                        return Ok(val);
                     }
-                    "#x" => { val.flags.insert(ValueFlags::HEX); return Ok(val); }
-                    "#b" => { val.flags.insert(ValueFlags::BIN); return Ok(val); }
-                    "#be" => { val.flags.insert(ValueFlags::BIG_ENDIAN); return Ok(val); }
-                    "#le" => { val.flags.remove(ValueFlags::BIG_ENDIAN); return Ok(val); }
-                    _ => (),
+                    "#x" => val.flags.insert(ValueFlags::HEX),
+                    "#b" => val.flags.insert(ValueFlags::BIN),
+                    "#be" => val.flags.insert(ValueFlags::BIG_ENDIAN),
+                    "#le" => val.flags.remove(ValueFlags::BIG_ENDIAN),
+                    _ => found = false,
+                }
+                if found {
+                    return Ok(val);
                 }
             }
-            follow_references_and_prettify(&mut val, /*pointers_too*/ true, state, context)?;
-            let type_ = unsafe {&*val.type_};
-            match &type_.t {
-                Type::Struct(s) => {
-                    let field_idx = match s.fields().iter().position(|f| f.name == name) {
-                        Some(x) => x,
-                        None => return err!(TypeMismatch, "field {} not found", name),
-                    };
-                    let field = &s.fields()[field_idx];
-                    let v = get_struct_field(&val.val, field, &mut context.memory)?;
-                    // Should the field inherit flags from the struct? E.g. should `foo.#r._M_begin` be printed as raw?
-                    // Unclear, but this should be kept consistent between expression evaluation and value printing (format_value()).
-                    // Currently we inherit.
-                    Ok(Value {val: v, type_: field.type_, flags: val.flags.inherit()})
+            let mut values_to_check: Vec<Value> = Vec::new();
+            follow_references_and_prettify(&mut val, Some(&mut values_to_check), /*pointers_too*/ true, state, context)?;
+            // Look for the field in `val`, then in `additional_values` in reverse order (from inner to outer).
+            values_to_check.push(val);
+            let mut value_has_fields_at_all = false;
+            for val in values_to_check.iter().rev() {
+                let type_ = unsafe {&*val.type_};
+                return match &type_.t {
+                    Type::Struct(s) => {
+                        value_has_fields_at_all = true;
+                        let field_idx = match s.fields().iter().position(|f| f.name == name) {
+                            Some(x) => x,
+                            None => continue,
+                        };
+                        let field = &s.fields()[field_idx];
+                        let v = get_struct_field(&val.val, field, &mut context.memory)?;
+                        // Should the field inherit flags from the struct? E.g. should `foo.#r._M_begin` be printed as raw?
+                        // Unclear, but this should be kept consistent between expression evaluation and value printing (format_value()).
+                        // Currently we inherit.
+                        Ok(Value {val: v, type_: field.type_, flags: val.flags.inherit()})
+                    }
+                    Type::Slice(s) if !quoted => {
+                        value_has_fields_at_all = true;
+                        match name.as_str() {
+                            "#len" => {
+                                let len = val.val.bit_range(8..16, &mut context.memory)?;
+                                Ok(Value {val: AddrOrValueBlob::Blob(ValueBlob::new(len)), type_: state.builtin_types.u64_, flags: ValueFlags::empty()})
+                            }
+                            _ => continue,
+                        }
+                    }
+                    Type::Array(a) if !quoted => {
+                        value_has_fields_at_all = true;
+                        match name.as_str() {
+                            "#len" => {
+                                if !a.flags.contains(ArrayFlags::LEN_KNOWN) {
+                                    return err!(TypeMismatch, "can't take length of unsized array");
+                                }
+                                Ok(Value {val: AddrOrValueBlob::Blob(ValueBlob::new(a.len)), type_: state.builtin_types.u64_, flags: ValueFlags::empty()})
+                            }
+                            _ => continue,
+                        }
+                    }
+                    _ => continue,
                 }
-                _ => return err!(TypeMismatch, "trying to get field of {}", type_.t.kind_name()),
+            }
+            return if value_has_fields_at_all {
+                err!(TypeMismatch, "field {} not found", name)
+            } else {
+                err!(TypeMismatch, "trying to get field of {}", unsafe {&*values_to_check.last().unwrap().type_}.t.kind_name())
             }
         }
         &AST::TupleIndexing(field_idx) => {
             let mut val = eval_expression(expr, node.children[0], state, context, false)?;
-            follow_references_and_prettify(&mut val, /*pointers_too*/ true, state, context)?;
+            follow_references_and_prettify(&mut val, None, /*pointers_too*/ true, state, context)?;
             let type_ = unsafe {&*val.type_};
             match &type_.t {
                 Type::Struct(s) => {
@@ -217,7 +253,7 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
         }
         &AST::UnaryOperator(op) => {
             let mut val = eval_expression(expr, node.children[0], state, context, false)?;
-            follow_references_and_prettify(&mut val, false, state, context)?;
+            follow_references_and_prettify(&mut val, None, false, state, context)?;
             let type_ = unsafe {&*val.type_};
             match op {
                 UnaryOperator::Dereference => match &type_.t {
@@ -271,7 +307,7 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
         }
         AST::TypeCast => {
             let mut val = eval_expression(expr, node.children[0], state, context, false)?;
-            follow_references_and_prettify(&mut val, false, state, context)?;
+            follow_references_and_prettify(&mut val, None, false, state, context)?;
             let type_ = eval_type(expr, node.children[1], state, context)?;
             let is_reinterpretable = |type_: *const TypeInfo, to: bool| -> bool {
                 match unsafe {&(*type_).t} {
@@ -368,7 +404,7 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                     }
                     let mut val = eval_expression(expr, node.children[1], state, context, false)?;
                     if val.flags.contains(ValueFlags::PRETTY) {
-                        follow_references_and_prettify(&mut val, /*pointers_too*/ false, state, context)?;
+                        follow_references_and_prettify(&mut val, None, /*pointers_too*/ false, state, context)?;
                     }
                     state.variables.insert(name.clone(), val.clone());
                     Ok(val)
@@ -381,14 +417,14 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
         }
         &AST::BinaryOperator(op) => {
             let mut lhs = eval_expression(expr, node.children[0], state, context, false)?;
-            follow_references_and_prettify(&mut lhs, false, state, context)?;
+            follow_references_and_prettify(&mut lhs, None, false, state, context)?;
             match op { // short-circuiting
                 BinaryOperator::LazyAnd | BinaryOperator::LazyOr => {
                     let mut x = to_basic(&lhs, &mut context.memory, "&&/||")?.cast_to_usize() != 0;
                     if x == (op == BinaryOperator::LazyAnd) {
                         // Not ideal that short-circuiting also skips typechecking.
                         let rhs = eval_expression(expr, node.children[1], state, context, false)?;
-                        follow_references_and_prettify(&mut lhs, false, state, context)?;
+                        follow_references_and_prettify(&mut lhs, None, false, state, context)?;
                         x = to_basic(&rhs, &mut context.memory, "&&/||")?.cast_to_usize() != 0;
                     }
                     let type_ = state.builtin_types.bool_;
@@ -397,7 +433,7 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                 _ => (),
             }
             let mut rhs = eval_expression(expr, node.children[1], state, context, false)?;
-            follow_references_and_prettify(&mut rhs, false, state, context)?;
+            follow_references_and_prettify(&mut rhs, None, false, state, context)?;
             if op == BinaryOperator::Index || op == BinaryOperator::Slicify {
                 let b = to_basic(&rhs, &mut context.memory, "index with")?;
                 if b.is_f64() { return err!(TypeMismatch, "can't index with float"); }
@@ -415,7 +451,7 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                         }
                     }
                     Type::Array(a) if op == BinaryOperator::Index => {
-                        if a.flags.contains(ArrayFlags::LEN_KNOWN) && idx >= a.len {
+                        if a.flags.contains(ArrayFlags::LEN_KNOWN) && idx >= a.len.max(1) { // allow accessing element 0 of 0-length arrays, just in case
                             return err!(Runtime, "array index out of range: {} >= {}", idx, a.len);
                         }
                         let stride = if a.stride == 0 {unsafe {(*a.type_).calculate_size()}} else {a.stride};
@@ -430,7 +466,7 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                         let blob = lhs.val.into_value(16, &mut context.memory)?;
                         let addr = blob.get_usize_prefix();
                         let len = blob.get_usize_at(8)?;
-                        if idx >= len {
+                        if idx >= len.max(1) { // allow accessing element 0 of empty slice, as a way to get the data pointer
                             return err!(Runtime, "slice index out of range: {} >= {}", idx, len);
                         }
                         Value {val: AddrOrValueBlob::Addr(addr + idx * stride), type_: s.type_, flags: lhs.flags.inherit()}
@@ -702,7 +738,7 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                 }
                 let mut val = eval_expression(expr, node.children[0], state, context, true)?;
                 if val.flags.contains(ValueFlags::PRETTY) {
-                    follow_references_and_prettify(&mut val, /*pointers_too*/ true, state, context)?;
+                    follow_references_and_prettify(&mut val, None, /*pointers_too*/ true, state, context)?;
                 }
                 Ok(Value {val: AddrOrValueBlob::Blob(ValueBlob::new(val.type_ as usize)), type_: state.types.types_arena.add(TypeInfo {name: "type", size: 8, flags: TypeFlags::SIZE_KNOWN, t: Type::MetaType, ..Default::default()}), flags: ValueFlags::empty()})
             }
@@ -748,7 +784,9 @@ fn eval_type(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, context
     }
 }
 
-fn follow_references_and_prettify(val: &mut Value, pointers_too: bool, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
+// `additional_values` are values before prettify_value() was applied. For field access, these are the structs whose fields the user may plausibly be trying to access.
+// E.g. `unique_ptr<vector<int>>` is prettified into a slice, but we want to also allow things like `x._M_t` to access unique_ptr's fields and `x._M_begin` to access vector's fields.
+fn follow_references_and_prettify(val: &mut Value, mut additional_values: Option<&mut Vec<Value>>, pointers_too: bool, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
     for step in 0..100 {
         if unsafe {(*val.type_).t.is_meta()} {
             *val = reflect_meta_value(val, state, context, None);
@@ -759,7 +797,10 @@ fn follow_references_and_prettify(val: &mut Value, pointers_too: bool, state: &m
             let mut _warning = None;
             prettify_value(&mut cow, &mut _warning, state, context)?;
             if let Cow::Owned(v) = cow {
-                *val = v;
+                let prev_val = mem::replace(val, v);
+                if let Some(ref mut additional) = additional_values {
+                    additional.push(prev_val);
+                }
             }
         }
         let type_ = unsafe {&*val.type_};

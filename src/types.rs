@@ -201,6 +201,7 @@ pub enum Type {
     // and we don't spend time recognizing them and converting to slices at symbols loading time.
     // This type is mostly superfluous in the current very-dynamically-typed interpreter, where we can just create a new Array type for each array,
     // but hopefully we'll do something more statically typed later.
+    // TODO: Adding this as a whole new `Type` was probably a mistake, this can just be a struct with two fields and a flag.
     Slice(SliceType),
 }
 impl Type {

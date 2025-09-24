@@ -64,11 +64,10 @@ reordering watches
 reordering tabs
 rearranging windows
 maximizing windows
-meta functions like checking for field presense of superclass type, and also just slice length etc, for use in conditions
+meta functions like checking for field presense of superclass type for use in conditions
 key to freeze value in watches window; can also be used for controlling when to run the expression if it has side effects
 key to add watch value as new watch, maybe cast to type, e.g. *(0x1234 as *DB::Block)
 tooltip in status window showing more log lines with line wrapping
-make return key do something in each window: go from threads to stack -> code -> disassembly -> code; from locals create a watch; from watch sub-value create another watch for that field/element; from breakpoints to code/disassembly/watch (depending on breakpoint type)
 allow expressions (especially conditions) to have multiple statements separated by ';'
 "unexpectedly big memory read" (16 bytes) for f64 local variables on the stack in rust
 some kind of non-stop mode to prevent clickhouse server from losing keeper connection when stepping through the code

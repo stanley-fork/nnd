@@ -86,6 +86,8 @@ int main() {
     std::unordered_map<int, std::string> umap = {{1, "one"}, {2, "two"}};                    // [yes, yes]
     std::unordered_multimap<int, std::string> ummap = {{1, "one"}, {1, "uno"}, {2, "two"}};  // [yes, yes]
 
+    std::unique_ptr<std::vector<int>> pvec(new std::vector<int>{10, 20, 30, 40});
+
     // Discriminated unions.
     std::optional<int> opt = 42;           // [no, no]
     std::variant<int, double> var = 3.14;  // [no, no]
@@ -152,7 +154,7 @@ int main() {
     volatile int dummy2 = vec[0] + arr[0] + *uptr + *sptr + short_str[0] + long_str[0] + pair.first + std::get<0>(tuple) + 
         *opt + (int)std::get<double>(var) + std::any_cast<int>(any_val) + func(1) + 
         bits.count() + c.real() + va[0] + sp[0] + *range.begin() + strview[0] + 
-        wstr[0] + u16str[0] + u32str[0] + (*pv)[0] + mat.size() + mat[10].size();
+        wstr[0] + u16str[0] + u32str[0] + (*pv)[0] + mat.size() + mat[10].size() + pvec->size();
     (void)dummy2;
 
     return 0;
