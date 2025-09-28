@@ -20,6 +20,7 @@ pub enum UnwindInfoSource {
     DebugFrame,
     SigReturn,
     FramePointer,
+    BadFunctionCall,
 }
 
 #[derive(Clone)]
@@ -276,12 +277,12 @@ impl UnwindInfo {
     }
 
     // Assigns cfa and return address in current frame and returns registers for next frame.
-    pub fn step(&self, memory: &mut CachedMemReader, binary: &Binary, scratch: &mut UnwindScratchBuffer, pseudo_addr: usize, frame: &mut StackFrame) -> Result<(Registers, /*is_signal_trampoline*/ bool)> {
+    pub fn step(memory: &mut CachedMemReader, binary: Option<&Binary>, scratch: &mut UnwindScratchBuffer, pseudo_addr: usize, frame: &mut StackFrame) -> Result<(Registers, /*is_signal_trampoline*/ bool)> {
         let addr = frame.regs.get(RegisterIdx::Rip)?.0 as usize;
-        let special = self.recognize_special_location(memory, binary, addr);
+        let special = Self::recognize_special_location(memory, binary.clone(), addr);
 
         if special == SpecialUnwindLocation::SigReturn {
-            let new_regs = self.step_through_sig_return(memory, &mut frame.regs)?;
+            let new_regs = Self::step_through_sig_return(memory, &mut frame.regs)?;
             frame.unwind_source = UnwindInfoSource::SigReturn;
             if let Some((x, dub)) = new_regs.get_option(RegisterIdx::Rip) {
                 frame.regs.set(RegisterIdx::Ret, x, dub);
@@ -289,16 +290,33 @@ impl UnwindInfo {
             return Ok((new_regs, true));
         }
 
-        if let Some(r) = self.step_using_dwarf(memory, binary, scratch, pseudo_addr, frame)? {
-            return Ok(r);
+        if let Some(binary) = binary {
+            match &binary.unwind {
+                Ok(unwind) => if let Some(r) = unwind.step_using_dwarf(memory, binary, scratch, pseudo_addr, frame)? {
+                    return Ok(r);
+                }
+                Err(e) if e.is_loading() => return Err(e.clone()),
+                Err(_) => (),
+            }
         }
 
-        let r = self.step_using_frame_pointer(special, memory, frame)?;
+        let r = Self::step_using_frame_pointer(special, memory, frame)?;
         frame.unwind_source = UnwindInfoSource::FramePointer;
         Ok((r, false))
     }
 
-    fn step_using_frame_pointer(&self, special: SpecialUnwindLocation, memory: &mut CachedMemReader, frame: &mut StackFrame) -> Result<Registers> {
+    pub fn step_from_bad_function_call(memory: &mut CachedMemReader, frame: &mut StackFrame) -> Result<(Registers, /*is_signal_trampoline*/ bool)> {
+        // Assume the code did a `call` on a bad (e.g. null) address. I.e. they pushed return address on the stack and jumped, and no code executed in this thread since then.
+        let rsp = frame.regs.get(RegisterIdx::Rsp)?.0 as usize;
+        let prev_rip = memory.read_usize(rsp)?;
+        let mut new_regs = frame.regs.clone();
+        new_regs.set(RegisterIdx::Rip, prev_rip as u64, /*dubious*/ true);
+        new_regs.set(RegisterIdx::Rsp, rsp as u64 + 8, /*dubious*/ true);
+        frame.unwind_source = UnwindInfoSource::BadFunctionCall;
+        Ok((new_regs, false))
+    }
+
+    fn step_using_frame_pointer(special: SpecialUnwindLocation, memory: &mut CachedMemReader, frame: &mut StackFrame) -> Result<Registers> {
         // push rbp         PreludeStart
         // mov rbp,rsp      PreludeMiddle
         // [function body]
@@ -423,7 +441,7 @@ impl UnwindInfo {
     }
 
     // Look at machine code near the instruction pointer and recognize a few common patterns.
-    fn recognize_special_location(&self, memory: &mut CachedMemReader, binary: &Binary, addr: usize) -> SpecialUnwindLocation {
+    fn recognize_special_location(memory: &mut CachedMemReader, binary: Option<&Binary>, addr: usize) -> SpecialUnwindLocation {
         // Recognize signal trampoline machine code, like GDB does. Because some libc implementations (musl) don't have correct DWARF unwind information for this function.
         const SIG_RETURN_CODE: [u8; 9] = [
             0x48, 0xc7, 0xc0, 0x0f, 0x00, 0x00, 0x00, // mov rax, 15
@@ -459,25 +477,31 @@ impl UnwindInfo {
 
         // Prefer to read the machine code from file rather than memory to avoid our breakpoint instructions. And it's probably faster because we have it mmapped.
         let mut data_buf = [MaybeUninit::<u8>::uninit(); MAX_MID + MAX_LEN];
-        let elf = &self.elves[0];
-        let (data, offset) = if let &Some(section_idx) = &elf.text_section {
-            let pc = binary.addr_map.dynamic_to_static(addr);
-            let section = &elf.sections[section_idx];
-            let data = match elf.section_data(section_idx) {
-                Ok(x) => x,
-                Err(_) => return SpecialUnwindLocation::None,
-            };
-            if pc < section.address || pc >= section.address + data.len() {
-                return SpecialUnwindLocation::None;
+        let mut code = None;
+        if let Some(binary) = binary {
+            let elf = &binary.elves.as_ref_clone_error().unwrap()[0];
+            if let &Some(section_idx) = &elf.text_section {
+                let pc = binary.addr_map.dynamic_to_static(addr);
+                let section = &elf.sections[section_idx];
+                let data = match elf.section_data(section_idx) {
+                    Ok(x) => x,
+                    Err(_) => return SpecialUnwindLocation::None,
+                };
+                if pc < section.address || pc >= section.address + data.len() {
+                    return SpecialUnwindLocation::None;
+                }
+                code = Some((data, pc - section.address));
             }
-            (data, pc - section.address)
-        } else {
-            // (This fallback is currently unnecessary, we always expect to have .text section. Even for binaries reconstructed from core dump we add a fake .text section, for convenience.)
-            let offset = MAX_MID.min(addr);
-            (match memory.read_uninit(addr - offset, &mut data_buf[..offset+MAX_LEN]) {
-                Ok(x) => &*x,
-                Err(_) => return SpecialUnwindLocation::None,
-            }, offset)
+        }
+        let (data, offset) = match code {
+            Some(x) => x,
+            None => {
+                let offset = MAX_MID.min(addr);
+                (match memory.read_uninit(addr - offset, &mut data_buf[..offset+MAX_LEN]) {
+                    Ok(x) => &*x,
+                    Err(_) => return SpecialUnwindLocation::None,
+                }, offset)
+            }
         };
 
         match data[offset] {
@@ -491,7 +515,7 @@ impl UnwindInfo {
         }
     }
 
-    fn step_through_sig_return(&self, memory: &mut CachedMemReader, regs: &mut Registers) -> Result<Registers> {
+    fn step_through_sig_return(memory: &mut CachedMemReader, regs: &mut Registers) -> Result<Registers> {
         let offset = regs.get(RegisterIdx::Rsp)?.0 as usize + offsetof!(libc::ucontext_t, uc_mcontext);
         let mut mcontext: libc::mcontext_t;
         unsafe {

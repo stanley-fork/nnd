@@ -1726,33 +1726,46 @@ impl Debugger {
             stack.frames.push(StackFrame {addr, pseudo_addr, regs: regs.clone(), subframes: stack.subframes.len()-1..stack.subframes.len(), .. Default::default()});
             let frame = &mut stack.frames.last_mut().unwrap();
 
-            // Would be nice to fall back to unwinding using some default ABI (rbp and callee cleanup, or something).
-            // But for now we just stop if we can't find the binary (may be a problem for JIT-generated code) or .eh_frame section in it.
-            let (_, mut static_pseudo_addr, binary, _) = match self.addr_to_binary(pseudo_addr) {
+            // Cases:
+            //  * Address is mapped to a binary. Normal case. Unwind using the binary's UnwindInfo.
+            //  * Address is mapped but not to a binary. Probably JIT-generated code. Unwind using frame pointer.
+            //  * Address is not mapped, we're at the top of the stack. Probably the program called a bad function pointer and is about to crash with SIGSEGV. Take return address from the top of the stack.
+            //  * Address is not mapped, we're in the middle of the stack. Probably we got a garbage address when unwinding from previous frame. Stop the unwind.
+            let (addr_is_mapped, binary) = match self.info.maps.addr_to_map(pseudo_addr) {
+                Some(&MemMapInfo {binary_id: Some(binary_id), ..}) => (true, Ok(self.symbols.get(binary_id).unwrap())),
+                Some(map) if !map.perms.contains(MemMapPermissions::EXECUTE) => (false, err!(ProcessState, "address in non-executable memory")),
+                Some(_) => (true, err!(ProcessState, "address not mapped to a binary")),
+                None => (false, err!(ProcessState, "address not mapped")),
+            };
+
+            let step_result = match &binary {
+                &Ok(binary) => {
+                    frame.binary_id = Ok(binary.id);
+                    frame.addr_static_to_dynamic = pseudo_addr.wrapping_sub(binary.addr_map.dynamic_to_static(pseudo_addr));
+                    // This populates CFA "register", so needs to happen before symbolizing the frame (because frame_base expression might use CFA).
+                    UnwindInfo::step(&mut memory, Some(binary), &mut scratch, pseudo_addr, frame)
+                }
                 Err(e) => {
                     frame.binary_id = Err(e.clone());
-                    return Err(e);
+                    if addr_is_mapped {
+                        UnwindInfo::step(&mut memory, /*binary*/ None, &mut scratch, pseudo_addr, frame)
+                    } else if idx == 0 {
+                        UnwindInfo::step_from_bad_function_call(&mut memory, frame)
+                    } else {
+                        return err!(Dwarf, "address not mapped")
+                    }
                 }
-                Ok(x) => x,
             };
-            frame.binary_id = Ok(binary.id);
-            frame.addr_static_to_dynamic = binary.addr_map.static_to_dynamic(static_pseudo_addr).wrapping_sub(static_pseudo_addr);
 
-            // This populates CFA "register", so needs to happen before symbolizing the frame (because frame_base expression might use CFA).
-            let unwind = match &binary.unwind {
-                Ok(x) => x,
-                Err(e) if e.is_loading() => return Err(e.clone()),
-                Err(_) => return err!(MissingSymbols, "no unwind info for binary"),
-            };
-            let step_result = unwind.step(&mut memory, binary, &mut scratch, pseudo_addr, frame);
-
-            if step_result.as_ref().is_ok_and(|(_, is_signal_trampoline)| *is_signal_trampoline) {
+            if let &Ok((_, /*is_signal_trampoline*/ true)) = &step_result {
                 // Un-decrement the instruction pointer, there's no `call` in signal trampoline.
                 frame.pseudo_addr = frame.regs.get(RegisterIdx::Rip).unwrap().0 as usize;
-                static_pseudo_addr = binary.addr_map.dynamic_to_static(frame.pseudo_addr);
             }
 
-            self.symbolize_stack_frame(static_pseudo_addr, binary, frame, &mut stack.subframes, &mut memory);
+            // (This has to be after updating pseudo_addr above.)
+            if let Ok(ref binary) = binary {
+                self.symbolize_stack_frame(binary, frame, &mut stack.subframes, &mut memory);
+            }
 
             if partial {
                 return Ok(());
@@ -1837,8 +1850,9 @@ impl Debugger {
         Ok(())
     }
     
-    fn symbolize_stack_frame(&self, static_addr: usize, binary: &Binary, frame: &mut StackFrame, subframes: &mut Vec<StackSubframe>, memory: &mut CachedMemReader) {
+    fn symbolize_stack_frame(&self, binary: &Binary, frame: &mut StackFrame, subframes: &mut Vec<StackSubframe>, memory: &mut CachedMemReader) {
         assert!(frame.subframes.len() == 1 && frame.subframes.start + 1 == subframes.len());
+        let static_addr = binary.addr_map.dynamic_to_static(frame.pseudo_addr);
         let frame_idx = subframes.last().unwrap().frame_idx;
         let symbols = match binary.symbols.as_ref_clone_error() {
             Ok(s) => s,

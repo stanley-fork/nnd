@@ -39,7 +39,7 @@ reverse --tty mode: run debugger in another window and the debuggee in current w
 "Expected an attribute value to be a string form" on zsh
 buffer input when program is quitting, especially k+r and steps
 test with breakpad minidumps
-function pointers
+function pointers; maybe just one "function pointer" type without signature; maybe jump to disas window when pressing enter of function address
 modifying debuggee variables (memory and registers), modifying ip
 log a message if the process forked away
 add alternative default key binds for next/prev search result, F3 is not always available on mac
