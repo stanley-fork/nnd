@@ -28,7 +28,7 @@ Limitations:
  * no record/replay or backwards stepping
 
 Development status:
- * Most standard debugger features are there. E.g. breakpoints, conditional breakpoints (but no data breakpoints yet), stepping, showing code and disassembly, watch expressions, built-in pretty-printers for most of C++ and Rust standard library. Many quality-of-life features are there (e.g. auto-downcasting abstract classes to concrete classes based on vtable). But I'm sure there are lots of missing features that I never needed but other people consider essential; let me know.
+ * Most standard debugger features are there. E.g. breakpoints, conditional breakpoints, data breakpoints, stepping of all kinds, showing code and disassembly, watch expressions, built-in pretty-printers for most of C++ and Rust standard library. Many quality-of-life features are there (e.g. auto-downcasting abstract classes to concrete classes based on vtable). But I'm sure there are lots of missing features that I never needed but other people consider essential; let me know.
  * I use it every day and find it very helpful.
  * Not in active development right now. I fix reported bugs and add small requested features, but likely won't get around to implementing big features soon (e.g. redesigning the watch expression language to have loops etc, ARM support, Mac OS support, GUI, DAP).
 
