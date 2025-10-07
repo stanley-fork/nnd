@@ -152,7 +152,7 @@ pub struct Debugger {
 
     pub stepping: Option<StepState>,
 
-    // Start this step when we're ready: on PTRACE_EVENT_EXEC and/or after symbols are loaded.
+    // Start this step when we're ready: on PTRACE_EVENT_EXEC and/or after symbols are loaded. Can't be a data breakpoint.
     pub pending_step: Option<(pid_t, BreakpointOn)>,
 
     pub breakpoint_locations: Vec<BreakpointLocation>, // sorted by address
@@ -248,13 +248,19 @@ pub struct BreakpointLocation {
     pub error: Option<Error>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct HardwareBreakpoint {
     pub active: bool,
     // We allocate hardware breakpoint slots as if no breakpoints are thread-specific. This is fine currently since only steps use thread-specific breakpoints, but
     // if we add support for user-provided thread-specific breakpoints we may want to make thread-specific hw breakpoint allocation be per thread.
     pub thread_specific: Option<pid_t>,
     pub addr: usize,
+
+    pub data_breakpoint_id: Option<BreakpointId>, // iff it's a data breakpoint
+    pub stop_on_read: bool,
+    pub data_size: u8, // 1, 2, 4, or 8
+
+    pub pushed_to_threads: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -268,7 +274,7 @@ pub struct LineBreakpoint {
 }
 
 #[derive(Debug, Clone)]
-pub struct AddressBreakpoint {
+pub struct InstructionBreakpoint {
     // We remember the address relative to its function to make the breakpoint survive changes to the executable.
     pub function: Option<(FunctionLocator, /*offset*/ usize)>,
     pub addr: usize, // in case `function` is None or not found
@@ -276,20 +282,32 @@ pub struct AddressBreakpoint {
 }
 
 #[derive(Debug, Clone)]
+pub struct DataBreakpoint {
+    pub addr: usize,
+    pub size: u8, // 1, 2, 4, or 8 bytes
+    pub stop_on_read: bool, // we always stop on write regardless of this
+}
+
+#[derive(Debug, Clone)]
 pub enum BreakpointOn {
     Line(LineBreakpoint),
-    Address(AddressBreakpoint),
+    Instruction(InstructionBreakpoint),
     InitialExec, // right after initial exec (PTRACE_EVENT_EXEC)
     PointOfInterest(PointOfInterest),
-    // Could add data breakpoints, syscall, signal, etc.
+    Data(DataBreakpoint),
+    // Could add syscall, signal, etc.
+}
+impl BreakpointOn {
+    pub fn is_data(&self) -> bool { match self { Self::Data(_) => true, _ => false } }
 }
 
 pub struct Breakpoint {
     pub on: BreakpointOn,
     pub condition: Option<(String, Result<Expression>, Option<Error>)>,
     pub hits: usize, // including spurious stops of all kinds
-    // Cached list of addresses, determined using the BreakpointOn and debug symbols. NotCalculated if we didn't resolve this yet.
-    // The addresses are dynamic, not static, so we clear this list when restarting the debuggee as runtime addresses may have changed.
+    // Cached list of instruction addresses, determined using the BreakpointOn and debug symbols. NotCalculated if we didn't resolve this yet.
+    // (We don't put data breakpoint addresses here because that would invite bugs.)
+    // These are dynamic addresses, so we clear this list when restarting the debuggee as runtime addresses may have changed.
     // If the breakpoint is on a line that has inlined function call, subfunction_level is the depth of that inlined call.
     // When the breakpoint is hit we should select the stack subframe at that inline depth, not the top subframe that shows the insides
     // of the inlined function (it's very confusing otherwise). If u16::MAX, no subframe selection is made (so ui probably selects the top subframe).
@@ -308,7 +326,7 @@ impl Breakpoint {
                 b.file_version.save_state(out)?;
                 out.write_usize(b.line)?;
             }
-            BreakpointOn::Address(b) => {
+            BreakpointOn::Instruction(b) => {
                 out.write_u8(1)?;
                 match &b.function {
                     None => out.write_u8(0)?,
@@ -326,6 +344,12 @@ impl Breakpoint {
                 out.write_u8(3)?;
                 point.save_state(out)?;
             }
+            BreakpointOn::Data(b) => {
+                out.write_u8(4)?;
+                out.write_usize(b.addr)?;
+                out.write_u8(b.size)?;
+                out.write_bool(b.stop_on_read)?;
+            }
         }
         if let Some((s, _, _)) = &self.condition {
             out.write_u8(1)?;
@@ -340,15 +364,16 @@ impl Breakpoint {
         let on = match inp.read_u8()? {
             0 => BreakpointOn::Line(LineBreakpoint {path: inp.read_path()?, file_version: FileVersionInfo::load_state(inp)?, line: inp.read_usize()?, adjusted_line: None}),
             1 => {
-                let function = match inp.read_u8()? {
-                    0 => None,
-                    1 => Some((FunctionLocator::load_state(inp)?, inp.read_usize()?)),
-                    x => return err!(Environment, "unexpected AddressBreakpoint function flag: {}", x),
+                let function = if inp.read_bool()? {
+                    Some((FunctionLocator::load_state(inp)?, inp.read_usize()?))
+                } else {
+                    None
                 };
-                BreakpointOn::Address(AddressBreakpoint {function, addr: inp.read_usize()?, subfunction_level: inp.read_u16()?})
+                BreakpointOn::Instruction(InstructionBreakpoint {function, addr: inp.read_usize()?, subfunction_level: inp.read_u16()?})
             }
             2 => BreakpointOn::InitialExec,
             3 => BreakpointOn::PointOfInterest(PointOfInterest::load_state(inp)?),
+            4 => BreakpointOn::Data(DataBreakpoint {addr: inp.read_usize()?, size: inp.read_u8()?, stop_on_read: inp.read_bool()?}),
             x => return err!(Environment, "unexpected breakpoint type in save file: {}", x),
         };
         let condition = match inp.read_u8()? {
@@ -394,13 +419,15 @@ impl Thread {
 
 impl Debugger {
     fn new(mode: RunMode, command_line: Vec<String>, context: Arc<Context>, symbols: SymbolsRegistry, breakpoints: Pool<Breakpoint>, persistent: PersistentState, my_resource_stats: ResourceStats, prof: Profiling) -> Self {
-        Debugger {mode, command_line, context, pid: 0, target_state: ProcessState::NoProcess, log: Log::new(), prof, threads: HashMap::new(), pending_wait_events: VecDeque::new(), next_thread_idx: 1, info: ProcessInfo::default(), my_resource_stats, symbols, memory: MemReader::Invalid, waiting_for_initial_sigstop: false, initial_exec_failed: false, stepping: None, pending_step: None, breakpoint_locations: Vec::new(), breakpoints, stopping_to_handle_breakpoints: false, stopped_until_symbols_are_loaded: None, hardware_breakpoints: std::array::from_fn(|_| HardwareBreakpoint {active: false, thread_specific: None, addr: 0}), persistent}
+        Debugger {mode, command_line, context, pid: 0, target_state: ProcessState::NoProcess, log: Log::new(), prof, threads: HashMap::new(), pending_wait_events: VecDeque::new(), next_thread_idx: 1, info: ProcessInfo::default(), my_resource_stats, symbols, memory: MemReader::Invalid, waiting_for_initial_sigstop: false, initial_exec_failed: false, stepping: None, pending_step: None, breakpoint_locations: Vec::new(), breakpoints, stopping_to_handle_breakpoints: false, stopped_until_symbols_are_loaded: None, hardware_breakpoints: std::array::from_fn(|_| HardwareBreakpoint::default()), persistent}
     }
 
     pub fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {
         for (id, bp) in self.breakpoints.iter() {
-            out.write_u8(1)?;
-            bp.save_state(out)?;
+            if !bp.on.is_data() { // data breakpoint addresses usually becomes obsolete on program restart or recompilation, just delete data breakpoints on restart
+                out.write_u8(1)?;
+                bp.save_state(out)?;
+            }
         }
         out.write_u8(0)?;
         Ok(())
@@ -1100,6 +1127,7 @@ impl Debugger {
                         self.pending_step = None;
                     }
                     Ok(addrs) => {
+                        assert!(!addrs.is_empty());
                         eprintln!("info: step to cursor thread {} cursor {:?}", tid, breakpoint.on);
 
                         let step = StepState {tid, keep_other_threads_suspended: false, disable_breakpoints: true, internal_kind: StepKind::Cursor, by_instructions: false, single_steps: false, ..StepState::default()};
@@ -1611,6 +1639,7 @@ impl Debugger {
     }
 
     pub fn step_to_cursor(&mut self, tid: pid_t, cursor: BreakpointOn) -> Result<()> {
+        assert!(!cursor.is_data());
         match self.target_state {
             ProcessState::Suspended | ProcessState::Running | ProcessState::Stepping => (),
             ProcessState::NoProcess => return self.start_child(Some(cursor)),
@@ -1926,6 +1955,12 @@ impl Debugger {
     }
 
     pub fn add_breakpoint(&mut self, on: BreakpointOn) -> Result<BreakpointId> {
+        if let BreakpointOn::Data(d) = &on {
+            if ![1, 2, 4, 8].contains(&d.size) {
+                return err!(Internal, "unsupported size for data breakpoint size: {}", d.size);
+            }
+        }
+        
         let breakpoint = Breakpoint {on, condition: None, hits: 0, addrs: err!(NotCalculated, ""), enabled: true, active: false};
         let id = self.breakpoints.add(breakpoint).0;
         if self.target_state.process_ready() {
@@ -1970,6 +2005,26 @@ impl Debugger {
         }
     }
 
+    pub fn set_data_breakpoint_stop_on_read(&mut self, id: BreakpointId, stop_on_read: bool) -> Result<bool> {
+        let b = match self.breakpoints.try_get_mut(id) {
+            None => return Ok(false),
+            Some(x) => x };
+        let d = match &mut b.on {
+            BreakpointOn::Data(x) => x,
+            _ => panic!("unexpected non-data breakpoint") };
+        if d.stop_on_read == stop_on_read {
+            return Ok(false);
+        }
+        d.stop_on_read = stop_on_read;
+
+        // Reactivate to update debug register in all threads.
+        self.deactivate_breakpoint(id);
+        if self.target_state.process_ready() {
+            self.activate_breakpoints(vec![id])?;
+        }
+        Ok(true)
+    }
+
     pub fn find_line_breakpoint_fuzzy(&self, lb: &LineBreakpoint) -> Option<BreakpointId> {
         for (id, breakpoint) in self.breakpoints.iter() {
             match &breakpoint.on {
@@ -1982,30 +2037,51 @@ impl Debugger {
 
     fn activate_breakpoints(&mut self, ids: Vec<BreakpointId>) -> Result<()> {
         assert!(self.target_state.process_ready());
-        let mut added_locations = false;
+        let mut should_handle_breakpoints = false;
         let mut wait_for_symbols = false;
         for id in ids {
             let b = self.breakpoints.get_mut(id);
             if !b.enabled || b.active {
                 continue;
             }
-            if let Err(e) = &b.addrs {
-                Self::determine_locations_for_breakpoint(&self.symbols, b);
-            }
-            match &b.addrs {
-                Ok(addrs) => {
-                    assert!(!addrs.is_empty());
-                    added_locations = true;
-                    b.active = true;
-                    for (addr, subfunction_level) in addrs.clone() {
-                        self.add_breakpoint_location(BreakpointRef::Id {id, subfunction_level}, addr);
+            if let BreakpointOn::Data(d) = &b.on {
+                // Allocate a hardware breakpoint slot right here.
+                let mut found = false;
+                for h in &mut self.hardware_breakpoints {
+                    if !h.active {
+                        *h = HardwareBreakpoint {active: true, addr: d.addr, data_breakpoint_id: Some(id), stop_on_read: d.stop_on_read, data_size: d.size, ..Default::default()};
+                        found = true;
+                        break;
                     }
                 }
-                Err(e) if e.is_loading() => wait_for_symbols = true,
-                Err(_) => (),
+                if found {
+                    b.active = true;
+                    b.addrs = err!(NotCalculated, "");
+                    should_handle_breakpoints = true; // to set debug registers in all threads
+                } else {
+                    b.enabled = false; // auto-disable, seems convenient
+                    b.addrs = err!(OutOfHardwareBreakpoints, "out of hardware breakpoints (max: 4)");
+                    log!(self.log, "out of hw breakpoints (max: 4)");
+                }
+            } else {
+                if let Err(e) = &b.addrs {
+                    Self::determine_locations_for_breakpoint(&self.symbols, b);
+                }
+                match &b.addrs {
+                    Ok(addrs) => {
+                        assert!(!addrs.is_empty());
+                        should_handle_breakpoints = true;
+                        b.active = true;
+                        for (addr, subfunction_level) in addrs.clone() {
+                            self.add_breakpoint_location(BreakpointRef::Id {id, subfunction_level}, addr);
+                        }
+                    }
+                    Err(e) if e.is_loading() => wait_for_symbols = true,
+                    Err(_) => (),
+                }
             }
         }
-        if added_locations {
+        if should_handle_breakpoints {
             self.arrange_handle_breakpoints()?;
         }
         if wait_for_symbols && self.stopped_until_symbols_are_loaded.is_none() {
@@ -2023,6 +2099,11 @@ impl Debugger {
             // Don't bother deactivating the breakpoint locations here, just wait for the next handle_breakpoints() call to do everything.
             // (Don't bother scheduling such call either, it'll happen if the stale breakpoint gets hit.)
             location.breakpoints.retain(|b| match b { BreakpointRef::Id {id: id_, ..} if id_ == &id => false, _ => true });
+        }
+        for h in &mut self.hardware_breakpoints {
+            if h.active && h.data_breakpoint_id == Some(id) {
+                *h = HardwareBreakpoint::default();
+            }
         }
     }
 
@@ -2109,7 +2190,7 @@ impl Debugger {
                     breakpoint.addrs = Ok(res.1);
                 }
             }
-            BreakpointOn::Address(bp) => {
+            BreakpointOn::Instruction(bp) => {
                 if let Some((locator, offset)) = &mut bp.function {
                     match Self::resolve_function_breakpoint_location(symbols_registry, locator, *offset) {
                         Ok(a) => bp.addr = a,
@@ -2149,7 +2230,7 @@ impl Debugger {
                     err!(NoFunction, "{} not found", point.name_for_ui())
                 };
             }
-            BreakpointOn::InitialExec => breakpoint.addrs = err!(Internal, "unexpected InitialExec breakpoint"),
+            b => breakpoint.addrs = err!(Internal, "unexpected breakpoint kind: {:?}", b),
         }
     }
 
@@ -2207,11 +2288,7 @@ impl Debugger {
                 _ => None,
             };
 
-            self.hardware_breakpoints[hw_idx] = HardwareBreakpoint {active: true, thread_specific, addr};
-            let tids: Vec<pid_t> = self.threads.keys().copied().collect();
-            for tid in tids {
-                self.set_debug_registers_for_thread(tid)?;
-            }
+            self.hardware_breakpoints[hw_idx] = HardwareBreakpoint {active: true, thread_specific, addr, ..Default::default()};
         } else {
             let byte_idx = addr % 8;
             let bit_idx = byte_idx * 8;
@@ -2240,9 +2317,8 @@ impl Debugger {
         if !location.active { return Ok(()); }
         if location.hardware {
             for h in &mut self.hardware_breakpoints {
-                if h.addr == location.addr {
-                    h.active = false;
-                    h.addr = 0;
+                if h.active && h.addr == location.addr {
+                    *h = HardwareBreakpoint::default();
                 }
             }
             // Don't actively update threads' debug registers. We'll update them if the stale breakpoint gets hit.
@@ -2359,6 +2435,16 @@ impl Debugger {
             }
         }
 
+        if self.hardware_breakpoints.iter().any(|b| b.active && !b.pushed_to_threads) {
+            let tids: Vec<pid_t> = self.threads.keys().copied().collect();
+            for tid in tids {
+                self.set_debug_registers_for_thread(tid)?;
+            }
+            for b in &mut self.hardware_breakpoints {
+                b.pushed_to_threads = true;
+            }
+        }
+
         Ok(())
     }
 
@@ -2371,6 +2457,18 @@ impl Debugger {
             }
             unsafe { ptrace(PTRACE_POKEUSER, tid, (offsetof!(libc::user, u_debugreg) + i * 8) as u64, b.addr as u64)? };
             dr7 |= 1 << (i*2);
+
+            if b.data_breakpoint_id.is_some() {
+                dr7 |= (if b.stop_on_read {3} else {1}) << (16 + i*4);
+                let size_code: u64 = match b.data_size {
+                    1 => 0,
+                    2 => 1,
+                    4 => 3,
+                    8 => 2,
+                    _ => panic!("unexpected data breakpoint size"),
+                };
+                dr7 |= size_code << (18 + i*4);
+            }
         }
         unsafe { ptrace(PTRACE_POKEUSER, tid, (offsetof!(libc::user, u_debugreg) + 7*8) as u64, dr7)? };
         Ok(())
@@ -2578,6 +2676,32 @@ impl Debugger {
             Ok(Some((_, _, cfa, _, _, _))) => Some(cfa),
         }
     }
+
+    fn process_breakpoint_hit(&mut self, id: BreakpointId, tid: pid_t, ignore_breakpoints: bool, subfunction_level: u16, stop_reasons: &mut Vec<StopReason>) -> bool {
+        let bp = self.breakpoints.get_mut(id);
+        bp.hits += 1;
+
+        if ignore_breakpoints {
+            return false;
+        }
+        if let Some((_, Ok(_), _)) = &bp.condition {
+            let r = self.eval_breakpoint_condition(tid, id, subfunction_level);
+            let bp = self.breakpoints.get_mut(id);
+            let cond = &mut bp.condition.as_mut().unwrap();
+            match r {
+                Ok(hit) => {
+                    cond.2 = None;
+                    if !hit {
+                        return false;
+                    }
+                }
+                Err(e) => cond.2 = Some(e), // put error into the breakpoint to be shown in UI, and stop
+            }
+        }
+
+        stop_reasons.push(StopReason::Breakpoint(id));
+        true
+    }
     
     // Returns true if any breakpoint was actually hit, so we should switch to ProcessState::Suspended.
     // May also set stopping_to_handle_breakpoints to true, in which case the caller should stop all threads.
@@ -2611,7 +2735,7 @@ impl Debugger {
         // Possibly even that would be insufficient because maybe a SIGTRAP may be queued behind another type of stop, then get delivered after we resume threads; or maybe that's impossible, I haven't checked.
 
         let dr6 = unsafe { ptrace(PTRACE_PEEKUSER, tid, offsetof!(libc::user, u_debugreg) as u64 + 6*8, 0)? };
-        let stopped_on_hw_breakpoint = dr6 & 15 != 0;
+        let stopped_on_hw_breakpoint = dr6 & 15 != 0; // may be a data breakpoint
         if stopped_on_hw_breakpoint {
             // In case it's a stale breakpoint.
             self.set_debug_registers_for_thread(tid)?;
@@ -2619,15 +2743,32 @@ impl Debugger {
             unsafe { ptrace(PTRACE_POKEUSER, tid, (offsetof!(libc::user, u_debugreg) + 6 * 8) as u64, (dr6 & !15) as u64)? };
         }
 
+        // Need to be careful to correctly handle being stopped for multiple reasons at once:
+        //  * Data breakpoint and instruction breakpoint (e.g. breakpoint on a `mov` that writes to memory address with data breakpoint).
+        //    In this case, the code below will just run both the instruction-related and data-related code paths,
+        //    combining the results the same way as multiple instruction breakpoints at the same address.
+        //  * Software breakpoint and hardware breakpoint. We assume this can't happen, see below.
+
+        // (This doesn't apply to data breakpoint hit, if any.)
         let spurious_stop = stopped_on_hw_breakpoint && ignore_next_hw_breakpoint_hit_at_addr == Some(addr);
 
+        // True if the stop was caused by a software breakpoint.
+        // Why can't stopped_on_hw_breakpoint and single_stepping be true for a stop caused by a software breakpoint? E.g. if there's a hw breakpoint on the same spot.
+        //  * single_stepping can't be true because we never single-step from an address with sw breakpoint (we convert it to hw first).
+        //  * Can't be stopped on hw data breakpoint because int3 doesn't write to memory.
+        //    (... Or maybe kernel's interrupt handler can write to userspace memory and trip our data breakpoint?
+        //     Welp, then we'll use incorrect value of stopped_on_sw_breakpoint, which means the debuggee will likely execute illegal instruction and die.
+        //     I don't know how to distinguish that case.)
+        //  * If stopped on hw bp with the same address as sw bp (maybe possible for stale hw bp), that shouldn't be considered sw bp hit as we shouldn't decrement rip.
+        //  * If there's a hw bp just after int3, presumably such hw bp hit is not reported on int3 trap, but I haven't checked.
+        // So, this assumption may not be fully sound, but I don't know how to do better. (I feel this should be the job of si_code, and it has failed at this job.)
         let stopped_on_sw_breakpoint = (si_code == libc::TRAP_BRKPT || si_code == libc::SI_KERNEL) && !stopped_on_hw_breakpoint && !single_stepping;
         if stopped_on_sw_breakpoint {
             addr -= 1;
         }
 
         // More ptrace jank: after PTRACE_SINGLESTEP we may get a TRAP_BRKPT (!) before the single-step step happens (i.e. still at original address).
-        // We ignore it and do another PTRACE_SINGLESTEP, which then actually stepa and generates a TRAP_TRACE.
+        // We ignore it and do another PTRACE_SINGLESTEP, which then actually steps and generates a TRAP_TRACE.
         let single_stepped = (si_code == libc::TRAP_TRACE || si_code == libc::SI_KERNEL) && single_stepping && !spurious_stop;
 
         let mut hit = false;
@@ -2681,6 +2822,7 @@ impl Debugger {
             eprintln!("warning: unexpected SIGTRAP ({}) in thread {} at 0x{:x}", trap_si_code_name(si_code), tid, addr);
         }
 
+        // Instruction breakpoints/stepping.
         if let Some(idx) = breakpoint_location_idx {
             let location = &mut self.breakpoint_locations[idx];
 
@@ -2713,37 +2855,17 @@ impl Debugger {
                         }
                     }
                     &BreakpointRef::Id {id, subfunction_level} => {
-                        let bp = self.breakpoints.get_mut(id);
-                        bp.hits += 1;
-
                         if spurious_stop {
                             // Spurious stop after converting breakpoint from software to hardware, or initial hit after adding a breakpoint on current line.
                             if self.context.settings.trace_logging { eprintln!("trace: ignoring spurious stop on hw breakpoint {:x}", addr); }
-                            continue;
-                        }
-                        if ignore_breakpoints {
-                            continue;
-                        }
-                        if let Some((_, Ok(_), _)) = &bp.condition {
-                            let r = self.eval_breakpoint_condition(tid, id, subfunction_level);
-                            let bp = self.breakpoints.get_mut(id);
-                            let cond = &mut bp.condition.as_mut().unwrap();
-                            match r {
-                                Ok(hit) => {
-                                    cond.2 = None;
-                                    if !hit {
-                                        continue;
-                                    }
-                                }
-                                Err(e) => cond.2 = Some(e), // put error into the breakpoint to be shown in UI, and stop
+                            // But still increment hit counter to make it easier to notice and debug if we get unexpectedly many spurious stops.
+                            self.breakpoints.get_mut(id).hits += 1;
+                        } else if self.process_breakpoint_hit(id, tid, ignore_breakpoints, subfunction_level, &mut stop_reasons) {
+                            hit = true;
+                            if subfunction_level != u16::MAX {
+                                stack_digest_to_select = Some((Vec::new(), false, subfunction_level));
                             }
                         }
-
-                        stop_reasons.push(StopReason::Breakpoint(id));
-                        if subfunction_level != u16::MAX {
-                            stack_digest_to_select = Some((Vec::new(), false, subfunction_level));
-                        }
-                        hit = true;
                     }
                 }
             }
@@ -2753,6 +2875,20 @@ impl Debugger {
                 // Stop all threads so that we can convert the breakpoint into hardware breakpoint (or single-step past it).
                 // If this turns out too slow, we could hook the current instruction instead (maybe won't work for all instructions).
                 self.stopping_to_handle_breakpoints = true;
+            }
+        }
+
+        // Data breakpoints.
+        if stopped_on_hw_breakpoint {
+            for i in 0..4 {
+                if (dr6 & (1 << i)) != 0 {
+                    let bp = &self.hardware_breakpoints[i];
+                    if bp.active {
+                        if let &Some(id) = &bp.data_breakpoint_id {
+                            hit |= self.process_breakpoint_hit(id, tid, ignore_breakpoints, /*subfunction_level*/ u16::MAX, &mut stop_reasons);
+                        }
+                    }
+                }
             }
         }
 

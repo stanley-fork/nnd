@@ -1268,6 +1268,11 @@ impl TypesLoader {
             t.nested_names = new_nested_names;
         }
 
+        if t.name.is_empty() && t.can_have_own_name() {
+            // Make sure all structs have names so we can refer to them in watches.
+            t.name = "_";
+        }
+
         if !t.name.is_empty() {
             self.send_dedup_name(original_shard_idx, NameDedupMessage {name: t.name, type_: p, unpriority: name_dedup_unpriority(&info), ..Default::default()});
 

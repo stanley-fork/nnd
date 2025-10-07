@@ -222,6 +222,13 @@ Debugging tips:
  * The function search (in disassembly window, 'o' key) currently does fuzzy search over *mangled* function names, for peformance reasons.
    The search results display demangled names, i.e. slightly different from what's actually searched. Press tab to see mangled name.
  * In watches window, on non-root tree nodes press Enter to add a corresponding watch. E.g. for local variable or struct field or array element.
+ * In watches window, press 'b' to add data breakpoint (aka watchpoint) on the address of the curent value. 'b' for write-only, 'B' for read/write. Conditional data breakpoints are allowed as well. Limitations:
+    * There can be at most 2-3 active data breakpoints. (x86 supports 4 hardware breakpoints, but the debugger transintly uses some of them for regular breakpoints and stepping.)
+    * Data breakpoints only catch memory reads/writes. If a variable resides in a register for all or part of its lifetime, data breakpoints won't work on it during that time.
+    * Data breakpoints don't catch writes by syscalls, e.g. read() writing to the buffer.
+    * When data breakpoint is hit, control stops just *after* the instruction that did the write, after the value is changed.
+    * Data breakpoints aren't automatically removed when the variable goes out of scope. Use breakpoints window to clean up obsolete data breakpoints.
+ * In watches window, press shift-d to take the pointer to the current value and add a watch on it. E.g. pressing enter on `my_thing_ptr.buffer` would add a watch `*(0x12345 as *[u8; 1024])`, where 0x12345 is the current address of `my_thing_ptr.buffer`, and `[u8; 1024]` is the type of `my_thing.buffer`. Useful for data breakpoints, as this watch will work regardless of the selected thread and stack frame, not relying on `my_thing` being visible.
  * Expect debugger's memory usage around 3x the size of the executable. E.g. ~7 GB for 2.3 GB clickhouse, release build. This is mostly debug information.
    (If you're curious, see ~/.nnd/<number>/log for a breakdown of which parts of the debug info take how much memory and take how long to load.)
  * For clickhouse server, use CLICKHOUSE_WATCHDOG_ENABLE=0. Otherwise it forks on startup, and the debugger doesn't follow forks."###),
@@ -263,6 +270,9 @@ General info:
  * 'begin..end' to turn a pair of pointers to the array [begin, end). E.g. 'my_vector.begin..my_vector.end'.
  * '^x' looks for variable x in all stack frames.
  * 'var(x)' shows additional information about variable x, e.g. its declaration site.
+
+Data breakpoints:
+ * asdqwe
 
 Gotchas:
  * 'var(x)' and 'type(t)'/'typeof(x)' show variable/type declaration site (if present in debug info). Press enter on it (or click) to open in code window.
@@ -426,6 +436,7 @@ breakpoints (top right, second tab)
   can be disabled
   jump to location when selecting in the breakpoints window
   shows adjusted line
+data breakpoints
 autosaving/restoring state
   see --help-files
 obscure feature: locations window

@@ -479,18 +479,20 @@ impl UnwindInfo {
         let mut data_buf = [MaybeUninit::<u8>::uninit(); MAX_MID + MAX_LEN];
         let mut code = None;
         if let Some(binary) = binary {
-            let elf = &binary.elves.as_ref_clone_error().unwrap()[0];
-            if let &Some(section_idx) = &elf.text_section {
-                let pc = binary.addr_map.dynamic_to_static(addr);
-                let section = &elf.sections[section_idx];
-                let data = match elf.section_data(section_idx) {
-                    Ok(x) => x,
-                    Err(_) => return SpecialUnwindLocation::None,
-                };
-                if pc < section.address || pc >= section.address + data.len() {
-                    return SpecialUnwindLocation::None;
+            if let Ok(elves) = &binary.elves {
+                let elf = &elves[0];
+                if let &Some(section_idx) = &elf.text_section {
+                    let pc = binary.addr_map.dynamic_to_static(addr);
+                    let section = &elf.sections[section_idx];
+                    let data = match elf.section_data(section_idx) {
+                        Ok(x) => x,
+                        Err(_) => return SpecialUnwindLocation::None,
+                    };
+                    if pc < section.address || pc >= section.address + data.len() {
+                        return SpecialUnwindLocation::None;
+                    }
+                    code = Some((data, pc - section.address));
                 }
-                code = Some((data, pc - section.address));
             }
         }
         let (data, offset) = match code {

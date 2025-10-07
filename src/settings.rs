@@ -380,11 +380,17 @@ pub enum KeyAction {
 
     Open,
     FindType,
-    EditCondition,
     Find,
     GoToLine,
 
+    EditCondition,
+    DataWriteBreakpoint,
+    DataReadWriteBreakpoint,
+    ConditionalDataWriteBreakpoint,
+    ConditionalDataReadWriteBreakpoint,
+
     DuplicateRow,
+    AddValueRefWatch,
 
     Help,
     DropCaches,
@@ -694,14 +700,19 @@ impl Default for KeyBinds {
             (Key::Char('+').plain(), KeyAction::ToggleSort),
             (Key::Char('o').plain(), KeyAction::Open),
             (Key::Char('t').plain(), KeyAction::FindType),
-            (Key::Char('\n').alt(), KeyAction::EditCondition),
             (Key::Char('/').plain(), KeyAction::Find),
             (Key::Char('g').plain(), KeyAction::GoToLine),
             (Key::Char('d').plain(), KeyAction::DuplicateRow),
+            (Key::Char('D').plain(), KeyAction::AddValueRefWatch),
             (Key::Char('?').plain(), KeyAction::Help),
             (Key::Char('h').plain(), KeyAction::Help),
             (Key::Char('l').ctrl(), KeyAction::DropCaches),
             (Key::Char('p').ctrl(), KeyAction::ToggleProfiler),
+            (Key::Char('\n').alt(), KeyAction::EditCondition),
+            (Key::Char('b').plain(), KeyAction::DataWriteBreakpoint),
+            (Key::Char('B').plain(), KeyAction::DataReadWriteBreakpoint),
+            (Key::Char('b').alt(), KeyAction::ConditionalDataWriteBreakpoint),
+            (Key::Char('B').alt(), KeyAction::ConditionalDataReadWriteBreakpoint),
         ]);
         let text_input = KeyMap::new(&[
             (Key::Char('7').ctrl(), KeyAction::Undo), // ctrl+/ is indistinguishable from ctrl+7

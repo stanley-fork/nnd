@@ -1,5 +1,5 @@
 use crate::{*, types::*, expr::*, error::*, procfs::*, pretty::*, registers::*};
-use std::{ops::Range, mem, borrow::Cow};
+use std::{ops::Range, mem, borrow::Cow, fmt::Write as fmtWrite};
 
 pub struct Expression {
     ast: Vec<ASTNode>,
@@ -70,7 +70,7 @@ pub fn adjust_expression_for_appending_child_path(expr_str: &str) -> Result<Stri
 }
 
 pub fn make_expression_for_variable(name: &str) -> String {
-    if should_quote_identifier(name) {
+    if RegisterIdx::parse_ignore_case(name).is_some() || should_quote_identifier(name) {
         format!("`{}`", name)
     } else {
         name.to_string()
@@ -88,9 +88,6 @@ pub fn does_expression_need_full_stack(expr: &Expression) -> bool {
 }
 
 fn should_quote_identifier(name: &str) -> bool {
-    if RegisterIdx::parse_ignore_case(name).is_some() {
-        return true;
-    }
     if name.is_empty() {
         return true;
     }
@@ -102,6 +99,39 @@ fn should_quote_identifier(name: &str) -> bool {
         }
     }
     false
+}
+
+pub fn print_type_in_watch_language_syntax(t: *const TypeInfo, out: &mut String, recursion_depth: usize) -> Result<()> {
+    if recursion_depth > 100 {
+        return err!(Sanity, "cyclic or very deeply nested pointer");
+    }
+    let t = unsafe {&*t};
+    match &t.t {
+        Type::Pointer(p) => {
+            // (The language doesn't have references, so ignore PointerFlags::REFERENCE and turn references into pointers.)
+            out.push_str("*");
+            print_type_in_watch_language_syntax(p.type_, out, recursion_depth + 1)
+        }
+        Type::Array(a) => {
+            if a.stride != 0 && a.stride != unsafe {(*a.type_).calculate_size()} {
+                return err!(NotImplemented, "array has nonstandard stride");
+            }
+            let len = if a.flags.contains(ArrayFlags::LEN_KNOWN) {a.len} else {1};
+            out.push_str("[");
+            print_type_in_watch_language_syntax(a.type_, out, recursion_depth + 1)?;
+            write!(out, "; {}]", len).unwrap();
+            Ok(())
+        }
+        _ if t.name.is_empty() => err!(Internal, "type has no name"),
+        _ => {
+            if should_quote_identifier(t.name) {
+                write!(out, "`{}`", t.name).unwrap();
+            } else {
+                out.push_str(t.name);
+            }
+            Ok(())
+        }
+    }
 }
 
 // Slow dumb interpreter that walks the AST directly.

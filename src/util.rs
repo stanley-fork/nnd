@@ -491,6 +491,7 @@ pub trait ByteRead : BufRead {
     fn read_i32(&mut self) -> io::Result<i32>;
     fn read_i64(&mut self) -> io::Result<i64>;
     fn read_isize(&mut self) -> io::Result<isize>;
+    fn read_bool(&mut self) -> io::Result<bool>;
     fn read_slice(&mut self) -> io::Result<Vec<u8>>;
     fn read_str(&mut self) -> io::Result<String>;
     fn read_path(&mut self) -> io::Result<PathBuf>;
@@ -506,6 +507,15 @@ impl<R: BufRead> ByteRead for R {
     fn read_i32(&mut self) -> io::Result<i32> { let mut b = [0u8; 4]; self.read_exact(&mut b)?; Ok(i32::from_le_bytes(b)) }
     fn read_i64(&mut self) -> io::Result<i64> { let mut b = [0u8; 8]; self.read_exact(&mut b)?; Ok(i64::from_le_bytes(b)) }
     fn read_isize(&mut self) -> io::Result<isize> { let mut b = [0u8; 8]; self.read_exact(&mut b)?; Ok(isize::from_le_bytes(b)) }
+    fn read_bool(&mut self) -> io::Result<bool> {
+        let mut b = [0u8];
+        self.read_exact(&mut b)?;
+        Ok(match b[0] {
+            0 => false,
+            1 => true,
+            x => return Err(io::Error::new(io::ErrorKind::Other, "invalid bool")),
+        })
+    }
     fn read_slice(&mut self) -> io::Result<Vec<u8>> {
         let n = self.read_usize()?;
         // Don't unconditionally allocate the whole n bytes because it may be huge if the input contains garbage.
@@ -537,6 +547,7 @@ pub trait ByteWrite : Write {
     fn write_i32(&mut self, x: i32) -> io::Result<()>;
     fn write_i64(&mut self, x: i64) -> io::Result<()>;
     fn write_isize(&mut self, x: isize) -> io::Result<()>;
+    fn write_bool(&mut self, x: bool) -> io::Result<()>;
     fn write_slice(&mut self, s: &[u8]) -> io::Result<()>;
     fn write_str(&mut self, s: &str) -> io::Result<()>;
     fn write_path(&mut self, s: &Path) -> io::Result<()>;
@@ -553,6 +564,7 @@ impl<R: Write> ByteWrite for R {
     fn write_i32(&mut self, x: i32) -> io::Result<()> { self.write_all(&x.to_le_bytes()) }
     fn write_i64(&mut self, x: i64) -> io::Result<()> { self.write_all(&x.to_le_bytes()) }
     fn write_isize(&mut self, x: isize) -> io::Result<()> { self.write_all(&x.to_le_bytes()) }
+    fn write_bool(&mut self, x: bool) -> io::Result<()> { self.write_all(&[x as u8]) }
     fn write_slice(&mut self, s: &[u8]) -> io::Result<()> { self.write_usize(s.len())?; self.write_all(s) }
     fn write_str(&mut self, s: &str) -> io::Result<()> { self.write_slice(s.as_bytes()) }
     fn write_path(&mut self, s: &Path) -> io::Result<()> { self.write_slice(s.as_os_str().as_bytes()) }

@@ -32,6 +32,7 @@ pub struct UIState {
 
     // Redundant copies of information from Debugger. Updated on every frame. Used for convenience and for consistent ordering.
     stack: StackTrace, // assigned by StackWindow
+    hit_breakpoints: Vec<BreakpointId>,
 
     // Communication between windows, for interactions like:
     //  * when switching stack frames (for any of a number of reasons, including the above), scroll to the corresponding source file+line and disassembly instruction,
@@ -446,8 +447,38 @@ fn report_result<R>(state: &mut UIState, r: &Result<R>) {
     }
 }
 
-fn get_breakpoint_icon(enabled: bool, active: bool, secondary: bool, conditional: bool, palette: &Palette) -> (&'static str, Style) {
-    if !enabled {
+fn get_breakpoint_icon(enabled: bool, active: bool, secondary: bool, conditional: bool, data: bool, stop_on_read: bool, palette: &Palette) -> (&'static str, Style) {
+    if data {
+        if stop_on_read {
+            if conditional {
+                if active {
+                    ("★ᶜ", palette.breakpoint)
+                } else {
+                    ("☆ᶜ", palette.secondary_breakpoint)
+                }
+            } else {
+                if active {
+                    ("★ ", palette.breakpoint)
+                } else {
+                    ("☆ ", palette.secondary_breakpoint)
+                }
+            }
+        } else {
+            if conditional {
+                if active {
+                    ("◆ᶜ", palette.breakpoint)
+                } else {
+                    ("◇ᶜ", palette.secondary_breakpoint)
+                }
+            } else {
+                if active {
+                    ("◆ ", palette.breakpoint)
+                } else {
+                    ("◇ ", palette.secondary_breakpoint)
+                }
+            }
+        }
+    } else if !enabled {
         if conditional {
             ("© ", palette.secondary_breakpoint)
         } else {
@@ -595,12 +626,14 @@ struct WatchesWindow {
 
     eval_state: EvalState,
 
+    data_breakpoints: HashMap<(/*addr*/ usize, /*size*/ u8), (/*enabled*/ bool, /*active*/ bool, /*stop_on_read*/ bool, /*conditional*/ bool, /*hit*/ bool)>,
+
     variable_search_dialog: Option<SearchDialog>,
     type_search_dialog: Option<SearchDialog>,
 }
 impl Default for WatchesWindow {
     fn default() -> Self {
-        let mut r = Self {tree: ValueTree::default(), expanded_nodes: HashSet::new(), cursor_path: Vec::new(), cursor_idx: 0, scroll: 0, scroll_to_cursor: false, name_width: 0, value_width: 0, row_height_limit: 0, indent_width: 0, max_indent: 0, seen: (0, usize::MAX, usize::MAX, ProcessState::NoProcess), have_good_cached_values: false, expressions: Vec::new(), text_input: None, text_input_built: false, eval_state: EvalState::new(), variable_search_dialog: None, type_search_dialog: None };
+        let mut r = Self {tree: ValueTree::default(), expanded_nodes: HashSet::new(), cursor_path: Vec::new(), cursor_idx: 0, scroll: 0, scroll_to_cursor: false, name_width: 0, value_width: 0, row_height_limit: 0, indent_width: 0, max_indent: 0, seen: (0, usize::MAX, usize::MAX, ProcessState::NoProcess), have_good_cached_values: false, expressions: Vec::new(), text_input: None, text_input_built: false, eval_state: EvalState::new(), data_breakpoints: HashMap::new(), variable_search_dialog: None, type_search_dialog: None };
 
         let locals_identity: usize = random();
         r.expanded_nodes.insert(locals_identity);
@@ -610,6 +643,8 @@ impl Default for WatchesWindow {
     }
 }
 impl WatchesWindow {
+    const COLUMN_SPACING: usize = 3;
+    
     fn eval_locals(&mut self, context: &mut EvalContext, parent: ValueTreeNodeIdx, palette: &Palette) {
         let selected_subframe = context.selected_subframe;
         let subframe = &context.stack.subframes[selected_subframe];
@@ -947,7 +982,7 @@ impl WatchesWindow {
 
             if node.node_end_y > visible_y.start {
                 let row_x = indent + 2;
-                let row_widget = ui.add(widget!().identity(&node.identity).fixed_x(row_x as isize).fixed_width((self.name_width + self.value_width + 1).saturating_sub(row_x)).fixed_height((node.node_end_y - node.start_y) as usize).fixed_y(node.start_y).fill(' ', ui.palette.default).highlight_on_hover());
+                let row_widget = ui.add(widget!().identity(&node.identity).fixed_x(row_x as isize).fixed_width((self.name_width + self.value_width + Self::COLUMN_SPACING).saturating_sub(row_x)).fixed_height((node.node_end_y - node.start_y) as usize).fixed_y(node.start_y).fill(' ', ui.palette.default).highlight_on_hover());
                 with_parent!(ui, row_widget, {
                     if self.cursor_path.last() == Some(&node.identity) {
                         let a = ui.palette.selected;
@@ -979,17 +1014,29 @@ impl WatchesWindow {
 
                     let name_effective_width = self.name_width.saturating_sub(row_x);
 
-                    let mut w = widget!().fixed_x(name_effective_width as isize + 1).fixed_width(self.value_width).text_lines(value_start..value_end);
+                    let mut w = widget!().fixed_x((name_effective_width + Self::COLUMN_SPACING) as isize).fixed_width(self.value_width).text_lines(value_start..value_end);
                     if node.dubious || !suspended {
                         w.style_adjustment.update(ui.palette.value_dubious);
                     }
                     ui.add(w);
 
+                    if let Ok(Some((addr, size))) = Self::get_value_addr_and_size_for_data_breakpoint(&node.value, Ok(context)) {
+                        if let Some(&(enabled, active, stop_on_read, conditional, hit)) = self.data_breakpoints.get(&(addr, size)) {
+                            let l = if hit {
+                                ui_writeln!(ui, instruction_pointer, "{}", "⮕ ")
+                            } else {
+                                let bp = get_breakpoint_icon(enabled, active, /*secondary*/ false, conditional, /*data*/ true, stop_on_read, &ui.palette);
+                                styled_writeln!(ui.text, bp.1, "{}", bp.0)
+                            };
+                            ui.add(widget!().fixed_x(name_effective_width as isize + 1).fixed_width(2).text(l));
+                        }
+                    }
+
                     let mut clicked_name = false;
                     if node.is_text_input && ui.check_focus() {
                         let (identity, height, input) = self.text_input.as_mut().unwrap();
                         assert_eq!(*identity, node.identity);
-                        let input_widget = ui.add(widget!().identity(&'i').width(AutoSize::Children).min_width(name_effective_width).max_width(name_effective_width + self.value_width + 1).height(AutoSize::Children).max_height(self.row_height_limit));
+                        let input_widget = ui.add(widget!().identity(&'i').width(AutoSize::Children).min_width(name_effective_width).max_width(name_effective_width + self.value_width + Self::COLUMN_SPACING).height(AutoSize::Children).max_height(self.row_height_limit));
                         with_parent!(ui, input_widget, {
                             ui.relative_focus(row_widget);
                             let changed = input.build(ui);
@@ -1132,6 +1179,16 @@ impl WatchesWindow {
         Some(res)
     }
 
+    fn make_value_ref_expression_for_tree_node(value: &Result<Value>, state: &mut UIState, debugger: &mut Debugger) -> Result<Option<String>> {
+        let (addr, t) = match Self::get_value_addr_and_type(value, Err(debugger))? {
+            Some(x) => x,
+            None => return Ok(None) };
+        let mut type_name = String::new();
+        print_type_in_watch_language_syntax(t, &mut type_name, 0)?;
+        let expr = format!("*(0x{:x} as *{})", addr, type_name);
+        Ok(Some(expr))
+    }
+
     fn add_watch(&mut self, s: String, refresh_data: &mut bool) {
         let mut i = self.expressions.len();
         if self.expressions.last().is_some_and(|e| &e.special == &Some(SpecialWatch::AddWatch)) {
@@ -1141,6 +1198,79 @@ impl WatchesWindow {
         self.expressions.insert(i, WatchExpression {identity, text: s, special: None});
         self.cursor_path = vec![identity];
         *refresh_data = true;
+    }
+
+    // If the value shown for a node comes from dereferencing some memory address, returns that address and data type.
+    fn get_value_addr_and_type(value: &Result<Value>, eval_context: std::result::Result<&mut EvalContext, &mut Debugger>) -> Result<Option<(usize, *const TypeInfo)>> {
+        let value = match value {
+            Ok(x) => x,
+            Err(_) => return Ok(None), // error is already shown in UI
+        };
+        let mut addr = match &value.val {
+            &AddrOrValueBlob::Addr(x) => x,
+            AddrOrValueBlob::Blob(_) => return err!(Usage, "value is not in memory"),
+        };
+        let mut t = value.type_;
+        match unsafe {&(*t).t} {
+            Type::Pointer(p) if p.flags.contains(PointerFlags::REFERENCE) => {
+                addr = match eval_context {
+                    Ok(ctx) => ctx.memory.read_usize(addr)?,
+                    // The call site that does at most one call per frame doesn't have EvalContext at hand (with CachedMemReader), so we fall back to uncached memory read.
+                    Err(debugger) => debugger.memory.read_u64(addr)? as usize,
+                };
+                t = p.type_;
+            }
+            _ => () }
+
+        Ok(Some((addr, t)))
+    }
+
+    fn get_value_addr_and_size_for_data_breakpoint(value: &Result<Value>, eval_context: std::result::Result<&mut EvalContext, &mut Debugger>) -> Result<Option<(usize, u8)>> {
+        match Self::get_value_addr_and_type(value, eval_context) {
+            Err(e) => Err(e),
+            Ok(None) => Ok(None),
+            Ok(Some((addr, t))) => {
+                let size = unsafe {(*t).calculate_size()};
+                if [1, 2, 4, 8].contains(&size) {
+                    Ok(Some((addr, size as u8)))
+                } else {
+                    return err!(Usage, "unsupported size: {} bytes (must be 1, 2, 4, or 8)", size);
+                }
+            }
+        }
+    }
+    
+    fn toggle_data_breakpoint(value: &Result<Value>, stop_on_read: bool, edit_condition: bool, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) -> Result<()> {
+        let (addr, size) = match Self::get_value_addr_and_size_for_data_breakpoint(value, Err(debugger))? {
+            Some(x) => x,
+            None => return Ok(()) };
+
+        ui.should_redraw = true;
+
+        let mut existing = None;
+        for (id, breakpoint) in debugger.breakpoints.iter() {
+            if let BreakpointOn::Data(d) = &breakpoint.on {
+                if d.addr == addr && d.size == size {
+                    existing = Some((id, d.stop_on_read));
+                    break;
+                }
+            }
+        }
+        let id = if let Some((id, existing_stop_on_read)) = existing {
+            if stop_on_read != existing_stop_on_read {
+                debugger.set_data_breakpoint_stop_on_read(id, stop_on_read)?;
+            } else if !edit_condition {
+                debugger.remove_breakpoint(id);
+                return Ok(());
+            }
+            id
+        } else {
+            debugger.add_breakpoint(BreakpointOn::Data(DataBreakpoint {addr, size, stop_on_read}))?
+        };
+        if edit_condition {
+            state.should_edit_breakpoint_condition = Some(id);
+        }
+        Ok(())
     }
 
     fn build_variable_search_dialog(&mut self, create: bool, refresh_data: &mut bool, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
@@ -1203,7 +1333,7 @@ impl WindowContent for WatchesWindow {
         // Keyboard input.
         let mut refresh_data = self.tree.roots.is_empty();
         let (mut open_variable_search, mut open_type_search) = (false, false);
-        for action in ui.check_keys(&[KeyAction::Cancel, KeyAction::CursorRight, KeyAction::CursorLeft, KeyAction::Enter, KeyAction::DeleteRow, KeyAction::DuplicateRow, KeyAction::Open, KeyAction::FindType]) {
+        for action in ui.check_keys(&[KeyAction::Cancel, KeyAction::CursorRight, KeyAction::CursorLeft, KeyAction::Enter, KeyAction::DeleteRow, KeyAction::DuplicateRow, KeyAction::AddValueRefWatch, KeyAction::Open, KeyAction::FindType, KeyAction::DataWriteBreakpoint, KeyAction::DataReadWriteBreakpoint, KeyAction::ConditionalDataWriteBreakpoint, KeyAction::ConditionalDataReadWriteBreakpoint]) {
             self.scroll_to_cursor = true;
 
             if action == KeyAction::Cancel {
@@ -1256,7 +1386,7 @@ impl WindowContent for WatchesWindow {
                 KeyAction::Enter if !node.click_action.is_none() => {
                     Self::perform_click_action(&node.click_action, &debugger.symbols, state, ui);
                 }
-                KeyAction::Enter | KeyAction::DuplicateRow => {
+                KeyAction::Enter | KeyAction::DuplicateRow | KeyAction::AddValueRefWatch => {
                     let s = if action == KeyAction::DuplicateRow && expr_idx.is_some() {
                         let e = &self.expressions[expr_idx.clone().unwrap()];
                         if e.special.is_none() {
@@ -1264,6 +1394,10 @@ impl WindowContent for WatchesWindow {
                         } else {
                             None
                         }
+                    } else if action == KeyAction::AddValueRefWatch {
+                        let r = Self::make_value_ref_expression_for_tree_node(&self.tree.nodes[node_idx.0].value, state, debugger);
+                        report_result(state, &r);
+                        r.ok().flatten()
                     } else {
                         self.make_expression_for_tree_node(node_idx)
                     };
@@ -1278,6 +1412,12 @@ impl WindowContent for WatchesWindow {
                     if !self.expressions.is_empty() {
                         self.cursor_path = vec![self.expressions[i.min(self.expressions.len()-1)].identity];
                     }
+                }
+                KeyAction::DataWriteBreakpoint | KeyAction::DataReadWriteBreakpoint | KeyAction::ConditionalDataWriteBreakpoint | KeyAction::ConditionalDataReadWriteBreakpoint => {
+                    let stop_on_read = action == KeyAction::DataReadWriteBreakpoint || action == KeyAction::ConditionalDataReadWriteBreakpoint;
+                    let conditional = action == KeyAction::ConditionalDataWriteBreakpoint || action == KeyAction::ConditionalDataReadWriteBreakpoint;
+                    let r = Self::toggle_data_breakpoint(&node.value, stop_on_read, conditional, state, debugger, ui);
+                    report_result(state, &r);
                 }
                 KeyAction::Open => open_variable_search = true,
                 KeyAction::FindType => open_type_search = true,
@@ -1325,6 +1465,15 @@ impl WindowContent for WatchesWindow {
             self.eval_watches(&mut eval_context, &ui.palette);
         }
 
+        // Get data breakpoints info.
+        self.data_breakpoints.clear();
+        for (id, bp) in debugger.breakpoints.iter() {
+            if let BreakpointOn::Data(d) = &bp.on {
+                let hit = state.hit_breakpoints.binary_search(&id).is_ok();
+                self.data_breakpoints.insert((d.addr, d.size), (bp.enabled, bp.active, d.stop_on_read, bp.condition.is_some(), hit));
+            }
+        }
+
         // Create container widgets.
         ui.cur_mut().set_hstack();
         let header_and_viewport = ui.add(widget!().width(AutoSize::Remainder(1.0)).vstack());
@@ -1332,7 +1481,7 @@ impl WindowContent for WatchesWindow {
         ui.layout_children(Axis::X);
         let viewport_width = ui.calculate_size(header_and_viewport, Axis::X);
         let name_width = viewport_width * 4 / 10;
-        let value_width = viewport_width.saturating_sub(name_width + 1);
+        let value_width = viewport_width.saturating_sub(name_width + Self::COLUMN_SPACING);
         let viewport;
         with_parent!(ui, header_and_viewport, {
             if !ui.check_focus() {
@@ -1344,7 +1493,7 @@ impl WindowContent for WatchesWindow {
                 let l = ui_writeln!(ui, table_header, "  name");
                 ui.add(widget!().text(l).fixed_width(name_width));
                 let l = ui_writeln!(ui, table_header, "value");
-                ui.add(widget!().text(l).fixed_width(value_width).fixed_x(name_width as isize + 1));
+                ui.add(widget!().text(l).fixed_width(value_width).fixed_x((name_width + Self::COLUMN_SPACING) as isize));
             });
 
             viewport = ui.add(widget!().height(AutoSize::Remainder(1.0)));
@@ -1422,11 +1571,12 @@ impl WindowContent for WatchesWindow {
     fn get_key_hints(&self, out: &mut Vec<KeyHint>, debugger: &Debugger) {
         out.extend([
             KeyHint::key(KeyAction::Enter, "edit/add"),
-            KeyHint::key(KeyAction::DuplicateRow, "duplicate"),
+            KeyHint::keys(&[KeyAction::DuplicateRow, KeyAction::AddValueRefWatch], "copy/ref"),
             KeyHint::key(KeyAction::DeleteRow, "delete"),
             KeyHint::keys(&[KeyAction::CursorRight, KeyAction::CursorLeft], "expand/collapse"),
             KeyHint::keys(&[KeyAction::Open, KeyAction::FindType], "find variable/type"),
             KeyHint::key(KeyAction::Tooltip, "tooltip"),
+            KeyHint::keys(&[KeyAction::DataWriteBreakpoint, KeyAction::DataReadWriteBreakpoint, KeyAction::ConditionalDataWriteBreakpoint, KeyAction::ConditionalDataReadWriteBreakpoint], "data breakpoint w/rw/cond"),
         ]);
     }
 
@@ -1856,7 +2006,7 @@ impl DisassemblyWindow {
     }
 
     // Breakpoint addresses in Debugger may be outdated if the process is not running or if breakpoints weren't activated. This is a crutch to correct for that.
-    fn fixup_breakpoint_address(bp: &AddressBreakpoint, tab: &DisassemblyTab, addr_map: &AddrMap) -> usize {
+    fn fixup_breakpoint_address(bp: &InstructionBreakpoint, tab: &DisassemblyTab, addr_map: &AddrMap) -> usize {
         if let Some((bp_locator, offset)) = &bp.function {
             if let Some(tab_locator) = &tab.locator {
                 if tab_locator.matches_incomplete(bp_locator) {
@@ -1867,12 +2017,12 @@ impl DisassemblyWindow {
         bp.addr
     }
 
-    fn toggle_breakpoint(new_breakpoint: AddressBreakpoint, delete: bool, edit_condition: bool, tab: &DisassemblyTab, addr_map: &AddrMap, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
+    fn toggle_breakpoint(new_breakpoint: InstructionBreakpoint, delete: bool, edit_condition: bool, tab: &DisassemblyTab, addr_map: &AddrMap, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
         ui.should_redraw = true;
 
         let mut existing_id = None;
         for (id, breakpoint) in debugger.breakpoints.iter() {
-            if let BreakpointOn::Address(bp) = &breakpoint.on {
+            if let BreakpointOn::Instruction(bp) = &breakpoint.on {
                 let addr = Self::fixup_breakpoint_address(bp, tab, addr_map);
                 if addr == new_breakpoint.addr {
                     existing_id = Some(id);
@@ -1899,7 +2049,7 @@ impl DisassemblyWindow {
             }
             id
         } else {
-            let r = debugger.add_breakpoint(BreakpointOn::Address(new_breakpoint));
+            let r = debugger.add_breakpoint(BreakpointOn::Instruction(new_breakpoint));
             report_result(state, &r);
             match r {
                 Ok(id) => id,
@@ -2111,10 +2261,10 @@ impl WindowContent for DisassemblyWindow {
                     KeyAction::Enter | KeyAction::DeleteRow | KeyAction::EditCondition | KeyAction::StepToCursor if cursor_addr != usize::MAX => {
                         let offset = cursor_static_addr - function.addr.0;
                         // TODO: For function entry breakpoints use entry_pc instead of start of first range. Figure out how to indicate it in the UI nicely.
-                        let new_breakpoint = AddressBreakpoint {function: Some((tab.locator.clone().unwrap(), offset)), addr: cursor_addr, subfunction_level: tab.selected_subfunction_level};
+                        let new_breakpoint = InstructionBreakpoint {function: Some((tab.locator.clone().unwrap(), offset)), addr: cursor_addr, subfunction_level: tab.selected_subfunction_level};
                         if action == KeyAction::StepToCursor {
                             ui.should_redraw = true;
-                            let r = debugger.step_to_cursor(state.selected_thread, BreakpointOn::Address(new_breakpoint));
+                            let r = debugger.step_to_cursor(state.selected_thread, BreakpointOn::Instruction(new_breakpoint));
                             report_result(state, &r);
                         } else {
                             Self::toggle_breakpoint(new_breakpoint, action == KeyAction::DeleteRow, action == KeyAction::EditCondition, tab, &binary.addr_map, state, debugger, ui);
@@ -2175,7 +2325,7 @@ impl WindowContent for DisassemblyWindow {
         let mut address_breakpoints: Vec<(usize, /*enabled*/ bool, /*location_active*/ bool, /*conditional*/ bool)> = Vec::new();
         for (_, breakpoint) in debugger.breakpoints.iter() {
             match &breakpoint.on {
-                BreakpointOn::Address(bp) => {
+                BreakpointOn::Instruction(bp) => {
                     let mut location_active = false;
                     if breakpoint.active {
                         let i = debugger.breakpoint_locations.partition_point(|l| l.addr < bp.addr);
@@ -2222,7 +2372,7 @@ impl WindowContent for DisassemblyWindow {
                                     match b {
                                         &BreakpointRef::Id {id, ..} => {
                                             let conditional = debugger.breakpoints.get(id).condition.is_some();
-                                            (marker, style) = get_breakpoint_icon(/*enabled*/ true, /*active*/ true, /*secondary*/ true, conditional, &ui.palette);
+                                            (marker, style) = get_breakpoint_icon(/*enabled*/ true, /*active*/ true, /*secondary*/ true, conditional, /*data*/ false, /*stop_on_read*/ false, &ui.palette);
                                         }
                                         BreakpointRef::Step(_) => (),
                                     }
@@ -2234,7 +2384,7 @@ impl WindowContent for DisassemblyWindow {
                         if bp_idx < address_breakpoints.len() {
                             let &(a, enabled, location_active, conditional) = &address_breakpoints[bp_idx];
                             if a == addr {
-                                (marker, style) = get_breakpoint_icon(enabled, location_active, /*secondary*/ false, conditional, &ui.palette);
+                                (marker, style) = get_breakpoint_icon(enabled, location_active, /*secondary*/ false, conditional, /*data*/ false, /*stop_on_read*/ false, &ui.palette);
                             }
                         }
                     }
@@ -4199,7 +4349,7 @@ impl WindowContent for CodeWindow {
                 let idx = breakpoint_lines.partition_point(|t| t.line < i + 1);
                 if idx < breakpoint_lines.len() && breakpoint_lines[idx].line == i + 1 {
                     let l = &breakpoint_lines[idx];
-                    let (marker, style) = get_breakpoint_icon(l.enabled, l.active, l.adjusted, l.conditional, &ui.palette);
+                    let (marker, style) = get_breakpoint_icon(l.enabled, l.active, l.adjusted, l.conditional, /*data*/ false, /*stop_on_read*/ false, &ui.palette);
                     styled_write!(ui.text, style, "{}", marker);
                 } else {
                     ui_write!(ui, default, "  ");
@@ -4306,16 +4456,16 @@ impl WindowContent for BreakpointsWindow {
     }
 
     fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
-        let mut hit_breakpoints: Vec<BreakpointId> = Vec::new();
+        state.hit_breakpoints.clear();
         for (tid, thread) in &debugger.threads {
             for reason in &thread.stop_reasons {
                 if let &StopReason::Breakpoint(id) = reason {
-                    hit_breakpoints.push(id);
+                    state.hit_breakpoints.push(id);
                 }
             }
         }
-        hit_breakpoints.sort();
-        hit_breakpoints.dedup();
+        state.hit_breakpoints.sort();
+        state.hit_breakpoints.dedup();
 
         let mut table = Table::new(mem::take(&mut self.table_state), ui, vec![
             Column::new("idx", AutoSize::Text, false),
@@ -4393,9 +4543,12 @@ impl WindowContent for BreakpointsWindow {
         let mut text_input_parent_widget = None;
         for &id in &breakpoints {
             let b = debugger.breakpoints.get(id);
-            let is_hit = hit_breakpoints.binary_search(&id).is_ok();
+            let is_hit = state.hit_breakpoints.binary_search(&id).is_ok();
             let locs_begin = locations.partition_point(|t| t.0 < id);
             let locs_end = locations.partition_point(|t| t.0 <= id);
+            let (data, stop_on_read) = match &b.on {
+                BreakpointOn::Data(d) => (true, d.stop_on_read),
+                _ => (false, false) };
 
             let mut error: Option<Error> = None;
             if b.enabled {
@@ -4416,7 +4569,7 @@ impl WindowContent for BreakpointsWindow {
             table.text_cell(ui);
 
             ui_write!(ui, instruction_pointer, "{}", if is_hit {"⮕ "} else {"  "});
-            let (marker, style) = get_breakpoint_icon(b.enabled, b.active, /*secondary*/ false, b.condition.is_some(), &ui.palette);
+            let (marker, style) = get_breakpoint_icon(b.enabled, b.active, /*secondary*/ false, b.condition.is_some(), data, stop_on_read, &ui.palette);
             styled_writeln!(ui.text, style, "{}", marker);
             with_parent!(ui, table.text_cell(ui), {
                 ui.cur_mut().flags.insert(WidgetFlags::HIGHLIGHT_ON_HOVER);
@@ -4439,7 +4592,7 @@ impl WindowContent for BreakpointsWindow {
                         ui_write!(ui, line_number, "{}", adj);
                     }
                 }
-                BreakpointOn::Address(on) => {
+                BreakpointOn::Instruction(on) => {
                     if let Some((locator, offset)) = &on.function {
                         ui_write!(ui, function_name, "{}", locator.demangled_name);
                         ui_write!(ui, default, " + 0x{:x}", offset);
@@ -4449,6 +4602,7 @@ impl WindowContent for BreakpointsWindow {
                 }
                 BreakpointOn::InitialExec => ui_write!(ui, default, "early during startup"),
                 BreakpointOn::PointOfInterest(point) => ui_write!(ui, default, "{}", point.name_for_ui()),
+                BreakpointOn::Data(on) => ui_write!(ui, default, "0x{:x} ({}, {} bytes)", on.addr, if on.stop_on_read {"rw"} else {"w"}, on.size),
             }
             let row_is_focused = ui.check_focus();
             let l = ui.text.close_line();
@@ -4479,7 +4633,11 @@ impl WindowContent for BreakpointsWindow {
                 }
             });
 
-            ui_writeln!(ui, default_dim, "{}", locs_end - locs_begin);
+            if b.enabled && !b.on.is_data() {
+                ui_writeln!(ui, default_dim, "{}", locs_end - locs_begin);
+            } else {
+                ui.text.close_line();
+            }
             table.text_cell(ui);
 
             ui_writeln!(ui, default_dim, "{}", b.hits);
@@ -4514,7 +4672,7 @@ impl WindowContent for BreakpointsWindow {
                     BreakpointOn::Line(on) => {
                         state.should_scroll_source = Some((Some(SourceScrollTarget {path: on.path.clone(), version: on.file_version.clone(), line: on.line}), false));
                     }
-                    BreakpointOn::Address(on) => {
+                    BreakpointOn::Instruction(on) => {
                         if let Some((locator, offset)) = &on.function {
                             if let Ok(binary) = Debugger::find_binary_fuzzy(&debugger.symbols, &locator.binary_locator) {
                                 if let Ok(symbols) = &binary.symbols {
@@ -4549,7 +4707,7 @@ impl WindowContent for BreakpointsWindow {
                             }
                         }
                     }
-                    BreakpointOn::InitialExec => (),
+                    BreakpointOn::InitialExec | BreakpointOn::Data(_) => (),
                 }
             }
         }

@@ -29,6 +29,7 @@ test with watches window filled with long arrays (I saw 50ms frames when there a
 investigate unresponsive ui when conditional breakpoint is hit at a high rate
 
 todo:
+tooltip in status window with more log lines and more space for last error
 draggable column widths in watches window
 try with odin
 zig pretty-printers
@@ -117,7 +118,6 @@ unfocus search bars when moving up/down the list (but not when scrolling)
 show disassembly even if symbols are missing
 group threads by stack trace, to make it easy to exclude pool threads waiting for work
 show return value after step-out (and other steps that happened to step out)
-data breakpoints (added by pressing 'b' on a watch, the breakpoint would use the address of the watched value at the time of setting the breakpoint, with some indication if it's different from current); maybe added as a new watch with address as a literal; or added in breakpoints window and focus jumps there
 thread-specific breakpoints (controlled in breakpoints window), a key to lock all breakpoints to current thread
 hotkeys for switching to specific windows
 resolve dynamic library call targets in disassembly, instead of showing them as "call .plt.sec+1234h"

@@ -238,6 +238,14 @@ impl AddrOrValueBlob {
     pub fn addr(&self) -> Option<usize> { match self { Self::Addr(a) => Some(*a), _ => None } }
     pub fn blob_ref(&self) -> Option<&ValueBlob> { match self { Self::Blob(b) => Some(b), _ => None } }
 
+    pub fn byte_range(&self, offset: Range<usize>, memory: &mut CachedMemReader) -> Result<Self> {
+        match self {
+            &Self::Addr(addr) if addr > usize::MAX - offset.start => err!(ProcessState, "address overflow: 0x{} + {}", addr, offset.start),
+            &Self::Addr(addr) => Ok(Self::Addr(addr + offset.start)),
+            Self::Blob(blob) => Ok(Self::Blob(blob.byte_range(offset)?)),
+        }
+    }
+
     pub fn bit_range(&self, bit_offset: Range<usize>, memory: &mut CachedMemReader) -> Result<usize> {
         assert!(bit_offset.len() <= 64);
         let mut a = [0u8; 9];
@@ -268,6 +276,25 @@ impl AddrOrValueBlob {
         }
 
         Ok(r)
+    }
+
+    pub fn get_usize(&self, memory: &mut CachedMemReader) -> Result<usize> {
+        match self {
+            &Self::Addr(addr) => memory.read_usize(addr),
+            Self::Blob(blob) => blob.get_usize(),
+        }
+    }
+    pub fn get_usize_prefix(&self, memory: &mut CachedMemReader) -> Result<usize> {
+        match self {
+            &Self::Addr(addr) => memory.read_usize(addr),
+            Self::Blob(blob) => Ok(blob.get_usize_prefix()),
+        }
+    }
+    pub fn get_usize_at(&self, offset: usize, memory: &mut CachedMemReader) -> Result<usize> {
+        match self {
+            &Self::Addr(addr) => memory.read_usize(addr + offset),
+            Self::Blob(blob) => blob.get_usize_at(offset),
+        }
     }
 }
 
@@ -745,15 +772,11 @@ fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut Form
     let mut children: Vec<ValueChildInfo> = Vec::new();
     let t = unsafe {&*v.type_};
     let size = t.calculate_size();
-    let mut temp_value = AddrOrValueBlob::Addr(0);
-    let preread_limit = 100000;
-    let value = match &v.val {
-        AddrOrValueBlob::Blob(b) => b,
-        AddrOrValueBlob::Addr(addr) => match v.val.clone().into_value(size.min(preread_limit), &mut state.context.memory) {
-            Ok(v) => {
-                temp_value = AddrOrValueBlob::Blob(v);
-                &temp_value.blob_ref().unwrap()
-            }
+    let usize_prefix = if size == 0 {
+        0
+    } else {
+        match v.val.get_usize_prefix(&mut state.context.memory) {
+            Ok(x) => x,
             Err(e) => {
                 write_val_address_if_needed(&v.val, state);
                 styled_write!(state.out, state.palette.error, "<{}>", e);
@@ -765,12 +788,12 @@ fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut Form
     match &t.t {
         Type::Unknown => {
             write_val_address_if_needed(&v.val, state);
-            styled_write!(state.out, state.palette.value_misc, "0x{:x} ", value.get_usize_prefix());
+            styled_write!(state.out, state.palette.value_misc, "0x{:x} ", usize_prefix);
             styled_write!(state.out, state.palette.error, "<unknown type>");
         }
         // `value` can be longer than the type's `size` e.g. if a 4-byte value is stored in an 8-byte register.
         // It can even be longer than 8 bytes if it's stored in a wider register, e.g. float stored in zmm0 (aka xmm0 or ymm0).
-        Type::Primitive(p) => match value.get_usize_prefix() {
+        Type::Primitive(p) => match usize_prefix {
             _ if size == 0 => styled_write!(state.out, state.palette.value_misc, "()"), // covers things like void, decltype(nullptr), rust empty tuple, rust `!` type
             mut x if size <= 8 => {
                 let as_number = v.flags.intersects(ValueFlags::RAW | ValueFlags::HEX | ValueFlags::BIN);
@@ -810,56 +833,42 @@ fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut Form
             }
             _ => styled_write!(state.out, state.palette.error, "<bad size: {}>", size),
         }
-        Type::Pointer(p) => match value.get_usize() {
-            Ok(x) => if p.flags.contains(PointerFlags::REFERENCE) {
-                //write_address(x, state);
-                return format_value_recurse(&Value {val: AddrOrValueBlob::Addr(x), type_: p.type_, flags: v.flags.inherit()}, true, state);
-            } else {
-                styled_write!(state.out, if state.expanded {state.palette.value_misc} else {state.palette.value}, "*0x{:x} ", x);
-                let t = unsafe {&*p.type_};
-                if x == 0 || (t.flags.contains(TypeFlags::SIZE_KNOWN) && t.size == 0) { // don't expand nullptr and void*
-                    return (false, children, click_action);
-                }
-                if !state.expanded {
-                    return (true, children, click_action);
-                }
-                if !try_format_as_string(Some(x), None, p.type_, None, false, v.flags, &mut state.context.memory, "", state.out, state.palette) {
-                    // If expanded, act like a reference, i.e. expand the pointee.
-                    (_, children, _) = format_value_recurse(&Value {val: AddrOrValueBlob::Addr(x), type_: p.type_, flags: v.flags.inherit()}, true, state);
-                    for c in &mut children {
-                        c.deref += 1;
-                    }
-                }
+        Type::Pointer(p) => if p.flags.contains(PointerFlags::REFERENCE) {
+            //write_address(x, state);
+            return format_value_recurse(&Value {val: AddrOrValueBlob::Addr(usize_prefix), type_: p.type_, flags: v.flags.inherit()}, true, state);
+        } else {
+            styled_write!(state.out, if state.expanded {state.palette.value_misc} else {state.palette.value}, "*0x{:x} ", usize_prefix);
+            let t = unsafe {&*p.type_};
+            if usize_prefix == 0 || (t.flags.contains(TypeFlags::SIZE_KNOWN) && t.size == 0) { // don't expand nullptr and void*
+                return (false, children, click_action);
+            }
+            if !state.expanded {
                 return (true, children, click_action);
             }
-            Err(e) => styled_write!(state.out, state.palette.error, "<{}>", e),
+            if !try_format_as_string(&AddrOrValueBlob::Addr(usize_prefix), p.type_, None, false, v.flags, &mut state.context.memory, "", state.out, state.palette) {
+                // If expanded, act like a reference, i.e. expand the pointee.
+                (_, children, _) = format_value_recurse(&Value {val: AddrOrValueBlob::Addr(usize_prefix), type_: p.type_, flags: v.flags.inherit()}, true, state);
+                for c in &mut children {
+                    c.deref += 1;
+                }
+            }
+            return (true, children, click_action);
         }
         Type::Array(a) => {
-            format_array(a.type_, if a.flags.contains(ArrayFlags::LEN_KNOWN) {Some(a.len)} else {None}, a.stride, value, v.val.addr(), a.flags.contains(ArrayFlags::UTF_STRING), a.flags.contains(ArrayFlags::TRUNCATED), v.flags, state, &mut children);
+            format_array(a.type_, if a.flags.contains(ArrayFlags::LEN_KNOWN) {Some(a.len)} else {None}, a.stride, &v.val, a.flags.contains(ArrayFlags::UTF_STRING), a.flags.contains(ArrayFlags::TRUNCATED), v.flags, state, &mut children);
             return (true, children, click_action);
         }
         Type::Slice(s) => {
-            let addr = value.get_usize_at(0).unwrap();
-            let len = value.get_usize_at(8).unwrap();
-            let inner_type = unsafe {&*s.type_};
-            let to_read = inner_type.calculate_size().saturating_mul(len).min(preread_limit);
-            let contents = match AddrOrValueBlob::Addr(addr).into_value(to_read, &mut state.context.memory) {
-                Ok(x) => x,
-                Err(e) => {
-                    write_val_address_if_needed(&v.val, state);
-                    styled_write!(state.out, state.palette.error, "<{}>", e);
-                    return (false, children, click_action);
-                }
-            };
-            format_array(s.type_, Some(len), 0, &contents, Some(addr), s.flags.contains(SliceFlags::UTF_STRING), /*is_truncated*/ false, v.flags, state, &mut children);
+            let blob = match &v.val {
+                AddrOrValueBlob::Blob(x) => x,
+                AddrOrValueBlob::Addr(_) => panic!("unexpected slice ref") };
+            let addr = blob.get_usize_at(0).unwrap();
+            let len = blob.get_usize_at(8).unwrap();
+            format_array(s.type_, Some(len), 0, &AddrOrValueBlob::Addr(addr), s.flags.contains(SliceFlags::UTF_STRING), /*is_truncated*/ false, v.flags, state, &mut children);
             return (true, children, click_action);
         }
         Type::Struct(s) => {
-            let value = match temp_value.blob_ref() {
-                Some(b) if b.capacity() >= size => &temp_value,
-                _ => &v.val,
-            };
-            children = list_struct_children(value, s, v.flags, state);
+            children = list_struct_children(&v.val, s, v.flags, state);
             if v.flags.contains(ValueFlags::SHOW_TYPE_NAME) || (state.expanded && (!t.name.is_empty() || t.die.0 != 0)) {
                 if t.name.is_empty() {
                     // TODO: Print file+line instead of DIE offset.
@@ -904,47 +913,48 @@ fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut Form
                 styled_write!(state.out, state.palette.value_misc, "}}");
             }
         }
-        Type::Enum(e) => match value.get_usize() {
-            Ok(mut x) => {
-                let et = unsafe {&*e.type_};
-                let (mut size, signed) = match &et.t {
-                    Type::Primitive(p) => (et.size, p.contains(PrimitiveFlags::SIGNED)),
-                    _ => (8, false),
-                };
-                if size != 1 && size != 2 && size != 4 && size != 8 {
-                    size = 8;
-                }
-                flip_endianness_if_needed(&mut x, size, v.flags);
-                // Sign-extend (for matching with enumerand values below).
-                if signed && size < 8 && x & 1 << (size*8-1) as u32 != 0 {
-                    x |= !((1usize << size*8)-1);
-                }
-                format_integer(x, size, signed, v.flags, state.out, state.palette);
-                if !v.flags.intersects(ValueFlags::RAW | ValueFlags::HEX | ValueFlags::BIN) {
-                    styled_write!(state.out, state.palette.value_misc, " (");
-                    let mut found = false;
-                    for enumerand in e.enumerands {
-                        if enumerand.value == x && !enumerand.name.is_empty() {
-                            styled_write!(state.out, state.palette.field_name, "{}", enumerand.name);
-                            found = true;
-                            break;
-                        }
-                    }
-                    if !found {
-                        styled_write!(state.out, state.palette.error, "?");
-                    }
-                    styled_write!(state.out, state.palette.value_misc, ")");
-                }
+        Type::Enum(e) => {
+            let mut x = usize_prefix;
+            let et = unsafe {&*e.type_};
+            let (mut size, signed) = match &et.t {
+                Type::Primitive(p) => (et.size, p.contains(PrimitiveFlags::SIGNED)),
+                _ => (8, false),
+            };
+            if size != 1 && size != 2 && size != 4 && size != 8 {
+                size = 8;
             }
-            Err(e) => styled_write!(state.out, state.palette.error, "<{}>", e),
+            flip_endianness_if_needed(&mut x, size, v.flags);
+            // Sign-extend (for matching with enumerand values below).
+            if signed && size < 8 && x & 1 << (size*8-1) as u32 != 0 {
+                x |= !((1usize << size*8)-1);
+            }
+            format_integer(x, size, signed, v.flags, state.out, state.palette);
+            if !v.flags.intersects(ValueFlags::RAW | ValueFlags::HEX | ValueFlags::BIN) {
+                styled_write!(state.out, state.palette.value_misc, " (");
+                let mut found = false;
+                for enumerand in e.enumerands {
+                    if enumerand.value == x && !enumerand.name.is_empty() {
+                        styled_write!(state.out, state.palette.field_name, "{}", enumerand.name);
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    styled_write!(state.out, state.palette.error, "?");
+                }
+                styled_write!(state.out, state.palette.value_misc, ")");
+            }
         }
         Type::MetaType | Type::MetaField | Type::MetaVariable => {
             let val = reflect_meta_value(&v, state.state, state.context, Some((state.out, state.palette)));
             children = list_struct_children(&val.val, unsafe {(*val.type_).t.as_struct().unwrap()}, val.flags, state);
         }
         Type::MetaCodeLocation => {
-            let binary_id = value.get_usize_at(0).unwrap();
-            let line = LineInfo {data: [value.get_usize_at(8).unwrap(), value.get_usize_at(16).unwrap()]};
+            let blob = match &v.val {
+                AddrOrValueBlob::Blob(x) => x,
+                AddrOrValueBlob::Addr(_) => panic!("unexpected slice ref") };
+            let binary_id = blob.get_usize_at(0).unwrap();
+            let line = LineInfo {data: [blob.get_usize_at(8).unwrap(), blob.get_usize_at(16).unwrap()]};
             match state.context.symbols_registry.get(binary_id) {
                 None => styled_write!(state.out, state.palette.error, "binary unloaded"),
                 Some(binary) => {
@@ -985,20 +995,16 @@ fn format_integer(x0: usize, size: usize, signed: bool, flags: ValueFlags, out: 
     }
 }
 
-fn format_array(inner_type: *const TypeInfo, len: Option<usize>, stride: usize, value: &ValueBlob, addr: Option<usize>, is_string: bool, is_truncated: bool, flags: ValueFlags,
+fn format_array(inner_type: *const TypeInfo, len: Option<usize>, stride: usize, value: &AddrOrValueBlob, is_string: bool, is_truncated: bool, flags: ValueFlags,
                 state: &mut FormatValueState, children: &mut Vec<ValueChildInfo>) {
-    // TODO: Hexdump (0x"1a74673bc67f") if element is 1-byte and HEX value flag is set.
     let inner_type = unsafe {&*inner_type};
     let inner_size = inner_type.calculate_size();
     let stride = if stride != 0 { stride } else { inner_size };
-    let get_val = |i: usize| -> Result<Value> {
+    let get_val = |i: usize, state: &mut FormatValueState| -> Result<Value> {
         let start = i * stride;
         let end = start + inner_size;
-        let elem = match value.bit_range(start * 8, inner_size * 8) {
-            Ok(v) => v,
-            Err(_) => return err!(TooLong, ""),
-        };
-        Ok(Value {val: AddrOrValueBlob::Blob(elem), type_: inner_type, flags: flags.inherit()})
+        let val = value.byte_range(start..end, &mut state.context.memory)?;
+        Ok(Value {val, type_: inner_type, flags: flags.inherit()})
     };
     if state.expanded {
         let mut indicated_truncation = false;
@@ -1009,7 +1015,7 @@ fn format_array(inner_type: *const TypeInfo, len: Option<usize>, stride: usize, 
                 indicated_truncation = true;
                 break;
             }
-            let value = get_val(i);
+            let value = get_val(i, state);
             let err = value.is_err();
             styled_write!(state.names_out, state.palette.value_misc, "[");
             styled_write!(state.names_out, state.palette.value, "{}", i);
@@ -1032,9 +1038,9 @@ fn format_array(inner_type: *const TypeInfo, len: Option<usize>, stride: usize, 
         } else {
             styled_write!(state.out, state.palette.value_misc, "length unknown");
         }
-        try_format_as_string(addr.clone(), Some(value), inner_type, len.clone(), is_string, flags, &mut state.context.memory, ", ", state.out, state.palette);
+        try_format_as_string(value, inner_type, len.clone(), is_string, flags, &mut state.context.memory, ", ", state.out, state.palette);
     } else {
-        if !try_format_as_string(addr.clone(), Some(value), inner_type, len.clone(), is_string, flags, &mut state.context.memory, "", state.out, state.palette) {
+        if !try_format_as_string(value, inner_type, len.clone(), is_string, flags, &mut state.context.memory, "", state.out, state.palette) {
             styled_write!(state.out, state.palette.value_misc, "[");
             for i in 0..len.unwrap_or(1) {
                 if i != 0 {
@@ -1044,7 +1050,7 @@ fn format_array(inner_type: *const TypeInfo, len: Option<usize>, stride: usize, 
                     styled_write!(state.out, state.palette.truncation_indicator.2, "{}", state.palette.truncation_indicator.1);
                     break;
                 }
-                match get_val(i) {
+                match get_val(i, state) {
                     Ok(v) => {
                         format_value_recurse(&v, false, state);
                     }
@@ -1066,7 +1072,8 @@ fn format_array(inner_type: *const TypeInfo, len: Option<usize>, stride: usize, 
     }
 }
 
-fn try_format_as_string(addr: Option<usize>, preread_blob: Option<&ValueBlob>, element_type: *const TypeInfo, len: Option<usize>, marked_as_string: bool, flags: ValueFlags, memory: &mut CachedMemReader, prefix: &str, out: &mut StyledText, palette: &Palette) -> bool {
+// If an array seems like a string, format it as string.
+fn try_format_as_string(value: &AddrOrValueBlob, element_type: *const TypeInfo, len: Option<usize>, marked_as_string: bool, flags: ValueFlags, memory: &mut CachedMemReader, prefix: &str, out: &mut StyledText, palette: &Palette) -> bool {
     if flags.contains(ValueFlags::RAW) {
         return false;
     }
@@ -1076,7 +1083,7 @@ fn try_format_as_string(addr: Option<usize>, preread_blob: Option<&ValueBlob>, e
         _ => return false,
     };
     if element_type.calculate_size() != 1 {
-        // Support for utf16 or utf32 would go somewhere around here, if we were to add it.
+        // Support for utf16 and utf32 would go somewhere around here, if we were to add it.
         return false;
     }
     if len.is_none() && !p.contains(PrimitiveFlags::AMBIGUOUS_CHAR) {
@@ -1089,11 +1096,10 @@ fn try_format_as_string(addr: Option<usize>, preread_blob: Option<&ValueBlob>, e
     let mut temp_storage: Vec<u8>;
     let mut terminated = true;
     let (len, slice) = match len {
-        Some(len) => match preread_blob {
-            Some(b) => (len, b.as_slice()),
-            None => {
+        Some(len) => match value {
+            &AddrOrValueBlob::Addr(addr) => {
                 temp_storage = vec![0; len.min(limit)];
-                match memory.read(addr.unwrap(), &mut temp_storage) {
+                match memory.read(addr, &mut temp_storage) {
                     Ok(()) => (),
                     Err(e) => {
                         styled_write!(out, palette.error, "<{}>", e);
@@ -1102,11 +1108,12 @@ fn try_format_as_string(addr: Option<usize>, preread_blob: Option<&ValueBlob>, e
                 }
                 (len, &temp_storage[..])
             }
+            AddrOrValueBlob::Blob(b) => (len, b.as_slice()),
         }
         None => {
-            let addr = match addr {
-                Some(x) => x,
-                None => return false,
+            let addr = match value {
+                &AddrOrValueBlob::Addr(x) => x,
+                AddrOrValueBlob::Blob(_) => return false,
             };
             temp_storage = match memory.read_null_terminated(addr, limit) {
                 Ok((r, t)) => {
