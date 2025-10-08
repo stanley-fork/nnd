@@ -68,6 +68,7 @@ struct SourceScrollTarget {
     path: PathBuf,
     version: FileVersionInfo,
     line: usize,
+    cascade: bool, // scroll disassembly as well
 }
 
 struct DisassemblyScrollTarget {
@@ -75,6 +76,7 @@ struct DisassemblyScrollTarget {
     function_idx: usize,
     static_pseudo_addr: usize,
     subfunction_level: u16,
+    cascade: bool, // scroll source as well
 }
 
 pub trait WindowContent {
@@ -1112,8 +1114,13 @@ impl WatchesWindow {
         match action {
             ValueClickAction::None => panic!("huh"),
             ValueClickAction::CodeLocation(line) => {
-                let target = SourceScrollTarget {path: line.path.clone(), version: line.version.clone(), line: line.line.line()};
+                let target = SourceScrollTarget {path: line.path.clone(), version: line.version.clone(), line: line.line.line(), cascade: true};
                 state.should_scroll_source = Some((Some(target), /*only_if_on_error_tab*/ false));
+                ui.should_redraw = true;
+            }
+            &ValueClickAction::Function {binary_id, function_idx, static_addr} => {
+                let target = DisassemblyScrollTarget {binary_id, function_idx, static_pseudo_addr: static_addr, subfunction_level: 0, cascade: true};
+                state.should_scroll_disassembly = Some((Ok(target), /*only_if_on_error_tab*/ false));
                 ui.should_redraw = true;
             }
         }
@@ -1791,7 +1798,7 @@ impl DisassemblyWindow {
                 Some(x) => x,
                 None => return err!(Usage, "no open function"),
             };
-            Ok(DisassemblyScrollTarget {binary_id, function_idx, static_pseudo_addr: function_locator.addr.0.saturating_add(addr), subfunction_level: u16::MAX})
+            Ok(DisassemblyScrollTarget {binary_id, function_idx, static_pseudo_addr: function_locator.addr.0.saturating_add(addr), subfunction_level: u16::MAX, cascade: true})
         } else {
             let (static_addr, binary) = match debugger.addr_to_binary(addr) {
                 Ok((_, static_addr, binary, _)) => (static_addr, binary),
@@ -1818,7 +1825,7 @@ impl DisassemblyWindow {
             };
             let symbols = binary.symbols.as_ref_clone_error()?;
             let (function, function_idx) = symbols.addr_to_function(static_addr)?;
-            Ok(DisassemblyScrollTarget {binary_id: binary.id, function_idx, static_pseudo_addr: static_addr, subfunction_level: u16::MAX})
+            Ok(DisassemblyScrollTarget {binary_id: binary.id, function_idx, static_pseudo_addr: static_addr, subfunction_level: u16::MAX, cascade: true})
         }
     }
 
@@ -1998,7 +2005,7 @@ impl DisassemblyWindow {
         }
 
         if let Some(res) = mem::take(&mut d.should_open_document) {
-            match self.open_function(Ok(DisassemblyScrollTarget {binary_id: res.binary_id, function_idx: res.id, static_pseudo_addr: 0, subfunction_level: u16::MAX}), debugger) {
+            match self.open_function(Ok(DisassemblyScrollTarget {binary_id: res.binary_id, function_idx: res.id, static_pseudo_addr: 0, subfunction_level: u16::MAX, cascade: true}), debugger) {
                 Ok(()) => self.tabs[self.tabs_state.selected].ephemeral = false,
                 Err(e) => log!(debugger.log, "{}", e),
             }
@@ -2022,6 +2029,9 @@ impl DisassemblyWindow {
 
         let mut existing_id = None;
         for (id, breakpoint) in debugger.breakpoints.iter() {
+            if breakpoint.hidden {
+                continue;
+            }
             if let BreakpointOn::Instruction(bp) = &breakpoint.on {
                 let addr = Self::fixup_breakpoint_address(bp, tab, addr_map);
                 if addr == new_breakpoint.addr {
@@ -2096,7 +2106,6 @@ impl WindowContent for DisassemblyWindow {
         let go_to_address_bar = ui.add(widget!().fixed_height(0));
         let content_root = ui.add(widget!().height(AutoSize::Remainder(1.0)));
 
-        let mut autoscroll_source_even_after_scrolling_disassembly = false;
         with_parent!(ui, go_to_address_bar, {
             ui.multifocus();
             if self.go_to_address_bar.editing {
@@ -2108,7 +2117,6 @@ impl WindowContent for DisassemblyWindow {
                         match self.find_address(&self.go_to_address_bar.text.text, debugger) {
                             Ok(target) => {
                                 state.should_scroll_disassembly = Some((Ok(target), /*only_if_on_error_tab*/ false));
-                                autoscroll_source_even_after_scrolling_disassembly = true;
                                 close = true;
                             }
                             Err(e) => self.go_to_address_error = Some(e),
@@ -2140,7 +2148,7 @@ impl WindowContent for DisassemblyWindow {
         ui.layout_children(Axis::Y);
 
         let mut scroll_to_addr: Option<(usize, u16)> = None;
-        let suppress_code_autoscroll = state.should_scroll_disassembly.is_some() && !autoscroll_source_even_after_scrolling_disassembly;
+        let mut suppress_code_autoscroll = false;
         if let Some((target, only_if_on_error_tab)) = mem::take(&mut state.should_scroll_disassembly) {
             let mut tab_to_restore: Option<usize> = None;
             if only_if_on_error_tab {
@@ -2148,11 +2156,14 @@ impl WindowContent for DisassemblyWindow {
             }
 
             if let Ok(target) = &target {
+                suppress_code_autoscroll = !target.cascade;
                 if tab_to_restore.is_none() {
                     scroll_to_addr = Some((target.static_pseudo_addr, target.subfunction_level));
                 } else {
                     // (Not ideal that we don't scroll when the tab is not selected, but meh.)
                 }
+            } else {
+                suppress_code_autoscroll = true;
             }
 
             self.open_function(target, debugger).unwrap();
@@ -2296,7 +2307,7 @@ impl WindowContent for DisassemblyWindow {
             }
             if let Some(line) = source_line_info {
                 let file = &symbols.files[line.file_idx().unwrap()];
-                source_line = Some(SourceScrollTarget {path: file.path.to_owned(), version: file.version.clone(), line: line.line()});
+                source_line = Some(SourceScrollTarget {path: file.path.to_owned(), version: file.version.clone(), line: line.line(), cascade: false});
             }
         }
         let key = (binary.id, function_idx, tab.area_state.cursor, tab.selected_subfunction_level);
@@ -3528,13 +3539,13 @@ impl WindowContent for StackWindow {
             let cur = (state.selected_thread, thr.1, frame.addr);
             scroll_source_and_disassembly |= cur != self.seen;
             if scroll_source_and_disassembly || rerequest_scroll {
-                state.should_scroll_source = Some((subframe.line.as_ref().map(|line| SourceScrollTarget {path: line.path.clone(), version: line.version.clone(), line: line.line.line()}), !scroll_source_and_disassembly));
+                state.should_scroll_source = Some((subframe.line.as_ref().map(|line| SourceScrollTarget {path: line.path.clone(), version: line.version.clone(), line: line.line.line(), cascade: false}), !scroll_source_and_disassembly));
                 state.should_scroll_disassembly = Some((match (&frame.binary_id, &state.stack.subframes[frame.subframes.end - 1].function_idx) {
                     (Err(e), _) => Err(e.clone()),
                     (_, Err(e)) => Err(e.clone()),
                     (&Ok(binary_id), &Ok(function_idx)) => Ok(DisassemblyScrollTarget {
                         binary_id, function_idx, static_pseudo_addr: frame.pseudo_addr.wrapping_sub(frame.addr_static_to_dynamic),
-                        subfunction_level: (frame.subframes.end - state.selected_subframe - 1) as u16}),
+                        subfunction_level: (frame.subframes.end - state.selected_subframe - 1) as u16, cascade: false}),
                 }, !scroll_source_and_disassembly));
             }
             self.seen = cur;
@@ -4091,7 +4102,7 @@ impl CodeWindow {
                 None => closest_idx,
             };
 
-            state.should_scroll_disassembly = Some((Ok(DisassemblyScrollTarget {binary_id: binary.id, function_idx: addrs[idx].0, static_pseudo_addr: addrs[idx].2, subfunction_level: addrs[idx].1}), false));
+            state.should_scroll_disassembly = Some((Ok(DisassemblyScrollTarget {binary_id: binary.id, function_idx: addrs[idx].0, static_pseudo_addr: addrs[idx].2, subfunction_level: addrs[idx].1, cascade: false}), false));
 
             break;
         }
@@ -4161,7 +4172,11 @@ impl WindowContent for CodeWindow {
 
         self.build_search_dialog(open_dialog, state, debugger, ui);
 
-        let suppress_disassembly_autoscroll = state.should_scroll_source.is_some();
+        let suppress_disassembly_autoscroll = match &state.should_scroll_source {
+            None => false,
+            Some((None, _)) => true,
+            Some((Some(SourceScrollTarget {cascade, ..}), _)) => !cascade,
+        };
         let switch_to = match mem::take(&mut state.should_scroll_source) {
             Some((to, false)) => Some(to),
             Some((to, true)) if self.tabs.is_empty() || self.tabs[self.tabs_state.selected].path_in_symbols.as_os_str().is_empty() => Some(to),
@@ -4521,7 +4536,7 @@ impl WindowContent for BreakpointsWindow {
             }
         }
 
-        let mut breakpoints: Vec<BreakpointId> = debugger.breakpoints.iter().map(|p| p.0).collect();
+        let mut breakpoints: Vec<BreakpointId> = debugger.breakpoints.iter().filter(|(_, b)| !b.hidden).map(|p| p.0).collect();
         breakpoints.sort_by_key(|id| id.seqno);
 
         if let &Some(id) = &self.selected_breakpoint {
@@ -4670,7 +4685,7 @@ impl WindowContent for BreakpointsWindow {
             if let &Some(id) = &self.selected_breakpoint {
                 match &debugger.breakpoints.get(id).on {
                     BreakpointOn::Line(on) => {
-                        state.should_scroll_source = Some((Some(SourceScrollTarget {path: on.path.clone(), version: on.file_version.clone(), line: on.line}), false));
+                        state.should_scroll_source = Some((Some(SourceScrollTarget {path: on.path.clone(), version: on.file_version.clone(), line: on.line, cascade: true}), false));
                     }
                     BreakpointOn::Instruction(on) => {
                         if let Some((locator, offset)) = &on.function {
@@ -4679,7 +4694,7 @@ impl WindowContent for BreakpointsWindow {
                                     if let Some(function_idx) = symbols.find_nearest_function(&locator.mangled_name, locator.addr) {
                                         let function = &symbols.functions[function_idx];
                                         state.should_scroll_disassembly = Some((Ok(DisassemblyScrollTarget {
-                                            binary_id: binary.id, function_idx, static_pseudo_addr: function.addr.0 + offset, subfunction_level: on.subfunction_level}), false));
+                                            binary_id: binary.id, function_idx, static_pseudo_addr: function.addr.0 + offset, subfunction_level: on.subfunction_level, cascade: true}), false));
                                     }
                                 }
                             }
@@ -4696,7 +4711,7 @@ impl WindowContent for BreakpointsWindow {
                                 for &static_addr in static_addrs {
                                     if let Some(line) = symbols.find_line(static_addr) {
                                         let file = &symbols.files[line.file_idx().unwrap()];
-                                        state.should_scroll_source = Some((Some(SourceScrollTarget {path: file.path.to_owned(), version: file.version.clone(), line: line.line()}), false));
+                                        state.should_scroll_source = Some((Some(SourceScrollTarget {path: file.path.to_owned(), version: file.version.clone(), line: line.line(), cascade: true}), false));
                                         found = true;
                                         break;
                                     }

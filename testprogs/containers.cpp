@@ -89,7 +89,12 @@ int main() {
     std::unique_ptr<std::vector<int>> pvec(new std::vector<int>{10, 20, 30, 40});
 
     // Discriminated unions.
-    std::optional<int> opt = 42;           // [no, no]
+    std::optional<int> opt = 42;           // [yes, yes]
+    std::optional<std::string> opt_str = "henlo";
+    std::optional<std::optional<std::vector<int>>> opt_nested = std::make_optional(std::make_optional(std::vector<int> {10, 20, 30}));
+    std::optional<std::optional<std::vector<int>>> opt_half_null;
+    opt_half_null.emplace();
+    std::optional<std::string> opt_null;
     std::variant<int, double> var = 3.14;  // [no, no]
 
     // Complicated and not worth it.
@@ -118,8 +123,9 @@ int main() {
     auto range = std::views::iota(1, 10);
 
     // Prevent optimizations
-    volatile int dummy = vec[0] + arr[0] + arr[2] + *uptr + *sptr + short_str[0] + long_str[0] + pair.first + std::get<0>(tuple) + 
-        *opt + (int)std::get<double>(var) + std::any_cast<int>(any_val) + func(1) + 
+    volatile int64_t dummy = vec[0] + arr[0] + arr[2] + *uptr + *sptr + short_str[0] + long_str[0] + pair.first + std::get<0>(tuple) + 
+        (int64_t)&opt + (int64_t)&opt_str + (int64_t)&opt_nested + (int64_t)&opt_half_null + (int64_t)&opt_null +
+        (int)std::get<double>(var) + std::any_cast<int>(any_val) + func(1) + 
         bits.count() + c.real() + va[0] + sp[0] + *range.begin() + strview[0] + 
         wstr[0] + u16str[0] + u32str[0] + (*pv)[0];
     (void)dummy;
@@ -152,7 +158,7 @@ int main() {
     auto big_array = std::make_unique<std::array<int, 1000000>>();
 
     volatile int dummy2 = vec[0] + arr[0] + *uptr + *sptr + short_str[0] + long_str[0] + pair.first + std::get<0>(tuple) + 
-        *opt + (int)std::get<double>(var) + std::any_cast<int>(any_val) + func(1) + 
+        (int)std::get<double>(var) + std::any_cast<int>(any_val) + func(1) + 
         bits.count() + c.real() + va[0] + sp[0] + *range.begin() + strview[0] + 
         wstr[0] + u16str[0] + u32str[0] + (*pv)[0] + mat.size() + mat[10].size() + pvec->size();
     (void)dummy2;

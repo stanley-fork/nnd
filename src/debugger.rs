@@ -316,6 +316,9 @@ pub struct Breakpoint {
     pub enabled: bool,
     // True if this breakpoint's addresses are added to breakpoint_locations (even if these locations failed to activate).
     pub active: bool,
+
+    // Internal breakpoint. Don't show in UI, don't delete. We create such breakpoints once and rely that no code site will accidentally remove or disable them after that.
+    pub hidden: bool,
 }
 impl Breakpoint {
     fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {
@@ -385,7 +388,7 @@ impl Breakpoint {
             }
             x => return err!(Environment, "unexpected breakpoint condition flag in save file: {}", x),
         };
-        Ok(Breakpoint {on, condition, hits: 0, addrs: err!(NotCalculated, ""), enabled: false, active: false})
+        Ok(Breakpoint {on, condition, hits: 0, addrs: err!(NotCalculated, ""), enabled: false, active: false, hidden: false})
     }
 }
 
@@ -418,13 +421,19 @@ impl Thread {
 }
 
 impl Debugger {
-    fn new(mode: RunMode, command_line: Vec<String>, context: Arc<Context>, symbols: SymbolsRegistry, breakpoints: Pool<Breakpoint>, persistent: PersistentState, my_resource_stats: ResourceStats, prof: Profiling) -> Self {
+    fn new(mode: RunMode, command_line: Vec<String>, context: Arc<Context>, symbols: SymbolsRegistry, mut breakpoints: Pool<Breakpoint>, persistent: PersistentState, my_resource_stats: ResourceStats, prof: Profiling) -> Self {
+        if breakpoints.is_empty() {
+            breakpoints.add(Breakpoint {on: BreakpointOn::PointOfInterest(PointOfInterest::LibraryLoad), condition: None, hits: 0, addrs: err!(NotCalculated, ""), enabled: true, active: false, hidden: true});
+        } else {
+            assert!(breakpoints.iter().filter(|(_, b)| b.hidden).count() == 1);
+        }
+
         Debugger {mode, command_line, context, pid: 0, target_state: ProcessState::NoProcess, log: Log::new(), prof, threads: HashMap::new(), pending_wait_events: VecDeque::new(), next_thread_idx: 1, info: ProcessInfo::default(), my_resource_stats, symbols, memory: MemReader::Invalid, waiting_for_initial_sigstop: false, initial_exec_failed: false, stepping: None, pending_step: None, breakpoint_locations: Vec::new(), breakpoints, stopping_to_handle_breakpoints: false, stopped_until_symbols_are_loaded: None, hardware_breakpoints: std::array::from_fn(|_| HardwareBreakpoint::default()), persistent}
     }
 
     pub fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {
         for (id, bp) in self.breakpoints.iter() {
-            if !bp.on.is_data() { // data breakpoint addresses usually becomes obsolete on program restart or recompilation, just delete data breakpoints on restart
+            if !bp.hidden && !bp.on.is_data() { // data breakpoint addresses usually become obsolete on program restart or recompilation, just delete data breakpoints on restart
                 out.write_u8(1)?;
                 bp.save_state(out)?;
             }
@@ -853,7 +862,7 @@ impl Debugger {
                         let thread_single_stepping = mem::take(&mut thread.single_stepping);
                         let thread_ignore_next_hw_breakpoint_hit_at_addr = mem::take(&mut thread.ignore_next_hw_breakpoint_hit_at_addr);
 
-                        let (hit, _regs, stack_digest_to_select) = self.handle_breakpoint_trap(tid, si.si_code, thread_single_stepping, thread_ignore_next_hw_breakpoint_hit_at_addr)?;
+                        let (hit, refresh_process_info, _regs, stack_digest_to_select) = self.handle_breakpoint_trap(tid, si.si_code, thread_single_stepping, thread_ignore_next_hw_breakpoint_hit_at_addr)?;
 
                         if hit || self.stopping_to_handle_breakpoints {
                             if hit || self.target_state == ProcessState::Running || self.stepping.as_ref().is_some_and(|s| !s.keep_other_threads_suspended || s.tid != tid) {
@@ -871,7 +880,7 @@ impl Debugger {
                         } else {
                             // Fast path for conditional breakpoints when condition is not satisfied (among other things).
                             force_resume = true;
-                            skip_refresh = true;
+                            skip_refresh = !refresh_process_info;
                         }
                     } else { // other signals, with no special meaning for the debugger
                         if self.context.settings.trace_logging { eprintln!("trace: thread {} stopped by signal {} {}", tid, signal, signal_name(signal)); }
@@ -920,9 +929,8 @@ impl Debugger {
         //  * All we did was skip conditional breakpoints. This path must be kept fast, otherwise conditional breakpoints will be slow.
         let mut drop_caches = false;
         if refresh_info && self.target_state.process_ready() {
-            // Re-read /proc/<pid>/maps to see what dynamic libraries are loaded. Re-resolve breakpoints if there are any new ones.
-            // TODO: Also trigger this on dynamic library load, using r_debug rendezvoud thing (put breakpoint on _dl_debug_state?).
-            //       Once we have that, maybe don't refresh on any stop (but maybe refresh periodically to handle custom dynamic linkers).
+            // Re-read /proc/<pid>/maps to see what dynamic libraries are loaded. Re-resolve breakpoints if there are any new libraries.
+            // For simplicity we do it on every user-visible stop. If this turns out to be slow, we can be more careful and only do it on _dl_debug_state hit and maybe on periodic timer.
             drop_caches |= refresh_maps_and_binaries_info(self);
             drop_caches |= self.symbols.do_eviction();
 
@@ -1117,7 +1125,7 @@ impl Debugger {
                 self.target_state = ProcessState::Suspended;
                 self.pending_step = None;
             } else {
-                let mut breakpoint = Breakpoint {on: on.clone(), condition: None, hits: 0, addrs: err!(NotCalculated, ""), enabled: true, active: false};
+                let mut breakpoint = Breakpoint {on: on.clone(), condition: None, hits: 0, addrs: err!(NotCalculated, ""), enabled: true, active: false, hidden: true};
                 Self::determine_locations_for_breakpoint(&self.symbols, &mut breakpoint);
                 match breakpoint.addrs {
                     Err(e) if e.is_loading() => (),
@@ -1961,7 +1969,7 @@ impl Debugger {
             }
         }
         
-        let breakpoint = Breakpoint {on, condition: None, hits: 0, addrs: err!(NotCalculated, ""), enabled: true, active: false};
+        let breakpoint = Breakpoint {on, condition: None, hits: 0, addrs: err!(NotCalculated, ""), enabled: true, active: false, hidden: false};
         let id = self.breakpoints.add(breakpoint).0;
         if self.target_state.process_ready() {
             self.activate_breakpoints(vec![id])?;
@@ -2706,7 +2714,7 @@ impl Debugger {
     // Returns true if any breakpoint was actually hit, so we should switch to ProcessState::Suspended.
     // May also set stopping_to_handle_breakpoints to true, in which case the caller should stop all threads.
     // Otherwise treat it as a spurious wakeup and continue (e.g. breakpoint is for a different thread, or conditional breakpoint's condition evaluated to false, or something).
-    fn handle_breakpoint_trap(&mut self, tid: pid_t, si_code: i32, single_stepping: bool, ignore_next_hw_breakpoint_hit_at_addr: Option<usize>) -> Result<(/*hit*/ bool, Registers, Option<(Vec<usize>, bool, u16)>)> {
+    fn handle_breakpoint_trap(&mut self, tid: pid_t, si_code: i32, single_stepping: bool, ignore_next_hw_breakpoint_hit_at_addr: Option<usize>) -> Result<(/*hit*/ bool, /*refresh_process_info*/ bool, Registers, Option<(Vec<usize>, bool, u16)>)> {
         let mut regs = ptrace_getregs(tid)?;
         let mut addr = regs.get(RegisterIdx::Rip).unwrap().0 as usize;
 
@@ -2772,6 +2780,7 @@ impl Debugger {
         let single_stepped = (si_code == libc::TRAP_TRACE || si_code == libc::SI_KERNEL) && single_stepping && !spurious_stop;
 
         let mut hit = false;
+        let mut refresh_process_info = false;
         let mut request_single_step = false;
         let mut is_active_breakpoint_location = false;
         let mut stop_reasons: Vec<StopReason> = Vec::new();
@@ -2860,6 +2869,8 @@ impl Debugger {
                             if self.context.settings.trace_logging { eprintln!("trace: ignoring spurious stop on hw breakpoint {:x}", addr); }
                             // But still increment hit counter to make it easier to notice and debug if we get unexpectedly many spurious stops.
                             self.breakpoints.get_mut(id).hits += 1;
+                        } else if self.breakpoints.get(id).hidden {
+                            refresh_process_info = true;
                         } else if self.process_breakpoint_hit(id, tid, ignore_breakpoints, subfunction_level, &mut stop_reasons) {
                             hit = true;
                             if subfunction_level != u16::MAX {
@@ -2927,7 +2938,7 @@ impl Debugger {
             self.threads.get_mut(&tid).unwrap().is_after_user_debug_trap_instruction = true;
         }
 
-        Ok((hit, regs, stack_digest_to_select))
+        Ok((hit, refresh_process_info, regs, stack_digest_to_select))
     }
 
     fn eval_breakpoint_condition(&mut self, tid: pid_t, id: BreakpointId, subfunction_level: u16) -> Result<bool> {

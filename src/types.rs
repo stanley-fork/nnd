@@ -184,6 +184,9 @@ pub enum Type {
     Unknown, // unresolved type reference or other errors
     Primitive(PrimitiveFlags),
     Pointer(PointerType),
+    // Function. Only meaningful as target of a Pointer, making it a function pointer.
+    // No function signature, it doesn't seem useful since we don't support calling functions.
+    Function,
     Array(ArrayType),
     // We don't distinguish structs from unions, we just allow fields to overlap.
     // For discriminated unions, discriminant is just another field.
@@ -207,6 +210,7 @@ pub enum Type {
 impl Type {
     pub fn as_primitive(&self) -> Option<PrimitiveFlags> { match self { &Type::Primitive(f) => Some(f), _ => None } }
     pub fn as_pointer(&self) -> Option<&PointerType> { match self { Type::Pointer(p) => Some(p), _ => None } }
+    pub fn is_function(&self) -> bool { match self { Type::Function => true, _ => false } }
     pub fn as_array(&self) -> Option<&ArrayType> { match self { Type::Array(a) => Some(a), _ => None } }
     pub fn as_array_mut(&mut self) -> Option<&mut ArrayType> { match self { Type::Array(a) => Some(a), _ => None } }
     pub fn as_struct(&self) -> Option<&StructType> { match self { Type::Struct(s) => Some(s), _ => None } }
@@ -218,6 +222,7 @@ impl Type {
             Type::Unknown => "unknown",
             Type::Primitive(_) => "primitive type",
             Type::Pointer(_) => "pointer",
+            Type::Function => "fn",
             Type::Array(_) => "array",
             Type::Slice(s) if s.flags.contains(SliceFlags::UTF_STRING) => "string",
             Type::Slice(_) => "slice",
@@ -287,7 +292,7 @@ impl TypeInfo {
                 return t.size * multiplier;
             }
             match &t.t {
-                Type::Unknown | Type::Primitive(_) | Type::Pointer(_) | Type::MetaType | Type::MetaField => return 8 * multiplier,
+                Type::Unknown | Type::Primitive(_) | Type::Pointer(_) | Type::Function | Type::MetaType | Type::MetaField => return 8 * multiplier,
                 Type::MetaVariable => return 16 * multiplier,
                 Type::MetaCodeLocation => return 24 * multiplier,
                 Type::Slice(_) => return 16 * multiplier,
@@ -370,6 +375,9 @@ impl Types {
     pub fn add_slice(&mut self, type_: *const TypeInfo, flags: SliceFlags) -> *const TypeInfo {
         self.types_arena.add(TypeInfo {size: 16, flags: TypeFlags::SIZE_KNOWN, t: Type::Slice(SliceType {type_, flags}), ..TypeInfo::default()})
     }
+    pub fn add_enum(&mut self, en: EnumType) -> *const TypeInfo {
+        self.types_arena.add(TypeInfo {size: unsafe {(*en.type_).calculate_size()}, flags: TypeFlags::SIZE_KNOWN, t: Type::Enum(en), ..TypeInfo::default()})
+    }
 
     pub fn find_by_name(&self, name: &str) -> Option<*const TypeInfo> {
         if let Some(id) = self.sorted_type_names.binary_search(name.as_bytes()) {
@@ -440,6 +448,8 @@ impl Types {
 pub struct BuiltinTypes {
     pub void: *const TypeInfo,
     pub void_pointer: *const TypeInfo,
+    pub function: *const TypeInfo,
+    pub function_pointer: *const TypeInfo,
     pub unknown: *const TypeInfo,
     pub u8_: *const TypeInfo,
     pub u16_: *const TypeInfo,
@@ -461,19 +471,22 @@ pub struct BuiltinTypes {
     pub meta_code_location: *const TypeInfo,
 }
 impl BuiltinTypes {
-    pub fn invalid() -> Self { Self {void: ptr::null(), void_pointer: ptr::null(), unknown: ptr::null(), u8_: ptr::null(), u16_: ptr::null(), u32_: ptr::null(), u64_: ptr::null(), i8_: ptr::null(), i16_: ptr::null(), i32_: ptr::null(), i64_: ptr::null(), f32_: ptr::null(), f64_: ptr::null(), f128_: ptr::null(), char8: ptr::null(), char32: ptr::null(), bool_: ptr::null(), meta_type: ptr::null(), meta_field: ptr::null(), meta_variable: ptr::null(), meta_code_location: ptr::null()} }
+    pub fn invalid() -> Self { Self {void: ptr::null(), void_pointer: ptr::null(), function: ptr::null(), function_pointer: ptr::null(), unknown: ptr::null(), u8_: ptr::null(), u16_: ptr::null(), u32_: ptr::null(), u64_: ptr::null(), i8_: ptr::null(), i16_: ptr::null(), i32_: ptr::null(), i64_: ptr::null(), f32_: ptr::null(), f64_: ptr::null(), f128_: ptr::null(), char8: ptr::null(), char32: ptr::null(), bool_: ptr::null(), meta_type: ptr::null(), meta_field: ptr::null(), meta_variable: ptr::null(), meta_code_location: ptr::null()} }
 
     fn map<F: FnMut(*const TypeInfo) -> *const TypeInfo>(&self, mut f: F) -> Self {
-        Self {void: f(self.void), void_pointer: f(self.void_pointer), unknown: f(self.unknown), u8_: f(self.u8_), u16_: f(self.u16_), u32_: f(self.u32_), u64_: f(self.u64_), i8_: f(self.i8_), i16_: f(self.i16_), i32_: f(self.i32_), i64_: f(self.i64_), f32_: f(self.f32_), f64_: f(self.f64_), f128_: f(self.f128_), char8: f(self.char8), char32: f(self.char32), bool_: f(self.bool_), meta_type: f(self.meta_type), meta_field: f(self.meta_field), meta_variable: f(self.meta_variable), meta_code_location: f(self.meta_code_location)}
+        Self {void: f(self.void), void_pointer: f(self.void_pointer), function: f(self.function), function_pointer: f(self.function_pointer), unknown: f(self.unknown), u8_: f(self.u8_), u16_: f(self.u16_), u32_: f(self.u32_), u64_: f(self.u64_), i8_: f(self.i8_), i16_: f(self.i16_), i32_: f(self.i32_), i64_: f(self.i64_), f32_: f(self.f32_), f64_: f(self.f64_), f128_: f(self.f128_), char8: f(self.char8), char32: f(self.char32), bool_: f(self.bool_), meta_type: f(self.meta_type), meta_field: f(self.meta_field), meta_variable: f(self.meta_variable), meta_code_location: f(self.meta_code_location)}
     }
 
     fn create<F: FnMut(TypeInfo) -> *const TypeInfo>(mut f: F) -> Self {
         let primitive = |name, size, flags| TypeInfo {name, size, flags: TypeFlags::SIZE_KNOWN | TypeFlags::BUILTIN, t: Type::Primitive(flags), ..Default::default()};
         let void = f(primitive("void", 0, PrimitiveFlags::UNSPECIFIED));
+        let function = f(TypeInfo {name: "fn", size: 0, flags: TypeFlags::SIZE_KNOWN | TypeFlags::BUILTIN, t: Type::Function, ..Default::default()});
         Self {
             unknown: f(TypeInfo {name: "<unknown>", size: 8, flags: TypeFlags::SIZE_KNOWN | TypeFlags::BUILTIN, ..Default::default()}),
             void,
             void_pointer: f(TypeInfo {size: 8, flags: TypeFlags::SIZE_KNOWN | TypeFlags::BUILTIN, t: Type::Pointer(PointerType {type_: void, flags: PointerFlags::empty()}), ..Default::default()}),
+            function,
+            function_pointer: f(TypeInfo {size: 8, flags: TypeFlags::SIZE_KNOWN | TypeFlags::BUILTIN, t: Type::Pointer(PointerType {type_: function, flags: PointerFlags::empty()}), ..Default::default()}),
             u8_: f(primitive("u8", 1, PrimitiveFlags::empty())),
             u16_: f(primitive("u16", 2, PrimitiveFlags::empty())),
             u32_: f(primitive("u32", 4, PrimitiveFlags::empty())),
@@ -506,6 +519,7 @@ impl fmt::Debug for DumpType {
                 Type::Unknown => write!(f, "unknown")?,
                 Type::Primitive(p) => write!(f, "primitive {:?}", p)?,
                 Type::Pointer(p) => write!(f, "* {:?}  @{:x} '{}'", p.flags, (*p.type_).die.0, (*p.type_).name)?,
+                Type::Function => write!(f, "fn")?,
                 Type::Array(a) => write!(f, "[] {:?} /{}  @{:x} '{}'", a.flags, a.stride, (*a.type_).die.0, (*a.type_).name)?,
                 Type::Slice(s) => write!(f, "[..] {:?} @{:x} '{}'", s.flags, (*s.type_).die.0, (*s.type_).name)?,
                 Type::Struct(s) => {
@@ -1140,7 +1154,7 @@ impl TypesLoader {
                 let do_dedup = true;
                 let mut dedup_with_name = false;
                 match &mut info.t {
-                    Type::Unknown | Type::Primitive(_) => (),
+                    Type::Unknown | Type::Primitive(_) | Type::Function => (),
                     Type::MetaType | Type::MetaField | Type::MetaVariable | Type::MetaCodeLocation | Type::Slice(_) => (), // these don't appear in debug symbols, but we add them as builtins along the way, so end up participating in deduplication unnecessarily
                     Type::Pointer(p) => {
                         unlock();

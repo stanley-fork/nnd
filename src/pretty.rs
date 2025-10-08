@@ -8,88 +8,95 @@ use bitflags::*;
 // Note: ValueFlags::BIG_ENDIAN is intentionally ignored by pretty-printers (but propagated to elements), on the assumption that big-endianness is only relevant for simple
 //       serialization-related structs that don't need pretty-printers, but such structs can appear inside normal containers; e.g. `std::vector<NetworkPacket>`.
 pub fn prettify_value(val: &mut Cow<Value>, warning: &mut Option<Error>, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
-    if val.flags.contains(ValueFlags::NO_UNWRAPPING_INTERNAL) {
-        return Ok(());
-    }
+    // The outer loop is for the case where a value was pretty-printed into another pretty-printable value. E.g. std::optional<std::string> -> std::string -> slice.
+    // This is unusual, most pretty-printers produce a slice, array, or struct, whose elements will be automatically pretty-printed later when formatting them.
+    for layer in 0..10 {
+        if val.flags.contains(ValueFlags::NO_UNWRAPPING_INTERNAL) {
+            return Ok(());
+        }
 
-    // Plan:
-    //  1. Downcast to concrete type.
-    //  2. Unravel.
-    //  3. Resolve discriminated union.
-    //  4. Recognize containers.
-    //  5. Unwrap single-field struct.
+        // Plan:
+        //  1. Downcast to concrete type.
+        //  2. Unravel.
+        //  3. Resolve discriminated union.
+        //  4. Recognize containers.
+        //  5. Unwrap single-field struct.
 
-    let mut type_ = unsafe {&*val.type_};
-    let mut struct_ = match &type_.t {
-        Type::Struct(s) => s,
-        _ => return Ok(()),
-    };
+        let mut type_ = unsafe {&*val.type_};
+        let mut struct_ = match &type_.t {
+            Type::Struct(s) => s,
+            _ => return Ok(()),
+        };
 
-    let mut allow_full_unwrap = true;
+        let mut allow_full_unwrap = true;
 
-    if let Some(off) = find_vtable_ptr_field_offset(type_, struct_) {
-        if val.val.addr().is_some() {
-            match downcast_to_concrete_type(val, off, context) {
-                Ok(()) => {
-                    allow_full_unwrap = false;
-                    type_ = unsafe {&*val.type_};
-                    struct_ = match &type_.t {
-                        Type::Struct(s) => s,
-                        _ => return Ok(()),
-                    };
+        if let Some(off) = find_vtable_ptr_field_offset(type_, struct_) {
+            if val.val.addr().is_some() {
+                match downcast_to_concrete_type(val, off, context) {
+                    Ok(()) => {
+                        allow_full_unwrap = false;
+                        type_ = unsafe {&*val.type_};
+                        struct_ = match &type_.t {
+                            Type::Struct(s) => s,
+                            _ => return Ok(()),
+                        };
+                    }
+                    Err(e) => *warning = Some(e),
                 }
-                Err(e) => *warning = Some(e),
             }
         }
+
+        let mut substruct = Substruct::new(struct_, type_);
+        unravel_struct(&mut substruct);
+
+        if resolve_discriminated_union(&val.val, &mut substruct, warning, context)? {
+            allow_full_unwrap = false;
+        }
+
+        let mut prettify_again = false;
+        match recognize_containers(val, &mut substruct, warning, state, context, &mut prettify_again) {
+            Ok(()) if prettify_again => continue,
+            Ok(()) => break,
+            Err(e) if !e.is_not_container() && !e.is_no_field() => *warning = Some(e),
+            _ => (),
+        }
+
+        // Final level of unwrapping: replace the whole struct with its field. Unlike unravel_struct(), this works even if the field is not a struct.
+        // E.g. turns unique_ptr into plain pointer. Useful for things like strong typedefs, Box/unique_ptr, Atomic/atomic, NonzeroUsize, Pin, etc.
+        //
+        // If the field is a pointer to the same struct, don't unwrap it; it's probably an std::forward_list;
+        // if we unwrap, it gets formatted in a single line, as a long chain of addresses with no children, which is valid but confusing.
+        let is_pointer_to = |ptr: *const TypeInfo, inner: *const TypeInfo| -> bool {
+            let t = unsafe {&*ptr};
+            t.t.as_pointer().is_some_and(|p| p.type_ == inner)
+        };
+        if allow_full_unwrap && substruct.fields.len() == 1 && !is_pointer_to(substruct.fields[0].type_, type_) {
+            let field_val = get_struct_field(&val.val, &substruct.fields[0], &mut context.memory)?;
+            let new_val = Value {val: field_val, type_: substruct.fields[0].type_, flags: val.flags};
+            *val = Cow::Owned(new_val);
+            return Ok(());
+        }
+
+        // If we altered the set of fields, create a new struct type.
+        if let Cow::Owned(fields) = substruct.fields {
+            let val = val.to_mut();
+            assert!(type_ as *const TypeInfo == val.type_);
+            let mut new_type = type_.clone();
+            let new_struct = new_type.t.as_struct_mut().unwrap();
+
+            let new_fields = state.types.fields_arena.add_slice(&fields);
+            new_struct.set_fields(new_fields);
+
+            let mut w = state.types.unsorted_type_names.write();
+            write!(w, "{}", type_.name).unwrap();
+            new_type.name = w.finish_str(0);
+
+            let new_type = state.types.types_arena.add(new_type);
+            val.type_ = new_type;
+        }
+
+        break;
     }
-
-    let mut substruct = Substruct::new(struct_, type_);
-    unravel_struct(&mut substruct);
-
-    if resolve_discriminated_union(&val.val, &mut substruct, warning, context)? {
-        allow_full_unwrap = false;
-    }
-
-    match recognize_containers(val, &mut substruct, warning, state, context) {
-        Ok(()) => return Ok(()),
-        Err(e) if !e.is_not_container() && !e.is_no_field() => *warning = Some(e),
-        _ => (),
-    }
-
-    // Final level of unwrapping: replace the whole struct with its field. Unlike unravel_struct(), this works even if the field is not a struct.
-    // E.g. turns unique_ptr into plain pointer. Useful for things like strong typedefs, Box/unique_ptr, Atomic/atomic, NonzeroUsize, Pin, etc.
-    //
-    // If the field is a pointer to the same struct, don't unwrap it; it's probably an std::forward_list;
-    // if we unwrap, it gets formatted in a single line, as a long chain of addresses with no children, which is valid but confusing.
-    let is_pointer_to = |ptr: *const TypeInfo, inner: *const TypeInfo| -> bool {
-        let t = unsafe {&*ptr};
-        t.t.as_pointer().is_some_and(|p| p.type_ == inner)
-    };
-    if allow_full_unwrap && substruct.fields.len() == 1 && !is_pointer_to(substruct.fields[0].type_, type_) {
-        let field_val = get_struct_field(&val.val, &substruct.fields[0], &mut context.memory)?;
-        let new_val = Value {val: field_val, type_: substruct.fields[0].type_, flags: val.flags};
-        *val = Cow::Owned(new_val);
-        return Ok(());
-    }
-
-    // If we altered the set of fields, create a new struct type.
-    if let Cow::Owned(fields) = substruct.fields {
-        let val = val.to_mut();
-        assert!(type_ as *const TypeInfo == val.type_);
-        let mut new_type = type_.clone();
-        let new_struct = new_type.t.as_struct_mut().unwrap();
-
-        let new_fields = state.types.fields_arena.add_slice(&fields);
-        new_struct.set_fields(new_fields);
-
-        let mut w = state.types.unsorted_type_names.write();
-        write!(w, "{}", type_.name).unwrap();
-        new_type.name = w.finish_str(0);
-
-        let new_type = state.types.types_arena.add(new_type);
-        val.type_ = new_type;
-    }
-
     Ok(())
 }
 
@@ -135,6 +142,7 @@ pub fn reflect_meta_value(val: &Value, state: &mut EvalState, context: &mut Eval
                     if let Some((text, palette)) = &mut out {print_type_name(t, *text, *palette, 0);}
                     builder.add_usize_field("type", p.type_ as usize, state.builtin_types.meta_type);
                 }
+                Type::Function => styled_write_maybe!(out, default, "fn"),
                 Type::Array(a) => {
                     if let Some((text, palette)) = &mut out {print_type_name(t, *text, *palette, 0);}
                     builder.add_usize_field("type", a.type_ as usize, state.builtin_types.meta_type);
@@ -758,7 +766,7 @@ fn trim_field_name(mut name: &str) -> &str {
 // Returns Ok if the whole Value was replaced and doesn't need any further transformations.
 // Returns NotContainer error if the value wasn't replaced (but `fields` may have been mutated, e.g. removing refcount field from shared_ptr).
 // Returns other errors if we should fail the whole prettification (e.g. failed to read the struct from memory).
-fn recognize_containers(val: &mut Cow<Value>, substruct: &mut Substruct, warning: &mut Option<Error>, state: &mut EvalState, context: &mut EvalContext) -> Result<()> {
+fn recognize_containers(val: &mut Cow<Value>, substruct: &mut Substruct, warning: &mut Option<Error>, state: &mut EvalState, context: &mut EvalContext, prettify_again: &mut bool) -> Result<()> {
     let t = unsafe {&*val.type_};
     let language = match t.language {
         LanguageFamily::Internal => return err!(NotContainer, ""),
@@ -817,6 +825,11 @@ fn recognize_containers(val: &mut Cow<Value>, substruct: &mut Substruct, warning
         Err(e) => return Err(e),
     }
     match recognize_cpp_map(substruct, val, state, context) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.is_no_field() => substruct.clear_used(),
+        Err(e) => return Err(e),
+    }
+    match recognize_cpp_optional(substruct, val, state, context, prettify_again) {
         Ok(()) => return Ok(()),
         Err(e) if e.is_no_field() => substruct.clear_used(),
         Err(e) => return Err(e),
@@ -1430,5 +1443,40 @@ fn recognize_cpp_map(substruct: &mut Substruct, val: &mut Cow<Value>, state: &mu
 
     make_array_of_references(val, data, value_type, /*is_truncated*/ !stack.is_empty(), state);
 
+    Ok(())
+}
+
+// libc++: {union {__null_state_, __val_}, __engaged_}
+// libstdc++: {_M_payload: {_M_empty: {}, _M_value}, _M_engaged}
+fn recognize_cpp_optional(substruct: &mut Substruct, val: &mut Cow<Value>, state: &mut EvalState, context: &mut EvalContext, prettify_again: &mut bool) -> Result<()> {
+    let engaged_field = find_int_field(&["engaged"], substruct)?;
+    let mut payload_field;
+    if let Some(mut wrapper) = optional_field(find_struct_field(&[""], substruct))? {
+        optional_field(find_field(&["null_state"], &mut wrapper))?;
+        payload_field = find_field(&["val"], &mut wrapper)?;
+        payload_field.bit_offset += wrapper.bit_offset - substruct.bit_offset;
+        wrapper.check_all_fields_used()?;
+    } else {
+        payload_field = find_field(&["payload"], substruct)?;
+    }
+    substruct.check_all_fields_used()?;
+
+    let engaged = val.val.bit_range(engaged_field.clone(), &mut context.memory)?;
+    match engaged {
+        0 => {
+            let mut en = EnumType {enumerands: &[], type_: state.builtin_types.u8_};
+            state.types.add_enumerand(&mut en, Enumerand {name: "nullopt", value: 0, flags: EnumerandFlags::empty()});
+            let enum_type = state.types.add_enum(en);
+            let new_val = Value {val: AddrOrValueBlob::Blob(ValueBlob::new(0)), type_: enum_type, flags: ValueFlags::empty()};
+            *val = Cow::Owned(new_val);
+        }
+        1 => {
+            let field_val = get_struct_field(&val.val, &payload_field, &mut context.memory)?;
+            let new_val = Value {val: field_val, type_: payload_field.type_, flags: val.flags};
+            *val = Cow::Owned(new_val);
+            *prettify_again = true;
+        }
+        _ => return err!(NotContainer, "")
+    }
     Ok(())
 }

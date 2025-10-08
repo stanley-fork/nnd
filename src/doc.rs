@@ -271,9 +271,6 @@ General info:
  * '^x' looks for variable x in all stack frames.
  * 'var(x)' shows additional information about variable x, e.g. its declaration site.
 
-Data breakpoints:
- * asdqwe
-
 Gotchas:
  * 'var(x)' and 'type(t)'/'typeof(x)' show variable/type declaration site (if present in debug info). Press enter on it (or click) to open in code window.
  * If a variable has the same name as a register, use `` to refer to the variable: '`rax`'.

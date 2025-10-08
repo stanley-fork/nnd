@@ -120,11 +120,12 @@ pub struct SymbolsShard {
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Debug, Hash)]
 pub enum PointOfInterest {
     MainFunction,
-    // TODO: Throw, Panic, LibraryLoad
+    LibraryLoad, // _dl_debug_state
+    // TODO: Throw, Panic
 }
 impl PointOfInterest {
     pub fn save_state(self, out: &mut Vec<u8>) -> Result<()> {
-        match self { Self::MainFunction => out.write_u8(0)? } Ok(())
+        match self { Self::MainFunction => out.write_u8(0)?, Self::LibraryLoad => out.write_u8(1)?, } Ok(())
     }
     pub fn load_state(inp: &mut &[u8]) -> Result<Self> {
         Ok(match inp.read_u8()? { 0 => Self::MainFunction, x => return err!(Environment, "unexpected PointOfInterest in save file: {}", x) })
@@ -133,6 +134,7 @@ impl PointOfInterest {
     pub fn name_for_ui(self) -> &'static str {
         match self {
             Self::MainFunction => "main function",
+            Self::LibraryLoad => "library load",
         }
     }
 }
@@ -1067,7 +1069,7 @@ impl SymbolsLoader {
                 (vec![DW_TAG_namespace], NamespaceAttributes::layout()),
                 (vec![DW_TAG_variable, DW_TAG_formal_parameter], VariableAttributes::layout()),
                 (vec![DW_TAG_subprogram], SubprogramAttributes::layout()),
-                (vec![DW_TAG_base_type, DW_TAG_unspecified_type, DW_TAG_structure_type, DW_TAG_class_type, DW_TAG_union_type, DW_TAG_enumeration_type, DW_TAG_pointer_type, DW_TAG_reference_type, DW_TAG_rvalue_reference_type, DW_TAG_array_type, DW_TAG_const_type, DW_TAG_restrict_type, DW_TAG_volatile_type, DW_TAG_atomic_type, DW_TAG_typedef], TypeAttributes::layout()),
+                (vec![DW_TAG_base_type, DW_TAG_unspecified_type, DW_TAG_structure_type, DW_TAG_class_type, DW_TAG_union_type, DW_TAG_enumeration_type, DW_TAG_pointer_type, DW_TAG_reference_type, DW_TAG_rvalue_reference_type, DW_TAG_array_type, DW_TAG_const_type, DW_TAG_restrict_type, DW_TAG_volatile_type, DW_TAG_atomic_type, DW_TAG_typedef, DW_TAG_subroutine_type], TypeAttributes::layout()),
                 (vec![DW_TAG_inheritance, DW_TAG_member, DW_TAG_enumerator], FieldAttributes::layout()),
                 (vec![DW_TAG_variant_part], VariantPartAttributes::layout()),
                 (vec![DW_TAG_variant], VariantAttributes::layout()),
@@ -1532,6 +1534,11 @@ impl SymbolsLoader {
                         let f_addr = FunctionAddr::new(addr, &mut shard.warn);
                         shard.functions.push(FunctionInfo {addr: f_addr, die: DebugInfoOffset(usize::MAX), entry_addr: addr, prev_addr: f_addr, mangled_name: name_ref.as_ptr(), mangled_name_len: name_ref.len() as u32, shard_idx: shard_idx as u16, flags: FunctionFlags::SYMTAB, language: LanguageFamily::Unknown, subfunction_levels: 0..0});
 
+                        // Dummy function that the dynamic linker calls to notify the debugger after each library load.
+                        if name_ref == "_dl_debug_state" {
+                            shard.points_of_interest.entry(PointOfInterest::LibraryLoad).or_default().push(addr);
+                        }
+
                         // For some reason functions' [st_value, st_value + st_size) ranges overlap a lot. Maybe st_size is just not reliable.
                         // So we ignore st_size and assume that each function ends where the next function starts.
                         continue;
@@ -1669,6 +1676,11 @@ impl SymbolsLoader {
             find_function(b"__cxa_throw", PointOfInterest::..., &mut self.sym);
         }*/
         self.sym.vtables.sort_unstable_by_key(|v| v.start);
+
+        for (_, addrs) in &mut self.sym.points_of_interest {
+            addrs.sort_unstable();
+            addrs.dedup();
+        }
 
         let mut adjusted_name = String::new();
         for v in &mut self.sym.vtables {
@@ -2623,7 +2635,7 @@ impl<'a> DwarfLoader<'a> {
                 }
 
                 // Types.
-                DW_TAG_base_type | DW_TAG_unspecified_type | DW_TAG_structure_type | DW_TAG_class_type | DW_TAG_union_type | DW_TAG_enumeration_type | DW_TAG_pointer_type | DW_TAG_reference_type | DW_TAG_rvalue_reference_type | DW_TAG_array_type | DW_TAG_const_type | DW_TAG_restrict_type | DW_TAG_volatile_type | DW_TAG_atomic_type | DW_TAG_typedef => {
+                DW_TAG_base_type | DW_TAG_unspecified_type | DW_TAG_structure_type | DW_TAG_class_type | DW_TAG_union_type | DW_TAG_enumeration_type | DW_TAG_pointer_type | DW_TAG_reference_type | DW_TAG_rvalue_reference_type | DW_TAG_array_type | DW_TAG_const_type | DW_TAG_restrict_type | DW_TAG_volatile_type | DW_TAG_atomic_type | DW_TAG_typedef | DW_TAG_subroutine_type => {
                     // Applicable attributes (DW_AT_*) (DECL means decl_file, decl_line, decl_column):
                     // Useful: DECL, name, bit_size, byte_size, declaration, type, signature, alignment
                     // For base types: encoding
@@ -2647,6 +2659,7 @@ impl<'a> DwarfLoader<'a> {
                             is_alias = true;
                             Type::Pointer(PointerType {flags: PointerFlags::empty(), type_: self.loader.types.builtin_types.unknown})
                         }
+                        DW_TAG_subroutine_type => Type::Function,
                         _ => panic!("huh?") };
                     let mut info = TypeInfo {die: offset, binary_id: self.loader.binary_id, line: LineInfo::invalid(), t, language: self.unit.language, ..Default::default()};
                     let mut is_complex_float = false;
@@ -3033,8 +3046,8 @@ impl<'a> DwarfLoader<'a> {
                     cursor.skip_attributes(abbrev, &attribute_context)?;
                 }
 
-                // TODO: Function pointers and pointers to members.
-                DW_TAG_ptr_to_member_type | DW_TAG_subroutine_type => {
+                // TODO: Pointers to members.
+                DW_TAG_ptr_to_member_type => {
                     self.shard.types.add_type(TypeInfo {name: "<unsupported>", die: offset, binary_id: self.loader.binary_id, language: self.unit.language, flags: TypeFlags::UNSUPPORTED, ..TypeInfo::default()});
                     skip_subtree = self.main_stack.len;
                     cursor.skip_attributes(abbrev, &attribute_context)?;

@@ -1,5 +1,5 @@
 bugs:
-get stuck when debuggee is OOM-killed by linux
+gets stuck when debuggee is OOM-killed by linux
 fix empty symbols loading stage name near the end
 investigate regression in symbols loading speed (stuck on "parsing drawf" for ~10 seconds)
 investigate why many types are not deduped, e.g. there's DB::Block#441
@@ -40,7 +40,6 @@ reverse --tty mode: run debugger in another window and the debuggee in current w
 "Expected an attribute value to be a string form" on zsh
 buffer input when program is quitting, especially k+r and steps
 test with breakpad minidumps
-function pointers; maybe just one "function pointer" type without signature; maybe jump to disas window when pressing enter of function address
 modifying debuggee variables (memory and registers), modifying ip
 log a message if the process forked away
 add alternative default key binds for next/prev search result, F3 is not always available on mac
@@ -68,13 +67,12 @@ maximizing windows
 meta functions like checking for field presense of superclass type for use in conditions
 key to freeze value in watches window; can also be used for controlling when to run the expression if it has side effects
 key to add watch value as new watch, maybe cast to type, e.g. *(0x1234 as *DB::Block)
-tooltip in status window showing more log lines with line wrapping
 allow expressions (especially conditions) to have multiple statements separated by ';'
 "unexpectedly big memory read" (16 bytes) for f64 local variables on the stack in rust
 some kind of non-stop mode to prevent clickhouse server from losing keeper connection when stepping through the code
 allow navigating from source to variables (especially global) and types declared there
 allow to put breakpoint on a whole file (by adding breakpoint on the first line, since there's never any real code on first line in practice; have a new icon for it; internally use line 0 to cover the garbage LineInfo-s with line 0; or maybe put breakpoint only on function entry points instead of everything)
-function pointers and field pointers
+member pointers
 handle tail calls: if you step-into a tail call (by single-stepping from instruction pointed by DW_AT_call_pc of a DW_TAG_call_site with DW_AT_call_tail_call), the tail-callee should be added to stack digest (so its stack frame is selected instead of parent)
 find function by address (like addr2line)
 use actual function name instead of "_" in namespace path, or do something else to make function-static variables usable
@@ -83,13 +81,12 @@ show stop reason in status window, next to "suspended"
 follow forks, maybe even support multiple processes
 allow cast `foo as typeof(bar)`, also `foo as typeof(bar)::T`
 show argument values in stack trace
-detect dynamic library loads using r_debug thing
 hotkey to step to end of basic block or next call/ret
 key to follow a jump in disas
 allow line-based steps in .plt* (maybe by just turning them into single-instruction-steps)
 in disassembly window, make 'left' key jump to the start of inlined function
 maximizing windows (hot key and button in a corner)
-special breakpoints: panic (rust_panic, core::panicking::panic_fmt, or maybe std::panicking::rust_panic_with_hook; maybe disable find_catch_blocks() for rust at least when panic bp is enabled), exception (__cxa_throw), signals, main function, dynamic library load
+special breakpoints: panic (rust_panic, core::panicking::panic_fmt, or maybe std::panicking::rust_panic_with_hook; maybe disable find_catch_blocks() for rust at least when panic bp is enabled), exception (__cxa_throw), signals, main function
 make source window autoscroll horizontally in addition to vertically
 -v for build datetime
 handle partially-optimized-out struct values (common in rust)
@@ -132,7 +129,7 @@ parse and colorize type names, especially the template stuff
 try refactoring Debugger to move threads outside to avoid re-lookups everywhere
 show code in disassembly
 show variable names in disassembly
-deferred breakpoints that are resolved on future dynamic library loads; allow opening files that don't exist, or something
+allow opening files that don't exist to put breakpoints before dynamic library load
 locking windows
 test on very large disassembled functions and large source files
 disassembly: show basic block boundaries (jump destinations)

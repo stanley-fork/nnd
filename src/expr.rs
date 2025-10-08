@@ -680,6 +680,7 @@ pub enum ValueClickAction {
     None,
     // This value represents code location, jump to it on click.
     CodeLocation(FileLineInfo),
+    Function {binary_id: usize, function_idx: usize, static_addr: usize},
 }
 impl ValueClickAction {
     pub fn is_none(&self) -> bool { match self { Self::None => true, _ => false } }
@@ -776,7 +777,12 @@ fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut Form
         0
     } else {
         match v.val.get_usize_prefix(&mut state.context.memory) {
-            Ok(x) => x,
+            Ok(mut x) => {
+                if size < 8 {
+                    x &= usize::MAX >> (64 - size as u32 * 8);
+                }
+                x
+            }
             Err(e) => {
                 write_val_address_if_needed(&v.val, state);
                 styled_write!(state.out, state.palette.error, "<{}>", e);
@@ -836,6 +842,9 @@ fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut Form
         Type::Pointer(p) => if p.flags.contains(PointerFlags::REFERENCE) {
             //write_address(x, state);
             return format_value_recurse(&Value {val: AddrOrValueBlob::Addr(usize_prefix), type_: p.type_, flags: v.flags.inherit()}, true, state);
+        } else if unsafe {(*p.type_).t.is_function()} {
+            format_function_pointer(usize_prefix, state, &mut click_action);
+            return (false, children, click_action);
         } else {
             styled_write!(state.out, if state.expanded {state.palette.value_misc} else {state.palette.value}, "*0x{:x} ", usize_prefix);
             let t = unsafe {&*p.type_};
@@ -853,6 +862,18 @@ fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut Form
                 }
             }
             return (true, children, click_action);
+        }
+        Type::Function => {
+            match &v.val {
+                &AddrOrValueBlob::Addr(addr) => {
+                    format_function_pointer(addr, state, &mut click_action);
+                    return (false, children, click_action);
+                }
+                AddrOrValueBlob::Blob(_) => {
+                    styled_write!(state.out, state.palette.error, "<function with unknown address>");
+                    return (false, children, click_action);
+                }
+            }
         }
         Type::Array(a) => {
             format_array(a.type_, if a.flags.contains(ArrayFlags::LEN_KNOWN) {Some(a.len)} else {None}, a.stride, &v.val, a.flags.contains(ArrayFlags::UTF_STRING), a.flags.contains(ArrayFlags::TRUNCATED), v.flags, state, &mut children);
@@ -992,6 +1013,23 @@ fn format_integer(x0: usize, size: usize, signed: bool, flags: ValueFlags, out: 
         styled_write!(out, palette.value, "{}", x0 as isize);
     } else {
         styled_write!(out, palette.value, "{}", x);
+    }
+}
+
+fn format_function_pointer(addr: usize, state: &mut FormatValueState, click_action: &mut ValueClickAction) {
+    styled_write!(state.out, state.palette.value_misc, "0x{:x}", addr);
+
+    if addr != 0 {
+        for binary in state.context.symbols_registry.iter() {
+            let Ok(symbols) = &binary.symbols else {continue};
+            let static_addr = binary.addr_map.dynamic_to_static(addr);
+            let Ok((function, function_idx)) = symbols.addr_to_function(static_addr) else {continue};
+            *click_action = ValueClickAction::Function {binary_id: binary.id, function_idx, static_addr};
+            styled_write!(state.out, state.palette.function_name, " {}", function.demangle_name());
+            return;
+        }
+
+        styled_write!(state.out, state.palette.default_dim, " <unknown function>");
     }
 }
 
@@ -1456,6 +1494,15 @@ impl StructBuilder {
         a[..8].copy_from_slice(&ptr.to_le_bytes());
         a[8..].copy_from_slice(&len.to_le_bytes());
         self.add_blob_field(name, &a, slice_type);
+    }
+    pub fn add_enum_field(&mut self, name: &'static str, val: usize, enumerands: &[&'static str], types: &mut Types, builtin_types: &BuiltinTypes) {
+        assert!(val < enumerands.len());
+        let mut en = EnumType {enumerands: &[], type_: builtin_types.u64_};
+        for (value, name) in enumerands.iter().enumerate() {
+            types.add_enumerand(&mut en, Enumerand {name, value, flags: EnumerandFlags::empty()});
+        }
+        let enum_type = types.add_enum(en);
+        self.add_usize_field(name, val, enum_type);
     }
 
     pub fn finish(mut self, name: &'static str, flags: ValueFlags, types: &mut Types) -> Value {

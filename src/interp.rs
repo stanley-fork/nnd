@@ -922,7 +922,7 @@ fn from_basic(b: BasicValue, type_: *const TypeInfo) -> Result<Option<AddrOrValu
         _ => return Ok(None),
     };
     if size < 8 {
-        x &= usize::MAX >> (64 - size*8);
+        x &= (1usize << (size * 8)) - 1;
     }
     Ok(Some(AddrOrValueBlob::Blob(ValueBlob::new(x))))
 }

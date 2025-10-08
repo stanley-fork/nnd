@@ -94,6 +94,11 @@ impl<T> Pool<T> {
     pub fn iter_mut(&mut self) -> PoolIterMut<'_, T> {
         PoolIterMut {iter: self.slots.iter_mut(), idx: 0, slot: 0}
     }
+
+    pub fn is_empty(&self) -> bool {
+        assert!(self.slots.len() >= self.vacant.len());
+        self.slots.len() == self.vacant.len()
+    }
 }
 
 pub struct PoolIter<'a, T> {
