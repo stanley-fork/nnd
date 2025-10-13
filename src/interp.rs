@@ -108,9 +108,13 @@ pub fn print_type_in_watch_language_syntax(t: *const TypeInfo, out: &mut String,
     let t = unsafe {&*t};
     match &t.t {
         Type::Pointer(p) => {
-            // (The language doesn't have references, so ignore PointerFlags::REFERENCE and turn references into pointers.)
+            // (The language doesn't have syntax for references, so ignore PointerFlags::REFERENCE and turn references into pointers.)
             out.push_str("*");
             print_type_in_watch_language_syntax(p.type_, out, recursion_depth + 1)
+        }
+        Type::Function => {
+            out.push_str("fn");
+            Ok(())
         }
         Type::Array(a) => {
             if a.stride != 0 && a.stride != unsafe {(*a.type_).calculate_size()} {
@@ -341,7 +345,7 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
             let type_ = eval_type(expr, node.children[1], state, context)?;
             let is_reinterpretable = |type_: *const TypeInfo, to: bool| -> bool {
                 match unsafe {&(*type_).t} {
-                    Type::Primitive(_) | Type::Pointer(_) | Type::Struct(_) | Type::Enum(_) => true,
+                    Type::Primitive(_) | Type::Pointer(_) | Type::PointerToMember(_) | Type::Struct(_) | Type::Enum(_) => true,
                     Type::Array(a) => a.flags.contains(ArrayFlags::LEN_KNOWN) || to,
                     Type::Slice(_) => !to,
                     _ => false,
@@ -634,20 +638,34 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                                 let type_ = state.builtin_types.i64_;
                                 return Ok(Value {val: AddrOrValueBlob::Blob(ValueBlob::new(x)), type_, flags: ValueFlags::empty()});
                             }
-                        }
-                        if op == BinaryOperator::Add {
+                        } else if op == BinaryOperator::Add {
                             mem::swap(&mut a, &mut b);
                             mem::swap(&mut ta, &mut tb);
                         }
                     }
                     if let Some(pa) = ta.t.as_pointer() {
-                        if tb.t.as_pointer().is_none() {
-                            if b.is_f64() { return err!(TypeMismatch, "can't add float to pointer"); }
-                            let stride = unsafe {(*pa.type_).calculate_size()};
-                            let x = a.cast_to_usize();
-                            let y = b.cast_to_usize().wrapping_mul(stride);
-                            let x = if op == BinaryOperator::Add {x.wrapping_add(y)} else {x.wrapping_sub(y)};
-                            return Ok(Value {val: AddrOrValueBlob::Blob(ValueBlob::new(x)), type_: ta, flags: ValueFlags::empty()});
+                        match &tb.t {
+                            Type::PointerToMember(member) => if op == BinaryOperator::Add {
+                                // pointer + field_offset: "dereference" the pointer-to-field
+                                if pa.type_ != member.containing_type {
+                                    return err!(TypeMismatch, "adding field offset to a pointer of different type");
+                                }
+                                let addr = a.cast_to_usize().wrapping_add(b.cast_to_usize());
+                                let field_ptr_type = state.types.add_pointer(member.type_, PointerFlags::empty());
+                                return Ok(Value {val: AddrOrValueBlob::Blob(ValueBlob::new(addr)), type_: field_ptr_type, flags: ValueFlags::empty()});
+                            } else {
+                                // pointer - field_offset: just subtract as numbers
+                            }
+                            Type::Pointer(_) => (), // pointer + pointer: add as numbers
+                            _ if b.is_f64() => return err!(TypeMismatch, "can't add float to pointer"),
+                            _ => {
+                                // pointer + number: offset by number*sizeof(*pointer) bytes
+                                let stride = unsafe {(*pa.type_).calculate_size()};
+                                let x = a.cast_to_usize();
+                                let y = b.cast_to_usize().wrapping_mul(stride);
+                                let x = if op == BinaryOperator::Add {x.wrapping_add(y)} else {x.wrapping_sub(y)};
+                                return Ok(Value {val: AddrOrValueBlob::Blob(ValueBlob::new(x)), type_: ta, flags: ValueFlags::empty()});
+                            }
                         }
                     }
 
@@ -896,7 +914,7 @@ fn to_basic(val: &Value, memory: &mut CachedMemReader, what: &str) -> Result<Bas
                 }
             }
         }
-        Type::Pointer(_) => BasicValue::U(val.val.clone().into_value(size, memory)?.get_usize()?),
+        Type::Pointer(_) | Type::PointerToMember(_) => BasicValue::U(val.val.clone().into_value(size, memory)?.get_usize()?),
         _ => return err!(TypeMismatch, "can't {} {}", what, t.t.kind_name()),
     })
 }
@@ -918,7 +936,7 @@ fn from_basic(b: BasicValue, type_: *const TypeInfo) -> Result<Option<AddrOrValu
             }
         }
         Type::Primitive(f) if f.contains(PrimitiveFlags::SIGNED) => b.cast_to_isize() as usize, // covers negative float to signed int
-        Type::Primitive(_) | Type::Pointer(_) => b.cast_to_usize(),
+        Type::Primitive(_) | Type::Pointer(_) | Type::PointerToMember(_) => b.cast_to_usize(),
         _ => return Ok(None),
     };
     if size < 8 {

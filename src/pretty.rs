@@ -109,10 +109,9 @@ macro_rules! styled_write_maybe {
     );
 }
 
-// For a *TypeInfo or a *StructField, tells how to show this type or field in watches window.
-// (Not a value of this type. The type itself. E.g. when using typeof().)
+// For a value of special type like TypeInfo or StructField, tells how to show this type or field in watches window.
 // The returned value is a struct that the user can explore using field access in watch expressions or by expanding the line in the watches window.
-// E.g. if the *TypeInfo describes a struct, we'll return something like {name: "foo", size: 24, fields: {f1: <MetaField>, f2: <MetaField>}}.
+// E.g. if the value contains a *TypeInfo describing a struct, we'll return something like {name: "foo", size: 24, fields: {f1: <MetaField>, f2: <MetaField>}}.
 pub fn reflect_meta_value(val: &Value, state: &mut EvalState, context: &mut EvalContext, mut out: Option<(&mut StyledText, &Palette)>) -> Value {
     let meta_t = unsafe {&*val.type_};
     let mut builder = StructBuilder::default();
@@ -141,6 +140,11 @@ pub fn reflect_meta_value(val: &Value, state: &mut EvalState, context: &mut Eval
                 Type::Pointer(p) => {
                     if let Some((text, palette)) = &mut out {print_type_name(t, *text, *palette, 0);}
                     builder.add_usize_field("type", p.type_ as usize, state.builtin_types.meta_type);
+                }
+                Type::PointerToMember(p) => {
+                    if let Some((text, palette)) = &mut out {print_type_name(t, *text, *palette, 0);}
+                    builder.add_usize_field("type", p.type_ as usize, state.builtin_types.meta_type);
+                    builder.add_usize_field("containing_type", p.containing_type as usize, state.builtin_types.meta_type);
                 }
                 Type::Function => styled_write_maybe!(out, default, "fn"),
                 Type::Array(a) => {

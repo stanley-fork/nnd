@@ -1069,7 +1069,7 @@ impl SymbolsLoader {
                 (vec![DW_TAG_namespace], NamespaceAttributes::layout()),
                 (vec![DW_TAG_variable, DW_TAG_formal_parameter], VariableAttributes::layout()),
                 (vec![DW_TAG_subprogram], SubprogramAttributes::layout()),
-                (vec![DW_TAG_base_type, DW_TAG_unspecified_type, DW_TAG_structure_type, DW_TAG_class_type, DW_TAG_union_type, DW_TAG_enumeration_type, DW_TAG_pointer_type, DW_TAG_reference_type, DW_TAG_rvalue_reference_type, DW_TAG_array_type, DW_TAG_const_type, DW_TAG_restrict_type, DW_TAG_volatile_type, DW_TAG_atomic_type, DW_TAG_typedef, DW_TAG_subroutine_type], TypeAttributes::layout()),
+                (vec![DW_TAG_base_type, DW_TAG_unspecified_type, DW_TAG_structure_type, DW_TAG_class_type, DW_TAG_union_type, DW_TAG_enumeration_type, DW_TAG_pointer_type, DW_TAG_reference_type, DW_TAG_rvalue_reference_type, DW_TAG_array_type, DW_TAG_const_type, DW_TAG_restrict_type, DW_TAG_volatile_type, DW_TAG_atomic_type, DW_TAG_typedef, DW_TAG_subroutine_type, DW_TAG_ptr_to_member_type], TypeAttributes::layout()),
                 (vec![DW_TAG_inheritance, DW_TAG_member, DW_TAG_enumerator], FieldAttributes::layout()),
                 (vec![DW_TAG_variant_part], VariantPartAttributes::layout()),
                 (vec![DW_TAG_variant], VariantAttributes::layout()),
@@ -2071,6 +2071,7 @@ dwarf_struct!{ TypeAttributes {
     specification_or_abstract_origin: DwarfReference, DW_AT_specification, SpecificationOrAbstractOrigin;
     name: &'static str, DW_AT_name, String;
     type_: /*DieOffset*/ usize, DW_AT_type, DebugInfoOffset;
+    containing_type: /*DieOffset*/ usize, DW_AT_containing_type, DebugInfoOffset;
     // byte_size/bit_size may in theory be exprloc, presumably for some kind of dynamically-sized types, but I haven't seen that in practice.
     byte_size: usize, DW_AT_byte_size, Unsigned;
     bit_size: usize, DW_AT_bit_size, Unsigned;
@@ -2635,9 +2636,9 @@ impl<'a> DwarfLoader<'a> {
                 }
 
                 // Types.
-                DW_TAG_base_type | DW_TAG_unspecified_type | DW_TAG_structure_type | DW_TAG_class_type | DW_TAG_union_type | DW_TAG_enumeration_type | DW_TAG_pointer_type | DW_TAG_reference_type | DW_TAG_rvalue_reference_type | DW_TAG_array_type | DW_TAG_const_type | DW_TAG_restrict_type | DW_TAG_volatile_type | DW_TAG_atomic_type | DW_TAG_typedef | DW_TAG_subroutine_type => {
+                DW_TAG_base_type | DW_TAG_unspecified_type | DW_TAG_structure_type | DW_TAG_class_type | DW_TAG_union_type | DW_TAG_enumeration_type | DW_TAG_pointer_type | DW_TAG_reference_type | DW_TAG_rvalue_reference_type | DW_TAG_array_type | DW_TAG_const_type | DW_TAG_restrict_type | DW_TAG_volatile_type | DW_TAG_atomic_type | DW_TAG_typedef | DW_TAG_subroutine_type | DW_TAG_ptr_to_member_type => {
                     // Applicable attributes (DW_AT_*) (DECL means decl_file, decl_line, decl_column):
-                    // Useful: DECL, name, bit_size, byte_size, declaration, type, signature, alignment
+                    // Useful: DECL, name, bit_size, byte_size, declaration, type, containing_type, signature, alignment
                     // For base types: encoding
                     // For arrays and enums used as array index: bit_stride, byte_stride, ordering, rank
                     // Possible in theory, but I haven't seen these on types: specification, abstract_origin
@@ -2653,13 +2654,16 @@ impl<'a> DwarfLoader<'a> {
                         DW_TAG_structure_type | DW_TAG_class_type | DW_TAG_union_type => Type::Struct(StructType::default()),
                         DW_TAG_enumeration_type => Type::Enum(EnumType {enumerands: &[], type_: self.loader.types.builtin_types.unknown}),
                         DW_TAG_pointer_type | DW_TAG_reference_type | DW_TAG_rvalue_reference_type => Type::Pointer(
-                            PointerType {flags: if abbrev.tag() == DW_TAG_pointer_type {PointerFlags::empty()} else {PointerFlags::REFERENCE}, type_: self.loader.types.builtin_types.unknown}),
+                            PointerType {flags: if abbrev.tag() == DW_TAG_pointer_type {PointerFlags::empty()} else {PointerFlags::REFERENCE},
+                                         // pointer without DW_AT_type is a void*
+                                         type_: self.loader.types.builtin_types.void}),
                         DW_TAG_array_type => Type::Array(ArrayType {flags: ArrayFlags::empty(), type_: self.loader.types.builtin_types.unknown, stride: 0, len: 0}),
                         DW_TAG_const_type | DW_TAG_restrict_type | DW_TAG_volatile_type | DW_TAG_atomic_type | DW_TAG_typedef => {
                             is_alias = true;
                             Type::Pointer(PointerType {flags: PointerFlags::empty(), type_: self.loader.types.builtin_types.unknown})
                         }
                         DW_TAG_subroutine_type => Type::Function,
+                        DW_TAG_ptr_to_member_type => Type::PointerToMember(PointerToMemberType {type_: self.loader.types.builtin_types.void, containing_type: self.loader.types.builtin_types.unknown}),
                         _ => panic!("huh?") };
                     let mut info = TypeInfo {die: offset, binary_id: self.loader.binary_id, line: LineInfo::invalid(), t, language: self.unit.language, ..Default::default()};
                     let mut is_complex_float = false;
@@ -2716,15 +2720,19 @@ impl<'a> DwarfLoader<'a> {
                         match &mut info.t {
                             Type::Enum(e) => e.type_ = type_,
                             Type::Pointer(p) => p.type_ = type_,
+                            Type::PointerToMember(p) => p.type_ = type_,
                             Type::Array(a) => a.type_ = type_,
                             _ => if self.shard.warn.check(line!()) { eprintln!("warning: DW_AT_type on {} is not supported (@0x{:x})", abbrev.tag(), offset.0); }
                         }
-                    } else {
+                    }
+
+                    if attrs.fields & TypeAttributes::containing_type != 0 {
                         match &mut info.t {
-                            // Pointer without DW_AT_type is a void*
-                            Type::Pointer(p) => p.type_ = self.loader.types.builtin_types.void, // (this will apply to typedefs too, seems ok)
-                            _ => (),
+                            Type::PointerToMember(p) => p.containing_type = attrs.containing_type as *const TypeInfo,
+                            _ => if self.shard.warn.check(line!()) { eprintln!("warning: DW_AT_containing_type on {} is not supported (@0x{:x})", abbrev.tag(), offset.0); }
                         }
+                    } else if let Type::PointerToMember(p) = &info.t {
+                        if self.shard.warn.check(line!()) { eprintln!("warning: DW_AT_ptr_to_member_type without DW_AT_containing_type (@0x{:x})", offset.0); }
                     }
 
                     if attrs.fields & TypeAttributes::encoding != 0 {
@@ -2785,7 +2793,7 @@ impl<'a> DwarfLoader<'a> {
 
                     if !info.flags.contains(TypeFlags::SIZE_KNOWN) {
                         match &info.t {
-                            Type::Primitive(_) | Type::Pointer(_) => {
+                            Type::Primitive(_) | Type::Pointer(_) | Type::PointerToMember(_) => {
                                 info.size = 8;
                                 info.flags.insert(TypeFlags::SIZE_KNOWN);
                             }
@@ -3043,13 +3051,6 @@ impl<'a> DwarfLoader<'a> {
                 DW_TAG_generic_subrange => {
                     // Haven't seen these in C++ or Rust.
                     if self.shard.warn.check(line!()) { eprintln!("warning: arrays with dynamic number of dimensions are not supported (got one @0x{:x})", offset.0); }
-                    cursor.skip_attributes(abbrev, &attribute_context)?;
-                }
-
-                // TODO: Pointers to members.
-                DW_TAG_ptr_to_member_type => {
-                    self.shard.types.add_type(TypeInfo {name: "<unsupported>", die: offset, binary_id: self.loader.binary_id, language: self.unit.language, flags: TypeFlags::UNSUPPORTED, ..TypeInfo::default()});
-                    skip_subtree = self.main_stack.len;
                     cursor.skip_attributes(abbrev, &attribute_context)?;
                 }
 

@@ -29,6 +29,8 @@ test with watches window filled with long arrays (I saw 50ms frames when there a
 investigate unresponsive ui when conditional breakpoint is hit at a high rate
 
 todo:
+autodetect bitflags
+in type search, dedup builtin types so that they're not listed once for each binary
 tooltip in status window with more log lines and more space for last error
 draggable column widths in watches window
 try with odin
@@ -72,7 +74,6 @@ allow expressions (especially conditions) to have multiple statements separated 
 some kind of non-stop mode to prevent clickhouse server from losing keeper connection when stepping through the code
 allow navigating from source to variables (especially global) and types declared there
 allow to put breakpoint on a whole file (by adding breakpoint on the first line, since there's never any real code on first line in practice; have a new icon for it; internally use line 0 to cover the garbage LineInfo-s with line 0; or maybe put breakpoint only on function entry points instead of everything)
-member pointers
 handle tail calls: if you step-into a tail call (by single-stepping from instruction pointed by DW_AT_call_pc of a DW_TAG_call_site with DW_AT_call_tail_call), the tail-callee should be added to stack digest (so its stack frame is selected instead of parent)
 find function by address (like addr2line)
 use actual function name instead of "_" in namespace path, or do something else to make function-static variables usable

@@ -844,7 +844,6 @@ fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut Form
             return format_value_recurse(&Value {val: AddrOrValueBlob::Addr(usize_prefix), type_: p.type_, flags: v.flags.inherit()}, true, state);
         } else if unsafe {(*p.type_).t.is_function()} {
             format_function_pointer(usize_prefix, state, &mut click_action);
-            return (false, children, click_action);
         } else {
             styled_write!(state.out, if state.expanded {state.palette.value_misc} else {state.palette.value}, "*0x{:x} ", usize_prefix);
             let t = unsafe {&*p.type_};
@@ -863,15 +862,31 @@ fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut Form
             }
             return (true, children, click_action);
         }
+        Type::PointerToMember(p) => {
+            styled_write!(state.out, state.palette.value, "0x{:x}", usize_prefix);
+            styled_write!(state.out, state.palette.value_misc, " (");
+            let mut found = false;
+            if let Type::Struct(s) = unsafe {&(*p.containing_type).t} {
+                for field in s.fields() {
+                    if field.bit_offset == usize_prefix * 8 {
+                        styled_write!(state.out, state.palette.field_name, "{}", field.name);
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if !found {
+                styled_write!(state.out, state.palette.error, "?");
+            }
+            styled_write!(state.out, state.palette.value_misc, ")");
+        }
         Type::Function => {
             match &v.val {
                 &AddrOrValueBlob::Addr(addr) => {
                     format_function_pointer(addr, state, &mut click_action);
-                    return (false, children, click_action);
                 }
                 AddrOrValueBlob::Blob(_) => {
                     styled_write!(state.out, state.palette.error, "<function with unknown address>");
-                    return (false, children, click_action);
                 }
             }
         }

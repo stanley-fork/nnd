@@ -12,8 +12,19 @@ typedef long F(int x);
 
 struct S {
     int a=10,b=20,c=30,d=40;
+
+    void foo() volatile {
+        cout<<"foo "<<a<<endl;
+    }
+    void bar() volatile {
+        cout<<"bar "<<b<<endl;
+    }
 };
 typedef int S::*SF;
+
+struct fn {
+    int this_is_not_a_debugger_type = 1337;
+};
 
 int main() {
     long (*volatile p)(int) = f;
@@ -35,4 +46,11 @@ int main() {
     s.*bp += 2;
     s.*cp -= 2;
     cout << s.b << ' ' << s.c << endl;
+
+    void (S::*volatile mfp)() volatile = &S::foo;
+    (s.*mfp)();
+    mfp = &S::bar;
+    (s.*mfp)();
+
+    volatile fn ffn;
 }

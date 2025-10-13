@@ -61,6 +61,16 @@ pub struct PointerType {
     pub type_: *const TypeInfo,
 }
 
+// Pointer to a field, i.e. just offsetof of a field.
+// During symbols loading this may also be a silly C++ "pointer to member function" type, but then we convert it to a normal function pointer.
+#[derive(Hash, PartialEq, Eq, Clone, Debug)]
+pub struct PointerToMemberType {
+    // Type of the member. If Function, this PointerToMemberType is actually just a function pointer.
+    pub type_: *const TypeInfo,
+    // Type of the struct that has the member.
+    pub containing_type: *const TypeInfo,
+}
+
 bitflags! { pub struct ArrayFlags: u8 {
     // Length is constant. For VLA, DWARF contains an expression to calculate actual length, but we don't support it.
     const LEN_KNOWN = 0x1;
@@ -184,6 +194,7 @@ pub enum Type {
     Unknown, // unresolved type reference or other errors
     Primitive(PrimitiveFlags),
     Pointer(PointerType),
+    PointerToMember(PointerToMemberType),
     // Function. Only meaningful as target of a Pointer, making it a function pointer.
     // No function signature, it doesn't seem useful since we don't support calling functions.
     Function,
@@ -222,6 +233,7 @@ impl Type {
             Type::Unknown => "unknown",
             Type::Primitive(_) => "primitive type",
             Type::Pointer(_) => "pointer",
+            Type::PointerToMember(_) => "pointer to member",
             Type::Function => "fn",
             Type::Array(_) => "array",
             Type::Slice(s) if s.flags.contains(SliceFlags::UTF_STRING) => "string",
@@ -281,7 +293,7 @@ pub struct TypeInfo {
 impl Default for TypeInfo { fn default() -> Self { Self {name: "", size: 0, die: DebugInfoOffset(0), binary_id: usize::MAX, line: LineInfo::invalid(), flags: TypeFlags::empty(), language: LanguageFamily::Internal, nested_names: &[], t: Type::Unknown} } }
 
 impl TypeInfo {
-    fn can_have_own_name(&self) -> bool { match &self.t { Type::Pointer(_) | Type::Array(_) | Type::Slice(_) => false, _ => true } }
+    fn can_have_own_name(&self) -> bool { match &self.t { Type::Pointer(_) | Type::Function | Type::Array(_) | Type::Slice(_) => false, _ => true } }
     fn can_be_forward_declared(&self) -> bool { match &self.t { Type::Struct(_) | Type::Enum(_) => true, _ => false } }
 
     pub fn calculate_size(&self) -> usize {
@@ -292,7 +304,7 @@ impl TypeInfo {
                 return t.size * multiplier;
             }
             match &t.t {
-                Type::Unknown | Type::Primitive(_) | Type::Pointer(_) | Type::Function | Type::MetaType | Type::MetaField => return 8 * multiplier,
+                Type::Unknown | Type::Primitive(_) | Type::Pointer(_) | Type::PointerToMember(_) | Type::Function | Type::MetaType | Type::MetaField => return 8 * multiplier,
                 Type::MetaVariable => return 16 * multiplier,
                 Type::MetaCodeLocation => return 24 * multiplier,
                 Type::Slice(_) => return 16 * multiplier,
@@ -519,6 +531,7 @@ impl fmt::Debug for DumpType {
                 Type::Unknown => write!(f, "unknown")?,
                 Type::Primitive(p) => write!(f, "primitive {:?}", p)?,
                 Type::Pointer(p) => write!(f, "* {:?}  @{:x} '{}'", p.flags, (*p.type_).die.0, (*p.type_).name)?,
+                Type::PointerToMember(p) => write!(f, "*(member)  @{:x} '{}' :: @{:x} '{}'", (*p.containing_type).die.0, (*p.containing_type).name, (*p.type_).die.0, (*p.type_).name)?,
                 Type::Function => write!(f, "fn")?,
                 Type::Array(a) => write!(f, "[] {:?} /{}  @{:x} '{}'", a.flags, a.stride, (*a.type_).die.0, (*a.type_).name)?,
                 Type::Slice(s) => write!(f, "[..] {:?} @{:x} '{}'", s.flags, (*s.type_).die.0, (*s.type_).name)?,
@@ -559,6 +572,16 @@ pub fn print_type_name(t: *const TypeInfo, out: &mut StyledText, palette: &Palet
                 print_type_name((*p).type_, out, palette, recursion_depth + 1);
                 return;
             }
+            Type::PointerToMember(p) => {
+                print_type_name((*p).containing_type, out, palette, recursion_depth + 1);
+                styled_write!(out, palette.value_misc, " ::* ");
+                print_type_name((*p).type_, out, palette, recursion_depth + 1);
+                return;
+            }
+            Type::Function => {
+                styled_write!(out, palette.value_misc, "fn");
+                return;
+            }
             Type::Array(a) => {
                 // Print length before name (instead of e.g. Rust syntax [type; len]) because name may be long and cut off.
                 if a.flags.contains(ArrayFlags::UTF_STRING) {
@@ -595,6 +618,8 @@ pub fn print_type_name(t: *const TypeInfo, out: &mut StyledText, palette: &Palet
 
 unsafe impl Send for PointerType {}
 unsafe impl Sync for PointerType {}
+unsafe impl Send for PointerToMemberType {}
+unsafe impl Sync for PointerToMemberType {}
 unsafe impl Send for ArrayType {}
 unsafe impl Sync for ArrayType {}
 unsafe impl Send for SliceType {}
@@ -768,12 +793,15 @@ unsafe impl Sync for TypeLoadStateEnum {}
 enum TypeSpecialInfo {
     None,
     AmbiguousChar {signed: bool},
+    Function,
 }
 impl TypeSpecialInfo {
     fn is_none(self) -> bool { match self { TypeSpecialInfo::None => true, _ => false } }
+    fn is_function(self) -> bool { match self { TypeSpecialInfo::Function => true, _ => false } }
     fn extract(t: &TypeInfo) -> Self {
         match &t.t {
             Type::Primitive(p) if p.contains(PrimitiveFlags::AMBIGUOUS_CHAR) => TypeSpecialInfo::AmbiguousChar {signed: p.contains(PrimitiveFlags::SIGNED)},
+            Type::Function => TypeSpecialInfo::Function,
             _ => TypeSpecialInfo::None,
         }
     }
@@ -1160,6 +1188,17 @@ impl TypesLoader {
                         unlock();
                         p.type_ = self.find_and_dfs(original_shard_idx, DebugInfoOffset(p.type_ as usize), on_cycle).0;
                     }
+                    Type::PointerToMember(p) => {
+                        unlock();
+                        let (type_, special) = self.find_and_dfs(original_shard_idx, DebugInfoOffset(p.type_ as usize), on_cycle);
+                        if special.is_function() {
+                            // Turn the silly "pointer to member function" type into a normal function pointer.
+                            info.t = Type::Pointer(PointerType {flags: PointerFlags::empty(), type_: type_});
+                        } else {
+                            p.type_ = type_;
+                            p.containing_type = self.find_and_dfs(original_shard_idx, DebugInfoOffset(p.containing_type as usize), on_cycle).0;
+                        }
+                    }
                     Type::Array(a) => {
                         unlock();
                         a.type_ = self.find_and_dfs(original_shard_idx, DebugInfoOffset(a.type_ as usize), on_cycle).0;
@@ -1381,7 +1420,8 @@ fn name_dedup_unpriority(t: &TypeInfo) -> u8 {
 }
 
 // Heuristically detect things like `typedef char int8_t` and use a non-char integer type, i.e. it'll be printed as a number.
-// TODO: This turned out to be pretty useless, we should probably delet dis, along with TypeSpecialInfo.
+// This turned out to be pretty useless because debug info often refers to the typedef'd type directly even if the code refers to it through the typedef.
+// Maybe we should remove it.
 fn detect_cpp_non_char_8bit_type_from_typedef(name: &str, target: TypeSpecialInfo) -> Option<TypeInfo> {
     let signed = match target {
         TypeSpecialInfo::AmbiguousChar {signed} => signed,
