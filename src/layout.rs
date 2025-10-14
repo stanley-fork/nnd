@@ -523,7 +523,7 @@ impl Layout {
                     let win = self.windows.get(window_id);
                     tabs.add(Tab {identity: hash(&window_id), short_title: win.title.clone(), hotkey_number: win.hotkey_number.clone(), ..D!()}, ui);
                 }
-                leaf.tabs_state = tabs.finish(ui);
+                (leaf.tabs_state, _) = tabs.finish(ui);
             });
 
             for (i, &window_id) in leaf.tabs.iter().enumerate() {

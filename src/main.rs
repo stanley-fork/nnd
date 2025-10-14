@@ -126,6 +126,7 @@ fn main() {
     let mut dump_core = false;
     let mut core_dumper_buffer_size = 1usize << 20;
     let mut core_dumper_mode = CoreDumperMode::Fork;
+    let mut mouse_mode_changed = false;
     while !args.is_empty() && args[0].starts_with("-") {
         if let Some(v) = parse_arg(&mut args, &mut seen_args, "--pid", "-p", false, false) {
             attach_pid = match pid_t::from_str(&v) {
@@ -148,6 +149,7 @@ fn main() {
         } else if let Some(_) = parse_arg(&mut args, &mut seen_args, "--stop-early", "-S", true, false) {
             settings.stop_on_initial_exec = true;
         } else if let Some(m) = parse_arg(&mut args, &mut seen_args, "--mouse", "", false, false) {
+            mouse_mode_changed = true;
             settings.mouse_mode = match &m.to_lowercase()[..] {
                 "full" => MouseMode::Full,
                 "no-hover" => MouseMode::NoHover,
@@ -164,7 +166,8 @@ fn main() {
                 name => SessionName::Name(name.to_string()),
             };
         } else if let Some(_) = parse_arg(&mut args, &mut seen_args, "--echo-input", "", true, false) {
-            match run_input_echo_tool() {
+            let mouse_mode = if mouse_mode_changed {settings.mouse_mode} else {MouseMode::Disabled};
+            match run_input_echo_tool(mouse_mode) {
                 Ok(()) => (),
                 Err(e) => eprintln!("error: {}", e),
             }

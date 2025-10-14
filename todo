@@ -31,7 +31,6 @@ investigate unresponsive ui when conditional breakpoint is hit at a high rate
 todo:
 in type search, dedup builtin types so that they're not listed once for each binary
 tooltip in status window with more log lines and more space for last error
-draggable column widths in watches window
 try with odin
 zig pretty-printers
 support gnu_debugaltlink, as found in zsh in debuginfod
@@ -61,9 +60,12 @@ allow adding unconditional breakpoint on the same line as conditional one, someh
 global variables from .symtab, maybe from .debug_pubnames (maybe also look into .debug_pubtypes)
 more built-in pretty printers: boost::multi_index sparsehash, absl, rust b-trees
 hotkey to switch between .h/.cpp (/.cc/.hh/.hpp/.cxx - maybe just anything after '.')
-reordering watches
 reordering tabs
 rearranging windows
+  drag window title or tab
+  drop onto tabs widget (as if reordering tabs), or onto content area (adding tab at the end), or onto split line
+  if no tabs left, delete the region
+  allow adding tabs to code/disas windows, ignore the problem of clashing keys
 maximizing windows
 meta functions like checking for field presense of superclass type for use in conditions
 key to freeze value in watches window; can also be used for controlling when to run the expression if it has side effects

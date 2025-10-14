@@ -680,13 +680,66 @@ impl TabsState {
         self.selected = tab_idx;
         self.scroll_to_selected_tab = true;
     }
-    // Call when a tab is closed.
+    // Call when a tab is removed from the list.
     pub fn closed(&mut self, tab_idx: usize) {
         if self.selected > tab_idx {
             self.selected -= 1;
         }
         self.scroll_to_selected_tab = true;
     }
+    pub fn apply_action<T>(&mut self, action: TabsAction, tabs: &mut Vec<T>) -> bool {
+        match action {
+            TabsAction::None => false,
+            TabsAction::Close(idx) => if idx < tabs.len() {
+                tabs.remove(idx);
+                self.closed(idx);
+                true
+            } else {
+                false
+            }
+            TabsAction::Reorder {from_idx, to_idx} => {
+                let new_idx = if to_idx <= from_idx {
+                    to_idx
+                } else {
+                    to_idx - 1
+                };
+                if new_idx != from_idx && from_idx < tabs.len() && new_idx < tabs.len() {
+                    // (Remove+insert instead of a more efficient rotate because this seems less error-prone.)
+                    let t = tabs.remove(from_idx);
+                    tabs.insert(new_idx, t);
+
+                    if self.selected == from_idx {
+                        self.selected = new_idx;
+                        self.scroll_to_selected_tab = true;
+                    } else {
+                        if self.selected > from_idx {
+                            self.selected -= 1;
+                        }
+                        if self.selected >= new_idx {
+                            self.selected += 1;
+                        }
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            TabsAction::DropWindow {..} => panic!("unexpected DropWindow event"),
+        }
+    }
+}
+
+pub enum TabsAction {
+    None,
+    Reorder {
+        from_idx: usize, // take the tab at this index
+        to_idx: usize, // and put it just before the tab that's currently at this index
+    },
+    DropWindow { // used if allow_dropping_window
+        window_id: Id,
+        to_idx: usize,
+    },
+    Close(usize),
 }
 
 #[derive(Default)]
@@ -696,6 +749,8 @@ pub struct Tab {
     pub full_title: String,
     pub ephemeral: bool,
     pub hotkey_number: Option<usize>,
+    pub custom_drag: Option<DragWhat>,
+    pub allow_closing: bool,
 
     // (These shouldn't be used from the outside, they're public only to make Default work, to avoid the annoying "builder pattern".)
     pub idx: usize,
@@ -708,13 +763,17 @@ pub struct Tabs {
     pub tabs: Vec<Tab>,
     pub state: TabsState,
     pub custom_styles: Option<(/*selected*/ Style, /*ephemeral*/ (String, Style), /*deselected*/ Style, /*separator*/ (String, Style))>,
+    pub allow_reordering: bool,
+    // React to DRAG_IN with DragWhat::Window.
+    pub allow_dropping_window: bool,
     viewport: WidgetIdx,
     content: WidgetIdx,
+    action: TabsAction,
 }
 impl Tabs {
     pub fn new(state: TabsState, ui: &mut UI) -> Self {
         let content = ui.add(widget!().width(AutoSize::Children).fixed_height(1).flags(WidgetFlags::HSCROLL_INDICATOR_LEFT | WidgetFlags::HSCROLL_INDICATOR_RIGHT).hstack());
-        Self {tabs: Vec::new(), state, viewport: ui.cur_parent, content, custom_styles: None}
+        Self {tabs: Vec::new(), state, allow_reordering: false, allow_dropping_window: false, viewport: ui.cur_parent, content, custom_styles: None, action: TabsAction::None}
     }
 
     pub fn add(&mut self, mut tab: Tab, ui: &mut UI) {
@@ -725,19 +784,30 @@ impl Tabs {
         with_parent!(ui, self.content, {
             tab.separator_widget = ui.add(widget!().width(AutoSize::Text));
             tab.widget = ui.add(widget!().identity(&('t', tab.identity)).width(AutoSize::Text).max_width(35).highlight_on_hover());
+            let tabs_identity = ui.cur().identity;
 
             with_parent!(ui, tab.widget, {
                 if ui.check_mouse(MouseActions::CLICK) {
                     self.state.select(tab.idx);
                 }
+
+                if tab.allow_closing && ui.check_mouse(MouseActions::MIDDLE_CLICK) {
+                    self.action = TabsAction::Close(tab.idx);
+                }
+
+                if let &Some(what) = &tab.custom_drag {
+                    ui.check_drag_out(what);
+                } else if self.allow_reordering {
+                    ui.check_drag_out(DragWhat::Tab {tabs_identity, tab_idx: tab.idx});
+                }
             });
         });
-        
+
         self.tabs.push(tab);
     }
 
     #[must_use]
-    pub fn finish(mut self, ui: &mut UI) -> TabsState {
+    pub fn finish(mut self, ui: &mut UI) -> (TabsState, TabsAction) {
         self.disambiguate_titles(ui);
 
         self.state.selected = self.state.selected.min(self.tabs.len().saturating_sub(1));
@@ -755,6 +825,39 @@ impl Tabs {
             Some(x) => x,
             None => (ui.palette.tab_selected, ui.palette.tab_ephemeral.clone(), ui.palette.tab_deselected, ui.palette.tab_separator.clone()),
         };
+
+        let mut show_drop_indicator: Option<isize> = None;
+        if self.allow_reordering || self.allow_dropping_window {
+            with_parent!(ui, self.content, {
+                if let Some((what, pos, drop)) = ui.check_drag_in() {
+                    // Map `pos` to tab idx. Use tab positions and sizes from previous frame.
+                    for (i, tab) in self.tabs.iter().enumerate() {
+                        let w = ui.get(tab.widget);
+                        let mid = w.axes[Axis::X].rel_pos + w.axes[Axis::X].size as isize / 2;
+                        let (to_idx, x) = if pos[Axis::X] <= mid {
+                            (i, w.axes[Axis::X].rel_pos - 2)
+                        } else if i + 1 == self.tabs.len() {
+                            (self.tabs.len(), w.axes[Axis::X].rel_pos + w.axes[Axis::X].size as isize + 1)
+                        } else {
+                            continue;
+                        };
+
+                        let action = match what {
+                            DragWhat::Tab {tabs_identity, tab_idx} if self.allow_reordering && tabs_identity == ui.cur().identity && tab_idx != to_idx && tab_idx + 1 != to_idx => TabsAction::Reorder {from_idx: tab_idx, to_idx},
+                            DragWhat::Window(window_id) if self.allow_dropping_window && &tab.custom_drag != &Some(DragWhat::Window(window_id)) && &self.tabs[to_idx.saturating_sub(1)].custom_drag != &Some(DragWhat::Window(window_id)) => TabsAction::DropWindow {window_id, to_idx},
+                            _ => break,
+                        };
+
+                        show_drop_indicator = Some(x);
+                        if drop {
+                            self.action = action;
+                        }
+
+                        break;
+                    }
+                }
+            });
+        }
 
         let padding_line = styled_writeln!(ui.text, separator.1, " ");
         for (i, tab) in self.tabs.iter().enumerate() {
@@ -784,6 +887,12 @@ impl Tabs {
         }
         ui.add(widget!().parent(self.content).text(padding_line).width(AutoSize::Text));
 
+        if let Some(x) = show_drop_indicator {
+            let wid = str_width(&ui.palette.tab_drop_indicator.0);
+            let l = styled_writeln!(ui.text, ui.palette.tab_drop_indicator.1, "{}", ui.palette.tab_drop_indicator.0);
+            ui.add(widget!().parent(self.content).text(l).fixed_x(x - wid as isize / 2).width(AutoSize::Text));
+        }
+        
         self.state.hscroll += with_parent!(ui, self.viewport, {
             ui.check_scroll() * ui.key_binds.hscroll_sensitivity
         });
@@ -800,7 +909,7 @@ impl Tabs {
         let w = ui.get_mut(self.content);
         w.axes[Axis::X].rel_pos = -self.state.hscroll;
         w.axes[Axis::X].flags.insert(AxisFlags::POS_KNOWN);
-        self.state
+        (self.state, self.action)
     }
 
     fn disambiguate_titles(&mut self, ui: &mut UI) {

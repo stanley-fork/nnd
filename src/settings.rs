@@ -149,6 +149,7 @@ pub struct Palette {
     pub tab_ephemeral: (String, Style),
     pub tab_deselected: Style,
     pub tab_separator: (String, Style),
+    pub tab_drop_indicator: (String, Style),
 
     // fg - left side, bg - right side.
     pub progress_bar: Style,
@@ -255,6 +256,7 @@ impl Default for Palette {
             tab_ephemeral: ("∗".to_string(), Style {fg: white, ..D!()}),
             tab_deselected: Style {fg: white.darker(), ..D!()},
             tab_separator: (" | ".to_string(), Style {fg: white.darker(), ..D!()}),
+            tab_drop_indicator: (">>|<<".to_string(), Style {fg: white, ..D!()}),
 
             placeholder_fill: Some(('.', Style {fg: white.darker(), bg: black, ..D!()})),
             truncation_indicator: (("…".to_string(), "…".to_string(), Style {fg: white.darker(), ..D!()})),
@@ -687,6 +689,7 @@ impl Default for KeyBinds {
             (Key::Char('C').plain(), KeyAction::StepToCursor),
             // (Ctrl+tab and ctrl+shift+tab are unrepresentable in ansi escape codes.)
             (Key::Char('t').ctrl(), KeyAction::NextTab),
+            (Key::Char('t').alt(), KeyAction::PreviousTab),
             (Key::Char('b').ctrl(), KeyAction::PreviousTab),
             (Key::Char('w').ctrl(), KeyAction::CloseTab),
             (Key::Char(']').plain(), KeyAction::NextStackFrame),

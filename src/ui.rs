@@ -2101,137 +2101,20 @@ impl DisassemblyWindow {
             state.should_edit_breakpoint_condition = Some(id);
         }
     }
-}
 
-impl WindowContent for DisassemblyWindow {
-    fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
-        // First do things that may open or close tabs.
-
-        let mut open_dialog = false;
-        for action in ui.check_keys(&[KeyAction::Open, KeyAction::CloseTab, KeyAction::GoToLine]) {
-            match action {
-                KeyAction::Open if self.search_dialog.is_none() => {
-                    open_dialog = true;
+    fn handle_tabs_action(&mut self, action: TabsAction) -> bool {
+        if let &TabsAction::Close(idx) = &action {
+            if let Some(tab) = self.tabs.get_mut(idx) {
+                if tab.ephemeral && tab.locator.is_some() {
+                    tab.ephemeral = false;
+                    return true;
                 }
-                KeyAction::CloseTab if self.tabs.get(self.tabs_state.selected).is_some() => {
-                    let tab = &mut self.tabs[self.tabs_state.selected];
-                    if tab.ephemeral && tab.locator.is_some() {
-                        tab.ephemeral = false;
-                    } else {
-                        self.tabs.remove(self.tabs_state.selected);
-                    }
-                }
-                KeyAction::GoToLine => {
-                    self.go_to_address_bar.hide_when_not_editing = true;
-                    self.go_to_address_error = None;
-                    self.go_to_address_bar.start_editing();
-                }
-                _ => (),
             }
         }
+        self.tabs_state.apply_action(action, &mut self.tabs)
+    }
 
-        self.build_search_dialog(open_dialog, state, debugger, ui);
-
-        ui.cur_mut().set_vstack();
-        let tabs_widget = ui.add(widget!().fixed_height(1));
-        let go_to_address_bar = ui.add(widget!().fixed_height(0));
-        let content_root = ui.add(widget!().height(AutoSize::Remainder(1.0)));
-
-        with_parent!(ui, go_to_address_bar, {
-            ui.multifocus();
-            if self.go_to_address_bar.editing {
-                let mut close = false;
-                if ui.check_key(KeyAction::Enter) {
-                    if self.go_to_address_bar.text.text.is_empty() {
-                        close = true;
-                    } else {
-                        match self.find_address(&self.go_to_address_bar.text.text, debugger) {
-                            Ok(target) => {
-                                state.should_scroll_disassembly = Some((Ok(target), /*only_if_on_error_tab*/ false));
-                                close = true;
-                            }
-                            Err(e) => self.go_to_address_error = Some(e),
-                        }
-                    }
-                }
-                if close {
-                    self.go_to_address_bar.editing = false;
-                    self.go_to_address_bar.visible = false;
-                } else {
-                    let left = ui_writeln!(ui, default_dim, "go to address (hex): ");
-                    if let Some(e) = &self.go_to_address_error {
-                        ui_write!(ui, error, "{}", e);
-                    } else {
-                        ui_write!(ui, default_dim, "(+n - relative)");
-                    }
-                    let right = ui.text.close_line();
-                    if self.go_to_address_bar.build(Some(left), Some(right), ui) {
-                        self.go_to_address_error = None;
-                    }
-                }
-                if !self.go_to_address_bar.visible {
-                    ui.should_redraw = true; // make sure our check_key() request is not active when the bar is not open
-                }
-            }
-        });
-        with_parent!(ui, tabs_widget, {ui.multifocus()});
-        with_parent!(ui, content_root, {ui.multifocus()});
-        ui.layout_children(Axis::Y);
-
-        let mut scroll_to_addr: Option<(usize, u16)> = None;
-        let mut suppress_code_autoscroll = false;
-        if let Some((target, only_if_on_error_tab)) = mem::take(&mut state.should_scroll_disassembly) {
-            let mut tab_to_restore: Option<usize> = None;
-            if only_if_on_error_tab {
-                tab_to_restore = self.close_error_tab();
-            }
-
-            if let Ok(target) = &target {
-                suppress_code_autoscroll = !target.cascade;
-                if tab_to_restore.is_none() {
-                    scroll_to_addr = Some((target.static_pseudo_addr, target.subfunction_level));
-                } else {
-                    // (Not ideal that we don't scroll when the tab is not selected, but meh.)
-                }
-            } else {
-                suppress_code_autoscroll = true;
-            }
-
-            self.open_function(target, debugger).unwrap();
-
-            if let Some(i) = tab_to_restore {
-                self.tabs_state.selected = i;
-            }
-        }
-
-        close_excess_ephemeral_tabs(&mut self.tabs, &mut self.tabs_state, |t| t.ephemeral);
-        self.evict_cache();
-
-        // Now the set of tabs is final.
-
-        with_parent!(ui, tabs_widget, {
-            let mut tabs = Tabs::new(mem::take(&mut self.tabs_state), ui);
-            for tab in &self.tabs {
-                let full_title = match &tab.locator {
-                    Some(locator) => locator.demangled_name.clone(),
-                    None => String::new(),
-                };
-                tabs.add(Tab {identity: tab.identity, short_title: tab.title.clone(), full_title, ephemeral: tab.ephemeral, ..Default::default()}, ui);
-            }
-            self.tabs_state = tabs.finish(ui);
-        });
-
-        // Now the selected tab is final.
-
-        // (We'll reassign it below if there's no error.)
-        state.selected_addr = state.stack.frames.get(state.selected_frame).and_then(|f| {
-            let sf = &state.stack.subframes[f.subframes.end-1];
-            match (&f.binary_id, &sf.function_idx) {
-                (Ok(b), Ok(function_idx)) => Some((*b, *function_idx, f.pseudo_addr)),
-                _ => None,
-            }
-        });
-
+    fn build_tab_content(&mut self, content_root: WidgetIdx, scroll_to_addr: Option<(usize, u16)>, suppress_code_autoscroll: bool, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
         let tab = match self.tabs.get_mut(self.tabs_state.selected) {
             None => return,
             Some(x) => x };
@@ -2516,6 +2399,140 @@ impl WindowContent for DisassemblyWindow {
                 ui.should_redraw = true;
             }
         });
+    }
+}
+
+impl WindowContent for DisassemblyWindow {
+    fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
+        // First do things that may open or close tabs.
+
+        let mut open_dialog = false;
+        for action in ui.check_keys(&[KeyAction::Open, KeyAction::CloseTab, KeyAction::GoToLine, KeyAction::ReorderRowUp, KeyAction::ReorderRowDown]) {
+            match action {
+                KeyAction::Open if self.search_dialog.is_none() => {
+                    open_dialog = true;
+                }
+                KeyAction::CloseTab => {self.handle_tabs_action(TabsAction::Close(self.tabs_state.selected));}
+                KeyAction::ReorderRowUp if self.tabs_state.selected > 0 => {self.handle_tabs_action(TabsAction::Reorder {from_idx: self.tabs_state.selected, to_idx: self.tabs_state.selected - 1});}
+                KeyAction::ReorderRowDown => {self.handle_tabs_action(TabsAction::Reorder {from_idx: self.tabs_state.selected, to_idx: self.tabs_state.selected + 2});}
+                KeyAction::GoToLine => {
+                    self.go_to_address_bar.hide_when_not_editing = true;
+                    self.go_to_address_error = None;
+                    self.go_to_address_bar.start_editing();
+                }
+                _ => (),
+            }
+        }
+
+        self.build_search_dialog(open_dialog, state, debugger, ui);
+
+        ui.cur_mut().set_vstack();
+        let tabs_widget = ui.add(widget!().fixed_height(1));
+        let go_to_address_bar = ui.add(widget!().fixed_height(0));
+        let content_root = ui.add(widget!().height(AutoSize::Remainder(1.0)));
+
+        with_parent!(ui, go_to_address_bar, {
+            ui.multifocus();
+            if self.go_to_address_bar.editing {
+                let mut close = false;
+                if ui.check_key(KeyAction::Enter) {
+                    if self.go_to_address_bar.text.text.is_empty() {
+                        close = true;
+                    } else {
+                        match self.find_address(&self.go_to_address_bar.text.text, debugger) {
+                            Ok(target) => {
+                                state.should_scroll_disassembly = Some((Ok(target), /*only_if_on_error_tab*/ false));
+                                close = true;
+                            }
+                            Err(e) => self.go_to_address_error = Some(e),
+                        }
+                    }
+                }
+                if close {
+                    self.go_to_address_bar.editing = false;
+                    self.go_to_address_bar.visible = false;
+                } else {
+                    let left = ui_writeln!(ui, default_dim, "go to address (hex): ");
+                    if let Some(e) = &self.go_to_address_error {
+                        ui_write!(ui, error, "{}", e);
+                    } else {
+                        ui_write!(ui, default_dim, "(+n - relative)");
+                    }
+                    let right = ui.text.close_line();
+                    if self.go_to_address_bar.build(Some(left), Some(right), ui) {
+                        self.go_to_address_error = None;
+                    }
+                }
+                if !self.go_to_address_bar.visible {
+                    ui.should_redraw = true; // make sure our check_key() request is not active when the bar is not open
+                }
+            }
+        });
+        with_parent!(ui, tabs_widget, {ui.multifocus()});
+        with_parent!(ui, content_root, {ui.multifocus()});
+        ui.layout_children(Axis::Y);
+
+        let mut scroll_to_addr: Option<(usize, u16)> = None;
+        let mut suppress_code_autoscroll = false;
+        if let Some((target, only_if_on_error_tab)) = mem::take(&mut state.should_scroll_disassembly) {
+            let mut tab_to_restore: Option<usize> = None;
+            if only_if_on_error_tab {
+                tab_to_restore = self.close_error_tab();
+            }
+
+            if let Ok(target) = &target {
+                suppress_code_autoscroll = !target.cascade;
+                if tab_to_restore.is_none() {
+                    scroll_to_addr = Some((target.static_pseudo_addr, target.subfunction_level));
+                } else {
+                    // (Not ideal that we don't scroll when the tab is not selected, but meh.)
+                }
+            } else {
+                suppress_code_autoscroll = true;
+            }
+
+            self.open_function(target, debugger).unwrap();
+
+            if let Some(i) = tab_to_restore {
+                self.tabs_state.selected = i;
+            }
+        }
+
+        close_excess_ephemeral_tabs(&mut self.tabs, &mut self.tabs_state, |t| t.ephemeral);
+        self.evict_cache();
+
+        // Now the set of tabs is final.
+
+        let tabs_action;
+        with_parent!(ui, tabs_widget, {
+            let mut tabs = Tabs::new(mem::take(&mut self.tabs_state), ui);
+            tabs.allow_reordering = true;
+            for tab in &self.tabs {
+                let full_title = match &tab.locator {
+                    Some(locator) => locator.demangled_name.clone(),
+                    None => String::new(),
+                };
+                tabs.add(Tab {identity: tab.identity, allow_closing: true, short_title: tab.title.clone(), full_title, ephemeral: tab.ephemeral, ..Default::default()}, ui);
+            }
+            (self.tabs_state, tabs_action) = tabs.finish(ui);
+        });
+
+        // Now the selected tab is final.
+
+        // (We'll reassign it below if there's no error.)
+        state.selected_addr = state.stack.frames.get(state.selected_frame).and_then(|f| {
+            let sf = &state.stack.subframes[f.subframes.end-1];
+            match (&f.binary_id, &sf.function_idx) {
+                (Ok(b), Ok(function_idx)) => Some((*b, *function_idx, f.pseudo_addr)),
+                _ => None,
+            }
+        });
+
+        self.build_tab_content(content_root, scroll_to_addr, suppress_code_autoscroll, state, debugger, ui);
+        
+        if self.handle_tabs_action(tabs_action) {
+            ui.should_redraw = true;
+        }
     }
 
     fn get_key_hints(&self, out: &mut Vec<KeyHint>, debugger: &Debugger) {
@@ -4167,81 +4184,20 @@ impl CodeWindow {
             }
         }
     }
-}
-impl WindowContent for CodeWindow {
-    fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
-        let mut open_dialog = false;
-        let mut search_select_match = 0isize;
-        // TODO: Move CloseTab logic into Tabs, next to reordering logic. Also close tabs with middle click.
-        for action in ui.check_keys(&[KeyAction::Open, KeyAction::CloseTab, KeyAction::GoToLine, KeyAction::Find, KeyAction::NextMatch, KeyAction::PreviousMatch]) {
-            match action {
-                KeyAction::Open if self.search_dialog.is_none() => open_dialog = true,
-                KeyAction::CloseTab if self.tabs.get(self.tabs_state.selected).is_some() => {
-                    let tab = &mut self.tabs[self.tabs_state.selected];
-                    if tab.ephemeral && !tab.path_in_symbols.as_os_str().is_empty() {
-                        tab.ephemeral = false;
-                    } else {
-                        self.tabs.remove(self.tabs_state.selected);
-                    }
+
+    fn handle_tabs_action(&mut self, action: TabsAction) -> bool {
+        if let &TabsAction::Close(idx) = &action {
+            if let Some(tab) = self.tabs.get_mut(idx) {
+                if tab.ephemeral && !tab.path_in_symbols.as_os_str().is_empty() {
+                    tab.ephemeral = false;
+                    return true;
                 }
-                KeyAction::GoToLine => {
-                    self.go_to_line_bar.text.clear();
-                    self.go_to_line_bar.start_editing();
-                }
-                KeyAction::Find => self.search.bar.start_editing(),
-                KeyAction::NextMatch => {
-                    self.search.bar.visible = true;
-                    search_select_match += 1;
-                }
-                KeyAction::PreviousMatch => {
-                    self.search.bar.visible = true;
-                    search_select_match -= 1;
-                }
-                _ => (),
             }
         }
+        self.tabs_state.apply_action(action, &mut self.tabs)
+    }
 
-        self.build_search_dialog(open_dialog, state, debugger, ui);
-
-        let suppress_disassembly_autoscroll = match &state.should_scroll_source {
-            None => false,
-            Some((None, _)) => true,
-            Some((Some(SourceScrollTarget {cascade, ..}), _)) => !cascade,
-        };
-        let switch_to = match mem::take(&mut state.should_scroll_source) {
-            Some((to, false)) => Some(to),
-            Some((to, true)) if self.tabs.is_empty() || self.tabs[self.tabs_state.selected].path_in_symbols.as_os_str().is_empty() => Some(to),
-            _ => None,
-        };
-
-        match switch_to {
-            None => (),
-            Some(None) => self.switch_to_file(Path::new(""), &FileVersionInfo::default(), debugger),
-            Some(Some(target)) => {
-                self.switch_to_file(&target.path, &target.version, debugger);
-                let tab = &mut self.tabs[self.tabs_state.selected];
-                tab.area_state.select(target.line.saturating_sub(1));
-            }
-        }
-
-        close_excess_ephemeral_tabs(&mut self.tabs, &mut self.tabs_state, |t| t.ephemeral);
-        self.evict_cache();
-
-        // Now the set of tabs is final.
-
-        ui.cur_mut().set_vstack();
-        let tabs_widget = ui.add(widget!().fixed_height(1));
-        with_parent!(ui, tabs_widget, {
-            let mut tabs = Tabs::new(mem::take(&mut self.tabs_state), ui);
-            for tab in &self.tabs {
-                let full_title = tab.path_in_symbols.as_os_str().to_string_lossy().into_owned();
-                tabs.add(Tab {identity: tab.identity, short_title: tab.title.clone(), full_title, ephemeral: tab.ephemeral, ..Default::default()}, ui);
-            }
-            self.tabs_state = tabs.finish(ui);
-        });
-
-        // Now the selected tab is final.
-
+    fn build_tab_content(&mut self, tabs_widget: WidgetIdx, search_select_match: isize, suppress_disassembly_autoscroll: bool, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
         let tab = match self.tabs.get_mut(self.tabs_state.selected) {
             None => return,
             Some(t) => t };
@@ -4432,7 +4388,85 @@ impl WindowContent for CodeWindow {
             }
         });
 
-        self.scroll_disassembly_if_needed(suppress_disassembly_autoscroll, select_disassembly_address, state, debugger);
+    self.scroll_disassembly_if_needed(suppress_disassembly_autoscroll, select_disassembly_address, state, debugger);
+}
+}
+impl WindowContent for CodeWindow {
+    fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
+        let mut open_dialog = false;
+        let mut search_select_match = 0isize;
+        // TODO: Move CloseTab logic into Tabs, next to reordering logic. Also close tabs with middle click.
+        for action in ui.check_keys(&[KeyAction::Open, KeyAction::CloseTab, KeyAction::ReorderRowUp, KeyAction::ReorderRowDown, KeyAction::GoToLine, KeyAction::Find, KeyAction::NextMatch, KeyAction::PreviousMatch]) {
+            match action {
+                KeyAction::Open if self.search_dialog.is_none() => open_dialog = true,
+                KeyAction::CloseTab => {self.handle_tabs_action(TabsAction::Close(self.tabs_state.selected));}
+                KeyAction::ReorderRowUp if self.tabs_state.selected > 0 => {self.handle_tabs_action(TabsAction::Reorder {from_idx: self.tabs_state.selected, to_idx: self.tabs_state.selected - 1});}
+                KeyAction::ReorderRowDown => {self.handle_tabs_action(TabsAction::Reorder {from_idx: self.tabs_state.selected, to_idx: self.tabs_state.selected + 2});}
+                KeyAction::GoToLine => {
+                    self.go_to_line_bar.text.clear();
+                    self.go_to_line_bar.start_editing();
+                }
+                KeyAction::Find => self.search.bar.start_editing(),
+                KeyAction::NextMatch => {
+                    self.search.bar.visible = true;
+                    search_select_match += 1;
+                }
+                KeyAction::PreviousMatch => {
+                    self.search.bar.visible = true;
+                    search_select_match -= 1;
+                }
+                _ => (),
+            }
+        }
+
+        self.build_search_dialog(open_dialog, state, debugger, ui);
+
+        let suppress_disassembly_autoscroll = match &state.should_scroll_source {
+            None => false,
+            Some((None, _)) => true,
+            Some((Some(SourceScrollTarget {cascade, ..}), _)) => !cascade,
+        };
+        let switch_to = match mem::take(&mut state.should_scroll_source) {
+            Some((to, false)) => Some(to),
+            Some((to, true)) if self.tabs.is_empty() || self.tabs[self.tabs_state.selected].path_in_symbols.as_os_str().is_empty() => Some(to),
+            _ => None,
+        };
+
+        match switch_to {
+            None => (),
+            Some(None) => self.switch_to_file(Path::new(""), &FileVersionInfo::default(), debugger),
+            Some(Some(target)) => {
+                self.switch_to_file(&target.path, &target.version, debugger);
+                let tab = &mut self.tabs[self.tabs_state.selected];
+                tab.area_state.select(target.line.saturating_sub(1));
+            }
+        }
+
+        close_excess_ephemeral_tabs(&mut self.tabs, &mut self.tabs_state, |t| t.ephemeral);
+        self.evict_cache();
+
+        // Now the set of tabs is final.
+
+        ui.cur_mut().set_vstack();
+        let tabs_widget = ui.add(widget!().fixed_height(1));
+        let tabs_action;
+        with_parent!(ui, tabs_widget, {
+            let mut tabs = Tabs::new(mem::take(&mut self.tabs_state), ui);
+            tabs.allow_reordering = true;
+            for tab in &self.tabs {
+                let full_title = tab.path_in_symbols.as_os_str().to_string_lossy().into_owned();
+                tabs.add(Tab {identity: tab.identity, short_title: tab.title.clone(), full_title, ephemeral: tab.ephemeral, allow_closing: true, ..Default::default()}, ui);
+            }
+            (self.tabs_state, tabs_action) = tabs.finish(ui);
+        });
+
+        // Now the selected tab is final.
+
+        self.build_tab_content(tabs_widget, search_select_match, suppress_disassembly_autoscroll, state, debugger, ui);
+
+        if self.handle_tabs_action(tabs_action) {
+            ui.should_redraw = true;
+        }
     }
 
     fn drop_caches(&mut self) {
@@ -4787,7 +4821,7 @@ impl HelpDialog {
             for &(title, _) in &contents.tabs {
                 tabs.add(Tab {short_title: title.to_string(), ..Default::default()}, ui);
             }
-            self.tabs_state = tabs.finish(ui);
+            (self.tabs_state, _) = tabs.finish(ui);
         });
 
         let tab_idx = self.tabs_state.selected;

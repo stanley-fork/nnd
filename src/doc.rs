@@ -449,9 +449,9 @@ removing breakpoints on exit
     }
 }
 
-pub fn run_input_echo_tool() -> Result<()> {
+pub fn run_input_echo_tool(mouse_mode: MouseMode) -> Result<()> {
     let _restorer = TerminalRestorer;
-    configure_terminal(MouseMode::Disabled)?;
+    configure_terminal(mouse_mode)?;
 
     let mut reader = InputReader::new();
     let mut lines: Vec<String> = Vec::new();

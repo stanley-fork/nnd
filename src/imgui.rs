@@ -145,7 +145,7 @@ pub struct WidgetFlags: u32 {
 
 bitflags! {
 #[derive(Default)]
-pub struct MouseActions : u8 {
+pub struct MouseActions : u16 {
     // Mouse click inside this Widget's rectangle, if not captured by any descendant Widget (e.g. button inside table row) and not obstructed by a later clickable Widget with overlapping rectangle (e.g. dialog box).
     const CLICK = 0x2;
     // Mouse cursor being inside this Widget's rectangle, not captured by descendant, not obstructed. Event produced every frame, not only on mouse move.
@@ -166,6 +166,7 @@ pub struct MouseActions : u8 {
     const CLICK_SUBTREE = 0x40;
     // HOVER on this Widget or any descendant. E.g. for highlighting a table row even when hovering over some button inside that row.
     const HOVER_SUBTREE = 0x80;
+    const MIDDLE_CLICK = 0x100;
 }}
 
 // Identifies a thing that is being drag'n'dropped.
@@ -393,6 +394,7 @@ pub struct UI {
     // Information about mouse events that happened since last frame. If there were multiple clicks, we only keep the last one.
     mouse_pos: [isize; 2],
     mouse_click: Option<[isize; 2]>, // coordinates separate from mouse_pos, to be precise if a click happened in the middle of a fast motion
+    mouse_middle_click: Option<[isize; 2]>,
     mouse_scroll: isize,
     mouse_drag_out_widget: Option<usize>,
     mouse_drop_pos: Option<[isize; 2]>, // mouse coordinates when mouse button was released, if mouse_drag_out_widget is Some
@@ -421,6 +423,8 @@ impl UI {
                         } else {
                             significant = false;
                         }
+                    } else if button == &MouseButton::Middle && event == &MouseEvent::Press {
+                        self.mouse_middle_click = Some(pos.clone());
                     } else if event == &MouseEvent::ScrollUp {
                         self.mouse_scroll -= 1;
                     } else if event == &MouseEvent::ScrollDown {
@@ -1278,6 +1282,22 @@ impl UI {
         let hovered_idx = self.find_widget_at_cursor(self.mouse_pos);
         let mut scroll = mem::take(&mut self.mouse_scroll);
 
+        if let Some(middle_click_pos) = mem::take(&mut self.mouse_middle_click) {
+            let mut idx = if middle_click_pos == self.mouse_pos {
+                hovered_idx
+            } else {
+                self.find_widget_at_cursor(middle_click_pos)
+            };
+            while idx.is_valid() {
+                let w = &mut self.prev_tree[idx.0];
+                if w.capture_mouse.contains(MouseActions::MIDDLE_CLICK) {
+                    report_event(w, MouseActions::MIDDLE_CLICK, middle_click_pos);
+                    break;
+                }
+                idx = w.parent;
+            }
+        }
+        
         // Dispatch click, which may also start a drag.
         if let Some(click_pos) = mem::take(&mut self.mouse_click) {
             self.mouse_drag_out_widget = None;
