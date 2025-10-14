@@ -967,15 +967,46 @@ fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut Form
             format_integer(x, size, signed, v.flags, state.out, state.palette);
             if !v.flags.intersects(ValueFlags::RAW | ValueFlags::HEX | ValueFlags::BIN) {
                 styled_write!(state.out, state.palette.value_misc, " (");
-                let mut found = false;
+
+                // Represent the value as a bitwise OR of some enumerands, with no bits in common, preferring bigger ones.
+                // This works for both bitflags and regular enums:
+                //  * for regular enums we'll find an exact match and print just one enumerand,
+                //  * for bitflags we'll potentially print multiple enumerands ORed together,
+                //  * if bitflags enum has some multibit enumerands (e.g. representing meaningful combinations of flags),
+                //    we'll prefer to use them instead of their constituent single-bit enumerands,
+                //  * if value is 0, and bitflags enum doesn't have a 0 enumerand, we'll print a red '?'; a little confusing, but I don't have better ideas.
+                let mut candidates: Vec<(usize, &'static str)> = Vec::new();
                 for enumerand in e.enumerands {
-                    if enumerand.value == x && !enumerand.name.is_empty() {
-                        styled_write!(state.out, state.palette.field_name, "{}", enumerand.name);
-                        found = true;
-                        break;
+                    // Take enumerands whose bits are a subset of the value.
+                    if x & enumerand.value == enumerand.value && (enumerand.value != 0 || x == 0) && !enumerand.name.is_empty() {
+                        candidates.push((enumerand.value, enumerand.name));
                     }
                 }
-                if !found {
+                // Sort by descending value. If multiple enumerands have the same value, take the first one in order of declaration (hence the stable sort).
+                candidates.sort_by_key(|(v, _)| !v);
+                candidates.dedup_by_key(|(v, _)| *v);
+                // Greedily pick disjoint enumerands.
+                let mut found = 0usize;
+                candidates.retain(|(v, n)| {
+                    if found & v == 0 {
+                        found |= v;
+                        true
+                    } else {
+                        false
+                    }
+                });
+                if found == x && !candidates.is_empty() {
+                    // Covered all bits.
+                    let mut first = true;
+                    for (_, name) in candidates.iter().rev() {
+                        if !first {
+                            styled_write!(state.out, state.palette.value_misc, " | ");
+                        }
+                        first = false;
+                        styled_write!(state.out, state.palette.field_name, "{}", name);
+                    }
+                } else {
+                    assert!(found & x == found);
                     styled_write!(state.out, state.palette.error, "?");
                 }
                 styled_write!(state.out, state.palette.value_misc, ")");

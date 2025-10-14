@@ -29,7 +29,6 @@ test with watches window filled with long arrays (I saw 50ms frames when there a
 investigate unresponsive ui when conditional breakpoint is hit at a high rate
 
 todo:
-autodetect bitflags
 in type search, dedup builtin types so that they're not listed once for each binary
 tooltip in status window with more log lines and more space for last error
 draggable column widths in watches window
