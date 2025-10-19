@@ -729,6 +729,7 @@ impl TabsState {
     }
 }
 
+#[derive(Debug)]
 pub enum TabsAction {
     None,
     Reorder {

@@ -33,6 +33,22 @@ impl Rect {
     pub fn is_empty(&self) -> bool { self.size[0] == 0 && self.size[1] == 0 }
 
     pub fn contains(&self, pos: [isize; 2]) -> bool { self.pos[0] <= pos[0] && self.end(0) > pos[0] && self.pos[1] <= pos[1] && self.end(1) > pos[1] }
+
+    // Move all 4 edges outwards by a given amount. If negative, move inwards (shrink).
+    pub fn inflate(&self, delta: isize) -> Self {
+        let mut r = *self;
+        for i in 0..2 {
+            let new_size = r.size[i] as isize + delta * 2;
+            if new_size < 0 { // shrink to a point
+                r.pos[i] += r.size[i] as isize / 2;
+                r.size[i] = 0;
+            } else {
+                r.pos[i] -= delta;
+                r.size[i] = new_size as usize;
+            }
+        }
+        r
+    }
 }
 
 // RGB. (We always use RGB instead of terminal palette colors because the palette is not big enough for us, and mixing palette with RGB colors would look terrible with non-default palette.)

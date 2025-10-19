@@ -25,7 +25,7 @@ pub struct Settings {
     pub steps_stop_only_on_statements: bool,
 
     pub session_name: SessionName,
-    
+
     pub debuginfod_urls: Vec<String>,
     pub debuginfod_cache_path: Option<PathBuf>,
 

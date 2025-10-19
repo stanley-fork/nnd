@@ -196,7 +196,7 @@ UI tips:
    Key bindings can be changed through config file, see --help-files
  * If you use tmux, the escape key is unreliable, consider using ctrl-g instead. Tmux adds 0.5s delay before passing the escape key through, and if you press another key during that time,
    the two key presses get incorrectly interpreted as alt+keypress (that's how ansi escape codes work, unfortunately).
- * Windows can be resized by dragging the boundaries with the mouse. Rearranging windows is not implemented yet.
+ * Windows can be resized by dragging the boundaries with the mouse, and rearranged by drag'n'dropping from window title to anywhere. Mouse is required for this.
  * Press 'tab' to open a tooltip. Supported in tables (binaries, stack, etc) and watches window. Useful for copying long values or paths, and might contain additional information. Also available in search dialogs.
 
 Debugging tips:
@@ -219,6 +219,8 @@ Debugging tips:
    Conditional breakpoint stops the program if the condition expression evaluates to nonzero or fails to evaluate.
    If you don't want to stop on evaluation error, wrap the expression in 'try(...)' (it returns 0 if evaluation failed for any reason).
    E.g.: 'try(abstract_class_ptr.concrete_class_field)' will stop only if abstract_class_ptr was auto-downcast to a class that has the given field, and the field is nonzero.
+ * There are default special breakpoints for exceptions (C++, disabled by default) and panics (Rust, enabled by default). They can be enabled/disabled/conditioned like normal breakpoints.
+   Quirk: panic breakpoint is not activated until debug info is loaded, so it may fail to trigger if a panic happens very soon after debugger startup.
  * The function search (in disassembly window, 'o' key) currently does fuzzy search over *mangled* function names, for peformance reasons.
    The search results display demangled names, i.e. slightly different from what's actually searched. Press tab to see mangled name.
  * In watches window, on non-root tree nodes press Enter to add a corresponding watch. E.g. for local variable or struct field or array element.
@@ -240,7 +242,7 @@ Debugging tips:
    (There is no plan to actually parse the template type names into their component parts; doing it correctly would be crazy complicated like everything else in C++.)
  * No custom pretty-printers, only the built-in ones for C++ and Rust standard libraries.
  * Can't assign to the debugged program's variables or registers.
- * No data breakpoints, whole-file breakpoints, special breakpoints (signals, exceptions/panics, except for always-on stop on fatal signals). But for exceptions or panics you can set breakpoint manually: in disassembly window press 'o' to search for function, find __cxa_throw or rustc_panic, and put a breakpoint at the start.
+ * No whole-file breakpoints, signal breakpoints (except for always-on stop on fatal signals).
  * Conditional breakpoints are not super fast: a few thousand evaluations per second.
  * Inside libraries that were dlopen()ed at runtime, breakpoints get disabled on program restart. Manually disable-enable the breakpoint after the dlopen() to reactivate it.
  * The disassembly window can only open functions that appear in .symtab or debug info. Can't disassemble arbitrary memory, e.g. JIT-generated code or code from binaries without .symtab or debug info.

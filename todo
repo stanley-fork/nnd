@@ -52,7 +52,6 @@ make watch window show dereferenced string-like values by default (otherwise exp
 update rust HashMap pretty printer
 detect and show if a pointer points to a symbol (function, global variable, vtable)
 do something for downcasts in conditional breakpoints (coalesce()? maybe()? ?()? ()?? checkbox to stop on error? 'is' operator? explicit checked downcast? also function to check field presense without evaluating it)
-edit breakpoint condition on click
 `in` operator, e.g. x in [1, 2, 3]
 make names in MetaType etc unexpandable as array
 make '^' apply to expressions instead of variable names, e.g. ^(this.query_context)
@@ -60,14 +59,8 @@ allow adding unconditional breakpoint on the same line as conditional one, someh
 global variables from .symtab, maybe from .debug_pubnames (maybe also look into .debug_pubtypes)
 more built-in pretty printers: boost::multi_index sparsehash, absl, rust b-trees
 hotkey to switch between .h/.cpp (/.cc/.hh/.hpp/.cxx - maybe just anything after '.')
-reordering tabs
-rearranging windows
-  drag window title or tab
-  drop onto tabs widget (as if reordering tabs), or onto content area (adding tab at the end), or onto split line
-  if no tabs left, delete the region
-  allow adding tabs to code/disas windows, ignore the problem of clashing keys
 maximizing windows
-meta functions like checking for field presense of superclass type for use in conditions
+meta functions like checking for field presence of superclass type for use in conditions
 key to freeze value in watches window; can also be used for controlling when to run the expression if it has side effects
 key to add watch value as new watch, maybe cast to type, e.g. *(0x1234 as *DB::Block)
 allow expressions (especially conditions) to have multiple statements separated by ';'
@@ -79,7 +72,6 @@ handle tail calls: if you step-into a tail call (by single-stepping from instruc
 find function by address (like addr2line)
 use actual function name instead of "_" in namespace path, or do something else to make function-static variables usable
 show number of function inlined sites in disassembly window, allow setting breakpoint on it, allow opening inline-only functions
-show stop reason in status window, next to "suspended"
 follow forks, maybe even support multiple processes
 allow cast `foo as typeof(bar)`, also `foo as typeof(bar)::T`
 show argument values in stack trace
@@ -88,7 +80,7 @@ key to follow a jump in disas
 allow line-based steps in .plt* (maybe by just turning them into single-instruction-steps)
 in disassembly window, make 'left' key jump to the start of inlined function
 maximizing windows (hot key and button in a corner)
-special breakpoints: panic (rust_panic, core::panicking::panic_fmt, or maybe std::panicking::rust_panic_with_hook; maybe disable find_catch_blocks() for rust at least when panic bp is enabled), exception (__cxa_throw), signals, main function
+signal breakpoints
 make source window autoscroll horizontally in addition to vertically
 -v for build datetime
 handle partially-optimized-out struct values (common in rust)
@@ -118,7 +110,6 @@ show disassembly even if symbols are missing
 group threads by stack trace, to make it easy to exclude pool threads waiting for work
 show return value after step-out (and other steps that happened to step out)
 thread-specific breakpoints (controlled in breakpoints window), a key to lock all breakpoints to current thread
-hotkeys for switching to specific windows
 resolve dynamic library call targets in disassembly, instead of showing them as "call .plt.sec+1234h"
 research symtab function range overlaps, don't ignore lengths (e.g. in ld-linux-x86-64.so.2, entry point is a NOTYPE symbol _start, which we incorrectly attribute to previous function _dl_help that ends just before the program entry point)
 pretty print variable locations (inline frame base and cfa, turn simple expressions from postfix to infix notation)

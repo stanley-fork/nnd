@@ -9,6 +9,7 @@ pub struct DebuggerUI {
     input: InputReader,
     state: UIState,
     layout: Layout,
+    loaded_layout: bool,
 
     // These are assigned by build(), to be checked and acted on by the caller.
     pub should_quit: bool,
@@ -87,9 +88,8 @@ pub trait WindowContent {
 
     fn get_key_hints(&self, out: &mut Vec<KeyHint>, debugger: &Debugger) {}
 
-    fn has_persistent_state(&self) -> bool {false}
-    fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {panic!("unreachable")}
-    fn load_state(&mut self, inp: &mut &[u8]) -> Result<()> {panic!("unreachable")}
+    fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {Ok(())}
+    fn load_state(&mut self, inp: &mut &[u8]) -> Result<()> {Ok(())}
 }
 
 #[derive(Ord, PartialOrd, Eq, PartialEq, Debug, Clone, Copy, Hash)]
@@ -110,9 +110,7 @@ pub enum WindowType {
     Watches = 7,
     Hints = 8,
 
-    Other = 9,
-
-    Status = 10,
+    Status = 9,
 }
 impl WindowType {
     pub fn title(self) -> &'static str {
@@ -126,53 +124,87 @@ impl WindowType {
             Self::Locations => "locations",
             Self::Watches => "watches",
             Self::Hints => "controls",
-            Self::Other => "other",
             Self::Status => "status",
         }
     }
+
+    pub fn serialize(self) -> u8 {
+        self as u8
+    }
+
+    pub fn deserialize(x: u8) -> Result<Self> {
+        if x <= Self::Status as u8 {
+            Ok(unsafe {mem::transmute(x)})
+        } else {
+            err!(Environment, "bad WindowType")
+        }
+    }
+
+    pub fn create_window(self) -> Box<dyn WindowContent> {
+        match self {
+            WindowType::Hints => Box::new(HintsWindow::default()),
+            WindowType::Status => Box::new(StatusWindow::default()),
+            WindowType::Watches => Box::new(WatchesWindow::default()),
+            WindowType::Locations => Box::new(LocationsWindow::default()),
+            WindowType::Disassembly => Box::new(DisassemblyWindow::default()),
+            WindowType::Code => Box::new(CodeWindow::default()),
+            WindowType::Binaries => Box::new(BinariesWindow::default()),
+            WindowType::Breakpoints => Box::new(BreakpointsWindow::default()),
+            WindowType::Stack => Box::new(StackWindow::default()),
+            WindowType::Threads => Box::new(ThreadsWindow::default()),
+        }
+    }
 }
+
+pub struct RequiredWindowInfo {
+    pub type_: WindowType,
+    pub hotkey_number: Option<usize>,
+    pub fixed_height: Option<usize>,
+}
+
+pub const REQUIRED_WINDOWS: &'static [RequiredWindowInfo] = &[
+    RequiredWindowInfo {type_: WindowType::Hints, hotkey_number: None, fixed_height: None},
+    RequiredWindowInfo {type_: WindowType::Status, hotkey_number: None, fixed_height: Some(7)},
+    RequiredWindowInfo {type_: WindowType::Watches, hotkey_number: Some(1), fixed_height: None},
+    RequiredWindowInfo {type_: WindowType::Locations, hotkey_number: None, fixed_height: None},
+    RequiredWindowInfo {type_: WindowType::Disassembly, hotkey_number: Some(2), fixed_height: None},
+    RequiredWindowInfo {type_: WindowType::Code, hotkey_number: Some(3), fixed_height: None},
+    RequiredWindowInfo {type_: WindowType::Binaries, hotkey_number: None, fixed_height: None},
+    RequiredWindowInfo {type_: WindowType::Breakpoints, hotkey_number: Some(4), fixed_height: None},
+    RequiredWindowInfo {type_: WindowType::Stack, hotkey_number: Some(5), fixed_height: None},
+    RequiredWindowInfo {type_: WindowType::Threads, hotkey_number: Some(6), fixed_height: None},
+];
 
 impl DebuggerUI {
     pub fn new() -> Self {
         let ui = UI::default();
         let state = UIState::default();
-        //state.profiler_enabled = true;
-        let layout = Self::default_layout(&state);
-
-        Self {terminal: Terminal::new(), input: InputReader::new(), layout, ui, state, help_dialog: Default::default(), should_drop_caches: false, should_quit: false}
+        Self {terminal: Terminal::new(), input: InputReader::new(), layout: Layout::new(), loaded_layout: false, ui, state, help_dialog: Default::default(), should_drop_caches: false, should_quit: false}
     }
 
     pub fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {
-        for (id, w) in self.layout.sorted_windows() {
-            if !w.content.has_persistent_state() {
-                continue;
-            }
-            out.write_u8(w.type_ as u8)?;
-            w.content.save_state(out)?;
-        }
-        out.write_u8(255)?;
+        self.layout.save_state(out)?;
         Ok(())
     }
 
     pub fn load_state(&mut self, inp: &mut &[u8]) -> Result<()> {
-        for (id, w) in self.layout.sorted_windows_mut() {
-            if !w.content.has_persistent_state() {
-                continue;
-            }
-            let t = inp.read_u8()?;
-            if t != w.type_ as u8 {
-                return err!(Environment, "unexpected window type in save file: {} instead of {}", t, w.type_ as u8);
-            }
-            w.content.load_state(inp)?;
+        self.layout.load_state(inp)?;
+
+        let mut windows_by_type: HashMap<WindowType, usize> = HashMap::new();
+        for (_, window) in self.layout.sorted_windows() {
+            *windows_by_type.entry(window.type_).or_default() += 1;
         }
-        let t = inp.read_u8()?;
-        if t != 255 {
-            return err!(Environment, "unexpected extra window ({}) in save file", t);
+        for info in REQUIRED_WINDOWS {
+            if windows_by_type.get(&info.type_) != Some(&1) {
+                return err!(Environment, "missing or duplicate windows");
+            }
         }
+
+        self.loaded_layout = true;
         Ok(())
     }
 
-    fn default_layout(state: &UIState) -> Layout {
+    fn default_layout() -> Layout {
         // +---------+-------+-------------+
         // |  hints  |       |  binaries   |
         // |         |       | breakpoints |
@@ -188,31 +220,23 @@ impl DebuggerUI {
         // Other windows we could add: terminal, memory, detached watch.
 
         let mut layout = Layout::new();
-        let cols = layout.split(layout.root, Axis::X, vec![0.3, 0.75]);
+        let cols = layout.split(layout.root, Axis::X, vec![0.3, 0.75], 0);
 
-        let rows = layout.split(cols[0], Axis::Y, vec![0.3, 0.4]);
-        let hints_window = layout.new_window(Some(rows[0]), WindowType::Hints, true, Box::new(HintsWindow::default()));
-        let status_window = layout.new_window(Some(rows[1]), WindowType::Status, true, Box::new(StatusWindow::default()));
-        layout.set_fixed_size(status_window, Axis::Y, 7);
-        let watches_window = layout.new_window(Some(rows[2]), WindowType::Watches, true, Box::new(WatchesWindow::default()));
-        layout.new_window(Some(rows[2]), WindowType::Locations, true, Box::new(LocationsWindow::default()));
+        let rows = layout.split(cols[0], Axis::Y, vec![0.3, 0.4], 0);
+        let hints_window = layout.new_window(Some(rows[0]), WindowType::Hints);
+        let status_window = layout.new_window(Some(rows[1]), WindowType::Status);
+        let watches_window = layout.new_window(Some(rows[2]), WindowType::Watches);
+        layout.new_window(Some(rows[2]), WindowType::Locations);
 
-        let rows = layout.split(cols[1], Axis::Y, vec![0.4]);
-        let disassembly_window = layout.new_window(Some(rows[0]), WindowType::Disassembly, true, Box::new(DisassemblyWindow::default()));
-        let code_window = layout.new_window(Some(rows[1]), WindowType::Code, true, Box::new(CodeWindow::default()));
+        let rows = layout.split(cols[1], Axis::Y, vec![0.4], 0);
+        let disassembly_window = layout.new_window(Some(rows[0]), WindowType::Disassembly);
+        let code_window = layout.new_window(Some(rows[1]), WindowType::Code);
 
-        let rows = layout.split(cols[2], Axis::Y, vec![0.25, 0.75]);
-        layout.new_window(Some(rows[0]), WindowType::Binaries, true, Box::new(BinariesWindow::default()));
-        let breakpoints_window = layout.new_window(Some(rows[0]), WindowType::Breakpoints, true, Box::new(BreakpointsWindow::default()));
-        let stack_window = layout.new_window(Some(rows[1]), WindowType::Stack, true, Box::new(StackWindow::default()));
-        let threads_window = layout.new_window(Some(rows[2]), WindowType::Threads, true, Box::new(ThreadsWindow::default()));
-
-        layout.set_hotkey_number(watches_window, 1);
-        layout.set_hotkey_number(disassembly_window, 2);
-        layout.set_hotkey_number(code_window, 3);
-        layout.set_hotkey_number(breakpoints_window, 4);
-        layout.set_hotkey_number(stack_window, 5);
-        layout.set_hotkey_number(threads_window, 6);
+        let rows = layout.split(cols[2], Axis::Y, vec![0.25, 0.75], 0);
+        layout.new_window(Some(rows[0]), WindowType::Binaries);
+        let breakpoints_window = layout.new_window(Some(rows[0]), WindowType::Breakpoints);
+        let stack_window = layout.new_window(Some(rows[1]), WindowType::Stack);
+        let threads_window = layout.new_window(Some(rows[2]), WindowType::Threads);
 
         layout.active_window = Some(threads_window);
 
@@ -269,6 +293,11 @@ impl DebuggerUI {
     }
 
     fn build(&mut self, debugger: &mut Debugger) -> Result<()> {
+        if !self.loaded_layout {
+            self.layout = Self::default_layout();
+            self.loaded_layout = true;
+        }
+        
         self.should_drop_caches = false;
 
         let w = self.ui.get_mut(self.ui.content_root);
@@ -1618,10 +1647,8 @@ impl WindowContent for WatchesWindow {
         ]);
     }
 
-    fn has_persistent_state(&self) -> bool {
-        true
-    }
     fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {
+        out.write_u32((self.name_relative_width.max(0.0).min(1.0) * 1e9) as u32)?;
         for expr in &self.expressions {
             if expr.special.is_none() {
                 out.write_u8(1)?;
@@ -1632,6 +1659,7 @@ impl WindowContent for WatchesWindow {
         Ok(())
     }
     fn load_state(&mut self, inp: &mut &[u8]) -> Result<()> {
+        self.name_relative_width = inp.read_u32()? as f64 / 1e9;
         while inp.read_u8()? != 0 {
             let text = inp.read_str()?;
             self.expressions.push(WatchExpression {identity: random(), text, special: None});
@@ -1778,6 +1806,8 @@ impl DisassemblyWindow {
     fn open_function(&mut self, target: Result<DisassemblyScrollTarget>, debugger: &Debugger) -> Result<()> {
         let target = match target {
             Ok(x) => x,
+            // Ignore requests to open a "symbols are loading" error tab, because such tab would remain after symbols are loaded, and it'd be confusing.
+            Err(e) if e.is_loading() => return Ok(()),
             Err(e) => {
                 self.tabs.push(DisassemblyTab {identity: random(), error: Some(e), title: "[unknown]".to_string(), ephemeral: true, ..Default::default()});
                 self.tabs_state.select(self.tabs.len() - 1);
@@ -2546,9 +2576,6 @@ impl WindowContent for DisassemblyWindow {
         ]);
     }
 
-    fn has_persistent_state(&self) -> bool {
-        true
-    }
     fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {
         for (idx, tab) in self.tabs.iter().enumerate() {
             if tab.ephemeral {
@@ -4487,9 +4514,6 @@ impl WindowContent for CodeWindow {
         ]);
     }
 
-    fn has_persistent_state(&self) -> bool {
-        true
-    }
     fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {
         for (i, tab) in self.tabs.iter().enumerate() {
             if tab.ephemeral {
@@ -4696,7 +4720,12 @@ impl WindowContent for BreakpointsWindow {
                 } else if let Some((text, expr, err)) = &b.condition {
                     let l = ui_writeln!(ui, default, "{}", text);
                     let lines = ui.text.split_by_newline_character(l, None);
-                    ui.add(widget!().height(AutoSize::Text).text_lines(lines).flags(WidgetFlags::LINE_WRAP));
+                    with_parent!(ui, ui.add(widget!().height(AutoSize::Text).text_lines(lines).flags(WidgetFlags::LINE_WRAP)), {
+                        if ui.check_mouse(MouseActions::CLICK) {
+                            state.should_edit_breakpoint_condition = Some(id);
+                            ui.should_redraw = true;
+                        }
+                    });
 
                     if let Err(e) = expr {
                         let l = ui_writeln!(ui, error, "{}", e);

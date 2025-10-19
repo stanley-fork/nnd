@@ -1,7 +1,7 @@
 use crate::{*, elf::*, error::*, util::*, log::*, symbols::*, process_info::*, symbols_registry::*, unwind::*, procfs::*, registers::*, disassembly::*, pool::*, settings::*, context::*, disassembly::*, expr::*, persistent::*, interp::*, os::*};
 use libc::{pid_t, c_char, c_void};
 use iced_x86::FlowControl;
-use std::{io, ptr, rc::Rc, collections::{HashMap, VecDeque, HashSet}, mem, path::{Path, PathBuf}, sync::Arc, ffi::CStr, ops::Range, os::fd::AsRawFd, fs, time::{Instant, Duration}};
+use std::{io, ptr, rc::Rc, collections::{HashMap, VecDeque, HashSet, hash_map::Entry}, mem, path::{Path, PathBuf}, sync::Arc, ffi::CStr, ops::Range, os::fd::AsRawFd, fs, time::{Instant, Duration}};
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum RunMode {
@@ -299,6 +299,21 @@ pub enum BreakpointOn {
 }
 impl BreakpointOn {
     pub fn is_data(&self) -> bool { match self { Self::Data(_) => true, _ => false } }
+    pub fn as_point_of_interest(&self) -> Option<&PointOfInterest> { match self { Self::PointOfInterest(x) => Some(x), _ => None } }
+
+    pub fn should_wait_for_symbols(&self) -> bool {
+        match self {
+            Self::Data(_) | Self::InitialExec => false,
+            // Hack: exempt Panic breakpoint from waiting for symbols to load.
+            // This means panic will be missed if it happens early enough in the program execution.
+            // Without this, we'd always wait for symbols to load before running
+            // (because panic breakpoint is active on startup by default), which seems worse.
+            // Ideally we should make symbols loading find the panic handler early on, so we can
+            // activate panic breakpoint without waiting for the whole loading.
+            Self::PointOfInterest(PointOfInterest::Panic) => false,
+            _ => true,
+        }
+    }
 }
 
 pub struct Breakpoint {
@@ -360,6 +375,7 @@ impl Breakpoint {
         } else {
             out.write_u8(0)?;
         }
+        out.write_bool(self.enabled)?;
         Ok(())
     }
 
@@ -388,7 +404,8 @@ impl Breakpoint {
             }
             x => return err!(Environment, "unexpected breakpoint condition flag in save file: {}", x),
         };
-        Ok(Breakpoint {on, condition, hits: 0, addrs: err!(NotCalculated, ""), enabled: false, active: false, hidden: false})
+        let enabled = inp.read_bool()?;
+        Ok(Breakpoint {on, condition, hits: 0, addrs: err!(NotCalculated, ""), enabled, active: false, hidden: false})
     }
 }
 
@@ -423,7 +440,13 @@ impl Thread {
 impl Debugger {
     fn new(mode: RunMode, command_line: Vec<String>, context: Arc<Context>, symbols: SymbolsRegistry, mut breakpoints: Pool<Breakpoint>, persistent: PersistentState, my_resource_stats: ResourceStats, prof: Profiling) -> Self {
         if breakpoints.is_empty() {
+            // Add default breakpoints.
+
+            // Hidden non-stopping breakpoint on library load to activate breakpoints on dlopen.
             breakpoints.add(Breakpoint {on: BreakpointOn::PointOfInterest(PointOfInterest::LibraryLoad), condition: None, hits: 0, addrs: err!(NotCalculated, ""), enabled: true, active: false, hidden: true});
+            // Regular breakpoints on panics (on by default) and exceptions (off by default).
+            breakpoints.add(Breakpoint {on: BreakpointOn::PointOfInterest(PointOfInterest::Panic), condition: None, hits: 0, addrs: err!(NotCalculated, ""), enabled: true, active: false, hidden: false});
+            breakpoints.add(Breakpoint {on: BreakpointOn::PointOfInterest(PointOfInterest::Exception), condition: None, hits: 0, addrs: err!(NotCalculated, ""), enabled: false, active: false, hidden: false});
         } else {
             assert!(breakpoints.iter().filter(|(_, b)| b.hidden).count() == 1);
         }
@@ -443,13 +466,39 @@ impl Debugger {
     }
 
     pub fn load_state(&mut self, inp: &mut &[u8]) -> Result<()> {
-        loop {
-            match inp.read_u8()? {
-                0 => break,
-                1 => (),
-                x => return err!(Environment, "unexpected bool in save file: {}", x),
+        // Possibly overcomplicated management of default breakpoints (currently: Panic and Exception).
+        // Add them on startup before loading state, but allow the user to make them conditional.
+        // If a breakpoint is found in save file, it replaces the default breakpoint (to preserve the condition, if any).
+        let mut default_breakpoints: HashMap<PointOfInterest, BreakpointId> = HashMap::new();
+        for (id, bp) in self.breakpoints.iter() {
+            if let &BreakpointOn::PointOfInterest(p) = &bp.on {
+                default_breakpoints.insert(p, id);
             }
-            self.breakpoints.add(Breakpoint::load_state(inp)?);
+        }
+
+        loop {
+            if !inp.read_bool()? {
+                break;
+            }
+            let mut b = Breakpoint::load_state(inp)?;
+
+            let mut is_default = false;
+            if let &BreakpointOn::PointOfInterest(p) = &b.on {
+                if let Entry::Occupied(o) = default_breakpoints.entry(p) {
+                    is_default = true;
+                    self.breakpoints.remove(*o.get());
+                    o.remove();
+                }
+            }
+
+            if !is_default {
+                // Disable regular breakpoints on startup to allow running the program without waiting for symbols to load.
+                // For Panic and Exception, keep enabledness on restart.
+                // Kind of inconsistent behavior, but seems convenient. Maybe UI should show regular vs special breakpoints separately to make this more clear.
+                b.enabled = false;
+            }
+            
+            self.breakpoints.add(b);
         }
         Ok(())
     }
@@ -1088,7 +1137,7 @@ impl Debugger {
             // (Case that is not handled very correctly: conditional breakpoint in a binary that's already loaded, but the condition looks at variable higher up the stack that live in binary that's still loading.
             //  We won't wait for symbols to load, and the condition evaluation may fail unnecessarily. Which is ok if condition evaluation error triggers a stop, not so ok if the condition ignores errors.
             //  I guess the fix would be to just always wait for symbols if any breakpoints are active; anything more complex seems too error-prone and not worth it.)
-            if !self.breakpoints.iter().any(|(_, b)| b.enabled && b.addrs.as_ref().is_err_and(|e| e.is_loading())) {
+            if !self.breakpoints.iter().any(|(_, b)| b.enabled && b.addrs.as_ref().is_err_and(|e| e.is_loading()) && b.on.should_wait_for_symbols()) {
                 // Symbols not needed.
                 self.stopped_until_symbols_are_loaded = None;
                 return;
@@ -2084,7 +2133,7 @@ impl Debugger {
                             self.add_breakpoint_location(BreakpointRef::Id {id, subfunction_level}, addr);
                         }
                     }
-                    Err(e) if e.is_loading() => wait_for_symbols = true,
+                    Err(e) if e.is_loading() && b.on.should_wait_for_symbols() => wait_for_symbols = true,
                     Err(_) => (),
                 }
             }
@@ -2869,12 +2918,20 @@ impl Debugger {
                             if self.context.settings.trace_logging { eprintln!("trace: ignoring spurious stop on hw breakpoint {:x}", addr); }
                             // But still increment hit counter to make it easier to notice and debug if we get unexpectedly many spurious stops.
                             self.breakpoints.get_mut(id).hits += 1;
-                        } else if self.breakpoints.get(id).hidden {
-                            refresh_process_info = true;
-                        } else if self.process_breakpoint_hit(id, tid, ignore_breakpoints, subfunction_level, &mut stop_reasons) {
-                            hit = true;
-                            if subfunction_level != u16::MAX {
-                                stack_digest_to_select = Some((Vec::new(), false, subfunction_level));
+                        } else {
+                            let bp = self.breakpoints.get(id);
+                            if bp.hidden {
+                                match &bp.on {
+                                    BreakpointOn::PointOfInterest(PointOfInterest::LibraryLoad) => refresh_process_info = true,
+                                    // (Hardcoded behavior for this breakpoint, for now. We should make it a normal user-visible breakpoint instead, allowing attaching condition to it etc.)
+                                    BreakpointOn::PointOfInterest(PointOfInterest::Panic) => hit = true,
+                                    _ => panic!("unexpected hidden breakpoint"),
+                                }
+                            } else if self.process_breakpoint_hit(id, tid, ignore_breakpoints, subfunction_level, &mut stop_reasons) {
+                                hit = true;
+                                if subfunction_level != u16::MAX {
+                                    stack_digest_to_select = Some((Vec::new(), false, subfunction_level));
+                                }
                             }
                         }
                     }

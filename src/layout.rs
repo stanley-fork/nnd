@@ -3,8 +3,6 @@ use std::{mem, collections::HashSet, hash::{Hash, Hasher}, ops::Range};
 
 // (This file is about the UI panes, not layout in a general sense.)
 
-// TODO: Drag and drop windows.
-// TODO: Save state.
 pub struct Layout {
     pub windows: Pool<Window>,
     pub active_window: Option<WindowId>,
@@ -63,6 +61,7 @@ pub struct Region {
 impl Region {
     fn clear_layout(&mut self) { self.area = Rect::default(); self.outer_walls = [[WidgetIdx::invalid(); 2]; 2]; match &mut self.content { RegionContent::Leaf(leaf) => (leaf.tabs_widget, leaf.content_widget) = (WidgetIdx::invalid(), WidgetIdx::invalid()), _ => () } }
 }
+impl Default for Region { fn default() -> Self { Self { parent: None, content: RegionContent::Leaf(RegionLeaf::default()), relative_size: 1000000, area: Rect::default(), outer_walls: Default::default()} } }
 
 pub struct RegionSplit {
     pub axis: usize,
@@ -86,22 +85,104 @@ pub enum RegionContent {
 
 impl RegionContent {
     pub fn is_leaf(&self) -> bool { match self { RegionContent::Leaf(_) => true, _ => false }  }
+    pub fn is_split(&self) -> bool { match self { RegionContent::Split(_) => true, _ => false }  }
     pub fn as_split(&self) -> &RegionSplit { match self { RegionContent::Split(x) => x, RegionContent::Leaf(_) => panic!("not a split"), } }
     pub fn as_leaf(&self) -> &RegionLeaf { match self { RegionContent::Leaf(x) => x, RegionContent::Split(_) => panic!("not a leaf"), } }
     pub fn as_leaf_mut(&mut self) -> &mut RegionLeaf { match self { RegionContent::Leaf(x) => x, RegionContent::Split(_) => panic!("not a leaf"), } }
     pub fn as_split_mut(&mut self) -> &mut RegionSplit { match self { RegionContent::Split(x) => x, RegionContent::Leaf(_) => panic!("not a split"), } }
 }
 
+// Where to drag-n-drop a window.
+enum WindowRelocation {
+    AddTab(/*tab_idx*/ usize), // dropped on the middle of a window or on tabs widget
+    AddToExistingSplit(/*wall_idx*/ usize), // dropped onto a split line
+    SplitLeaf {axis: usize, side: usize}, // dropped near an edge of a window
+}
+
 impl Layout {
     pub fn new() -> Layout {
         let mut regions: Pool<Region> = Pool::new();
-        let root = regions.add(Region {parent: None, area: Rect::default(), content: RegionContent::Leaf(RegionLeaf::default()), relative_size: 1000000, outer_walls: [[WidgetIdx::invalid(); 2]; 2]}).0;
+        let root = regions.add(Region {..Default::default()}).0;
         let outer_walls = [[true, true], [true, true]]; // all walls along the edge of the screen
         // let outer_walls = [[false, false], [true, false]]; // only the top wall
         Layout {windows: Pool::new(), active_window: None, regions, root, outer_walls, root_widget: WidgetIdx::invalid(), wall_area: Rect::default(), wall_masks: Vec::new(), wall_widgets: Vec::new(), active_leaf: RegionId::default()}
     }
 
-    pub fn split(&mut self, region_id: RegionId, axis: usize, walls: Vec<f64>) -> Vec<RegionId> {
+    pub fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {
+        let mut stack: Vec<RegionId> = vec![self.root];
+        while let Some(region_id) = stack.pop() {
+            let region = self.regions.get(region_id);
+            out.write_usize(region.relative_size)?;
+            out.write_bool(region.content.is_split())?;
+            match &region.content {
+                RegionContent::Split(split) => {
+                    out.write_bool(split.axis != 0)?;
+                    out.write_usize(split.children.len())?;
+                    for id in split.children.iter().copied().rev() { // reversed
+                        stack.push(id);
+                    }
+                }
+                RegionContent::Leaf(leaf) => {
+                    out.write_usize(leaf.tabs.len())?;
+                    out.write_usize(leaf.tabs_state.selected)?;
+                    for &window_id in &leaf.tabs {
+                        let window = self.windows.get(window_id);
+                        out.write_u8(window.type_.serialize())?;
+                        out.write_bool(Some(window_id) == self.active_window)?;
+                        window.content.save_state(out)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // If fails, the Layout is left in invalid state and must be destroyed.
+    pub fn load_state(&mut self, inp: &mut &[u8]) -> Result<()> {
+        let mut stack: Vec<RegionId> = vec![self.root];
+        while let Some(region_id) = stack.pop() {
+            let relative_size = inp.read_usize()?;
+            let content = if inp.read_bool()? {
+                let axis = inp.read_bool()? as usize;
+                let num_children = inp.read_usize()?;
+                if num_children > 10000 {
+                    return err!(Sanity, "too many children, can't feed them all");
+                }
+                let mut children: Vec<RegionId> = Vec::new();
+                for i in 0..num_children {
+                    children.push(self.regions.add(Region {parent: Some(region_id), ..Default::default()}).0);
+                }
+                for id in children.iter().copied().rev() { // reversed
+                    stack.push(id);
+                }
+                RegionContent::Split(RegionSplit {axis, children})
+            } else {
+                let num_tabs = inp.read_usize()?;
+                let mut tabs_state = TabsState::default();
+                tabs_state.select(inp.read_usize()?);
+                let mut tabs: Vec<WindowId> = Vec::new();
+                for i in 0..num_tabs {
+                    let type_ = WindowType::deserialize(inp.read_u8()?)?;
+                    let window_id = self.new_window(None, type_);
+                    tabs.push(window_id);
+                    if inp.read_bool()? {
+                        self.active_window = Some(window_id);
+                    }
+                    let window = self.windows.get_mut(window_id);
+                    window.region = Some(region_id);
+                    window.content.load_state(inp)?;
+                }
+                RegionContent::Leaf(RegionLeaf {tabs, tabs_state, ..Default::default()})
+            };
+            let region = self.regions.get_mut(region_id);
+            region.content = content;
+            region.relative_size = relative_size;
+        }
+        Ok(())
+    }
+    
+    // existing_idx tells where to put the existing region (region_id) among the `walls.len() + 1` children of the new split region.
+    pub fn split(&mut self, region_id: RegionId, axis: usize, walls: Vec<f64>, existing_idx: usize) -> Vec<RegionId> {
         for i in 1..walls.len() {
             assert!(walls[i] >= walls[i-1]);
             assert!(walls[i] <= 1.0);
@@ -117,21 +198,26 @@ impl Layout {
 
         let parent = region.parent.take();
         let relative_size = region.relative_size;
-        let new_region_id = self.regions.add(Region {parent: parent.clone(), content: RegionContent::Split(RegionSplit {axis, children: Vec::new()}), relative_size, area: Rect::default(), outer_walls: [[WidgetIdx::invalid(); 2]; 2]}).0;
+        let new_region_id = self.regions.add(Region {parent: parent.clone(), content: RegionContent::Split(RegionSplit {axis, children: Vec::new()}), relative_size, ..Default::default()}).0;
 
-        let mut children = vec![region_id];
+        let mut children: Vec<RegionId> = Vec::new();
         let denominator = 1000000.0;
-        for i in 0..walls.len() {
-            let end = if i + 1 < walls.len() {walls[i+1]} else {1.0};
-            let relative_size = (((end - walls[i]) * denominator) as usize).max(1);
-            children.push(self.regions.add(Region {parent: Some(new_region_id), content: RegionContent::Leaf(RegionLeaf {tabs: Vec::new(), tabs_state: TabsState::default(), tabs_widget: WidgetIdx::invalid(), content_widget: WidgetIdx::invalid()}), relative_size, area: Rect::default(), outer_walls: [[WidgetIdx::invalid(); 2]; 2]}).0);
+        for i in 0..walls.len() + 1 {
+            let start = if i == 0 {0.0} else {walls[i - 1]};
+            let end = if i < walls.len() {walls[i]} else {1.0};
+            let relative_size = (((end - start) * denominator) as usize).max(1);
+            if i == existing_idx {
+                self.regions.get_mut(region_id).relative_size = relative_size;
+                children.push(region_id);
+            } else {
+                children.push(self.regions.add(Region {parent: Some(new_region_id), relative_size, ..Default::default()}).0);
+            }
         }
         let new_region = self.regions.get_mut(new_region_id);
         new_region.content.as_split_mut().children = children.clone();
 
         let region = self.regions.get_mut(region_id);
         region.parent = Some(new_region_id);
-        region.relative_size = ((walls[0] * denominator) as usize).max(1);
 
         match parent {
             None => self.root = new_region_id,
@@ -145,6 +231,35 @@ impl Layout {
         self.simplify_splits(new_region_id);
 
         children
+    }
+
+    pub fn remove_leaf(&mut self, region_id: RegionId) {
+        let region = self.regions.get_mut(region_id);
+        let leaf = region.content.as_leaf_mut();
+        for &window_id in &leaf.tabs {
+            self.windows.get_mut(window_id).region = None;
+        }
+        let parent_id = region.parent.unwrap();
+        let parent_split = self.regions.get_mut(parent_id).content.as_split_mut();
+        let idx = parent_split.children.iter().position(|id| *id == region_id).unwrap();
+        parent_split.children.remove(idx);
+        let children = parent_split.children.clone();
+
+        self.regions.remove(region_id);
+
+        // Renormalize relative_size of remaining children.
+        let total: usize = children.iter().copied().map(|id| self.regions.get(id).relative_size).sum();
+        assert!(total > 0);
+        let target = 1000000usize;
+        let mut so_far = 0usize;
+        for id in children {
+            let child = self.regions.get_mut(id);
+            let new_so_far = so_far + child.relative_size;
+            child.relative_size = (new_so_far*target/total - so_far*target/total).max(1);
+            so_far = new_so_far;
+        }
+
+        self.simplify_splits(parent_id);
     }
 
     pub fn set_fixed_size(&mut self, window_id: WindowId, axis: usize, size: usize) {
@@ -215,8 +330,13 @@ impl Layout {
         self.windows.get_mut(win_id).region = Some(leaf_id);
     }
 
-    pub fn new_window(&mut self, parent: Option<RegionId>, type_: WindowType, required: bool, content: Box<dyn WindowContent>) -> WindowId {
-        let win = Window {type_, region: parent.clone(), visible: false, area: Rect::default(), widget: WidgetIdx::invalid(), required, title: type_.title().to_string(), content, hotkey_number: None, fixed_size: [None; 2]};
+    pub fn new_window(&mut self, parent: Option<RegionId>, type_: WindowType) -> WindowId {
+        let mut win = Window {type_, region: parent.clone(), visible: false, area: Rect::default(), widget: WidgetIdx::invalid(), required: false, title: type_.title().to_string(), content: type_.create_window(), hotkey_number: None, fixed_size: [None; 2]};
+        if let Some(info) = REQUIRED_WINDOWS.iter().find(|info| info.type_ == type_) {
+            win.required = true;
+            win.hotkey_number = info.hotkey_number.clone();
+            win.fixed_size[Axis::Y] = info.fixed_height.clone();
+        }
         let win_id = self.windows.add(win).0;
         if let Some(id) = parent {
             self.regions.get_mut(id).content.as_leaf_mut().tabs.push(win_id);
@@ -334,6 +454,8 @@ impl Layout {
             }
         }
 
+        let mut should_relocate_window: Option<(WindowId, RegionId, WindowRelocation, /*drop*/ bool)> = None;
+
         // User of Layout mostly cares about windows and not regions, so we have public active_window field.
         // But the build() procedure mostly cares about regions and not windows.
         // So we map active_window to active_leaf here, then map it back near the end of build().
@@ -448,10 +570,33 @@ impl Layout {
                         if ui.check_mouse(MouseActions::CLICK_SUBTREE) {
                             self.active_leaf = region_id;
                         }
+                        if let Some((DragWhat::Window(window_id), pos, drop)) = ui.check_drag_in() {
+                            // Figure out which part of the region `pos` belongs to: near the center, near left edge, near bottom edge, etc.
+                            // Normalize coordinates to [-0.5, +0.5].
+                            let (x, y) = (pos[0] as f64 / region.area.width().max(1) as f64 - 0.5, pos[1] as f64 / region.area.height().max(1) as f64 - 0.5);
+                            if x.abs().max(y.abs()) < 0.25 {
+                                should_relocate_window = Some((window_id, region_id, WindowRelocation::AddTab(usize::MAX), drop));
+                            } else {
+                                let (axis, side) = if y > x {
+                                    if y > -x {
+                                        (Axis::Y, 1)
+                                    } else {
+                                        (Axis::X, 0)
+                                    }
+                                } else {
+                                    if y < -x {
+                                        (Axis::Y, 0)
+                                    } else {
+                                        (Axis::X, 1)
+                                    }
+                                };
+                                should_relocate_window = Some((window_id, region_id, WindowRelocation::SplitLeaf {axis, side}, drop));
+                            }
+                        }
                     });
                 }
                 RegionContent::Split(_) => {
-                    self.build_split(region_id, ui);
+                    self.build_split(region_id, &mut should_relocate_window, ui);
                     for &child_id in self.regions.get(region_id).content.as_split().children.iter().rev() {
                         assert_eq!(self.regions.get(child_id).parent, Some(region_id));
                         stack.push(child_id);
@@ -519,11 +664,19 @@ impl Layout {
                 let mut tabs = Tabs::new(mem::take(&mut leaf.tabs_state), ui);
                 let style = if is_active {ui.palette.window_title_active} else {ui.palette.window_title_selected};
                 tabs.custom_styles = Some((style, (String::new(), ui.palette.window_title_deselected), ui.palette.window_title_deselected, ui.palette.window_title_separator.clone()));
+                tabs.allow_dropping_window = true;
                 for &window_id in &leaf.tabs {
                     let win = self.windows.get(window_id);
-                    tabs.add(Tab {identity: hash(&window_id), short_title: win.title.clone(), hotkey_number: win.hotkey_number.clone(), ..D!()}, ui);
+                    tabs.add(Tab {identity: hash(&window_id), short_title: win.title.clone(), hotkey_number: win.hotkey_number.clone(), custom_drag: Some(DragWhat::Window(window_id)), ..D!()}, ui);
                 }
-                (leaf.tabs_state, _) = tabs.finish(ui);
+                let action;
+                (leaf.tabs_state, action) = tabs.finish(ui);
+
+                match action {
+                    TabsAction::None => (),
+                    TabsAction::DropWindow {window_id, to_idx} => should_relocate_window = Some((window_id, region_id, WindowRelocation::AddTab(to_idx), /*drop*/ true)),
+                    x => panic!("unexpected window TabsAction: {:?}", x),
+                }
             });
 
             for (i, &window_id) in leaf.tabs.iter().enumerate() {
@@ -551,9 +704,149 @@ impl Layout {
                 }
             }
         }
+
+        if let Some((window_id, region_id, relocation, drop)) = should_relocate_window {
+            if self.windows.try_get(window_id).is_some() && !self.is_window_relocation_pointess(window_id, region_id, &relocation) {
+                if drop {
+                    self.relocate_window(window_id, region_id, relocation);
+                    ui.should_redraw = true;
+                } else {
+                    self.preview_window_relocation(window_id, region_id, relocation, ui);
+                }
+            }
+        }
     }
 
-    fn build_split(&mut self, region_id: RegionId, ui: &mut UI) {
+    fn relocate_window(&mut self, window_id: WindowId, region_id: RegionId, relocation: WindowRelocation) {
+        let mut to_simplify: Vec<RegionId> = Vec::new();
+        if let &Some(from_region_id) = &self.windows.get(window_id).region {
+            let from_leaf = self.regions.get_mut(from_region_id).content.as_leaf_mut();
+            let from_idx = from_leaf.tabs.iter().position(|id| id == &window_id).unwrap();
+
+            if from_region_id == region_id {
+                if let &WindowRelocation::AddTab(to_idx) = &relocation {
+                    let to_idx = to_idx.min(from_leaf.tabs.len());
+                    from_leaf.tabs_state.apply_action(TabsAction::Reorder {from_idx, to_idx}, &mut from_leaf.tabs);
+                    return;
+                }
+            }
+
+            from_leaf.tabs_state.apply_action(TabsAction::Close(from_idx), &mut from_leaf.tabs);
+            to_simplify.push(from_region_id); // can't simplify right here because it might delete `region_id`
+        }
+
+        let region = self.regions.get_mut(region_id);
+        
+        match relocation {
+            WindowRelocation::AddTab(tab_idx) => {
+                let to_leaf = region.content.as_leaf_mut();
+                let tab_idx = tab_idx.min(to_leaf.tabs.len());
+                to_leaf.tabs.insert(tab_idx, window_id);
+                to_leaf.tabs_state.select(tab_idx);
+                self.windows.get_mut(window_id).region = Some(region_id);
+            }
+            WindowRelocation::AddToExistingSplit(wall_idx) => {
+                let split = region.content.as_split();
+                let (prev, next) = (split.children[wall_idx - 1], split.children[wall_idx]);
+                let relative_size = self.regions.get(prev).relative_size + self.regions.get(next).relative_size;
+                let new_size = relative_size / 3;
+                let prev_new_size = (relative_size - new_size) / 2;
+                let new_region_id = self.regions.add(Region {parent: Some(region_id), relative_size: new_size.max(1), content: RegionContent::Leaf(RegionLeaf {tabs: vec![window_id], ..Default::default()}), ..Default::default()}).0;
+                self.regions.get_mut(prev).relative_size = prev_new_size.max(1);
+                self.regions.get_mut(next).relative_size = (relative_size - new_size - prev_new_size).max(1);
+                self.regions.get_mut(region_id).content.as_split_mut().children.insert(wall_idx, new_region_id);
+                to_simplify.push(new_region_id);
+                self.windows.get_mut(window_id).region = Some(new_region_id);
+            }
+            WindowRelocation::SplitLeaf {axis, side} => {
+                let children = self.split(region_id, axis, vec![0.5], 1 - side);
+                assert_eq!(children.len(), 2);
+                let new_leaf_id = children[side];
+                let new_leaf = self.regions.get_mut(new_leaf_id).content.as_leaf_mut();
+                assert!(new_leaf.tabs.is_empty());
+                new_leaf.tabs.push(window_id);
+                to_simplify.push(new_leaf_id);
+                self.windows.get_mut(window_id).region = Some(new_leaf_id);
+            }
+        }
+
+        for id in to_simplify {
+            match self.regions.try_get(id) {
+                None => (),
+                Some(Region {content: RegionContent::Leaf(RegionLeaf {tabs, ..}), ..}) if tabs.is_empty() => self.remove_leaf(id),
+                _ => self.simplify_splits(id),
+            }
+        }
+    }
+
+    fn preview_window_relocation(&mut self, window_id: WindowId, region_id: RegionId, relocation: WindowRelocation, ui: &mut UI) {
+        let region = self.regions.get(region_id);
+        let (rect, text) = match relocation {
+            WindowRelocation::AddTab(_) => (region.area, "move here"),
+            WindowRelocation::AddToExistingSplit(wall_idx) => {
+                let split = region.content.as_split();
+                let (a, b) = (split.children[wall_idx - 1], split.children[wall_idx]);
+                let (a, b) = (self.regions.get(a).area, self.regions.get(b).area);
+                let mut r = a;
+                let ax = split.axis;
+                r.pos[ax] = (a.pos[ax] + b.pos[ax]*2).div_euclid(3);
+                r.size[ax] = (a.size[ax] + b.size[ax]) / 3;
+                (r, "split pane")
+            }
+            WindowRelocation::SplitLeaf {axis, side} => {
+                let mut r = region.area;
+                if side == 1 {
+                    r.pos[axis] += (r.size[axis] as isize + 1) / 2;
+                }
+                r.size[axis] /= 2;
+                (r, "split pane")
+            }
+        };
+        let mut outer = widget!().fixed_rect(rect).fill(' ', ui.palette.default);
+        outer.draw_frame = Some((ui.palette.window_border, /*rounded*/ true));
+        with_parent!(ui, ui.add(outer), {
+            let l = ui_writeln!(ui, default, "{}", text);
+            ui.add(widget!().hcenter().vcenter().fixed_height(1).width(AutoSize::Text).text(l));
+        });
+    }
+
+    // E.g. dragging an only tab into itself, such that the leaf gets split and immediately merged back because the old leaf became empty.
+    // We don't allow such moves as they look confusing.
+    fn is_window_relocation_pointess(&self, window_id: WindowId, region_id: RegionId, relocation: &WindowRelocation) -> bool {
+        let from_region_id = match &self.windows.get(window_id).region {
+            None => return false, // attaching a previously orphaned window
+            &Some(id) => id };
+        let from_region = self.regions.get(from_region_id);
+        if from_region.content.as_leaf().tabs.len() > 1 {
+            return false; // leaf has more tabs, it won't disappear
+        }
+
+        if from_region_id == region_id {
+            // Moving a tab into itself (as AddTab or SplitLeaf).
+            return true;
+        }
+
+        let parent_id = match &from_region.parent {
+            None => return false, // root is leaf with only one tab, weird
+            &Some(id) => id };
+        let parent_split = self.regions.get(parent_id).content.as_split();
+        let idx_in_parent_split = parent_split.children.iter().copied().position(|id| id == from_region_id).unwrap();
+
+        match relocation {
+            // Removing a leaf, then adding a new leaf at the same place in the same parent split.
+            &WindowRelocation::AddToExistingSplit(wall_idx)
+                if region_id == parent_id && (wall_idx == idx_in_parent_split || wall_idx == idx_in_parent_split + 1) => true,
+            // Same effect as above, but by dragging onto a neighboring window rather than onto a wall.
+            &WindowRelocation::SplitLeaf {axis, side} if axis == parent_split.axis => {
+                // (`side` is sibling's side, the opposite of our side.)
+                let neighbor_idx = idx_in_parent_split as isize + if side == 0 {1} else {-1};
+                return parent_split.children.get(/*overflow is ok*/ neighbor_idx as usize) == Some(&region_id)
+            }
+            _ => false,
+        }
+    }
+
+    fn build_split(&mut self, region_id: RegionId, should_relocate_window: &mut Option<(WindowId, RegionId, WindowRelocation, bool)>, ui: &mut UI) {
         let region = self.regions.get(region_id);
         let split = region.content.as_split();
         assert!(!split.children.is_empty());
@@ -614,41 +907,44 @@ impl Layout {
         // Create inner walls, handle mouse-drag resizing.
         let mut resized = false;
         for i in 1..walls.len()-1 {
-            let (pos, draggable) = calculate_wall_pos(i, &cumsum);
+            let (pos, movable) = calculate_wall_pos(i, &cumsum);
             walls[i] = (Self::build_wall(axis, region.area, pos, hash(&('w', region_id, i)), &mut self.wall_widgets, ui), pos);
 
-            if !draggable {
-                continue;
-            }
             with_parent!(ui, walls[i].0, {
-                ui.cur_mut().flags.insert(WidgetFlags::HIGHLIGHT_ON_HOVER);
-                if let Some(p) = ui.check_drag_out(DragWhat::NoDrop) {
-                    let p = p[axis];
-                    if p != 0 {
-                        let (fixed_left, fixed) = (cumsum[i].0, cumsum.last().unwrap().0);
-                        let (flexible_left, flexible) = (cumsum[i].1, cumsum.last().unwrap().1);
+                if movable {
+                    ui.cur_mut().flags.insert(WidgetFlags::HIGHLIGHT_ON_HOVER);
+                    if let Some(p) = ui.check_drag_out(DragWhat::NoDrop) {
+                        let p = p[axis];
+                        if p != 0 {
+                            let (fixed_left, fixed) = (cumsum[i].0, cumsum.last().unwrap().0);
+                            let (flexible_left, flexible) = (cumsum[i].1, cumsum.last().unwrap().1);
 
-                        let p = pos + p; // where we want the wall to be
-                        let p = (p.max(fixed_left as isize) as usize).min(size - fixed + fixed_left); // clamp
-                        // Find the flexible_left that solves the linear equation calculate_wall_pos(...) = p.
-                        let target_left = flexible * (p - fixed_left) / (size - fixed);
+                            let p = pos + p; // where we want the wall to be
+                            let p = (p.max(fixed_left as isize) as usize).min(size - fixed + fixed_left); // clamp
+                            // Find the flexible_left that solves the linear equation calculate_wall_pos(...) = p.
+                            let target_left = flexible * (p - fixed_left) / (size - fixed);
 
-                        // Adjust flexible sizes of the two children on either side of this wall (skipping fixed-size children).
-                        let (mut prev, mut next) = (i-1, i);
-                        while children[prev].0 {
-                            prev -= 1;
+                            // Adjust flexible sizes of the two children on either side of this wall (skipping fixed-size children).
+                            let (mut prev, mut next) = (i-1, i);
+                            while children[prev].0 {
+                                prev -= 1;
+                            }
+                            while children[next].0 {
+                                next += 1;
+                            }
+                            assert_eq!(cumsum[next+1].1 - cumsum[prev].1, children[prev].1 + children[next].1);
+                            let target_left = target_left.max(cumsum[prev].1 + 1).min(cumsum[next+1].1 - 1);
+                            children[prev].1 = target_left - cumsum[prev].1;
+                            children[next].1 = cumsum[next+1].1 - target_left;
+                            
+                            resized = true;
+                            cumsum = calculate_cumsum(&children);
                         }
-                        while children[next].0 {
-                            next += 1;
-                        }
-                        assert_eq!(cumsum[next+1].1 - cumsum[prev].1, children[prev].1 + children[next].1);
-                        let target_left = target_left.max(cumsum[prev].1 + 1).min(cumsum[next+1].1 - 1);
-                        children[prev].1 = target_left - cumsum[prev].1;
-                        children[next].1 = cumsum[next+1].1 - target_left;
-                        
-                        resized = true;
-                        cumsum = calculate_cumsum(&children);
                     }
+                }
+
+                if let Some((DragWhat::Window(window_id), _pos, drop)) = ui.check_drag_in() {
+                    *should_relocate_window = Some((window_id, region_id, WindowRelocation::AddToExistingSplit(i), drop));
                 }
             });
         }

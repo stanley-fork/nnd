@@ -121,20 +121,23 @@ pub struct SymbolsShard {
 pub enum PointOfInterest {
     MainFunction,
     LibraryLoad, // _dl_debug_state
-    // TODO: Throw, Panic
+    Panic,
+    Exception,
 }
 impl PointOfInterest {
     pub fn save_state(self, out: &mut Vec<u8>) -> Result<()> {
-        match self { Self::MainFunction => out.write_u8(0)?, Self::LibraryLoad => out.write_u8(1)?, } Ok(())
+        match self { Self::MainFunction => out.write_u8(0)?, Self::LibraryLoad => out.write_u8(1)?, Self::Panic => out.write_u8(2)?, Self::Exception => out.write_u8(3)?, } Ok(())
     }
     pub fn load_state(inp: &mut &[u8]) -> Result<Self> {
-        Ok(match inp.read_u8()? { 0 => Self::MainFunction, x => return err!(Environment, "unexpected PointOfInterest in save file: {}", x) })
+        Ok(match inp.read_u8()? { 0 => Self::MainFunction, 1 => Self::LibraryLoad, 2 => Self::Panic, 3 => Self::Exception, x => return err!(Environment, "unexpected PointOfInterest in save file: {}", x) })
     }
 
     pub fn name_for_ui(self) -> &'static str {
         match self {
             Self::MainFunction => "main function",
             Self::LibraryLoad => "library load",
+            Self::Panic => "panic (Rust)",
+            Self::Exception => "exception (C++)",
         }
     }
 }
@@ -1538,6 +1541,9 @@ impl SymbolsLoader {
                         if name_ref == "_dl_debug_state" {
                             shard.points_of_interest.entry(PointOfInterest::LibraryLoad).or_default().push(addr);
                         }
+                        if name_ref == "__cxa_throw" {
+                            shard.points_of_interest.entry(PointOfInterest::Exception).or_default().push(addr);
+                        }
 
                         // For some reason functions' [st_value, st_value + st_size) ranges overlap a lot. Maybe st_size is just not reliable.
                         // So we ignore st_size and assume that each function ends where the next function starts.
@@ -2604,6 +2610,10 @@ impl<'a> DwarfLoader<'a> {
                                 (attrs.name == "main" && (attrs.linkage_name.is_empty() || attrs.linkage_name.ends_with(".main")));
                             if is_main_function {
                                 self.shard.points_of_interest.entry(PointOfInterest::MainFunction).or_default().push(entry_pc);
+                            }
+
+                            if self.unit.language == LanguageFamily::Rust && attrs.name == "begin_panic_handler" {
+                                self.shard.points_of_interest.entry(PointOfInterest::Panic).or_default().push(entry_pc);
                             }
                         }
 
