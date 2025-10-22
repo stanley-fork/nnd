@@ -1,16 +1,29 @@
 #!/bin/bash
 set -e
 
-COMMIT_MESSAGE='.'
-if [ "$1" == "-m" ]
+COMMIT_MESSAGE=''
+TAG_NUM=''
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -m|--message)
+      COMMIT_MESSAGE="$2"
+      shift
+      shift
+      ;;
+    --version)
+      TAG_NUM="$2"
+      shift
+      shift
+      ;;
+    *)
+      echo "unknown option: $1"
+      exit 1
+      ;;
+  esac
+done
+
+if [ "$COMMIT_MESSAGE" == "" ]
 then
-    if [ "$2" == "" ]
-    then
-        echo "commit message required after -m"
-        exit 1
-    fi
-    COMMIT_MESSAGE="$2"
-else
     status="$(git status --porcelain)"
     if [ "$status" != "" ]
     then
@@ -21,12 +34,15 @@ fi
 
 # Pick a version number.
 
-git fetch origin
-TAG_NUM=`git tag | grep -Po '(?<=^v0\.)\d+$' | sort -n | tail -n1`
 if [ "$TAG_NUM" == "" ]
 then
-    echo "couldn't find latest tag number"
-    exit 1
+    git fetch origin
+    TAG_NUM=`git tag | grep -Po '(?<=^v0\.)\d+$' | sort -n | tail -n1`
+    if [ "$TAG_NUM" == "" ]
+    then
+        echo "couldn't find latest tag number"
+        exit 1
+    fi
 fi
 TAG="v0.$TAG_NUM"
 
