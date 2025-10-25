@@ -223,7 +223,7 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                         value_has_fields_at_all = true;
                         match name.as_str() {
                             "#len" => {
-                                let len = val.val.bit_range(8..16, &mut context.memory)?;
+                                let len = val.val.bit_range(64..128, &mut context.memory)?;
                                 Ok(Value {val: AddrOrValueBlob::Blob(ValueBlob::new(len)), type_: state.builtin_types.u64_, flags: ValueFlags::empty()})
                             }
                             _ => continue,

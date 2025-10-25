@@ -1,5 +1,3 @@
-use std::marker::PhantomData;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct Id {
     pub slot: usize,

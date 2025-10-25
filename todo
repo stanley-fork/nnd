@@ -1,6 +1,6 @@
 bugs:
+u128 <bad size>
 gets stuck when debuggee is OOM-killed by linux
-investigate regression in symbols loading speed (stuck on "parsing drawf" for ~10 seconds)
 investigate why many types are not deduped, e.g. there's DB::Block#441
 make stack unwinding work when control is in .plt or .plt.got, see "Recognise PLT entries such as" in libunwind code
 fix incorrect column numbers with tab indentation (tabs should be counted as 1 column, but we turn them into multiple spaces)
@@ -9,14 +9,22 @@ make auto-downcast check that the types are in the same language, to avoid downc
 
 performance:
 optimize symbols loading
-  profile attribute loading
   more dynamic work distribution to threads (see util% in --load-symbols output on devserver)
+    dynamically assign units to shards?
+      fixup_subfunction_call_line
+      worse locality
+      go by units (unit groups?) instead of by data kind
+    per-unit sort+dedup (then no dedup across units)
+    piecewise sort
+    dynamically pick dfs roots
+    small buckets for shuffles in types
+  memory usage
+    separate allocator for temp memory to make sure it's released to OS after symbols loading
   madvise
     benchmark with file pre-evicted from page cache (using vmtouch)
   fix warning about unsupported forms, especially implicit_const on flags
   try caching chase results (71M chases, 15M unique results, 205M total DIEs)
   test with dwarf 4
-  replace strlen inside .debug_str etc lookups
   simple things found by profiler (samply is nice)
 look at profiler on ch server (1500 threads)
 test with 10k threads
@@ -87,6 +95,7 @@ handle partially-optimized-out struct values (common in rust)
 read color scheme from file
 color threads based on stack hash
 search in watches window
+search in disassembly
 assigning to debuggee variables and registers, including rip
 key to teleport ip to current line
 

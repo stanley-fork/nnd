@@ -43,17 +43,9 @@ chmod +x nnd
 
 Or build from source:
 ```bash
-# Prerequisites:
-#  1. Install Rust.
-#  2. Install musl target:
-rustup target add x86_64-unknown-linux-musl
-#  3. Install musl-tools
-sudo apt install musl-tools
-
-# Build:
-cargo build --profile dbgo --bin nnd
-
-# The executable is at target/x86_64-unknown-linux-musl/dbgo/nnd
+rustup toolchain install 1.89
+cargo +1.89.0 build --profile dbgo
+# The executable is at target/dbgo/nnd
 ```
 
 Run `nnd --help` for documentation.

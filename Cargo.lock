@@ -192,7 +192,7 @@ dependencies = [
 
 [[package]]
 name = "nnd"
-version = "0.56.0"
+version = "0.57.0"
 dependencies = [
  "bitflags",
  "cpp_demangle",
@@ -207,6 +207,7 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width",
  "ureq",
+ "voracious_radix_sort",
 ]
 
 [[package]]
@@ -389,6 +390,12 @@ name = "utf-8"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09cc8ee72d2a9becf2f2febe0205bbed8fc6615b7cb429ad062dc7b7ddd036a9"
+
+[[package]]
+name = "voracious_radix_sort"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "446e7ffcb6c27a71d05af7e51ef2ee5b71c48424b122a832f2439651e1914899"
 
 [[package]]
 name = "wasi"

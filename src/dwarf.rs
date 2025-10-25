@@ -1,7 +1,6 @@
 use crate::{*, error::{*, Result, Error}, log::*, util::*, types::LanguageFamily};
 use gimli::{*, constants::DwForm};
-use std::{str, borrow::Cow, fmt, sync::{Mutex, Arc}, collections::HashSet, mem, ptr};
-use std::arch::x86_64::*;
+use std::{str, borrow::Cow, fmt, sync::{Mutex, Arc}, collections::{HashSet, HashMap, hash_map::Entry}, mem, ptr, ops::Range, arch::x86_64::*};
 use rand::random;
 
 // DWARF parsing.
@@ -51,6 +50,19 @@ impl DwarfSlice {
         a[..3].copy_from_slice(self.read_bytes(3)?);
         Ok(u32::from_le_bytes(a))
     }
+
+    pub fn get_null_terminated_slice(self, offset: usize) -> Result<&'static [u8]> {
+        unsafe {
+            if offset >= self.n {
+                return err!(Dwarf, "string ref starts out of bounds");
+            }
+            let len = strlen_padded(self.p.add(offset), self.n - offset);
+            if len >= self.n - offset {
+                return err!(Dwarf, "string ref unterminated");
+            }
+            Ok(std::slice::from_raw_parts(self.p.add(offset), len))
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -66,7 +78,7 @@ impl SliceReader {
     pub fn is_empty(&self) -> bool {
         self.n == 0
     }
-    
+
     pub fn offset_from(&self, base: &'static [u8]) -> usize {
         let base_ptr = base.as_ptr() as usize;
         let ptr = self.p as usize;
@@ -225,7 +237,7 @@ impl SliceReader {
             self.check()?;
             return Ok(None);
         }
-        Ok(Some(context.unit.abbreviation_set.get(code)?))
+        Ok(Some(context.unit.abbreviation_set.get(code, &context.shared)?))
     }
 
     pub fn skip_attributes(&mut self, abbreviation: &Abbreviation, context: &AttributeContext) -> Result<()> {
@@ -245,7 +257,8 @@ impl SliceReader {
     pub unsafe fn read_attributes_impl(&mut self, abbreviation: &Abbreviation, which_layout: usize, context: &AttributeContext, out: *mut u8) -> Result<()> {
         let actions = &abbreviation.actions[which_layout];
         let mut flags = actions.flags_value;
-        for mut action in actions.actions.iter().copied() {
+        for action_idx in actions.actions.clone() {
+            let mut action = context.shared.actions_pool[action_idx as usize];
             if action.form == DW_FORM_indirect {
                 let mut form = action.form;
                 while form == constants::DW_FORM_indirect {
@@ -278,9 +291,8 @@ impl SliceReader {
 
             let set_strx = |index: usize, context: &AttributeContext| -> Result<()> {
                 let offset = context.dwarf.string_offset(&context.unit.unit, DebugStrOffsetsIndex(index))?;
-                // TODO: Replace all occurrences of `string(` in this file with a faster SIMD null-terminated string implementation.
-                let s = context.dwarf.string(offset)?;
-                set_slice(s.slice(), action.param != 0);
+                let s = context.dwarf.debug_str.reader().get_null_terminated_slice(offset.0)?;
+                set_slice(s, action.param != 0);
                 Ok(())
             };
             let set_addrx = |index: usize, context: &AttributeContext| -> Result<()> {
@@ -327,33 +339,24 @@ impl SliceReader {
                 DW_FORM_string => set_slice(self.read_null_terminated_slice_or_empty(), action.param != 0),
                 DW_EXTRA_FORM_strp4 => {
                     let offset = self.read_u32_or_zero() as usize;
-                    let s = context.dwarf.string(DebugStrOffset(offset))?;
-                    set_slice(s.slice(), action.param != 0);
+                    let s = context.dwarf.debug_str.reader().get_null_terminated_slice(offset)?;
+                    set_slice(s, action.param != 0);
                 }
                 DW_EXTRA_FORM_strp8 => {
                     let offset = self.read_u64_or_zero();
-                    let s = context.dwarf.string(DebugStrOffset(offset))?;
-                    set_slice(s.slice(), action.param != 0);
+                    let s = context.dwarf.debug_str.reader().get_null_terminated_slice(offset)?;
+                    set_slice(s, action.param != 0);
                 }
-                DW_EXTRA_FORM_strp_sup4 => {
-                    let offset = self.read_u32_or_zero() as usize;
-                    let s = context.dwarf.sup_string(DebugStrOffset(offset))?;
-                    set_slice(s.slice(), action.param != 0);
-                }
-                DW_EXTRA_FORM_strp_sup8 => {
-                    let offset = self.read_u64_or_zero();
-                    let s = context.dwarf.sup_string(DebugStrOffset(offset))?;
-                    set_slice(s.slice(), action.param != 0);
-                }
+                DW_EXTRA_FORM_strp_sup4 | DW_EXTRA_FORM_strp_sup8 => return err!(NotImplemented, "DWARF 'supplementary' files are not supported (not to be confused with simply providing unstripped executable on the side - use -m <path> for that)"),
                 DW_EXTRA_FORM_line_strp4 => {
                     let offset = self.read_u32_or_zero() as usize;
-                    let s = context.dwarf.line_string(DebugLineStrOffset(offset))?;
-                    set_slice(s.slice(), action.param != 0);
+                    let s = context.dwarf.debug_line_str.reader().get_null_terminated_slice(offset)?;
+                    set_slice(s, action.param != 0);
                 }
                 DW_EXTRA_FORM_line_strp8 => {
                     let offset = self.read_u64_or_zero();
-                    let s = context.dwarf.line_string(DebugLineStrOffset(offset))?;
-                    set_slice(s.slice(), action.param != 0);
+                    let s = context.dwarf.debug_line_str.reader().get_null_terminated_slice(offset)?;
+                    set_slice(s, action.param != 0);
                 }
                 DW_FORM_strx => set_strx(self.read_uleb128_or_zero(), context)?,
                 DW_FORM_strx1 => set_strx(self.read_u8_or_zero() as usize, context)?,
@@ -448,7 +451,6 @@ pub struct AttributeSpecification {
 
 #[derive(Clone)]
 pub struct Abbreviation {
-    pub code: usize,
     pub tag: DwTag,
     pub has_children: bool,
 
@@ -460,27 +462,29 @@ pub struct Abbreviation {
 
 #[derive(Clone)]
 pub struct AbbreviationSet {
-    pub vec: Vec<Abbreviation>,
+    pub code_to_idx: Range<usize>, // in AttributesSharedData.code_to_idx_pool
     pub consecutive: bool,
 }
 impl AbbreviationSet {
-    fn new() -> Self { Self {vec: Vec::new(), consecutive: true} }
+    fn new() -> Self { Self {code_to_idx: 0..0, consecutive: true} }
 
-    fn get(&self, code: usize) -> Result<&Abbreviation> {
-        if self.consecutive {
-            if code < self.vec.len() {
-                Ok(&self.vec[code])
+    fn get<'a>(&self, code: usize, shared: &'a AbbreviationsSharedData) -> Result<&'a Abbreviation> {
+        let slice = &shared.code_to_idx_pool[self.code_to_idx.clone()];
+        let idx = if self.consecutive {
+            if code < slice.len() {
+                slice[code].1
             } else {
-                err!(Dwarf, "abbvreviation code out of bounds: {} >= {}", code, self.vec.len())
+                return err!(Dwarf, "abbvreviation code out of bounds: {} >= {}", code, slice.len());
             }
         } else {
-            let i = self.vec.partition_point(|a| a.code < code);
-            if i == self.vec.len() || self.vec[i].code > code {
-                err!(Dwarf, "abbreviation code not found: {}", code)
+            let i = slice.partition_point(|a| a.0 < code);
+            if i == slice.len() || slice[i].0 > code {
+                return err!(Dwarf, "abbreviation code not found: {}", code);
             } else {
-                Ok(&self.vec[i])
+                slice[i].1
             }
-        }
+        };
+        Ok(&shared.abbreviations_pool[idx])
     }
 }
 
@@ -500,7 +504,7 @@ struct AttributeAction {
 struct AbbreviationActions {
     flags_offset: u32,
     flags_value: u32,
-    actions: Vec<AttributeAction>, // TODO: try replacing this with Range<u32> of indices into a shared array
+    actions: Range<u32>, // in AbbreviationsSharedData.actions_pool
 }
 
 #[derive(Default, Clone)]
@@ -629,6 +633,10 @@ impl FormWarningLimiter {
 pub struct AbbreviationsSharedData {
     layouts: AllAttributeStructLayouts,
     warnings: FormWarningLimiter,
+
+    actions_pool: Vec<AttributeAction>,
+    abbreviations_pool: Vec<Abbreviation>,
+    code_to_idx_pool: Vec<(/*code*/ usize, /*idx_in_abbreviations_pool*/ usize)>,
 }
 
 #[derive(Clone)]
@@ -877,7 +885,7 @@ dwarf_struct!{ UnitLateAttributes {
 }}
 
 pub fn list_units(dwarf: &mut Dwarf<DwarfSlice>, binary_name: &str, layouts: AllAttributeStructLayouts) -> Result<(Vec<DwarfUnit>, AbbreviationsSharedData)> {
-    let mut shared = AbbreviationsSharedData {layouts, warnings: FormWarningLimiter::default()};
+    let mut shared = AbbreviationsSharedData {layouts, warnings: FormWarningLimiter::default(), actions_pool: Vec::new(), abbreviations_pool: Vec::new(), code_to_idx_pool: Vec::new()};
 
     let mut unit_headers: Vec<(UnitHeader<DwarfSlice>, AbbreviationSet)> = Vec::new();
     let mut abbrev_offsets: Vec<((/*offset*/ usize, Encoding), /*unit_idx*/ usize)> = Vec::new();
@@ -894,6 +902,9 @@ pub fn list_units(dwarf: &mut Dwarf<DwarfSlice>, binary_name: &str, layouts: All
         abbrev_offsets.sort_unstable_by_key(|((offset, encoding), _)| (*offset, encoding.address_size, encoding.format == Format::Dwarf64, encoding.version));
         let mut off_start = 0usize;
         let mut all_consecutive = true;
+        // serialized abbreviation -> index in abbreviations_pool
+        let mut abbrev_dedup: HashMap<&'static [u8], usize> = HashMap::new();
+        let mut attributes: Vec<AttributeSpecification> = Vec::new();
         while off_start < abbrev_offsets.len() {
             let &(offset, encoding) = &abbrev_offsets[off_start].0;
             let mut off_end = off_start + 1;
@@ -901,7 +912,8 @@ pub fn list_units(dwarf: &mut Dwarf<DwarfSlice>, binary_name: &str, layouts: All
                 off_end += 1;
             }
 
-            let mut vec = vec![Abbreviation {code: 0, tag: DW_TAG_null, has_children: false, actions: [Default::default(), Default::default(), Default::default()]}];
+            let code_to_idx_start = shared.code_to_idx_pool.len();
+            shared.code_to_idx_pool.push((0, 0));
             let (mut consecutive, mut sorted) = (true, true);
             let mut prev_code = 0;
 
@@ -913,6 +925,9 @@ pub fn list_units(dwarf: &mut Dwarf<DwarfSlice>, binary_name: &str, layouts: All
                     reader.check()?;
                     break;
                 }
+
+                let abbrev_slice = reader.as_slice();
+
                 let tag = reader.read_uleb128_u16_or_zero();
                 if tag == 0 {
                     reader.check()?;
@@ -924,8 +939,8 @@ pub fn list_units(dwarf: &mut Dwarf<DwarfSlice>, binary_name: &str, layouts: All
                     reader.check()?;
                     return err!(Dwarf, "invalid has_children value in abbreviation");
                 }
-                
-                let mut attributes: Vec<AttributeSpecification> = Vec::new();
+
+                attributes.clear();
                 loop {
                     let name = reader.read_uleb128_u16_or_zero();
                     let form = reader.read_uleb128_u16_or_zero();
@@ -944,16 +959,27 @@ pub fn list_units(dwarf: &mut Dwarf<DwarfSlice>, binary_name: &str, layouts: All
                     attributes.push(AttributeSpecification {name: DwAt(name), form: DwForm(form), implicit_const_value});
                 }
 
-                let mut actions = [AbbreviationActions::default(), AbbreviationActions::default(), AbbreviationActions::default()];
-                if let Some(layout_idx) = shared.layouts.find(tag) {
-                    actions[0] = prepare_abbreviation_actions(&attributes, layout_idx, encoding, &mut shared)?;
-                }
-                if let Some(layout_idx) = shared.layouts.find_secondary(tag) {
-                    actions[1] = prepare_abbreviation_actions(&attributes, layout_idx, encoding, &mut shared)?;
-                }
-                actions[2] = prepare_abbreviation_actions(&attributes, shared.layouts.empty_layout_idx, encoding, &mut shared)?;
+                let abbrev_slice = &abbrev_slice[..reader.offset_from(abbrev_slice)];
+                let abbrev_idx = match abbrev_dedup.entry(abbrev_slice) {
+                    Entry::Occupied(o) => *o.get(),
+                    Entry::Vacant(v) => {
+                        let mut actions = [AbbreviationActions::default(), AbbreviationActions::default(), AbbreviationActions::default()];
+                        if let Some(layout_idx) = shared.layouts.find(tag) {
+                            actions[0] = prepare_abbreviation_actions(&attributes, layout_idx, encoding, &mut shared)?;
+                        }
+                        if let Some(layout_idx) = shared.layouts.find_secondary(tag) {
+                            actions[1] = prepare_abbreviation_actions(&attributes, layout_idx, encoding, &mut shared)?;
+                        }
+                        actions[2] = prepare_abbreviation_actions(&attributes, shared.layouts.empty_layout_idx, encoding, &mut shared)?;
 
-                vec.push(Abbreviation {code, tag, has_children: has_children != 0, actions});
+                        let idx = shared.abbreviations_pool.len();
+                        shared.abbreviations_pool.push(Abbreviation {tag, has_children: has_children != 0, actions});
+                        v.insert(idx);
+                        idx
+                    }
+                };
+
+                shared.code_to_idx_pool.push((code, abbrev_idx));
 
                 if code != prev_code + 1 {
                     consecutive = false;
@@ -965,22 +991,21 @@ pub fn list_units(dwarf: &mut Dwarf<DwarfSlice>, binary_name: &str, layouts: All
             }
             reader.check()?;
 
+            let code_to_idx = code_to_idx_start..shared.code_to_idx_pool.len();
+
             if !sorted {
-                vec.sort_unstable_by_key(|a| a.code);
-                for i in 0..vec.len()-1 {
-                    if vec[i].code == vec[i+1].code {
-                        return err!(Dwarf, "duplicate abbreviation code: {}", vec[i].code);
+                let slice = &mut shared.code_to_idx_pool[code_to_idx.clone()];
+                slice.sort_unstable_by_key(|a| a.0);
+                for i in 0..slice.len()-1 {
+                    if slice[i].0 == slice[i+1].0 {
+                        return err!(Dwarf, "duplicate abbreviation code: {}", slice[i].0);
                     }
                 }
             }
             all_consecutive &= consecutive;
-            let set = AbbreviationSet {vec, consecutive};
+
+            let set = AbbreviationSet {code_to_idx, consecutive};
             for i in off_start+1..off_end {
-                // Instead of copying the array here, we could use something like Arc (like gimli does). But in one executable I looked at,
-                // almost all abbreviation sets were unique, so the deduplication is probably not worth the added indirection on lookup.
-                // TODO: A more promising deduplication would be at individual abbreviation granularity: individual abbreviations are duplicated ~10x,
-                //       so it may make sense to put unique abbreviations in an array and make AbbreviationSet have u32 indices instead of Abbreviation-s.
-                //       It's an extra indirection on lookup, but the whole data structure becomes much smaller and more likely to fit in cache. May or may not be net faster, need to test.
                 unit_headers[abbrev_offsets[i].1].1 = set.clone();
             }
             unit_headers[abbrev_offsets[off_start].1].1 = set;
@@ -1227,9 +1252,10 @@ fn prepare_attribute_action(attr: AttributeSpecification, layout: &AttributeStru
     let mut found_name = false;
     for i in 0..layout.fields.len() {
         let &(field_offset, attr_name, attr_type) = &layout.fields[i];
-        if attr.name != attr_name {
+        if attr_name != attr.name{
             continue;
         }
+
         found_name = true;
         let mut found_match = true;
         let mut form = attr.form;
@@ -1382,14 +1408,14 @@ fn prepare_attribute_action(attr: AttributeSpecification, layout: &AttributeStru
 
 fn prepare_abbreviation_actions(attributes: &[AttributeSpecification], layout_idx: usize, encoding: Encoding, shared: &mut AbbreviationsSharedData) -> Result<AbbreviationActions> {
     let mut flags_value = 0u32;
-    let mut actions: Vec<AttributeAction> = Vec::new();
+    let actions_start = shared.actions_pool.len();
     let layout = &shared.layouts.layouts[layout_idx].1;
 
     for attr in attributes {
         if attr.form == DW_FORM_indirect {
             // DW_FORM_indirect is annoying and almost never used, so we don't have to support it. But we support it.
             // Defer the prepare_attribute_action() call till parsing time.
-            actions.push(AttributeAction {form: DW_FORM_indirect, field_offset: u32::MAX, param: layout_idx << 16 | attr.name.0 as usize});
+            shared.actions_pool.push(AttributeAction {form: DW_FORM_indirect, field_offset: u32::MAX, param: layout_idx << 16 | attr.name.0 as usize});
             continue;
         }
 
@@ -1398,15 +1424,20 @@ fn prepare_abbreviation_actions(attributes: &[AttributeSpecification], layout_id
             if action.param == 0 {
                 continue;
             }
-            if actions.last().is_some_and(|a| a.form == DW_EXTRA_FORM_skip_bytes) {
-                actions.last_mut().unwrap().param += action.param;
+            if shared.actions_pool.len() > actions_start && shared.actions_pool.last().unwrap().form == DW_EXTRA_FORM_skip_bytes {
+                shared.actions_pool.last_mut().unwrap().param += action.param;
                 continue;
             }
         }
-        actions.push(action);
+        shared.actions_pool.push(action);
     }
 
-    Ok(AbbreviationActions {flags_offset: layout.flags_offset, flags_value, actions})
+    let actions_end = shared.actions_pool.len();
+    if actions_end > u32::MAX as usize {
+        return err!(Sanity, "more than 2^32 total attributes in abbreviations");
+    }
+
+    Ok(AbbreviationActions {flags_offset: layout.flags_offset, flags_value, actions: actions_start as u32 .. actions_end as u32})
 }
 
 // The input must have at least 15 readable bytes after the end of the string (we're reading in blocks of 16 bytes).

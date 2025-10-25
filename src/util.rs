@@ -686,3 +686,47 @@ pub unsafe fn memcpy_struct<'a, T: Copy>(a: &'a [u8], name: &'static str) -> Res
         Ok((t.assume_init(), &a[sizeof..]))
     }
 }
+
+// Adapter for voracious_radix_sort's questionable API.
+// Example:
+//   // at global scope:
+//   radix_sort_key!(Foo, FooSortByCuteness, usize, {x.cuteness})
+//   // to sort:
+//   FooSortByCuteness::sort(&mut my_array_of_foos);
+// This currently requires Copy, for no good reason.
+// TODO: The Copy requirement prevents us from using this in a few places where it may be useful, e.g. TypesLoadingShard::offset_map and sort_die_to_function.
+//       Maybe get rid of voracious_radix_sort and make our own.
+#[macro_export]
+macro_rules! radix_sort_key {
+    ($src:ty, $name:ident, $key:ty, |$x:ident| $($body:tt)*) => {
+        #[repr(transparent)]
+        #[derive(Clone, Copy)]
+        struct $name($src);
+        impl $name {
+            fn radix_key(&self) -> $key {
+                (|$x: &$src| -> $key { $($body)* })(&self.0)
+            }
+            fn sort(arr: &mut [$src]) {
+                use voracious_radix_sort::RadixSort;
+                // Hope this is not UB.
+                unsafe {slice::from_raw_parts_mut(arr.as_mut_ptr().cast::<$name>(), arr.len()).voracious_sort();}
+            }
+        }
+        impl voracious_radix_sort::Radixable<$key> for $name {
+            type Key = $key;
+            fn key(&self) -> $key {
+                self.radix_key()
+            }
+        }
+        impl core::cmp::Ord for $name {
+            fn cmp(&self, other: &Self) -> core::cmp::Ordering { self.radix_key().cmp(&other.radix_key()) }
+        }
+        impl core::cmp::PartialOrd for $name {
+            fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> { Some(self.cmp(other)) }
+        }
+        impl core::cmp::PartialEq for $name {
+            fn eq(&self, other: &Self) -> bool { self.radix_key() == other.radix_key() }
+        }
+        impl core::cmp::Eq for $name {}
+    };
+}

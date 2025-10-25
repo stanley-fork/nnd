@@ -6,7 +6,7 @@ documentation = "https://github.com/al13n321/nnd"
 repository = "https://github.com/al13n321/nnd"
 keywords = ["debugger", "tui"]
 categories = ["development-tools::debugging"]
-version = "0.56.0" # [[this version number is written by release.sh]]
+version = "0.57.0" # [[this version number is written by release.sh]]
 edition = "2021" # I tried updating to 2024, but it just makes build 10% slower without making the resulting executable any faster
 rust-version = "1.89" # build often breaks when updating the compiler because of newly added warnings
 
@@ -16,7 +16,6 @@ opt-level = 1
 
 [profile.release]
 panic = 'abort'
-#debug = true
 
 [profile.dbgo]
 inherits = "release"
@@ -24,11 +23,15 @@ debug = true
 debug-assertions = true
 overflow-checks = true
 
+[profile.release-with-debug-info]
+inherits = "release"
+debug = true
+
 [dependencies]
 libc = "0.2.146" # syscall wrappers
 iced-x86 = {version = "1.19", default-features = false, features = ["std", "decoder", "instr_info", "nasm"]} # disassember
 bitflags = "^1.3" # TODO: update to 2.*
-gimli = {version = "^0.31.1", default-features = false, features = ["std", "read"]} # for parsing DWARF; takes forever to compile, maybe we should roll our own parsing
+gimli = {version = "^0.31.1", default-features = false, features = ["std", "read"]} # TODO: remove the remaining usage (e.g. evaluating line number programs and dwarf expressions) and delet dis
 #gimli = {path = "/home/al13n/Dropbox/coding/gimli"}
 crc32fast = "^1.3.2" # a few things in ELF and DWARF use crc32
 flate2 = "^1.0.26" # for decompressing ELF sections
@@ -40,8 +43,9 @@ unicode-segmentation = "^1.10"
 unicode-width = "^0.1"
 rustc-demangle = "^0.1"
 # HTTP+TLS client for downloading from debuginfod. This accounts for more than half of the dependency tree (see `cargo tree`)
-# and adds the only non-cargo dependency: musl-tools (use e.g. `apt install musl-tools`). But I couldn't find anything better :(
+# and adds the only non-cargo dependency: musl-tools (use e.g. `apt install musl-tools`). But I couldn't find anything smaller :(
 ureq = "^3.0"
+voracious_radix_sort = "^1.2"
 
 [dev-dependencies]
 gimli = {version = "^0.31.1", default-features = false, features = ["std", "read", "write"]}

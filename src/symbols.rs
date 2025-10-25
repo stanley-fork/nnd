@@ -1,8 +1,8 @@
 use crate::{*, error::{*, Result, Error}, util::*, elf::*, procfs::*, range_index::*, registers::*, log::*, arena::*, types::*, expr::{*, Value}, dwarf::*, os::*};
-use std::{cmp, str, mem, rc::Rc, fs::File, path::{Path, PathBuf}, sync::atomic::{AtomicUsize, Ordering, AtomicBool}, sync::{Arc, Mutex}, collections::{HashMap, hash_map::{Entry, DefaultHasher}}, hash::{Hash, Hasher}, ffi::OsStr, os::unix::ffi::OsStrExt, io, io::{Read, Write as ioWrite}, fmt::Write, time::{Instant, Duration}, ptr, slice, fmt, borrow::Cow, thread, io::BufRead, hint};
+use std::{cmp, str, mem, rc::Rc, fs::File, path::{Path, PathBuf}, sync::atomic::{AtomicUsize, Ordering, AtomicBool}, sync::{Arc, Mutex}, collections::{HashMap, hash_map::{Entry, DefaultHasher}}, hash::{Hash, Hasher}, ffi::OsStr, os::unix::ffi::OsStrExt, io, io::{Read, Write as ioWrite}, fmt::Write, time::{Instant, Duration}, ptr, slice, fmt, borrow::Cow, thread, io::BufRead, hint, ops::Range};
 use gimli::*;
 use bitflags::*;
-use std::ops::Range;
+use voracious_radix_sort::RadixSort;
 
 // Data structures for the program information: functions, variables, struct fields, etc.
 //
@@ -82,34 +82,34 @@ pub struct SymbolsShard {
     // Doesn't include inlined function call sites.
     // Expect tens of millions of these.
     // This takes ~60% more memory than the corresponding .debug_line section, but the conversion is pretty fast (compared to .debug_info).
-    pub addr_to_line: Vec<LineInfo>,
+    pub addr_to_line: BigVec<LineInfo>,
 
     // Line number to addresses, for adding breakpoints.
-    // Includes both regular line numbers and inlined function call sites. For inlined call sites, includes subfunction_level, for regular line numbers it's u16::MAX.
+    // Includes both regular line numbers and inlined function call sites. For inlined call sites, includes subfunction_level, for regular line numbers it's SUBFUNCTION_LEVEL_MAX.
     // For .debug_line, includes only entries marked as "statement", i.e. recommended breakpoint addresses.
     // Sorted by (file_idx, line, column).
-    pub line_to_addr: Vec<(LineInfo, /*subfunction_level*/ u16)>,
+    pub line_to_addr: BigVec<LineInfo>,
 
     pub types: Types,
 
     // Functions and inlined function calls.
-    pub subfunctions: Vec<Subfunction>,
+    pub subfunctions: BigVec<Subfunction>,
     // Indices in `subfunctions` of boundaries between sorted runs of ranges corresponding to one function+level.
     // Normally accessed through FunctionInfo.subfunction_levels, which points to a slice of this array.
     // With that slice in hand, subfunctions[slice[i]..slice[i+1]] are the sorted ranges at level i within the function.
     // Length of the slice is number of levels + 1.
-    pub subfunction_levels: Vec<usize>,
+    pub subfunction_levels: BigVec<usize>,
 
     // (Used only for restoring tabs in disassembly window after restart. They're matched by name in case the executabe was recompiled, and addresses and DIE offsets changed.
     //  Unfortunate that we have to spend time and memory on building this whole map just for that minor feature, but I don't have better ideas. This adds ~3s/num_cores to load time.)
-    pub mangled_name_to_function: Vec<(&'static [u8], FunctionAddr, /*idx in Symbols.functions*/ usize)>,
+    pub mangled_name_to_function: BigVec<(&'static [u8], FunctionAddr, /*idx in Symbols.functions*/ usize)>,
 
     pub misc_arena: Arena,
 
     // "Local" variables, by which we mean variables that should show up in the local variables window when the instruction pointer is in the correct range.
     // Includes static variables inside functions, but with address range clamped to the function's address range - we want
     // the variable to automatically show up in the UI only if we're in that function, not all the time.
-    pub local_variables: Vec<Variable>,
+    pub local_variables: BigVec<Variable>,
 
     pub global_variables: Arena, // array of Variable-s (need stable pointers)
     // Id is *const Variable, can be in different shard.
@@ -168,7 +168,7 @@ pub struct Symbols {
     // We assume that functions' address ranges cover the whole .text section and don't overlap, so we only store start address for each range
     // and assume that each range ends where the next one begins. This assumption is also useful for .symtab, which seems to lack reliable range length information
     // (the information is there, but it's often incorrect).
-    pub functions: Vec<FunctionInfo>,
+    pub functions: BigVec<FunctionInfo>,
 
     pub shards: Vec<SymbolsShard>,
 
@@ -505,6 +505,8 @@ impl FileVersionInfo {
     }
 }
 
+pub const SUBFUNCTION_LEVEL_MAX: u16 = (1 << 12) - 1; // keep in sync with LineInfo
+
 bitflags! { pub struct LineFlags: usize {
     // In addr_to_line: end of inlined function.
     // In line_to_addr: start of inlined function.
@@ -516,70 +518,72 @@ bitflags! { pub struct LineFlags: usize {
     // (I didn't find a way to reliably tell whether a non-statement line info is garbage or not, but I didn't look very thoroughly.)
     const STATEMENT = 0x2;
 }}
-const LINE_FLAGS_BITS: u32 = 2;
 
-// A machine code location + source code location: address, file, line number, column number.
+// A machine code location + source code location: address, file, line number, column number, subfunction level (in line_to_addr only), some flags.
+// May come from two sources: .debug_line and inlined function call sites.
+// In practice there can be a hundred million of these, occupying 1.5 GB, so it's important to keep this struct compact.
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct LineInfo {
-    // There are tens of millions of instances of this struct, so it's important to make it compact.
-    // Currently we bit-pack things into 128 bits like this:
-    //   48 bits - address
-    //   16 bits - column number
-    //   31 bits - file idx; MAX means this is an end-of-sequence marker, not a real line info
-    //   1 bit   - LineFlags
-    //   32 bits - line number
-    // (If some of these get exceeded in practice, or if it takes too much memory, feel free to redistribute the bits or rethink the whole thing. E.g.:
-    //  * code could be split into 64 KB pages, with each page having its own addr -> everything indexes, making all addresses 16-bit,
-    //  * we could do a pre-pass to get max line number for each file, then use a common numbering for all lines of all files, as if the files were all concatenated into one;
-    //    or just redistribute the bits here dynamically based on how many files there are etc,
-    //  * instead of copying all line number information out of DWARF, we could store sparse checkpoints into DWARF's line number programs; note that the state of
-    //    line number "program" execution is just the gimli::read::LineRow struct, and the whole thing is pretty simple if you read the gimli code around it,
-    //    so this seems very doable if needed; (I'm guessing what people usually do is have an index of "sequences" (DWARF term), but those can be >100k rows, so we should split them up, which is easy;)
-    //    I went with the copy-everything-out approach to make it easier to support other platforms or split-DWARF in future if needed.)
-    pub data: [usize; 2],
+    // Currently packed like this:
+    //   data[0]:
+    //     48 bits - address
+    //     14 bits - column number
+    //      2 bits - LineFlags
+    //   data[1]:
+    //     26 bits - file idx; MAX means this is an end-of-sequence marker, not a real line info
+    //     26 bits - line number
+    //     12 bits - subfunction level
+    data: [usize; 2],
 }
 
 static PRINTED_LINE_INFO_OVERFLOW_WARNING: AtomicUsize = AtomicUsize::new(0);
 
-const LINE_FILE_IDX_MAX: usize = u32::MAX as usize >> LINE_FLAGS_BITS;
-
 impl LineInfo {
-    pub fn new(addr: usize, file_idx: Option<usize>, mut line: usize, mut column: usize, flags: LineFlags) -> Result<LineInfo> {
+    const NO_FILE_IDX: usize = (1 << 26) - 1;
+
+    pub fn new(addr: usize, file_idx: Option<usize>, mut line: usize, mut column: usize, flags: LineFlags, subfunction_level: u16) -> Result<LineInfo> {
+        let subfunction_level = subfunction_level.min(SUBFUNCTION_LEVEL_MAX);
         let file_idx = match file_idx {
-            None => LINE_FILE_IDX_MAX,
-            Some(i) if i >= LINE_FILE_IDX_MAX => return err!(NotImplemented, "unsupportedly many files: {}", i),
+            None => Self::NO_FILE_IDX,
+            Some(i) if i >= Self::NO_FILE_IDX => return err!(NotImplemented, "unsupportedly many files: {}", i),
             Some(i) => i };
         if addr >= 1 << 48 { return err!(NotImplemented, "unsupportedly high address: {}", addr); }
-        if line >= 1usize << 32 || column >= 1usize << 16 {
+        if line >= 1usize << 26 || column >= 1usize << 14 {
             if PRINTED_LINE_INFO_OVERFLOW_WARNING.fetch_add(1, Ordering::SeqCst) < 5 {
-                eprintln!("warning: line number ({}) or column number ({}) is too high and will be clamped (to 32 and 16 bits respectively)", line, column);
-                line = line.min((1usize << 32) - 1);
-                column = column.min((1usize << 16) - 1);
+                eprintln!("warning: line number ({}) or column number ({}) is too high and will be clamped (to 26 and 14 bits respectively)", line, column);
             }
+            line = line.min((1usize << 26) - 1);
+            column = column.min((1usize << 14) - 1);
         }
-        Ok(LineInfo {data: [(addr << 16) | column, file_idx << (32 + LINE_FLAGS_BITS) | flags.bits() << 32 | line]})
+        Ok(LineInfo {data: [(addr << 16) | (column << 2) | flags.bits(), (file_idx << 38) | (line << 12) | (subfunction_level as usize)]})
     }
     pub fn invalid() -> Self { Self {data: [usize::MAX, usize::MAX]} }
 
-    pub fn addr(&self) -> usize { self.data[0] >> 16 }
-    pub fn line(&self) -> usize { self.data[1] & 0xffffffff }
-    pub fn column(&self) -> usize { self.data[0] & 0xffff }
-    pub fn flags(&self) -> LineFlags { LineFlags::from_bits_truncate(self.data[1] >> 32) }
-    pub fn set_flag(&mut self, f: LineFlags) { self.data[1] |= f.bits() << 32; }
-    pub fn unset_flag(&mut self, f: LineFlags) { self.data[1] &= !(f.bits() << 32); }
-    pub fn set_line_and_column_from(&mut self, from: LineInfo) { self.data[0] = (self.data[0] & !0xffff) | (from.data[0] & 0xffff); self.data[1] = (self.data[1] & !0xffffffff) | (from.data[1] & 0xffffffff); }
+    // (Wrappers just to make it hard to accidentally rely on LineInfo bit layout in some random part of the code, then forget to update that code when changing the bit layout.)
+    pub fn serialize(self) -> [usize; 2] {self.data.clone()}
+    pub fn deserialize(data: [usize; 2]) -> Self { Self {data} }
 
+    pub fn addr(&self) -> usize { self.data[0] >> 16 }
+    pub fn column(&self) -> usize { (self.data[0] >> 2) & ((1 << 14) - 1) }
+    pub fn flags(&self) -> LineFlags { LineFlags::from_bits_truncate(self.data[0] & ((1 << 2) - 1)) }
     pub fn file_idx(&self) -> Option<usize> {
-        let r = self.data[1] >> (32 + LINE_FLAGS_BITS);
-        if r == LINE_FILE_IDX_MAX as usize {
+        let r = self.data[1] >> 38;
+        if r == Self::NO_FILE_IDX {
             None
         } else {
             Some(r)
         }
     }
+    pub fn line(&self) -> usize { (self.data[1] >> 12) & ((1 << 26) - 1) }
+    pub fn subfunction_level(&self) -> u16 { (self.data[1] & ((1 << 14) - 1)) as u16 }
 
-    pub fn equals(self, other: Self, use_line_number_with_column: bool) -> bool {
-        self.file_idx() == other.file_idx() && self.line() == other.line() && (!use_line_number_with_column || self.column() == other.column())
+    pub fn set_flag(&mut self, f: LineFlags) { self.data[0] |= f.bits(); }
+    pub fn unset_flag(&mut self, f: LineFlags) { self.data[0] &= !f.bits(); }
+    pub fn set_line_and_column_from(&mut self, from: LineInfo) {
+        let col_bits = (1 << 16) - (1 << 2);
+        self.data[0] = (self.data[0] & !col_bits) | (from.data[0] & col_bits);
+        let line_bits = (1 << 38) - (1 << 12);
+        self.data[1] = (self.data[1] & !line_bits) | (from.data[1] & line_bits);
     }
 
     pub fn with_addr(mut self, addr: usize) -> Self {
@@ -587,30 +591,44 @@ impl LineInfo {
         self
     }
     pub fn with_addr_and_flags(mut self, addr: usize, flags: LineFlags) -> Self {
-        self.data[0] = (self.data[0] & 0xffff) | (addr << 16);
-        self.data[1] = self.data[1] & !(LineFlags::all().bits() << 32) | (flags.bits() << 32);
+        self.data[0] = (self.data[0] & ((1 << 16) - (1 << 2))) | (addr << 16) | flags.bits();
         self
+    }
+    pub fn with_subfunction_level(mut self, subfunction_level: u16) -> Self {
+        let subfunction_level = subfunction_level.min(SUBFUNCTION_LEVEL_MAX);
+        self.data[1] = (self.data[1] & ((1 << 12) - 1)) | (subfunction_level as usize);
+        self
+    }
+
+    pub fn equals(self, other: Self, use_line_number_with_column: bool) -> bool {
+        self.file_idx() == other.file_idx() && self.line() == other.line() && (!use_line_number_with_column || self.column() == other.column())
     }
 
     // Sorting key equivalent to (file, line, column, addr)
     pub fn file_line_column_addr(&self) -> [usize; 2] {
-        [self.data[1] & !(LineFlags::all().bits() << 32), self.data[0] << 48 | self.data[0] >> 16]
+        [self.data[1] & !((1 << 12) - 1), ((self.data[0] >> 2) << (48 + 2)) | self.data[0] >> 16]
     }
+
     // Sorting key equivalent to (addr(), file_idx().is_none(), line() == 0, flags().contains(INLINED_FUNCTION)).
     // Used when sorting addr_to_line. addr() is for sorting, everything else is deduplication priority.
     // In particular:
     //  * An address range may start where another one ends (file_idx().is_none()) - keep the start, discard the end marker.
     //  * An inlined function end (from .debug_info) may clash with an explicit line number information row (from .debug_line) - keep the explicit one.
     //  * ... except the case when the row in .debug_line is missing the line number, which does happen, ugh.
-    pub fn addr_filenone_linebad_inlined(&self) -> (usize, bool, bool, bool) {
-        (self.data[0] & 0xffffffffffff0000, self.data[1] == LINE_FILE_IDX_MAX as usize, self.line() == 0, (self.data[1] >> 32) & LineFlags::INLINED_FUNCTION.bits() != 0)
+    pub fn addr_filenone_linebad_inlined(&self) -> usize {
+        let k = self.data[0] & 0xffffffffffff0000;
+        let a = (self.data[1] >> 38) == Self::NO_FILE_IDX;
+        let b = self.line() == 0;
+        let c = self.data[0] & LineFlags::INLINED_FUNCTION.bits() != 0;
+        k | (a as usize) << 2 | (b as usize) << 1 | (c as usize)
     }
 }
 impl fmt::Debug for LineInfo {
     fn fmt(&self, f: &mut fmt::Formatter) -> std::result::Result<(), fmt::Error> {
-        write!(f, "(f{:?},l{},c{},a{},f{:?})", self.file_idx(), self.line(), self.column(), self.addr(), self.flags())
+        write!(f, "(fi{:?},l{},c{},a{},fu{:?},sf{:?})", self.file_idx(), self.line(), self.column(), self.addr(), self.flags(), self.subfunction_level())
     }
 }
+radix_sort_key!(LineInfo, LineInfoSortByAddr, usize, |x| x.addr_filenone_linebad_inlined());
 
 #[derive(Clone)]
 pub struct VTableInfo {
@@ -723,7 +741,7 @@ impl Symbols {
     pub fn containing_subfunction_at_level(&self, addr: usize, level: u16, function: &FunctionInfo) -> Option<(/*subfunction_idx*/ usize, /*level*/u16)> {
         let shard = &self.shards[function.shard_idx()];
         let levels = &shard.subfunction_levels[function.subfunction_levels.clone()];
-        let range = if level == u16::MAX {
+        let range = if level >= SUBFUNCTION_LEVEL_MAX {
             0..function.num_levels()
         } else {
             assert!(levels.len() > level as usize + 1);
@@ -794,20 +812,20 @@ impl Symbols {
     }
 
     // If the given line has no addresses, returns the next line that has.
-    pub fn line_to_addrs(&self, file_idx: usize, line_number: usize, only_statements: bool) -> std::result::Result<Vec<(LineInfo, /*subfunction_level*/ u16)>, Option<usize>> {
-        let mut res: Vec<(LineInfo, u16)> = Vec::new();
+    pub fn line_to_addrs(&self, file_idx: usize, line_number: usize, only_statements: bool) -> std::result::Result<Vec<LineInfo>, Option<usize>> {
+        let mut res: Vec<LineInfo> = Vec::new();
         let mut min_line = usize::MAX;
         for s in &self.shards {
-            let mut idx = s.line_to_addr.partition_point(|l| (l.0.file_idx().unwrap(), l.0.line()) < (file_idx, line_number));
-            while idx < s.line_to_addr.len() && only_statements && !s.line_to_addr[idx].0.flags().contains(LineFlags::STATEMENT) {
+            let mut idx = s.line_to_addr.partition_point(|l| (l.file_idx().unwrap(), l.line()) < (file_idx, line_number));
+            while idx < s.line_to_addr.len() && only_statements && !s.line_to_addr[idx].flags().contains(LineFlags::STATEMENT) {
                 idx += 1;
             }
-            if idx < s.line_to_addr.len() && s.line_to_addr[idx].0.file_idx() == Some(file_idx) {
-                min_line = min_line.min(s.line_to_addr[idx].0.line());
+            if idx < s.line_to_addr.len() && s.line_to_addr[idx].file_idx() == Some(file_idx) {
+                min_line = min_line.min(s.line_to_addr[idx].line());
             }
-            while idx < s.line_to_addr.len() && s.line_to_addr[idx].0.file_idx() == Some(file_idx) && s.line_to_addr[idx].0.line() == line_number {
-                if !only_statements || s.line_to_addr[idx].0.flags().contains(LineFlags::STATEMENT) {
-                    res.push(s.line_to_addr[idx].clone());
+            while idx < s.line_to_addr.len() && s.line_to_addr[idx].file_idx() == Some(file_idx) && s.line_to_addr[idx].line() == line_number {
+                if !only_statements || s.line_to_addr[idx].flags().contains(LineFlags::STATEMENT) {
+                    res.push(s.line_to_addr[idx]);
                 }
                 
                 idx += 1;
@@ -828,9 +846,9 @@ impl Symbols {
             Some(i) => *i,
             None => return res };
         for s in &self.shards {
-            let mut i = s.line_to_addr.partition_point(|l| l.0.file_idx().unwrap() < file_idx);
-            while i < s.line_to_addr.len() && s.line_to_addr[i].0.file_idx().unwrap() == file_idx {
-                res.push(s.line_to_addr[i].0.clone());
+            let mut i = s.line_to_addr.partition_point(|l| l.file_idx().unwrap() < file_idx);
+            while i < s.line_to_addr.len() && s.line_to_addr[i].file_idx().unwrap() == file_idx {
+                res.push(s.line_to_addr[i]);
                 i += 1;
             }
         }
@@ -1056,7 +1074,7 @@ impl SymbolsLoader {
 
         let (types_loader, types_shards) = TypesLoader::create(num_shards);
         let mut shards: Vec<SymbolsLoaderShard> = types_shards.into_iter().map(|types| SymbolsLoaderShard {
-            sym: SymbolsShard {addr_to_line: Vec::new(), line_to_addr: Vec::new(), types: Types::new(), misc_arena: Arena::new(), local_variables: Vec::new(), global_variables: Arena::new(), sorted_global_variable_names: StringTable::new(), subfunctions: Vec::new(), subfunction_levels: Vec::new(), mangled_name_to_function: Vec::new()},
+            sym: SymbolsShard {addr_to_line: BigVec::new(), line_to_addr: BigVec::new(), types: Types::new(), misc_arena: Arena::new(), local_variables: BigVec::new(), global_variables: Arena::new(), sorted_global_variable_names: StringTable::new(), subfunctions: BigVec::new(), subfunction_levels: BigVec::new(), mangled_name_to_function: BigVec::new()},
             addr_to_line_len_after_debug_line: 0,
             units: Vec::new(), symtab_ranges: Vec::new(), file_dedup: Vec::new(), file_used_lines: Vec::new(), types, base_types: Vec::new(), functions: Vec::new(), subfunctions_need_fixup: Vec::new(), vtables: Vec::new(), points_of_interest: HashMap::new(),
             temp_global_var_arena: Arena::new(), max_function_end: 0, functions_before_dedup: 0, warn: Limiter::new()}).collect();
@@ -1117,7 +1135,7 @@ impl SymbolsLoader {
 
         prepare_time_per_stage_ns[0] = start_time.elapsed().as_nanos() as usize;
         Ok(SymbolsLoader {
-            num_shards: shards.len(), binary_id, sym: Symbols {elves, dwarf, units, files: Vec::new(), file_paths: StringTable::new(), path_to_used_file: HashMap::new(), functions: Vec::new(), shards: Vec::new(), builtin_types: BuiltinTypes::invalid(), base_types: Vec::new(), vtables: Vec::new(), points_of_interest: HashMap::new(), loading_duration_ns: 0, loading_memory_usage: None, code_addr_range},
+            num_shards: shards.len(), binary_id, sym: Symbols {elves, dwarf, units, files: Vec::new(), file_paths: StringTable::new(), path_to_used_file: HashMap::new(), functions: BigVec::new(), shards: Vec::new(), builtin_types: BuiltinTypes::invalid(), base_types: Vec::new(), vtables: Vec::new(), points_of_interest: HashMap::new(), loading_duration_ns: 0, loading_memory_usage: None, code_addr_range},
             shards: shards.into_iter().map(|s| SyncUnsafeCell::new(CachePadded::new(s))).collect(), die_to_function_shards: (0..num_shards).map(|_| SyncUnsafeCell::new(CachePadded::new(Vec::new()))).collect(), types: types_loader, send_global_variable_names, strtab_symtab, status, progress_per_stage,
             abbreviations_shared, prepare_time_per_stage_ns, run_time_per_stage_ns, shard_progress_ppm: (0..num_shards).map(|_| CachePadded::new(AtomicUsize::new(0))).collect(), stage: 0, types_before_dedup: 0, type_offsets: 0, type_offset_maps_bytes: 0, type_dedup_maps_bytes: 0})
     }
@@ -1178,13 +1196,13 @@ impl SymbolsLoader {
             2 => {
                 let shard = unsafe {&mut *self.shards[shard_idx].get()};
                 self.parse_debug_line(shard)?;
-                // We sort addr_to_line twice: before and after parsing .debug_info, because fixup_subfunction_line() needs to do lookup in the information from .debug_line.
-                self.sort_addr_to_line(shard, /*finalize*/ false);
+                // We sort addr_to_line twice: before and after parsing .debug_info, because fixup_subfunction_call_line() needs to do lookup in the information from .debug_line.
+                self.sort_addr_to_line(shard_idx, shard, /*finalize*/ false);
                 self.parse_dwarf(shard_idx, shard)?;
                 self.parse_symtab(shard_idx, shard)?;
                 self.sort_functions(shard);
-                self.sort_addr_to_line(shard, /*finalize*/ true);
-                self.sort_line_to_addr(shard);
+                self.sort_addr_to_line(shard_idx, shard, /*finalize*/ true);
+                self.sort_line_to_addr(shard_idx, shard);
             }
             3 => {
                 let shard = unsafe {&mut *self.shards[shard_idx].get()};
@@ -1265,7 +1283,7 @@ impl SymbolsLoader {
         for shard in &mut self.shards {
             files.append(&mut mem::take(&mut shard.get_mut().file_dedup));
         }
-        files.sort_unstable_by_key(|f| f.path_hash);
+        files.sort_unstable_by_key(|f| f.path_hash); // (I tried radix sort here, and it was slower for some reason)
         let mut file_idx = 0;
         let mut temp_path = PathBuf::new();
         for (i, file) in files.iter().enumerate() {
@@ -1334,7 +1352,7 @@ impl SymbolsLoader {
 
                 if !skip_current_sequence {
                     let info = if row.end_sequence() {
-                        LineInfo::new(row.address() as usize, None, 0, 0, LineFlags::empty())?
+                        LineInfo::new(row.address() as usize, None, 0, 0, LineFlags::empty(), SUBFUNCTION_LEVEL_MAX)?
                     } else {
                         let file = unit.file_idx_remap.get(row.file_index() as usize).copied(); // if out of bounds (unexpected in practice), just treat it as an end-of-sequence
                         let line = row.line().map_or(0, |x| u64::from(x) as usize);
@@ -1343,7 +1361,7 @@ impl SymbolsLoader {
                             ColumnType::Column(c) => u64::from(c) as usize,
                         };
                         let is_stmt = row.is_stmt() && file.is_some();
-                        LineInfo::new(row.address() as usize, file, line, column, if is_stmt {LineFlags::STATEMENT} else {LineFlags::empty()})?
+                        LineInfo::new(row.address() as usize, file, line, column, if is_stmt {LineFlags::STATEMENT} else {LineFlags::empty()}, SUBFUNCTION_LEVEL_MAX)?
                     };
 
                     let mut skip = false;
@@ -1372,7 +1390,7 @@ impl SymbolsLoader {
                             // Additionally, there's a DW_TAG_inlined_subroutine that starts at the same address.
                             // Notice that:
                             //  * We must not add rows 1-2 (lines 175-176) to line_to_addr with STATEMENT flag.
-                            //    Otherwise setting a breakpoint on line 176 would be broken: the breakpoint will have subfunction_level = u16::MAX,
+                            //    Otherwise setting a breakpoint on line 176 would be broken: the breakpoint will have subfunction_level = SUBFUNCTION_LEVEL_MAX,
                             //    so when it's hit we'll select the inner subframe of the stack trace, which is inside the inlined function on line 26 instead of 176.
                             //    (The breakpoint instead should be set using the LineInfo produced by DW_TAG_inlined_subroutine, which has subfunction_level = 0.)
                             //  * We must add at most one of the rows 3-4 (lines 25-26) to line_to_addr. If we add both, they'll be highlighted in the source code, as if there are two places control can stop;
@@ -1388,13 +1406,13 @@ impl SymbolsLoader {
                                 shard.sym.addr_to_line.pop();
                             } else {
                                 skip = true;
-                                assert!(shard.sym.line_to_addr.last().is_some_and(|(p, _)| p.addr() == row.address() as usize));
+                                assert!(shard.sym.line_to_addr.last().is_some_and(|p| p.addr() == row.address() as usize));
                                 if info.file_idx().is_none() {
                                     // `prev` covers an address range of length 0. We're not interested in that.
                                     shard.sym.line_to_addr.pop();
                                     *shard.sym.addr_to_line.last_mut().unwrap() = info;
                                 } else if info.flags().contains(LineFlags::STATEMENT) >= prev.flags().contains(LineFlags::STATEMENT) {
-                                    *shard.sym.line_to_addr.last_mut().unwrap() = (info, u16::MAX);
+                                    *shard.sym.line_to_addr.last_mut().unwrap() = info;
                                     *shard.sym.addr_to_line.last_mut().unwrap() = info;
                                 } else {
                                     // `prev` is a statement, and `info` is not. Keep `prev`.
@@ -1404,7 +1422,7 @@ impl SymbolsLoader {
                     }
                     if !skip {
                         if info.file_idx().is_some() {
-                            shard.sym.line_to_addr.push((info.clone(), u16::MAX));
+                            shard.sym.line_to_addr.push(info);
                         }
                         shard.sym.addr_to_line.push(info);
                     }
@@ -1424,11 +1442,11 @@ impl SymbolsLoader {
         // If a function starts at the same address as another function ends, the real function should come first (to discard the end marker).
         // If a function is present both in .symtab and .debug_info, the .debug_info function should come first (to discard the other one).
         (f.addr.0 << 2) | ((f.flags.contains(FunctionFlags::SENTINEL) as usize) << 1) | f.flags.contains(FunctionFlags::SYMTAB) as usize
-    }
-    
+    }    
+
     fn sort_functions(&self, shard: &mut SymbolsLoaderShard) {
         shard.functions_before_dedup = shard.functions.len();
-        shard.functions.sort_unstable_by_key(Self::function_sorting_key);
+        shard.functions.sort_unstable_by_key(Self::function_sorting_key); // (radix sort might be faster here, but currently that would be inconvenient for bs reason: FunctionInfo doesn't implement Copy)
         shard.functions.dedup_by_key(|f| f.addr);
     }
 
@@ -1455,10 +1473,10 @@ impl SymbolsLoader {
         }
     }
 
-    fn sort_addr_to_line(&self, shard: &mut SymbolsLoaderShard, finalize: bool) {
-        shard.sym.addr_to_line.sort_unstable_by_key(|x| x.addr_filenone_linebad_inlined());
+    fn sort_addr_to_line(&self, shard_idx: usize, shard: &mut SymbolsLoaderShard, finalize: bool) {
+        LineInfoSortByAddr::sort(&mut shard.sym.addr_to_line);
 
-        let mut prev = LineInfo::new(0, None, 0, 0, LineFlags::empty()).unwrap();
+        let mut prev = LineInfo::new(0, None, 0, 0, LineFlags::empty(), 0).unwrap();
         shard.sym.addr_to_line.retain(|l| {
             // Deduplicate. E.g. if a sequence starts at the same address another sequence ends, keep the start and discard the end.
             if l.addr() == prev.addr() {
@@ -1490,10 +1508,10 @@ impl SymbolsLoader {
         }
     }
 
-    fn sort_line_to_addr(&self, shard: &mut SymbolsLoaderShard) {
-        shard.sym.line_to_addr.sort_unstable_by_key(|x| x.0.file_line_column_addr());
+    fn sort_line_to_addr(&self, shard_idx: usize, shard: &mut SymbolsLoaderShard) {
+        shard.sym.line_to_addr.sort_unstable_by_key(|x| x.file_line_column_addr());
 
-        for (l, _) in &shard.sym.line_to_addr {
+        for &l in &shard.sym.line_to_addr {
             if l.line() == 0 || !l.flags().contains(LineFlags::STATEMENT) { // see comment on LineInfo::used_lines
                 continue;
             }
@@ -1630,7 +1648,7 @@ impl SymbolsLoader {
             self.sym.base_types.append(&mut mem::take(&mut shard.get_mut().base_types));
         }
         self.sym.base_types.shrink_to_fit();
-        self.sym.base_types.sort_unstable();
+        self.sym.base_types.voracious_sort();
     }
 
     // Some glue code to compensate for style differences between cpp_demangle output and our synthesized type names.
@@ -1721,7 +1739,7 @@ impl SymbolsLoader {
         let mut sources: Vec<&[FunctionInfo]> = self.shards.iter().map(|s| unsafe {&(*s.get()).functions[..]}).collect();
         sources.push(&additional_functions);
         let mut iter = MergeIterator::new(sources, |f| !Self::function_sorting_key(f));
-        let mut functions: Vec<FunctionInfo> = Vec::new();
+        let mut functions: BigVec<FunctionInfo> = BigVec::new();
         let mut prev_addr = FunctionAddr(usize::MAX);
         while let Some(f) = iter.next() {
             if f.addr != prev_addr {
@@ -1788,12 +1806,10 @@ impl SymbolsLoader {
             let files_before_dedup: usize = self.sym.units.iter().map(|u| u.file_idx_remap.len()).sum();
 
             let mut function_names_len = 0usize;
-            let mut max_subfunction_level = 0usize;
             for f in &self.sym.functions {
                 if f.prev_addr >= f.addr {
                     function_names_len += f.mangled_name().len();
                 }
-                max_subfunction_level = max_subfunction_level.max(f.subfunction_levels.len().saturating_sub(1));
             }
 
             let final_types: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.types.num_types()}).sum();
@@ -2174,7 +2190,7 @@ impl<'a> DwarfLoader<'a> {
 
     fn parse_line_info(shard: &mut SymbolsLoaderShard, loader: &SymbolsLoader, unit: &DwarfUnit, loc: &DwarfCodeLocation) -> LineInfo {
         let Some(&file) = unit.file_idx_remap.get(loc.file) else {return LineInfo::invalid()};
-        match LineInfo::new(0, Some(file), loc.line, loc.column, LineFlags::empty()) {
+        match LineInfo::new(/*addr*/ 0, Some(file), loc.line, loc.column, LineFlags::empty(), SUBFUNCTION_LEVEL_MAX) {
             Ok(x) => x,
             Err(e) => {
                 if shard.warn.check(line!()) { eprintln!("warning: {}", e); }
@@ -2270,21 +2286,28 @@ impl<'a> DwarfLoader<'a> {
                 }
             }
             // If name is not missing, prepend it with parent namespace names.
-            if !demangled {
+            if !demangled && !self.scope_name.is_empty() {
                 self.append_namespace_to_scope_name(unqualified_name, false);
                 var.set_name(self.shard.temp_global_var_arena.add_str(&self.scope_name));
             }
             let name = unsafe {var.name()};
-            let ptr = self.shard.sym.global_variables.add_mut(var) as *mut Variable;
+            if name.is_empty() {
+                // In an executable I'm looking at, debug info has lots of nameless "global variables" for string literals that don't seem to have any global variables in code,
+                // mostly in llvm-project/libcxx/include/vector for some reason. They don't seem useful, and they currently slow down symbols loading a lot
+                // because they get sent to the same shard for sorting (because hash(name) is the same).
+                // So currently we just ignore global variables with no name.
+            } else {
+                let ptr = self.shard.sym.global_variables.add_mut(var) as *mut Variable;
 
-            // Send the name to shard hash(name)%num_shards for deduplication.
-            let hash = hash(name);
-            let target_shard = hash % self.loader.shards.len();
-            unsafe {(*(*self.loader.send_global_variable_names[self.shard_idx].get())[target_shard].get()).push(GlobalVariableNameMessage {name, ptr})};
+                // Send the name to shard hash(name)%num_shards for deduplication.
+                let hash = hash(name);
+                let target_shard = hash % self.loader.shards.len();
+                unsafe {(*(*self.loader.send_global_variable_names[self.shard_idx].get())[target_shard].get()).push(GlobalVariableNameMessage {name, ptr})};
 
-            if stack_flags.contains(StackFlags::IS_TYPE_SCOPE | StackFlags::IS_VALID_SCOPE) {
-                // TODO: This doesn't cover the case when the declaration is separate from definition. The definition has location, the declaration has parent type, we have to somehow join the two.
-                self.type_stack.top_mut().nested_names.push((unqualified_name, NestedName::Variable(ptr)));
+                if stack_flags.contains(StackFlags::IS_TYPE_SCOPE | StackFlags::IS_VALID_SCOPE) {
+                    // TODO: This doesn't cover the case when the declaration is separate from definition. The definition has location, the declaration has parent type, we have to somehow join the two.
+                    self.type_stack.top_mut().nested_names.push((unqualified_name, NestedName::Variable(ptr)));
+                }
             }
         }
 
@@ -3109,14 +3132,14 @@ impl<'a> DwarfLoader<'a> {
                     if f.subfunctions.len() >= u32::MAX as usize - 1 {
                         if self.shard.warn.check(line!()) { eprintln!("function @0x{:x} has more than {} inlined function calls; this is not supported", offset.0, u32::MAX-1); }
                         self.main_stack.top_mut().flags.remove(StackFlags::IS_VALID_SCOPE);
-                    } else if level >= i16::MAX as u16 {
-                        if self.shard.warn.check(line!()) { eprintln!("warning: inlined functions nested > {} levels deep @0x{:x}; this is not supported", i16::MAX - 1, offset.0); }
+                    } else if level >= SUBFUNCTION_LEVEL_MAX {
+                        if self.shard.warn.check(line!()) { eprintln!("warning: inlined functions nested > {} levels deep @0x{:x}; this is not supported", SUBFUNCTION_LEVEL_MAX - 1, offset.0); }
                         self.main_stack.top_mut().flags.remove(StackFlags::IS_VALID_SCOPE);
                     } else {
                         if call_line.file_idx().is_some() && entry_pc != 0 {
                             let mut entry_call_line = call_line.clone().with_addr_and_flags(entry_pc, LineFlags::INLINED_FUNCTION | LineFlags::STATEMENT);
                             Self::fixup_subfunction_call_line(&self.shard, &mut entry_call_line, entry_pc);
-                            self.shard.sym.line_to_addr.push((entry_call_line, level - 1));
+                            self.shard.sym.line_to_addr.push(entry_call_line.with_subfunction_level(level - 1));
                         }
 
                         let sf_idx = f.subfunctions.len() as u32;
@@ -3444,7 +3467,9 @@ pub fn run_load_symbols_tool(path: String, num_threads: usize) -> Result<()> {
     status.cancel.store(true, Ordering::Relaxed);
     progress_thread.join().unwrap();
 
-    hint::black_box(symbols);
+    let start_time = Instant::now();
+    mem::drop(hint::black_box(symbols));
+    println!("deallocation took {}", PrettyDuration(start_time.elapsed().as_secs_f64()));
 
     Ok(())
 }

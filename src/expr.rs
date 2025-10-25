@@ -330,7 +330,7 @@ pub fn format_dwarf_expression<'a>(expr: Expression<DwarfSlice>, encoding: Encod
             Operation::FrameOffset {offset} => {
                 write!(res, "fb")?;
                 if offset != 0 {
-                    write!(res, "{:+}", offset)?;
+                    write!(res, "{}0x{:x}", if offset < 0 {"-"} else {"+"}, offset.abs())?;
                 }
             }
             Operation::EntryValue {expression} => write!(res, "entry_value({})", format_dwarf_expression(Expression(expression), encoding)?)?,
@@ -1021,7 +1021,7 @@ fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut Form
                 AddrOrValueBlob::Blob(x) => x,
                 AddrOrValueBlob::Addr(_) => panic!("unexpected slice ref") };
             let binary_id = blob.get_usize_at(0).unwrap();
-            let line = LineInfo {data: [blob.get_usize_at(8).unwrap(), blob.get_usize_at(16).unwrap()]};
+            let line = LineInfo::deserialize([blob.get_usize_at(8).unwrap(), blob.get_usize_at(16).unwrap()]);
             match state.context.symbols_registry.get(binary_id) {
                 None => styled_write!(state.out, state.palette.error, "binary unloaded"),
                 Some(binary) => {

@@ -659,7 +659,7 @@ pub struct TypesLoadingShard {
     units: Vec<(Range<DieOffset>, Range<usize>)>,
     finalized: bool,
     // Sorted by offset.
-    offset_map: Vec<TypeLoadState>,
+    offset_map: BigVec<TypeLoadState>,
     // Outgoing messages for map-reduce stages. Index is destination shard idx.
     // (This is O(num_threads^2) arrays, which seems fine up to maybe hundreds of threads, e.g. 2023 threadripper (not tested).
     //  For future CPUs with 1000 cores, maybe we'll have to add two-step routing, or maybe just use 100 cores.)
@@ -678,7 +678,6 @@ pub struct TypesLoader {
     shards: Vec<TypesLoadingShard>,
     // We map whole units to shards for locality, instead of e.g. hash(DieOffset)%num_shards.
     units: Vec<UnitInfo>,
-    // Point to a fake unit in one of the shards, with high DieOffset-s.
     // Sharded hash map for deduplicating types by content. Usually has more shards than `shards`.
     dedup_maps: Vec<CachePadded<Mutex<HashMap<DedupKey, (*const TypeInfo, TypeSpecialInfo)>>>>, // no other mutex/spinlock may be held under this one
 }
@@ -843,7 +842,7 @@ impl TypesLoadingShard {
     pub fn new(num_shards: usize) -> Self {
         Self {
             temp_types: Types::new(),
-            offset_map: Vec::new(),
+            offset_map: BigVec::new(),
             send_decl_def_names: (0..num_shards).map(|_| CachePadded::new(SyncUnsafeCell::new(Vec::new()))).collect(),
             send_dedup_names: (0..num_shards).map(|_| CachePadded::new(SyncUnsafeCell::new(Vec::new()))).collect(),
             send_assign_names: (0..num_shards).map(|_| CachePadded::new(SyncUnsafeCell::new(Vec::new()))).collect(),

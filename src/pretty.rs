@@ -191,7 +191,7 @@ pub fn reflect_meta_value(val: &Value, state: &mut EvalState, context: &mut Eval
             }
             builder.add_usize_field("size", size, state.builtin_types.u64_);
             if t.line != LineInfo::invalid() {
-                let d: [usize; 2] = t.line.data.clone();
+                let d: [usize; 2] = t.line.serialize();
                 builder.add_usize_blob_field("decl", &[t.binary_id, d[0], d[1]], state.builtin_types.meta_code_location);
             }
             if !t.name.is_empty() {
@@ -245,7 +245,7 @@ pub fn reflect_meta_value(val: &Value, state: &mut EvalState, context: &mut Eval
             builder.add_str_field("name", unsafe {v.name()}, &mut state.types, &state.builtin_types);
             builder.add_usize_field("type", v.type_ as usize, state.builtin_types.meta_type);
             if v.line != LineInfo::invalid() {
-                let d: [usize; 2] = v.line.data.clone();
+                let d: [usize; 2] = v.line.serialize();
                 builder.add_usize_blob_field("decl", &[binary_id, d[0], d[1]], state.builtin_types.meta_code_location);
             }
             let mut is_const = false;

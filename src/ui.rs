@@ -1830,7 +1830,7 @@ impl DisassemblyWindow {
         let title = Self::make_title(&demangled_name);
         self.tabs.push(DisassemblyTab {
             identity: random(), locator: Some(FunctionLocator {binary_locator: binary.locator.clone(), mangled_name: function.mangled_name().to_owned(), addr: function.addr, demangled_name}),
-            cached_function_idx: Some((target.binary_id, target.function_idx)), title, ephemeral: true, selected_subfunction_level: u16::MAX, ..Default::default()});
+            cached_function_idx: Some((target.binary_id, target.function_idx)), title, ephemeral: true, selected_subfunction_level: SUBFUNCTION_LEVEL_MAX, ..Default::default()});
         self.tabs_state.select(self.tabs.len() - 1);
 
         Ok(())
@@ -1859,7 +1859,7 @@ impl DisassemblyWindow {
                 Some(x) => x,
                 None => return err!(Usage, "no open function"),
             };
-            Ok(DisassemblyScrollTarget {binary_id, function_idx, static_pseudo_addr: function_locator.addr.0.saturating_add(addr), subfunction_level: u16::MAX, cascade: true})
+            Ok(DisassemblyScrollTarget {binary_id, function_idx, static_pseudo_addr: function_locator.addr.0.saturating_add(addr), subfunction_level: SUBFUNCTION_LEVEL_MAX, cascade: true})
         } else {
             let (static_addr, binary) = match debugger.addr_to_binary(addr) {
                 Ok((_, static_addr, binary, _)) => (static_addr, binary),
@@ -1886,7 +1886,7 @@ impl DisassemblyWindow {
             };
             let symbols = binary.symbols.as_ref_clone_error()?;
             let (function, function_idx) = symbols.addr_to_function(static_addr)?;
-            Ok(DisassemblyScrollTarget {binary_id: binary.id, function_idx, static_pseudo_addr: static_addr, subfunction_level: u16::MAX, cascade: true})
+            Ok(DisassemblyScrollTarget {binary_id: binary.id, function_idx, static_pseudo_addr: static_addr, subfunction_level: SUBFUNCTION_LEVEL_MAX, cascade: true})
         }
     }
 
@@ -2066,7 +2066,7 @@ impl DisassemblyWindow {
         }
 
         if let Some(res) = mem::take(&mut d.should_open_document) {
-            match self.open_function(Ok(DisassemblyScrollTarget {binary_id: res.binary_id, function_idx: res.id, static_pseudo_addr: 0, subfunction_level: u16::MAX, cascade: true}), debugger) {
+            match self.open_function(Ok(DisassemblyScrollTarget {binary_id: res.binary_id, function_idx: res.id, static_pseudo_addr: 0, subfunction_level: SUBFUNCTION_LEVEL_MAX, cascade: true}), debugger) {
                 Ok(()) => self.tabs[self.tabs_state.selected].ephemeral = false,
                 Err(e) => log!(debugger.log, "{}", e),
             }
@@ -2229,7 +2229,7 @@ impl DisassemblyWindow {
                     KeyAction::NextLocation => {
                         tab.selected_subfunction_level = tab.selected_subfunction_level.saturating_add(1);
                         if tab.selected_subfunction_level > disas_line.subfunction_level {
-                            tab.selected_subfunction_level = u16::MAX;
+                            tab.selected_subfunction_level = SUBFUNCTION_LEVEL_MAX;
                         }
                     }
                     _ => (),
@@ -4103,10 +4103,10 @@ impl CodeWindow {
             };
             assert!(!addrs0.is_empty());
             let mut addrs: Vec<(/*function_idx*/ usize, /*subfunction_level*/ u16, /*static_addr*/ usize)> = Vec::new();
-            for (line, level) in addrs0 {
+            for line in addrs0 {
                 let static_addr = line.addr();
                 if let Ok((_, function_idx)) = symbols.addr_to_function(static_addr) {
-                    addrs.push((function_idx, level, static_addr));
+                    addrs.push((function_idx, line.subfunction_level(), static_addr));
                 }
             }
             if addrs.is_empty() {
@@ -4126,7 +4126,7 @@ impl CodeWindow {
                 if level == 0 {
                     return true;
                 }
-                if level != u16::MAX {
+                if level < SUBFUNCTION_LEVEL_MAX {
                     return false;
                 }
                 let function = &symbols.functions[function_idx];

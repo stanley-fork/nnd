@@ -1,4 +1,4 @@
-use std::{mem, mem::MaybeUninit, ptr, alloc::{alloc, Layout, handle_alloc_error, dealloc}, slice, marker::PhantomData, io, path::Path, fmt, os::unix::ffi::OsStrExt, io::Write as ioWrite};
+use std::{mem, mem::MaybeUninit, ptr, alloc::{alloc, Layout, handle_alloc_error, dealloc}, slice, marker::PhantomData, io, path::Path, fmt, os::unix::ffi::OsStrExt, io::Write as ioWrite, ptr::NonNull, ops::{Deref, DerefMut, Index, IndexMut}, ops};
 
 // Arena - a simple untyped arena.
 // StringTable - arena equipped with a list of pointers to allocated strings, allowing search.
@@ -371,6 +371,168 @@ impl DisambiguatingSuffixes {
         }
     }
 }
+
+
+// Like Vec but allocates memory directly with mmap/mremap. This:
+//  * avoids the cost of memcpy on growth and shrink_to_fit,
+//  * reliably returns memory to the OS when BigVec is destroyed; useful for temp memory in symbols loading,
+// but:
+//  * high overhead of creating/destroying BigVec,
+//  * some cost if there are lots of BigVec-s (e.g. 100k) as each one is a linux vma, e.g. listed in /proc/<pid>/maps,
+//  * slow first access to contents because of page faults; for memory from regular allocator, this cost is avoided when reusing previously freed memory;
+//    this is usually fine for symbols loading as it allocates lots of memory quickly, there's wouldn't be much reuse of previously freed memory.
+//
+// But for some reason this makes no difference for performance in practice.
+pub struct BigVec<T> {
+    ptr: NonNull<T>,
+    len: usize,
+    cap: usize,
+    _marker: PhantomData<T>,
+}
+impl<T> BigVec<T> {
+    const INITIAL_SIZE: usize = 64 * 1024 * 1024;
+    const GROWTH_FACTOR: usize = 8;
+    const ELEMENT_BYTES: usize = if mem::size_of::<T>() == 0 {1} else {mem::size_of::<T>()};
+
+    pub fn new() -> Self {
+        let cap = (Self::INITIAL_SIZE / Self::ELEMENT_BYTES).max(1);
+
+        let ptr = unsafe {libc::mmap(std::ptr::null_mut(), cap * Self::ELEMENT_BYTES, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)};
+        if ptr == libc::MAP_FAILED { panic!("mmap failed"); }
+
+        Self {ptr: NonNull::new(ptr as *mut T).unwrap(), len: 0, cap, _marker: PhantomData}
+    }
+
+    pub fn len(&self) -> usize { self.len }
+    pub fn is_empty(&self) -> bool {self.len == 0}
+    pub fn capacity(&self) -> usize {self.cap}
+
+    pub fn last(&self) -> Option<&T> { if self.len == 0 {None} else {unsafe { Some(&*self.ptr.as_ptr().add(self.len - 1)) }} }
+    pub fn last_mut(&mut self) -> Option<&mut T> { if self.len == 0 {None} else {unsafe { Some(&mut *self.ptr.as_ptr().add(self.len - 1)) }} }
+
+    pub fn push(&mut self, value: T) {
+        if self.len >= self.cap {
+            assert!(self.len == self.cap);
+            self.change_capacity(self.cap * Self::GROWTH_FACTOR);
+            assert!(self.len < self.cap);
+        }
+        unsafe {
+            self.ptr.as_ptr().add(self.len).write(value);
+        }
+        self.len += 1;
+    }
+
+    pub fn append(&mut self, from: &mut Vec<T>) {
+        let new_len = self.len + from.len();
+        if new_len > self.cap {
+            let mut new_cap = self.cap;
+            while new_len > new_cap {
+                new_cap *= Self::GROWTH_FACTOR;
+            }
+            self.change_capacity(new_cap);
+        }
+        for x in mem::take(from).into_iter() {
+            unsafe {
+                self.ptr.as_ptr().add(self.len).write(x);
+            }
+            self.len += 1;
+        }
+    }
+
+    pub fn pop(&mut self) -> Option<T> {
+        if self.len == 0 {
+            None
+        } else {
+            self.len -= 1;
+            unsafe { Some(self.ptr.as_ptr().add(self.len).read()) }
+        }
+    }
+
+    pub fn clear(&mut self) {
+        unsafe {
+            std::ptr::drop_in_place(std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len));
+        }
+        self.len = 0;
+    }
+
+    pub fn retain<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&T) -> bool,
+    {
+        let mut write_idx = 0;
+        for read_idx in 0..self.len {
+            unsafe {
+                let elem = self.ptr.as_ptr().add(read_idx);
+                if f(&*elem) {
+                    if read_idx != write_idx {
+                        let dest = self.ptr.as_ptr().add(write_idx);
+                        std::ptr::copy_nonoverlapping(elem, dest, 1);
+                    }
+                    write_idx += 1;
+                } else {
+                    std::ptr::drop_in_place(elem);
+                }
+            }
+        }
+        self.len = write_idx;
+    }
+
+    pub fn shrink_to_fit(&mut self) {
+        if self.cap > self.len {
+            self.change_capacity(self.len);
+        }
+    }
+
+    fn change_capacity(&mut self, new_cap: usize) {
+        assert!(new_cap >= self.len);
+        let new_cap = new_cap.max(1);
+        let old_cap_bytes = self.cap * Self::ELEMENT_BYTES;
+
+        let new_ptr = unsafe {libc::mremap(self.ptr.as_ptr() as *mut libc::c_void, old_cap_bytes, new_cap * Self::ELEMENT_BYTES, libc::MREMAP_MAYMOVE)};
+        if new_ptr == libc::MAP_FAILED {panic!("mremap failed");}
+
+        self.ptr = NonNull::new(new_ptr as *mut T).unwrap();
+        self.cap = new_cap;
+    }
+}
+impl<T> Drop for BigVec<T> {
+    fn drop(&mut self) {
+        self.clear();
+        let r = unsafe {libc::munmap(self.ptr.as_ptr() as *mut libc::c_void, self.cap * mem::size_of::<T>().max(1))};
+        if r != 0 {panic!("munmap failed");}
+    }
+}
+impl<T> Deref for BigVec<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+}
+impl<T> DerefMut for BigVec<T> { fn deref_mut(&mut self) -> &mut [T] {unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }} }
+impl<T> Index<usize> for BigVec<T> {type Output = T; fn index(&self, idx: usize) -> &T {&(**self)[idx]} }
+impl<T> IndexMut<usize> for BigVec<T> {fn index_mut(&mut self, idx: usize) -> &mut T {&mut (**self)[idx]} }
+impl<T> Default for BigVec<T> { fn default() -> Self {Self::new()} }
+unsafe impl<T: Send> Send for BigVec<T> {}
+unsafe impl<T: Sync> Sync for BigVec<T> {}
+
+impl<T> Index<ops::Range<usize>> for BigVec<T> { type Output = [T]; fn index(&self, range: ops::Range<usize>) -> &[T] {&(**self)[range]} }
+impl<T> IndexMut<ops::Range<usize>> for BigVec<T> { fn index_mut(&mut self, range: ops::Range<usize>) -> &mut [T] {&mut (**self)[range]} }
+impl<T> Index<ops::RangeFrom<usize>> for BigVec<T> { type Output = [T]; fn index(&self, range: ops::RangeFrom<usize>) -> &[T] {&(**self)[range]} }
+impl<T> IndexMut<ops::RangeFrom<usize>> for BigVec<T> { fn index_mut(&mut self, range: ops::RangeFrom<usize>) -> &mut [T] {&mut (**self)[range]} }
+impl<T> Index<ops::RangeTo<usize>> for BigVec<T> { type Output = [T]; fn index(&self, range: ops::RangeTo<usize>) -> &[T] {&(**self)[range]} }
+impl<T> IndexMut<ops::RangeTo<usize>> for BigVec<T> { fn index_mut(&mut self, range: ops::RangeTo<usize>) -> &mut [T] {&mut (**self)[range]} }
+impl<T> Index<ops::RangeFull> for BigVec<T> { type Output = [T]; fn index(&self, _: ops::RangeFull) -> &[T] {self} }
+impl<T> IndexMut<ops::RangeFull> for BigVec<T> { fn index_mut(&mut self, _: ops::RangeFull) -> &mut [T] {self} }
+impl<T> Index<ops::RangeInclusive<usize>> for BigVec<T> { type Output = [T]; fn index(&self, range: ops::RangeInclusive<usize>) -> &[T] {&(**self)[range]} }
+impl<T> IndexMut<ops::RangeInclusive<usize>> for BigVec<T> { fn index_mut(&mut self, range: ops::RangeInclusive<usize>) -> &mut [T] {&mut (**self)[range]} }
+impl<T> Index<ops::RangeToInclusive<usize>> for BigVec<T> { type Output = [T]; fn index(&self, range: ops::RangeToInclusive<usize>) -> &[T] {&(**self)[range]} }
+impl<T> IndexMut<ops::RangeToInclusive<usize>> for BigVec<T> { fn index_mut(&mut self, range: ops::RangeToInclusive<usize>) -> &mut [T] {&mut (**self)[range]} }
+
+impl<'a, T> IntoIterator for &'a BigVec<T> { type Item = &'a T; type IntoIter = std::slice::Iter<'a, T>; fn into_iter(self) -> Self::IntoIter {self.iter()} }
+impl<'a, T> IntoIterator for &'a mut BigVec<T> { type Item = &'a mut T; type IntoIter = std::slice::IterMut<'a, T>; fn into_iter(self) -> Self::IntoIter {self.iter_mut()} }
+
+//pub type BigVec<T> = Vec<T>;
+
 
 #[cfg(test)]
 mod tests {

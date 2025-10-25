@@ -325,7 +325,7 @@ pub struct Breakpoint {
     // These are dynamic addresses, so we clear this list when restarting the debuggee as runtime addresses may have changed.
     // If the breakpoint is on a line that has inlined function call, subfunction_level is the depth of that inlined call.
     // When the breakpoint is hit we should select the stack subframe at that inline depth, not the top subframe that shows the insides
-    // of the inlined function (it's very confusing otherwise). If u16::MAX, no subframe selection is made (so ui probably selects the top subframe).
+    // of the inlined function (it's very confusing otherwise). If SUBFUNCTION_LEVEL_MAX, no subframe selection is made (so ui probably selects the top subframe).
     pub addrs: Result<Vec<(usize, /*subfunction_level*/ u16)>>,
     // Directly controlled by the user, may be true even if we failed to activate the breakpoint.
     pub enabled: bool,
@@ -2202,11 +2202,11 @@ impl Debugger {
                     if addrs.is_empty() {
                         continue;
                     }
-                    if addrs[0].0.line() > res.0 {
+                    if addrs[0].line() > res.0 {
                         continue;
                     }
-                    if addrs[0].0.line() < res.0 {
-                        res = (addrs[0].0.line(), Vec::new());
+                    if addrs[0].line() < res.0 {
+                        res = (addrs[0].line(), Vec::new());
                     }
 
                     // There are often multiple nearby addresses for the same line, usually with different column numbers.
@@ -2214,14 +2214,14 @@ impl Debugger {
                     // We want to set breakpoint on only the first of those addresses. Otherwise continuing from such breakpoint is very confusing: you continue and immediately stop without leaving the line.
                     // On the other hand, a line can have multiple addresses corresponding to different inlining sites of the containing function; we don't want to deduplicate those.
                     // So we group addresses by the containing (sub)function and keep the lowest address in each.
-                    let mut subfuncs_and_addrs: Vec<(/*function_idx*/ usize, /*subfunction_idx*/ usize, /*addr*/ usize, u16)> = addrs.iter().map(|(line, level)| {
+                    let mut subfuncs_and_addrs: Vec<(/*function_idx*/ usize, /*subfunction_idx*/ usize, /*addr*/ usize, u16)> = addrs.iter().map(|line| {
                         let addr = line.addr();
                         if let Ok((function, function_idx)) = symbols.addr_to_function(addr) {
-                            if let Some((sf, l)) = symbols.containing_subfunction_at_level(addr, *level, function) {
+                            if let Some((sf, l)) = symbols.containing_subfunction_at_level(addr, line.subfunction_level(), function) {
                                 return (function_idx, sf, addr, l);
                             }
                         }
-                        (usize::MAX, addr, addr, *level)
+                        (usize::MAX, addr, addr, line.subfunction_level())
                     }).collect();
                     subfuncs_and_addrs.sort_unstable();
                     for (i, &(f, sf, addr, level)) in subfuncs_and_addrs.iter().enumerate() {
@@ -2279,7 +2279,7 @@ impl Debugger {
                     if let Some(static_addrs) = symbols.points_of_interest.get(point) {
                         for &static_addr in static_addrs {
                             let addr = binary.addr_map.static_to_dynamic(static_addr);
-                            addrs.push((addr, u16::MAX));
+                            addrs.push((addr, SUBFUNCTION_LEVEL_MAX));
                         }
                     }
                 }
@@ -2673,7 +2673,7 @@ impl Debugger {
         if stack.frames.is_empty() {
             return None;
         }
-        if subfunction_level != u16::MAX {
+        if subfunction_level < SUBFUNCTION_LEVEL_MAX {
             return Some(stack.frames[0].subframes.end.saturating_sub(subfunction_level as usize + 1));
         }
         if stack_digest.is_empty() {
@@ -2910,7 +2910,7 @@ impl Debugger {
 
                             hit_step_breakpoint = Some(*t);
                             if let &StepBreakpointType::Cursor(subfunction_level) = t {
-                                if subfunction_level != u16::MAX {
+                                if subfunction_level < SUBFUNCTION_LEVEL_MAX {
                                     stack_digest_to_select = Some((Vec::new(), false, subfunction_level));
                                 }
                             }
@@ -2933,7 +2933,7 @@ impl Debugger {
                                 }
                             } else if self.process_breakpoint_hit(id, tid, ignore_breakpoints, subfunction_level, &mut stop_reasons) {
                                 hit = true;
-                                if subfunction_level != u16::MAX {
+                                if subfunction_level < SUBFUNCTION_LEVEL_MAX {
                                     stack_digest_to_select = Some((Vec::new(), false, subfunction_level));
                                 }
                             }
@@ -2957,7 +2957,7 @@ impl Debugger {
                     let bp = &self.hardware_breakpoints[i];
                     if bp.active {
                         if let &Some(id) = &bp.data_breakpoint_id {
-                            hit |= self.process_breakpoint_hit(id, tid, ignore_breakpoints, /*subfunction_level*/ u16::MAX, &mut stop_reasons);
+                            hit |= self.process_breakpoint_hit(id, tid, ignore_breakpoints, /*subfunction_level*/ SUBFUNCTION_LEVEL_MAX, &mut stop_reasons);
                         }
                     }
                 }
@@ -2978,7 +2978,7 @@ impl Debugger {
             } else if tid == step.tid && self.handle_step_stop(hit_step_breakpoint.is_some(), single_stepped, &regs) {
                 let step = self.stepping.as_mut().unwrap();
                 if step.internal_kind != StepKind::Cursor {
-                    stack_digest_to_select = Some((mem::take(&mut step.stack_digest), step.internal_kind == StepKind::Into, u16::MAX));
+                    stack_digest_to_select = Some((mem::take(&mut step.stack_digest), step.internal_kind == StepKind::Into, SUBFUNCTION_LEVEL_MAX));
                 }
                 let stop_reason = if hit_step_breakpoint.is_some_and(|t| t == StepBreakpointType::Catch) {StopReason::Exception} else {StopReason::Step};
                 stop_reasons.push(stop_reason);
@@ -3017,7 +3017,7 @@ impl Debugger {
         t.info.extra_regs.reset_with_tid(tid);
 
         let stack = self.get_stack_trace(tid, /*partial*/ !need_full_stack);
-        let selected_subframe = if subfunction_level != u16::MAX && !stack.frames.is_empty() {
+        let selected_subframe = if subfunction_level < SUBFUNCTION_LEVEL_MAX && !stack.frames.is_empty() {
             stack.frames[0].subframes.end.saturating_sub(subfunction_level as usize + 1)
         } else {
             0

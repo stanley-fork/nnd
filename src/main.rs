@@ -609,7 +609,7 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, core_dump_path: Option<Str
                 //  * Restore terminal state.
                 //  * Flush stderr.
                 // After that, just quit without wasting time on calling all the destructors.
-                // In particular, destroying Symbols can take seconds, which is really annoying for the user. (That's mostly because of lots of small Vec-s in Symbols; it would be nice to get rid of them for loading performance too.)
+                // In particular, destroying Symbols can take seconds, which is really annoying for the user.
                 PersistentState::try_to_save_state_if_changed(&mut debugger, &mut ui);
                 debugger.shutdown();
                 restore_terminal();
