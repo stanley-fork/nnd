@@ -431,7 +431,7 @@ impl<T> BigVec<T> {
             }
             self.change_capacity(new_cap);
         }
-        for x in mem::take(from).into_iter() {
+        for x in from.drain(..) {
             unsafe {
                 self.ptr.as_ptr().add(self.len).write(x);
             }

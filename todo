@@ -49,7 +49,7 @@ reverse --tty mode: run debugger in another window and the debuggee in current w
 buffer input when program is quitting, especially k+r and steps
 test with breakpad minidumps
 modifying debuggee variables (memory and registers), modifying ip
-log a message if the process forked away
+log a message if the process forked away; do something about software breakpoints being inherited on fork and crashing the unattached child when hit
 add alternative default key binds for next/prev search result, F3 is not always available on mac
 async fetch from debuginfod (load symbols without waiting for it, then on success start over)
 show an error if program failed to start (e.g. executable doesn't exist)
