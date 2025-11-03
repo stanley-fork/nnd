@@ -1306,12 +1306,15 @@ impl SymbolsLoader {
         let bytes_total: usize = shard.units.iter().map(|i| self.sym.units[*i].unit.header.unit_length()).sum();
         let mut bytes_reported = 0usize;
         let mut bytes_processed = 0usize;
+        let (mut temp, mut stacks) = (LoaderTempStorage::default(), DwarfLoaderStacks::default());
 
         let units_copy = shard.units.clone();
         for unit_idx in units_copy {
             {
-                let mut loader = DwarfLoader::new(self, shard, unit_idx)?;
+                let mut loader = DwarfLoader::new(self, shard, unit_idx, mem::take(&mut temp), mem::take(&mut stacks));
                 loader.load()?;
+                // Reuse memory across units. Makes noticeable difference on musl's very slow default allocator with 32 threads.
+                (temp, stacks) = (mem::take(&mut loader.temp), mem::take(&mut loader.stacks));
             }
 
             bytes_processed += self.sym.units[unit_idx].unit.header.unit_length();
@@ -1906,15 +1909,29 @@ struct DwarfLoader<'a> {
     scope_name: String,
 
     temp: LoaderTempStorage,
+    stacks: DwarfLoaderStacks,
+}
 
+#[derive(Default)]
+struct DwarfLoaderStacks {
     // Main stack contains a sentinel root entry, then all DIEs on the path from the unit's root to the current DIE.
-    // When pushing to non-main stacks, make sure to set the corresponding flag in main_stack.top_mut().flags.
-    main_stack: FastStack<MainStackEntry, 0>,
-    scope_stack: FastStack<ScopeStackEntry, {StackFlags::HAS_SCOPE.bits()}>,
-    function_stack: FastStack<FunctionStackEntry, {StackFlags::HAS_FUNCTION.bits()}>,
-    subfunction_stack: FastStack<SubfunctionStackEntry, {StackFlags::HAS_SUBFUNCTION.bits()}>,
-    type_stack: FastStack<TypeStackEntry, {StackFlags::HAS_TYPE.bits()}>,
-    ranges_stack: FastStack<RangesStackEntry, {StackFlags::HAS_RANGES.bits()}>,
+    // When pushing to non-main stacks, make sure to set the corresponding flag in main.top_mut().flags.
+    main: FastStack<MainStackEntry, 0>,
+    scope: FastStack<ScopeStackEntry, {StackFlags::HAS_SCOPE.bits()}>,
+    function: FastStack<FunctionStackEntry, {StackFlags::HAS_FUNCTION.bits()}>,
+    subfunction: FastStack<SubfunctionStackEntry, {StackFlags::HAS_SUBFUNCTION.bits()}>,
+    type_: FastStack<TypeStackEntry, {StackFlags::HAS_TYPE.bits()}>,
+    ranges: FastStack<RangesStackEntry, {StackFlags::HAS_RANGES.bits()}>,    
+}
+impl DwarfLoaderStacks {
+    fn clear(&mut self) {
+        self.main.len = 0;
+        self.scope.len = 0;
+        self.function.len = 0;
+        self.subfunction.len = 0;
+        self.type_.len = 0;
+        self.ranges.len = 0;
+    }
 }
 
 // Start or end of a tentative Subfunction.
@@ -1969,7 +1986,7 @@ bitflags! { struct StackFlags: u16 {
     const HAS_TYPE = 0x8;
     const HAS_RANGES = 0x10;
 
-    // Whether discriminated union info in type_stack.top() needs to be updated when popping this entry from the main stack.
+    // Whether discriminated union info in stacks.type_.top() needs to be updated when popping this entry from the main stack.
     // (We don't have a whole separate stack for VariantInfo-s because they seem to never be nested.)
     const HAS_VARIANT = 0x20;
 
@@ -2010,7 +2027,7 @@ struct FunctionStackEntry {
     function: usize,
     subfunctions: Vec<(Subfunction, /*parent*/ u32)>, // inlined function calls in `function`; all have different identities, each may correspond to multiple address ranges (described by subfunction_events)
     subfunction_events: Vec<SubfunctionEvent>,
-    ranges_stack_idx: usize, // where in ranges_stack are this function's address ranges
+    ranges_stack_idx: usize, // where in stacks.ranges are this function's address ranges
 }
 impl FunctionStackEntry { fn reset(&mut self, ranges_stack_idx: usize) { self.ranges_stack_idx = ranges_stack_idx; self.function = usize::MAX; self.subfunctions.clear(); self.subfunction_events.clear(); } }
 
@@ -2168,19 +2185,19 @@ enum DwarfVariableLocation {
 
 
 impl<'a> DwarfLoader<'a> {
-    fn new(loader: &'a SymbolsLoader, shard: &'a mut SymbolsLoaderShard, unit_idx: usize) -> Result<Self> {
+    fn new(loader: &'a SymbolsLoader, shard: &'a mut SymbolsLoaderShard, unit_idx: usize, temp: LoaderTempStorage, stacks: DwarfLoaderStacks) -> Self {
         let unit = &loader.sym.units[unit_idx];
         let section_slice = *loader.sym.dwarf.debug_info.reader();
-        Ok(Self {loader, section_slice, shard_idx: unit.shard_idx, shard, unit, scope_name: String::new(), temp: LoaderTempStorage::default(), main_stack: FastStack::default(), scope_stack: FastStack::default(), function_stack: FastStack::default(), subfunction_stack: FastStack::default(), type_stack: FastStack::default(), ranges_stack: FastStack::default()})
+        Self {loader, section_slice, shard_idx: unit.shard_idx, shard, unit, scope_name: String::new(), temp, stacks}
     }
 
     fn append_namespace_to_scope_name(&mut self, s: &str, linkable: bool) {
-        let top = self.main_stack.top_mut();
+        let top = self.stacks.main.top_mut();
         if top.flags.contains(StackFlags::HAS_SCOPE) {
-            self.scope_stack.top_mut().scope_name_is_linkable &= linkable;
+            self.stacks.scope.top_mut().scope_name_is_linkable &= linkable;
         } else {
-            let was_linkable = self.scope_stack.top().scope_name_is_linkable;
-            *self.scope_stack.push_uninit(&mut top.flags) = ScopeStackEntry {scope_name_len: self.scope_name.len(), scope_name_is_linkable: was_linkable && linkable};
+            let was_linkable = self.stacks.scope.top().scope_name_is_linkable;
+            *self.stacks.scope.push_uninit(&mut top.flags) = ScopeStackEntry {scope_name_len: self.scope_name.len(), scope_name_is_linkable: was_linkable && linkable};
         }
         if !self.scope_name.is_empty() {
             self.scope_name.push_str("::");
@@ -2212,8 +2229,8 @@ impl<'a> DwarfLoader<'a> {
     }
 
     fn add_variable_locations(&mut self, loc: DwarfVariableLocation, linkage_name: &'static str, mut var: Variable, offset: DieOffset) -> Result<()> {
-        let stack_flags = self.main_stack.top().flags;
-        let subfunction_top = self.subfunction_stack.top_mut();
+        let stack_flags = self.stacks.main.top().flags;
+        let subfunction_top = self.stacks.subfunction.top_mut();
         let mut custom_ranges = false;
         let mut is_global = false;
 
@@ -2234,8 +2251,8 @@ impl<'a> DwarfLoader<'a> {
                         // TODO: This is sometimes not enough: I've seen local variables being detected as global. Maybe also look at the DWARF expression: if it uses general-purpose registers, it's probably a local variable.
                         let mut is_local = var.flags().intersects(VariableFlags::FRAME_BASE | VariableFlags::PARAMETER);
                         if !is_local && stack_flags.contains(StackFlags::IS_VALID_SCOPE) {
-                            let function_top = self.function_stack.top();
-                            let function_pc_ranges = &self.ranges_stack.s[function_top.ranges_stack_idx].pc_ranges;
+                            let function_top = self.stacks.function.top();
+                            let function_pc_ranges = &self.stacks.ranges.s[function_top.ranges_stack_idx].pc_ranges;
                             is_local = function_pc_ranges.iter().any(|r| r.begin <= entry.range.begin && r.end + 1 >= entry.range.end);
                         }
                         if stack_flags.contains(StackFlags::IS_VALID_SCOPE) {
@@ -2257,7 +2274,7 @@ impl<'a> DwarfLoader<'a> {
         if !custom_ranges {
             if stack_flags.contains(StackFlags::IS_FUNCTION_SCOPE) {
                 if stack_flags.contains(StackFlags::IS_VALID_SCOPE) {
-                    for range in &self.ranges_stack.top().pc_ranges {
+                    for range in &self.stacks.ranges.top().pc_ranges {
                         subfunction_top.local_variables.push(var.with_range(*range));
                     }
                 }
@@ -2306,7 +2323,7 @@ impl<'a> DwarfLoader<'a> {
 
                 if stack_flags.contains(StackFlags::IS_TYPE_SCOPE | StackFlags::IS_VALID_SCOPE) {
                     // TODO: This doesn't cover the case when the declaration is separate from definition. The definition has location, the declaration has parent type, we have to somehow join the two.
-                    self.type_stack.top_mut().nested_names.push((unqualified_name, NestedName::Variable(ptr)));
+                    self.stacks.type_.top_mut().nested_names.push((unqualified_name, NestedName::Variable(ptr)));
                 }
             }
         }
@@ -2375,12 +2392,13 @@ impl<'a> DwarfLoader<'a> {
 
         // Fake sentinel values to avoid checking for empty stacks everywhere.
         {
+            self.stacks.clear();
             let mut _f = StackFlags::empty();
-            *self.main_stack.push_uninit(&mut _f) = MainStackEntry {tag: DW_TAG_null, flags: StackFlags::IS_VALID_SCOPE};
-            let f = &mut self.main_stack.top_mut().flags;
-            *self.scope_stack.push_uninit(f) = ScopeStackEntry {scope_name_len: 0, scope_name_is_linkable: true};
-            *self.ranges_stack.push_uninit(f) = RangesStackEntry::default();
-            *self.subfunction_stack.push_uninit(f) = SubfunctionStackEntry {subfunction_idx: u32::MAX, ..Default::default()};
+            *self.stacks.main.push_uninit(&mut _f) = MainStackEntry {tag: DW_TAG_null, flags: StackFlags::IS_VALID_SCOPE};
+            let f = &mut self.stacks.main.top_mut().flags;
+            *self.stacks.scope.push_uninit(f) = ScopeStackEntry {scope_name_len: 0, scope_name_is_linkable: true};
+            *self.stacks.ranges.push_uninit(f) = RangesStackEntry::default();
+            *self.stacks.subfunction.push_uninit(f) = SubfunctionStackEntry {subfunction_idx: u32::MAX, ..Default::default()};
         }
 
         // Iterate over DIEs in depth-first order.
@@ -2395,7 +2413,7 @@ impl<'a> DwarfLoader<'a> {
             // Pop from the stack if needed.
             if !prev_has_children {
                 // Expected stack contents: fake root, DW_TAG_compile_unit, ...
-                if self.main_stack.len < 2 {
+                if self.stacks.main.len < 2 {
                     if cursor.as_slice().iter().find(|c| **c != 0u8).is_some() {
                         return err!(Dwarf, "tree stack underflow");
                     } else {
@@ -2405,17 +2423,17 @@ impl<'a> DwarfLoader<'a> {
                         return Ok(());
                     }
                 }
-                let top = self.main_stack.pop();
+                let top = self.stacks.main.pop();
 
                 if skip_subtree == usize::MAX {
                     let flags = top.flags;
                     if flags.intersects(StackFlags::HAS_ANYTHING) {
                         if flags.contains(StackFlags::HAS_SCOPE) {
-                            let scope_top = self.scope_stack.pop();
+                            let scope_top = self.stacks.scope.pop();
                             self.scope_name.truncate(scope_top.scope_name_len);
                         }
                         if flags.contains(StackFlags::HAS_RANGES) {
-                            self.ranges_stack.pop();
+                            self.stacks.ranges.pop();
                         }
                         if flags.contains(StackFlags::HAS_SUBFUNCTION) {
                             self.finish_subfunction();
@@ -2427,17 +2445,17 @@ impl<'a> DwarfLoader<'a> {
                             self.finish_type();
                         }
                         if flags.contains(StackFlags::HAS_VARIANT) {
-                            self.type_stack.top_mut().variant_field_flags = FieldFlags::empty();
+                            self.stacks.type_.top_mut().variant_field_flags = FieldFlags::empty();
                         }
                     }
-                } else if self.main_stack.len < skip_subtree {
+                } else if self.stacks.main.len < skip_subtree {
                     skip_subtree = usize::MAX;
                 }
             }
 
             // Check if we ran out of bytes.
             if cursor.is_empty() {
-                if self.main_stack.len != 1 { // expected stack contents: fake root
+                if self.stacks.main.len != 1 { // expected stack contents: fake root
                     return err!(Dwarf, "tree ended early @0x{:x}", offset.0);
                 }
                 return Ok(());
@@ -2452,9 +2470,9 @@ impl<'a> DwarfLoader<'a> {
                 None => continue,
             };
 
-            let inherited_flags = self.main_stack.top().flags & StackFlags::IS_ANY_SCOPE;
+            let inherited_flags = self.stacks.main.top().flags & StackFlags::IS_ANY_SCOPE;
             let mut _f = StackFlags::empty();
-            let top = self.main_stack.push_uninit(&mut _f);
+            let top = self.stacks.main.push_uninit(&mut _f);
             *top = MainStackEntry {tag: abbrev.tag, flags: inherited_flags};
 
             if skip_subtree != usize::MAX {
@@ -2466,9 +2484,9 @@ impl<'a> DwarfLoader<'a> {
             match abbrev.tag {
                 DW_TAG_compile_unit | DW_TAG_partial_unit | DW_TAG_type_unit => {
                     cursor.skip_attributes(abbrev, &attribute_context)?;
-                    let ranges_top = self.ranges_stack.push_uninit(&mut self.main_stack.top_mut().flags);
+                    let ranges_top = self.stacks.ranges.push_uninit(&mut self.stacks.main.top_mut().flags);
                     parse_dwarf_ranges(&self.loader.sym.dwarf, &self.unit.unit, &self.unit.ranges, self.unit.fields, offset, self.loader.sym.code_addr_range.start, &mut ranges_top.pc_ranges, /*out_entry_pc*/ &mut 0, &mut self.shard.warn)?;
-                    self.main_stack.top_mut().flags.remove(StackFlags::IS_FUNCTION_SCOPE | StackFlags::IS_TYPE_SCOPE); // this shouldn't do anything since this tag is always root, but just in case
+                    self.stacks.main.top_mut().flags.remove(StackFlags::IS_FUNCTION_SCOPE | StackFlags::IS_TYPE_SCOPE); // this shouldn't do anything since this tag is always root, but just in case
                 }
 
                 // This tag means that the debug info is split into a separate file using DWARF's complicated mechanism for that.
@@ -2518,13 +2536,13 @@ impl<'a> DwarfLoader<'a> {
 
                 // Varargs.
                 DW_TAG_unspecified_parameters | DW_TAG_GNU_formal_parameter_pack => {
-                    skip_subtree = self.main_stack.len;
+                    skip_subtree = self.stacks.main.len;
                     cursor.skip_attributes(abbrev, &attribute_context)?;
                 }
 
                 // Call sites (seem to be very incomplete, presumed useless).
                 DW_TAG_GNU_call_site | DW_TAG_call_site | DW_TAG_GNU_call_site_parameter | DW_TAG_call_site_parameter => {
-                    skip_subtree = self.main_stack.len;
+                    skip_subtree = self.stacks.main.len;
                     cursor.skip_attributes(abbrev, &attribute_context)?;
                 }
 
@@ -2544,15 +2562,15 @@ impl<'a> DwarfLoader<'a> {
                     // (That was g++. Clang seems to only ever use DW_INL_inlined for this value.)
                     let is_inlined = attrs.inline != 0;
 
-                    let ranges_stack_idx = self.ranges_stack.len;
-                    let ranges_top = self.ranges_stack.push_uninit(&mut self.main_stack.top_mut().flags);
+                    let ranges_stack_idx = self.stacks.ranges.len;
+                    let ranges_top = self.stacks.ranges.push_uninit(&mut self.stacks.main.top_mut().flags);
                     let mut entry_pc = 0usize;
                     parse_dwarf_ranges(&self.loader.sym.dwarf, &self.unit.unit, &attrs.ranges, attrs.fields, offset, self.loader.sym.code_addr_range.start, &mut ranges_top.pc_ranges, &mut entry_pc, &mut self.shard.warn)?;
-                    self.main_stack.top_mut().flags.remove(StackFlags::IS_ANY_SCOPE);
-                    self.main_stack.top_mut().flags.insert(StackFlags::IS_FUNCTION_SCOPE);
+                    self.stacks.main.top_mut().flags.remove(StackFlags::IS_ANY_SCOPE);
+                    self.stacks.main.top_mut().flags.insert(StackFlags::IS_FUNCTION_SCOPE);
 
                     if !ranges_top.pc_ranges.is_empty() || is_inlined {
-                        let function_top = self.function_stack.push_uninit(&mut self.main_stack.top_mut().flags);
+                        let function_top = self.stacks.function.push_uninit(&mut self.stacks.main.top_mut().flags);
                         function_top.reset(ranges_stack_idx);
 
                         // Chase the specification/origin pointers to reach the function name (for function declarations and inlining stuff).
@@ -2600,11 +2618,11 @@ impl<'a> DwarfLoader<'a> {
                             f.prev_addr = f.addr;
                             self.shard.functions.push(f);
                         } else {
-                            self.main_stack.top_mut().flags.insert(StackFlags::IS_VALID_SCOPE);
+                            self.stacks.main.top_mut().flags.insert(StackFlags::IS_VALID_SCOPE);
                             ranges_top.pc_ranges.sort_unstable_by_key(|r| r.begin);
                             let sf_idx = 0u32;
                             function_top.subfunctions.push((Subfunction {callee_idx: offset.0, local_variables: Subfunction::pack_range(0..0), call_line: decl, addr_range: 0..0, identity: sf_idx}, u32::MAX));
-                            self.subfunction_stack.push_uninit(&mut self.main_stack.top_mut().flags).reset(sf_idx, /*subfunction_level*/ 0);
+                            self.stacks.subfunction.push_uninit(&mut self.stacks.main.top_mut().flags).reset(sf_idx, /*subfunction_level*/ 0);
                             for (i, range) in ranges_top.pc_ranges.iter().enumerate() {
                                 let mut f = f.clone();
                                 f.addr = FunctionAddr::new(range.begin as usize, &mut self.shard.warn);
@@ -2662,7 +2680,7 @@ impl<'a> DwarfLoader<'a> {
                     self.append_namespace_to_scope_name("_", false);
                 }
 
-                DW_TAG_enumeration_type if self.main_stack.top().tag == DW_TAG_array_type => {
+                DW_TAG_enumeration_type if self.stacks.main.top().tag == DW_TAG_array_type => {
                     // Haven't seen these in C++ or Rust.
                     if self.shard.warn.check(line!()) { eprintln!("warning: enum-valued array indices are not supported (have one @0x{:x})", offset.0); }
                     cursor.skip_attributes(abbrev, &attribute_context)?;
@@ -2710,7 +2728,7 @@ impl<'a> DwarfLoader<'a> {
                     } else {
                         self.append_namespace_to_scope_name(attrs.name, true);
                         info.name = self.shard.types.temp_types.unsorted_type_names.add_str(&self.scope_name, 0);
-                        if self.scope_stack.top().scope_name_is_linkable {
+                        if self.stacks.scope.top().scope_name_is_linkable {
                             info.flags.insert(TypeFlags::LINKABLE_NAME);
                         }
                     }
@@ -2857,7 +2875,7 @@ impl<'a> DwarfLoader<'a> {
                         self.shard.base_types.push((offset.0 as u64) << 8 | type_enum as u64);
                     }
 
-                    let prev_type_stack_len = self.type_stack.len;
+                    let prev_type_stack_len = self.stacks.type_.len;
                     let ti;
                     if is_alias {
                         ti = info.t.as_pointer().unwrap().type_;
@@ -2866,14 +2884,14 @@ impl<'a> DwarfLoader<'a> {
                         let t;
                         (t, ti) = self.shard.types.add_type(info);
                         assert!(t != ptr::null());
-                        let top = self.main_stack.top_mut();
-                        self.type_stack.push_uninit(&mut top.flags).reset(t as *mut TypeInfo);
+                        let top = self.stacks.main.top_mut();
+                        self.stacks.type_.push_uninit(&mut top.flags).reset(t as *mut TypeInfo);
                         top.flags.remove(StackFlags::IS_ANY_SCOPE);
                         top.flags.insert(StackFlags::IS_TYPE_SCOPE | StackFlags::IS_VALID_SCOPE);
                     }
 
-                    if !attrs.name.is_empty() && self.main_stack.top2().flags.contains(StackFlags::IS_TYPE_SCOPE | StackFlags::IS_VALID_SCOPE) {
-                        self.type_stack.s[prev_type_stack_len - 1].nested_names.push((attrs.name, NestedName::Type(ti)));
+                    if !attrs.name.is_empty() && self.stacks.main.top2().flags.contains(StackFlags::IS_TYPE_SCOPE | StackFlags::IS_VALID_SCOPE) {
+                        self.stacks.type_.s[prev_type_stack_len - 1].nested_names.push((attrs.name, NestedName::Type(ti)));
                     }
                 }
 
@@ -2884,13 +2902,13 @@ impl<'a> DwarfLoader<'a> {
                     // Other: accessibility, mutable, visibility, virtuality
                     let mut attrs = FieldAttributes::default();
                     unsafe {cursor.read_attributes(abbrev, /*which_layout*/ 0, &attribute_context, &raw mut attrs as *mut u8)}?;
-                    let top = self.main_stack.top();
+                    let top = self.stacks.main.top();
                     if !top.flags.contains(StackFlags::IS_TYPE_SCOPE | StackFlags::IS_VALID_SCOPE) {
                         if !top.flags.contains(StackFlags::IS_TYPE_SCOPE) {
-                            if self.shard.warn.check(line!()) { eprintln!("warning: {} in {} is not supported (@0x{:x})", abbrev.tag, self.main_stack.top2().tag, offset.0); }
+                            if self.shard.warn.check(line!()) { eprintln!("warning: {} in {} is not supported (@0x{:x})", abbrev.tag, self.stacks.main.top2().tag, offset.0); }
                         }
                     } else {
-                        let type_top = self.type_stack.top_mut();
+                        let type_top = self.stacks.type_.top_mut();
                         let type_ = type_top.type_;
                         let mut field = StructField {name: "", flags: FieldFlags::empty(), bit_offset: 0, bit_size: 0, type_: self.loader.types.builtin_types.unknown, discr_value: 0};
                         if offset == type_top.discriminant_die {
@@ -2930,7 +2948,7 @@ impl<'a> DwarfLoader<'a> {
                             unsafe {
                                 match &mut (*type_).t {
                                     Type::Enum(e) => self.shard.types.temp_types.add_enumerand(e, Enumerand {value: attrs.const_value_usize, name: field.name, flags: EnumerandFlags::empty()}),
-                                    _ => if self.shard.warn.check(line!()) { eprintln!("warning: {} in {} is not supported", abbrev.tag, self.main_stack.top2().tag); }
+                                    _ => if self.shard.warn.check(line!()) { eprintln!("warning: {} in {} is not supported", abbrev.tag, self.stacks.main.top2().tag); }
                                 }
                             }
                         } else {
@@ -2957,16 +2975,16 @@ impl<'a> DwarfLoader<'a> {
                                 let t = unsafe {&mut *type_};
                                 match &mut t.t {
                                     Type::Struct(s) => self.shard.types.temp_types.add_field(s, field),
-                                    _ => if self.shard.warn.check(line!()) { eprintln!("warning: {} in {} is not supported", abbrev.tag, self.main_stack.top2().tag); }
+                                    _ => if self.shard.warn.check(line!()) { eprintln!("warning: {} in {} is not supported", abbrev.tag, self.stacks.main.top2().tag); }
                                 }
                             }
                         }
                     }
                 }
 
-                DW_TAG_variant_part | DW_TAG_variant if !self.main_stack.top().flags.contains(StackFlags::IS_TYPE_SCOPE | StackFlags::IS_VALID_SCOPE) => {
-                    if !self.main_stack.top().flags.contains(StackFlags::IS_TYPE_SCOPE) {
-                        if self.shard.warn.check(line!()) { eprintln!("warning: {} in {} is not supported", abbrev.tag, self.main_stack.top2().tag); }
+                DW_TAG_variant_part | DW_TAG_variant if !self.stacks.main.top().flags.contains(StackFlags::IS_TYPE_SCOPE | StackFlags::IS_VALID_SCOPE) => {
+                    if !self.stacks.main.top().flags.contains(StackFlags::IS_TYPE_SCOPE) {
+                        if self.shard.warn.check(line!()) { eprintln!("warning: {} in {} is not supported", abbrev.tag, self.stacks.main.top2().tag); }
                     }
                     cursor.skip_attributes(abbrev, &attribute_context)?;
                 }
@@ -2991,7 +3009,7 @@ impl<'a> DwarfLoader<'a> {
                         // DW_AT_discr can be missing if there's only one reachable variant. Use nonzero value so that we can distinguish this from the whole DW_TAG_variant_part being missing.
                         attrs.discr = 1;
                     }
-                    self.type_stack.top_mut().discriminant_die = DebugInfoOffset(attrs.discr);
+                    self.stacks.type_.top_mut().discriminant_die = DebugInfoOffset(attrs.discr);
                 }
                 DW_TAG_variant => {
                     // Applicable attributes:
@@ -2999,7 +3017,7 @@ impl<'a> DwarfLoader<'a> {
                     // Other: accessibility, declaration
                     let mut attrs = VariantAttributes::default();
                     unsafe {cursor.read_attributes(abbrev, /*which_layout*/ 0, &attribute_context, &raw mut attrs as *mut u8)}?;
-                    let type_top = self.type_stack.top_mut();
+                    let type_top = self.stacks.type_.top_mut();
                     if type_top.discriminant_die.0 == 0 {
                         if self.shard.warn.check(line!()) { eprintln!("warning: variant is not inside variant_part @0x{:x}", offset.0); }
                     } else if !type_top.variant_field_flags.is_empty() {
@@ -3010,7 +3028,7 @@ impl<'a> DwarfLoader<'a> {
                         type_top.variant_field_flags.insert(if attrs.fields & VariantAttributes::discr_value != 0 {FieldFlags::VARIANT} else {FieldFlags::DEFAULT_VARIANT});
                         type_top.discr_value = attrs.discr_value;
                         // Clear variant_field_flags when leaving the DW_TAG_variant subtree.
-                        self.main_stack.top_mut().flags.insert(StackFlags::HAS_VARIANT);
+                        self.stacks.main.top_mut().flags.insert(StackFlags::HAS_VARIANT);
                     }
                 }
 
@@ -3023,10 +3041,10 @@ impl<'a> DwarfLoader<'a> {
                     let mut attrs = SubrangeTypeAttributes::default();
                     unsafe {cursor.read_attributes(abbrev, /*which_layout*/ 0, &attribute_context, &raw mut attrs as *mut u8)}?;
 
-                    let array = if !self.main_stack.top().flags.contains(StackFlags::IS_TYPE_SCOPE | StackFlags::IS_VALID_SCOPE) {
+                    let array = if !self.stacks.main.top().flags.contains(StackFlags::IS_TYPE_SCOPE | StackFlags::IS_VALID_SCOPE) {
                         None
                     } else {
-                        let t = self.type_stack.top().type_;
+                        let t = self.stacks.type_.top().type_;
                         unsafe {(*t).t.as_array_mut()}
                     };
                     if let Some(mut array) = array {
@@ -3036,15 +3054,15 @@ impl<'a> DwarfLoader<'a> {
                             // Turn multidimensional array into array of arrays.
                             // Point the stack entry to the inner array (so that subsequent DW_TAG_subrange_type-s apply to inner rather than outer dimensions).
                             // The outer array is still in `types`, but not in the stack, so finish_type() won't be called for it, which is ok.
-                            // (Note that pushing another type onto type_stack won't work because the repeated DW_TAG_subrange_type are not nested in each other, so the stack entry will be popped immediately.)
-                            let t = unsafe {&mut *self.type_stack.top().type_};
+                            // (Note that pushing another type onto stacks.type_ won't work because the repeated DW_TAG_subrange_type are not nested in each other, so the stack entry will be popped immediately.)
+                            let t = unsafe {&mut *self.stacks.type_.top().type_};
                             array = t.t.as_array_mut().unwrap(); // avoid UB
                             let info = TypeInfo {die: offset, binary_id: t.binary_id, line: t.line, language: self.unit.language, t: Type::Array(ArrayType {flags: ArrayFlags::PARSED_SUBRANGE, type_: array.type_, stride: 0, len: 0}), ..TypeInfo::default()};
                             let (ptr, off) = self.shard.types.add_type(info);
                             assert!(ptr != ptr::null());
                             array.type_ = off;
                             let ptr = ptr as *mut TypeInfo;
-                            self.type_stack.top_mut().type_ = ptr;
+                            self.stacks.type_.top_mut().type_ = ptr;
                             array = unsafe {(*ptr).t.as_array_mut().unwrap()};
                         }
 
@@ -3074,8 +3092,8 @@ impl<'a> DwarfLoader<'a> {
                             }
                         }
                     } else {
-                        if self.main_stack.top2().tag != DW_TAG_array_type {
-                            if self.shard.warn.check(line!()) { eprintln!("warning: {} in {} is not supported", abbrev.tag, self.main_stack.top2().tag); }
+                        if self.stacks.main.top2().tag != DW_TAG_array_type {
+                            if self.shard.warn.check(line!()) { eprintln!("warning: {} in {} is not supported", abbrev.tag, self.stacks.main.top2().tag); }
                         } else {
                             // (Warning would already be printed when parsing the parent.)
                         }
@@ -3093,13 +3111,13 @@ impl<'a> DwarfLoader<'a> {
                     let mut attrs = LexicalBlockAttributes::default();
                     unsafe {cursor.read_attributes(abbrev, /*which_layout*/ 0, &attribute_context, &raw mut attrs as *mut u8)}?;
                     if attrs.fields & (DwarfRanges::RANGES | DwarfRanges::LOW_PC) != 0 {
-                        let ranges_top = self.ranges_stack.push_uninit(&mut self.main_stack.top_mut().flags);
+                        let ranges_top = self.stacks.ranges.push_uninit(&mut self.stacks.main.top_mut().flags);
                         parse_dwarf_ranges(&self.loader.sym.dwarf, &self.unit.unit, &attrs.ranges, attrs.fields, offset, self.loader.sym.code_addr_range.start, &mut ranges_top.pc_ranges, /*out_entry_pc*/ &mut 0, &mut self.shard.warn)?;
                     }
                 }
 
-                DW_TAG_inlined_subroutine if !self.main_stack.top().flags.contains(StackFlags::IS_FUNCTION_SCOPE | StackFlags::IS_VALID_SCOPE) => {
-                    if !self.main_stack.top().flags.contains(StackFlags::IS_FUNCTION_SCOPE) {
+                DW_TAG_inlined_subroutine if !self.stacks.main.top().flags.contains(StackFlags::IS_FUNCTION_SCOPE | StackFlags::IS_VALID_SCOPE) => {
+                    if !self.stacks.main.top().flags.contains(StackFlags::IS_FUNCTION_SCOPE) {
                         if self.shard.warn.check(line!()) { eprintln!("warning: unexpected inlined_subroutine not inside function @0x{:x}", offset.0); }
                     }
                     cursor.skip_attributes(abbrev, &attribute_context)?;
@@ -3112,7 +3130,7 @@ impl<'a> DwarfLoader<'a> {
                     // Other: const_expr, return_addr, segment, start_scope, trampoline
                     let mut attrs = InlinedSubroutineAttributes::default();
                     unsafe {cursor.read_attributes(abbrev, /*which_layout*/ 0, &attribute_context, &raw mut attrs as *mut u8)}?;
-                    let ranges_top = self.ranges_stack.push_uninit(&mut self.main_stack.top_mut().flags);
+                    let ranges_top = self.stacks.ranges.push_uninit(&mut self.stacks.main.top_mut().flags);
                     let mut entry_pc = 0usize;
                     parse_dwarf_ranges(&self.loader.sym.dwarf, &self.unit.unit, &attrs.ranges, attrs.fields, offset, self.loader.sym.code_addr_range.start, &mut ranges_top.pc_ranges, &mut entry_pc, &mut self.shard.warn)?;
 
@@ -3124,17 +3142,17 @@ impl<'a> DwarfLoader<'a> {
                         DebugInfoOffset(usize::MAX)
                     };
 
-                    let f = self.function_stack.top_mut();
-                    let parent = self.subfunction_stack.top();
+                    let f = self.stacks.function.top_mut();
+                    let parent = self.stacks.subfunction.top();
                     let level = parent.subfunction_level + 1;
                     let parent_idx = parent.subfunction_idx;
 
                     if f.subfunctions.len() >= u32::MAX as usize - 1 {
                         if self.shard.warn.check(line!()) { eprintln!("function @0x{:x} has more than {} inlined function calls; this is not supported", offset.0, u32::MAX-1); }
-                        self.main_stack.top_mut().flags.remove(StackFlags::IS_VALID_SCOPE);
+                        self.stacks.main.top_mut().flags.remove(StackFlags::IS_VALID_SCOPE);
                     } else if level >= SUBFUNCTION_LEVEL_MAX {
                         if self.shard.warn.check(line!()) { eprintln!("warning: inlined functions nested > {} levels deep @0x{:x}; this is not supported", SUBFUNCTION_LEVEL_MAX - 1, offset.0); }
-                        self.main_stack.top_mut().flags.remove(StackFlags::IS_VALID_SCOPE);
+                        self.stacks.main.top_mut().flags.remove(StackFlags::IS_VALID_SCOPE);
                     } else {
                         if call_line.file_idx().is_some() && entry_pc != 0 {
                             let mut entry_call_line = call_line.clone().with_addr_and_flags(entry_pc, LineFlags::INLINED_FUNCTION | LineFlags::STATEMENT);
@@ -3144,8 +3162,8 @@ impl<'a> DwarfLoader<'a> {
 
                         let sf_idx = f.subfunctions.len() as u32;
                         f.subfunctions.push((Subfunction {callee_idx: callee_die.0, local_variables: Subfunction::pack_range(0..0), call_line: call_line.clone(), addr_range: 0..0, identity: sf_idx}, parent_idx));
-                        self.subfunction_stack.push_uninit(&mut self.main_stack.top_mut().flags).reset(sf_idx, level);
-                        for range in &self.ranges_stack.top().pc_ranges {
+                        self.stacks.subfunction.push_uninit(&mut self.stacks.main.top_mut().flags).reset(sf_idx, level);
+                        for range in &self.stacks.ranges.top().pc_ranges {
                             f.subfunction_events.push(SubfunctionEvent {addr: range.begin as usize, subfunction_idx: sf_idx, signed_level: level as i16 + 1});
                             f.subfunction_events.push(SubfunctionEvent {addr: range.end as usize, subfunction_idx: sf_idx, signed_level: -(level as i16 + 1)});
                         }
@@ -3154,13 +3172,13 @@ impl<'a> DwarfLoader<'a> {
 
                 // Things we (hopefully) don't care about.
                 DW_TAG_label | DW_TAG_imported_declaration | DW_TAG_imported_module | DW_TAG_GNU_template_parameter_pack | DW_TAG_GNU_template_template_param => {
-                    skip_subtree = self.main_stack.len;
+                    skip_subtree = self.stacks.main.len;
                     cursor.skip_attributes(abbrev, &attribute_context)?;
                 }
 
                 // Function template arguments.
-                DW_TAG_template_type_parameter if !self.main_stack.top().flags.contains(StackFlags::IS_TYPE_SCOPE | StackFlags::IS_VALID_SCOPE) => {
-                    skip_subtree = self.main_stack.len;
+                DW_TAG_template_type_parameter if !self.stacks.main.top().flags.contains(StackFlags::IS_TYPE_SCOPE | StackFlags::IS_VALID_SCOPE) => {
+                    skip_subtree = self.stacks.main.len;
                     cursor.skip_attributes(abbrev, &attribute_context)?;
                 }
 
@@ -3172,7 +3190,7 @@ impl<'a> DwarfLoader<'a> {
                     let mut attrs = TemplateTypeParameterAttributes::default();
                     unsafe {cursor.read_attributes(abbrev, /*which_layout*/ 0, &attribute_context, &raw mut attrs as *mut u8)}?;
                     if !attrs.name.is_empty() && attrs.fields & TemplateTypeParameterAttributes::type_ != 0 {
-                        self.type_stack.top_mut().nested_names.push((attrs.name, NestedName::Type(attrs.type_ as *const TypeInfo)));
+                        self.stacks.type_.top_mut().nested_names.push((attrs.name, NestedName::Type(attrs.type_ as *const TypeInfo)));
                     }
                 }
 
@@ -3204,16 +3222,16 @@ impl<'a> DwarfLoader<'a> {
     }
 
     fn finish_subfunction(&mut self) {
-        let top = self.subfunction_stack.pop_mut();
+        let top = self.stacks.subfunction.pop_mut();
         let start = self.shard.sym.local_variables.len();
         self.shard.sym.local_variables.append(&mut top.local_variables);
         let end = self.shard.sym.local_variables.len();
         let subfunction_idx = top.subfunction_idx;
-        self.function_stack.top_mut().subfunctions[subfunction_idx as usize].0.local_variables = Subfunction::pack_range(start..end);
+        self.stacks.function.top_mut().subfunctions[subfunction_idx as usize].0.local_variables = Subfunction::pack_range(start..end);
     }
     
     fn finish_function(&mut self) {
-        let top = self.function_stack.pop_mut();
+        let top = self.stacks.function.pop_mut();
         if top.subfunction_events.is_empty() {
             // Inline-only function.
             return;
@@ -3314,7 +3332,7 @@ impl<'a> DwarfLoader<'a> {
     }
 
     fn finish_type(&mut self) {
-        let type_top = self.type_stack.pop();
+        let type_top = self.stacks.type_.pop();
         let t = unsafe {&mut *type_top.type_};
         if !type_top.nested_names.is_empty() {
             t.nested_names = self.shard.types.temp_types.misc_arena.add_slice(&type_top.nested_names);

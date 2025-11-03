@@ -46,6 +46,12 @@ pub mod os;
 use crate::{elf::*, error::*, debugger::*, util::*, ui::*, log::*, process_info::*, symbols::*, symbols_registry::*, procfs::*, unwind::*, range_index::*, settings::*, context::*, executor::*, persistent::*, doc::*, terminal::*, common_ui::*, core_dumper::*, os::*};
 use std::{rc::Rc, mem, str, fs, os::fd::{FromRawFd}, io::Read, io, io::Write, panic, process, thread, thread::ThreadId, cell::UnsafeCell, ptr, pin::Pin, sync::Arc, str::FromStr, path::PathBuf, collections::HashSet};
 use libc::{self, STDIN_FILENO, pid_t};
+#[cfg(target_env = "musl")]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static ALLOCATOR: Jemalloc = Jemalloc;
 
 // Pipes written from corresponding signal handlers, read from main loop. We could use one pipe and write signal number to it, but it would break in the unlikely case when one signal fills up the whole pipe before the main loop drains it - then other signals would get lost. Probably not actually important.
 static mut SIGNAL_PIPES_WRITE: [i32; 32] = [-1; 32];
