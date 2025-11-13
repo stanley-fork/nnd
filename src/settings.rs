@@ -203,6 +203,7 @@ pub struct Palette {
     pub thread_breakpoint_hit: StyleAdjustment,
     pub thread_crash: StyleAdjustment,
     pub breakpoint_error: StyleAdjustment,
+    pub breakpoint_builtin: StyleAdjustment,
 }
 impl Default for Palette {
     fn default() -> Self {
@@ -313,6 +314,7 @@ impl Default for Palette {
             thread_breakpoint_hit: StyleAdjustment {add_fg: (100, 100, 100), add_bg: (10, 100, 10), ..D!()},
             thread_crash: StyleAdjustment {add_fg: (100, 100, 100), add_bg: (150, 50, 50), ..D!()},
             breakpoint_error: StyleAdjustment {add_fg: (100, 100, 100), add_bg: (150, 50, 50), ..D!()},
+            breakpoint_builtin: StyleAdjustment {add_fg: (10, 10, 10), add_bg: (30, 30, 30), ..D!()},
        }
     }
 }

@@ -80,9 +80,10 @@ git push
 
 # Copy to my machines.
 
-scp target/x86_64-unknown-linux-musl/dbgo/nnd dev:bin/new-nnd && scp target/x86_64-unknown-linux-musl/release/nnd dev:bin/new-nnd-release && ssh dev 'mv bin/new-nnd bin/nnd; mv bin/new-nnd-release bin/nnd-release;'
+#scp target/x86_64-unknown-linux-musl/dbgo/nnd dev:bin/new-nnd && scp target/x86_64-unknown-linux-musl/release/nnd dev:bin/new-nnd-release && ssh dev 'mv bin/new-nnd bin/nnd; mv bin/new-nnd-release bin/nnd-release;'
 
 cp target/x86_64-unknown-linux-musl/dbgo/nnd ../../nnd-release/nnd-new && mv ../../nnd-release/nnd-new ../../nnd-release/nnd && cp target/x86_64-unknown-linux-musl/release/nnd ../../nnd-release/nnd-release-new && mv ../../nnd-release/nnd-release-new ../../nnd-release/nnd-release
+cp target/dbgo/nnd ../../nnd-release/nnd-libc-new && mv ../../nnd-release/nnd-libc-new ../../nnd-release/nnd-libc && cp target/release/nnd ../../nnd-release/nnd-release-libc-new && mv ../../nnd-release/nnd-release-libc-new ../../nnd-release/nnd-release-libc
 
 # Push to itch.
 #butler push target/x86_64-unknown-linux-musl/release/nnd al13n/nnd:linux

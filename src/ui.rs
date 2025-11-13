@@ -4551,6 +4551,7 @@ struct BreakpointsWindow {
     table_state: TableState,
     selected_breakpoint: Option<BreakpointId>,
     condition_input: Option<(BreakpointId, TextInput)>,
+    initialized: bool,
 }
 impl WindowContent for BreakpointsWindow {
     fn get_key_hints(&self, out: &mut Vec<KeyHint>, debugger: &Debugger) {
@@ -4562,6 +4563,15 @@ impl WindowContent for BreakpointsWindow {
     }
 
     fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
+        if !mem::replace(&mut self.initialized, true) {
+            // Put cursor on first non-builtin breakpoint on startup.
+            for (id, b) in debugger.breakpoints.iter() {
+                if !b.hidden && !b.builtin && !self.selected_breakpoint.is_some_and(|idd| idd.seqno >= id.seqno) {
+                    self.selected_breakpoint = Some(id);
+                }
+            }
+        }
+
         state.hit_breakpoints.clear();
         for (tid, thread) in &debugger.threads {
             for reason in &thread.stop_reasons {
@@ -4574,7 +4584,7 @@ impl WindowContent for BreakpointsWindow {
         state.hit_breakpoints.dedup();
 
         let mut table = Table::new(mem::take(&mut self.table_state), ui, vec![
-            Column::new("idx", AutoSize::Text, false),
+            Column::new("id", AutoSize::Text, false),
             Column::new("", AutoSize::Fixed(4), false),
             Column::new("on", AutoSize::Remainder(1.0), false),
             Column::new("locs", AutoSize::Text, false),
@@ -4599,7 +4609,7 @@ impl WindowContent for BreakpointsWindow {
                 None => continue,
                 Some(x) => x };
             match action {
-                KeyAction::DeleteRow => {
+                KeyAction::DeleteRow if !breakpoint.builtin => {
                     debugger.remove_breakpoint(id);
                     table.state.scroll_to_cursor = true; // to auto-update the code window
                 }
@@ -4627,6 +4637,7 @@ impl WindowContent for BreakpointsWindow {
             }
         }
 
+        // (This has to be after the potential remove_breakpoint() above.)
         let mut breakpoints: Vec<BreakpointId> = debugger.breakpoints.iter().filter(|(_, b)| !b.hidden).map(|p| p.0).collect();
         breakpoints.sort_by_key(|id| id.seqno);
 
@@ -4668,6 +4679,8 @@ impl WindowContent for BreakpointsWindow {
                     }
                 }
             }
+            let error = error;
+            let error_is_benign = b.builtin && error.as_ref().is_some_and(|e| e.is_no_function());
 
             let row_widget = table.start_row(id.seqno, ui);
 
@@ -4739,7 +4752,8 @@ impl WindowContent for BreakpointsWindow {
                 }
 
                 if let Some(e) = &error {
-                    let l = ui_writeln!(ui, error, "{}", e);
+                    let style = if error_is_benign {ui.palette.default_dim} else {ui.palette.error};
+                    let l = styled_writeln!(ui.text, style, "{}", e);
                     ui.add(widget!().height(AutoSize::Text).text(l).flags(WidgetFlags::LINE_WRAP));
                 }
             });
@@ -4754,8 +4768,11 @@ impl WindowContent for BreakpointsWindow {
             ui_writeln!(ui, default_dim, "{}", b.hits);
             table.text_cell(ui);
 
-            if error.is_some() {
+            if error.is_some() && !error_is_benign {
                 let a = ui.palette.breakpoint_error;
+                ui.get_mut(row_widget).style_adjustment.update(a);
+            } else if b.builtin {
+                let a = ui.palette.breakpoint_builtin;
                 ui.get_mut(row_widget).style_adjustment.update(a);
             }
         }

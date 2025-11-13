@@ -334,6 +334,9 @@ pub struct Breakpoint {
 
     // Internal breakpoint. Don't show in UI, don't delete. We create such breakpoints once and rely that no code site will accidentally remove or disable them after that.
     pub hidden: bool,
+    // Special convenience breakpoints automatically created on startup. E.g. for exceptions and panics.
+    // We have a bunch of special behavior for them: don't allow deleting them in ui, don't show highlight errors in red (e.g. if panic breakpoint failed to activate because the program is not in Rust), place cursor after them on startup, etc.
+    pub builtin: bool,
 }
 impl Breakpoint {
     fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {
@@ -405,7 +408,7 @@ impl Breakpoint {
             x => return err!(Environment, "unexpected breakpoint condition flag in save file: {}", x),
         };
         let enabled = inp.read_bool()?;
-        Ok(Breakpoint {on, condition, hits: 0, addrs: err!(NotCalculated, ""), enabled, active: false, hidden: false})
+        Ok(Breakpoint {on, condition, hits: 0, addrs: err!(NotCalculated, ""), enabled, active: false, hidden: false, builtin: false})
     }
 }
 
@@ -443,10 +446,10 @@ impl Debugger {
             // Add default breakpoints.
 
             // Hidden non-stopping breakpoint on library load to activate breakpoints on dlopen.
-            breakpoints.add(Breakpoint {on: BreakpointOn::PointOfInterest(PointOfInterest::LibraryLoad), condition: None, hits: 0, addrs: err!(NotCalculated, ""), enabled: true, active: false, hidden: true});
+            breakpoints.add(Breakpoint {on: BreakpointOn::PointOfInterest(PointOfInterest::LibraryLoad), condition: None, hits: 0, addrs: err!(NotCalculated, ""), enabled: true, active: false, hidden: true, builtin: true});
             // Regular breakpoints on panics (on by default) and exceptions (off by default).
-            breakpoints.add(Breakpoint {on: BreakpointOn::PointOfInterest(PointOfInterest::Panic), condition: None, hits: 0, addrs: err!(NotCalculated, ""), enabled: true, active: false, hidden: false});
-            breakpoints.add(Breakpoint {on: BreakpointOn::PointOfInterest(PointOfInterest::Exception), condition: None, hits: 0, addrs: err!(NotCalculated, ""), enabled: false, active: false, hidden: false});
+            breakpoints.add(Breakpoint {on: BreakpointOn::PointOfInterest(PointOfInterest::Panic), condition: None, hits: 0, addrs: err!(NotCalculated, ""), enabled: true, active: false, hidden: false, builtin: true});
+            breakpoints.add(Breakpoint {on: BreakpointOn::PointOfInterest(PointOfInterest::Exception), condition: None, hits: 0, addrs: err!(NotCalculated, ""), enabled: false, active: false, hidden: false, builtin: true});
         } else {
             assert!(breakpoints.iter().filter(|(_, b)| b.hidden).count() == 1);
         }
@@ -469,10 +472,12 @@ impl Debugger {
         // Possibly overcomplicated management of default breakpoints (currently: Panic and Exception).
         // Add them on startup before loading state, but allow the user to make them conditional.
         // If a breakpoint is found in save file, it replaces the default breakpoint (to preserve the condition, if any).
-        let mut default_breakpoints: HashMap<PointOfInterest, BreakpointId> = HashMap::new();
+        let mut builtin_breakpoints: HashMap<PointOfInterest, BreakpointId> = HashMap::new();
         for (id, bp) in self.breakpoints.iter() {
             if let &BreakpointOn::PointOfInterest(p) = &bp.on {
-                default_breakpoints.insert(p, id);
+                if bp.builtin {
+                    builtin_breakpoints.insert(p, id);
+                }
             }
         }
 
@@ -482,22 +487,21 @@ impl Debugger {
             }
             let mut b = Breakpoint::load_state(inp)?;
 
-            let mut is_default = false;
             if let &BreakpointOn::PointOfInterest(p) = &b.on {
-                if let Entry::Occupied(o) = default_breakpoints.entry(p) {
-                    is_default = true;
+                if let Entry::Occupied(o) = builtin_breakpoints.entry(p) {
+                    b.builtin = true;
                     self.breakpoints.remove(*o.get());
                     o.remove();
                 }
             }
 
-            if !is_default {
+            if !b.builtin {
                 // Disable regular breakpoints on startup to allow running the program without waiting for symbols to load.
                 // For Panic and Exception, keep enabledness on restart.
                 // Kind of inconsistent behavior, but seems convenient. Maybe UI should show regular vs special breakpoints separately to make this more clear.
                 b.enabled = false;
             }
-            
+
             self.breakpoints.add(b);
         }
         Ok(())
@@ -1178,7 +1182,7 @@ impl Debugger {
                 self.target_state = ProcessState::Suspended;
                 self.pending_step = None;
             } else {
-                let mut breakpoint = Breakpoint {on: on.clone(), condition: None, hits: 0, addrs: err!(NotCalculated, ""), enabled: true, active: false, hidden: true};
+                let mut breakpoint = Breakpoint {on: on.clone(), condition: None, hits: 0, addrs: err!(NotCalculated, ""), enabled: true, active: false, hidden: true, builtin: true};
                 Self::determine_locations_for_breakpoint(&self.symbols, &mut breakpoint);
                 match breakpoint.addrs {
                     Err(e) if e.is_loading() => (),
@@ -2022,7 +2026,7 @@ impl Debugger {
             }
         }
         
-        let breakpoint = Breakpoint {on, condition: None, hits: 0, addrs: err!(NotCalculated, ""), enabled: true, active: false, hidden: false};
+        let breakpoint = Breakpoint {on, condition: None, hits: 0, addrs: err!(NotCalculated, ""), enabled: true, active: false, hidden: false, builtin: false};
         let id = self.breakpoints.add(breakpoint).0;
         if self.target_state.process_ready() {
             self.activate_breakpoints(vec![id])?;
@@ -2288,7 +2292,7 @@ impl Debugger {
                 } else if loading {
                     err!(Loading, "symbols are not loaded yet")
                 } else {
-                    err!(NoFunction, "{} not found", point.name_for_ui())
+                    err!(NoFunction, "no locations found for {}", point.name_for_ui())
                 };
             }
             b => breakpoint.addrs = err!(Internal, "unexpected breakpoint kind: {:?}", b),
