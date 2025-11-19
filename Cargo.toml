@@ -6,7 +6,7 @@ documentation = "https://github.com/al13n321/nnd"
 repository = "https://github.com/al13n321/nnd"
 keywords = ["debugger", "tui"]
 categories = ["development-tools::debugging"]
-version = "0.59.0" # [[this version number is written by release.sh]]
+version = "0.60.0" # [[this version number is written by release.sh]]
 edition = "2021" # I tried updating to 2024, but it just makes build 10% slower without making the resulting executable any faster
 rust-version = "1.89" # build often breaks when updating the compiler because of newly added warnings
 
@@ -36,8 +36,8 @@ gimli = {version = "^0.31.1", default-features = false, features = ["std", "read
 crc32fast = "^1.3.2" # a few things in ELF and DWARF use crc32
 flate2 = "^1.0.26" # for decompressing ELF sections
 md5 = "^0.7" # for checking source file hashes against debug symbols; but it seems that hashes are never present in the debug symbols in practice, so maybe we should remove this
-cpp_demangle = "^0.4.4" # for demangling function names (unavoidable in .symtab, convenient in .debug_info)
-#cpp_demangle = {path = "/home/al13n/Dropbox/coding/cpp_demangle"}
+cpp_demangle = "^0.5.1" # for demangling function names (unavoidable in .symtab, convenient in .debug_info); TODO: update after https://github.com/gimli-rs/cpp_demangle/pull/306 is released
+#cpp_demangle = {path = "/home/al13n/cpp_demangle"}
 rand = "^0.8.5"
 unicode-segmentation = "^1.10"
 unicode-width = "^0.1"

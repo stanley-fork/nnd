@@ -314,7 +314,7 @@ impl FunctionInfo {
             _ => if name.starts_with(b"_Z") {
                 if let Ok(symbol) = cpp_demangle::BorrowedSymbol::new_with_options(name, &cpp_demangle::ParseOptions::default().recursion_limit(1000)) {
                     let options = cpp_demangle::DemangleOptions::new().recursion_limit(1000).no_return_type().no_params().hide_expression_literal_types();
-                    if let Ok(r) = symbol.demangle(&options) {
+                    if let Ok(r) = symbol.demangle_with_options(&options) {
                         return r;
                     }
                 }
@@ -1584,7 +1584,7 @@ impl SymbolsLoader {
                         // print things like lambdas and anonymous namespaces; but that sounds too complicated.
                         match cpp_demangle::BorrowedSymbol::new_with_options(mangled, &cpp_demangle::ParseOptions::default().recursion_limit(1000)) {
                             Err(e) => if shard.warn.check(line!()) { eprintln!("warning: failed to demangle (1) vtable symtab entry '{}': {}", String::from_utf8_lossy(mangled), e); }
-                            Ok(symbol) => match symbol.demangle(&cpp_demangle::DemangleOptions::default().recursion_limit(1000)) {
+                            Ok(symbol) => match symbol.demangle_with_options(&cpp_demangle::DemangleOptions::default().recursion_limit(1000)) {
                                 Err(e) => if shard.warn.check(line!()) { eprintln!("warning: failed to demangle (2) vtable symtab entry '{}': {}", String::from_utf8_lossy(mangled), e); }
                                 Ok(name) if name.starts_with("{vtable(") => {
                                     // It's either "{vtable(Foo)}" or "{vtable(Foo)} [.clone .3e570ba5df68adedf72ec05448f83d40]". AFAIU, the latter means it's a synthetic type that's not quite Foo; I guess we should still treat it as Foo.
@@ -1609,7 +1609,14 @@ impl SymbolsLoader {
 
     fn parse_misc_sections(&self, shard_idx: usize, shard: &mut SymbolsLoaderShard) {
         // Sections that contain executable code but are not usually covered by debug symbols. We pretend that each of them is a function, to make them show up in disassembly window at all.
-        for name in [".init", ".fini", ".plt", ".plt.got", ".plt.sec"] {
+        let mut sections_to_add_as_functions = vec![".init", ".fini", ".plt", ".plt.got", ".plt.sec"];
+
+        // If we don't have any information about function address ranges, treat the whole .text section as a function.
+        if !self.sym.elves.iter().any(|elf| elf.section_by_name.get(".debug_info").is_some() || elf.section_by_name.get(".symtab").is_some()) {
+            sections_to_add_as_functions.push(".text");
+        }
+
+        for name in sections_to_add_as_functions {
             if let Some(&idx) = self.sym.elves[0].section_by_name.get(name) {
                 let s = &self.sym.elves[0].sections[idx];
                 if s.size != 0 && s.address != 0 {
@@ -1738,7 +1745,20 @@ impl SymbolsLoader {
     fn dedup_functions(&mut self) {
         let max_function_end = self.shards.iter_mut().map(|s| s.get_mut().max_function_end).max().unwrap_or(0);
         let end_addr = FunctionAddr::new(max_function_end, &mut self.shards[0].get_mut().warn);
-        let additional_functions = [FunctionInfo {addr: end_addr, prev_addr: end_addr, entry_addr: 0, mangled_name: "".as_ptr(), mangled_name_len: 0, shard_idx: 0, flags: FunctionFlags::SENTINEL, language: LanguageFamily::Unknown, subfunction_levels: 0..0, die: DebugInfoOffset(usize::MAX)}];
+        let mut additional_functions = vec![FunctionInfo {addr: end_addr, prev_addr: end_addr, entry_addr: 0, mangled_name: "".as_ptr(), mangled_name_len: 0, shard_idx: 0, flags: FunctionFlags::SENTINEL, language: LanguageFamily::Unknown, subfunction_levels: 0..0, die: DebugInfoOffset(usize::MAX)}];
+
+        // Make sure there's a sentinel at the end of .text section.
+        if let &Some(idx) = &self.sym.elves[0].text_section {
+            let s = &self.sym.elves[0].sections[idx];
+            let end_addr = s.address.saturating_add(s.size);
+            let end_func_addr = FunctionAddr::new(end_addr, unsafe {&mut (*self.shards[0].get()).warn});
+            if end_addr != max_function_end {
+                additional_functions.push(FunctionInfo {
+                    addr: end_func_addr, prev_addr: end_func_addr, entry_addr: 0, die: DebugInfoOffset(usize::MAX), mangled_name: "".as_ptr(), mangled_name_len: 0,
+                    shard_idx: 0 as u16, flags: FunctionFlags::SENTINEL, language: LanguageFamily::Unknown, subfunction_levels: 0..0});
+            }
+        }
+
         let mut sources: Vec<&[FunctionInfo]> = self.shards.iter().map(|s| unsafe {&(*s.get()).functions[..]}).collect();
         sources.push(&additional_functions);
         let mut iter = MergeIterator::new(sources, |f| !Self::function_sorting_key(f));
@@ -2292,7 +2312,7 @@ impl<'a> DwarfLoader<'a> {
             if unqualified_name.is_empty() && !linkage_name.is_empty() && self.unit.language.presumably_cpp() {
                 if let Ok(symbol) = cpp_demangle::BorrowedSymbol::new_with_options(linkage_name.as_bytes(), &cpp_demangle::ParseOptions::default().recursion_limit(1000)) {
                     let options = cpp_demangle::DemangleOptions::new().recursion_limit(1000).no_return_type().no_params().hide_expression_literal_types();
-                    if let Ok(r) = symbol.demangle(&options) {
+                    if let Ok(r) = symbol.demangle_with_options(&options) {
                         var.set_name(self.shard.temp_global_var_arena.add_str(&r));
                         if stack_flags.contains(StackFlags::IS_TYPE_SCOPE | StackFlags::IS_VALID_SCOPE) {
                             let i = r.rfind(':').map_or(0, |i| i + 1);

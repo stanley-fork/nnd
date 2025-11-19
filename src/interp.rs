@@ -591,6 +591,9 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                                     Type::Slice(s) => {
                                         let addr = val.val.bit_range(0..64, memory)?;
                                         let size = val.val.bit_range(64..128, memory)?;
+                                        if size > 100 << 20 {
+                                            return err!(Sanity, "slice too long (over 100 MiB)");
+                                        }
                                         let mut buf = vec![0u8; size];
                                         memory.read(addr, &mut buf)?;
                                         (ValueBlob::from_vec(buf), size)

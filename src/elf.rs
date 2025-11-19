@@ -305,18 +305,30 @@ pub fn parse_core_dump(elf: Arc<ElfFile>) -> Result<(CoreDumpMemReader, Vec<(pid
                             idx += 1;
                         }
                     }
-                    // Cores produced by gdump are missing the 'executable' flag on most maps for some reason.
-                    // So we pretend that all maps are executable to make our binary detection work at all.
-                    perms.insert(MemMapPermissions::EXECUTE);
 
                     maps.push(MemMapInfo {start: start_address, len: end_address - start_address, perms, offset: offset_pages * page_size, inode: 0, path: None, binary_locator: None, binary_id: None, elf_seen: false});
                 }
+                let mut files_with_executable_maps: HashSet<String> = HashSet::new();
                 for i in 0..count {
                     let mut filename: Vec<u8> = Vec::new();
                     reader.read_until(b'\0', &mut filename)?;
                     if !filename.ends_with(b"\0") { return err!(MalformedExecutable, "non-null-terminated filename in core dump"); }
                     filename.pop();
-                    maps[i].path = Some(str::from_utf8(&filename)?.to_string());
+                    let path = str::from_utf8(&filename)?.to_string();
+                    if maps[i].perms.contains(MemMapPermissions::EXECUTE) {
+                        files_with_executable_maps.insert(path.clone());
+                    }
+                    maps[i].path = Some(path);
+                }
+                for i in 0..count {
+                    if let Some(path) = &maps[i].path {
+                        if !files_with_executable_maps.contains(path) {
+                            // Cores produced by gcore are missing the 'executable' flag on most maps for some reason.
+                            // So if all maps of some file are non-executable, we pretend that they're all executable instead.
+                            // This is currently required to make our loaded binary detection code work at all on gcore outputs.
+                            maps[i].perms.insert(MemMapPermissions::EXECUTE);
+                        }
+                    }
                 }
             }
             _ => (),
@@ -712,7 +724,7 @@ fn open_elf(name: String, file: Option<(&File, /*file_len*/ usize)>, mut owned: 
         }
 
         let prev = elf.section_by_name.insert(s.name.clone(), idx);
-        // (Core dumps produced by gdump have lots of sections named "load".)
+        // (Core dumps produced by gcore have lots of sections named "load".)
         if prev.is_some() && !is_core_dump {
             eprintln!("warning: ELF has duplicate section name: {}", s.name);
         }

@@ -228,6 +228,9 @@ impl AddrOrValueBlob {
                 b
             }
             Self::Addr(a) => {
+                if bytes > (100 << 20) {
+                    return err!(Sanity, "value too long (over 100 MiB)");
+                }
                 let mut b = ValueBlob::with_capacity(bytes);
                 memory.read(a, &mut b.as_mut_slice()[..bytes])?;
                 b
