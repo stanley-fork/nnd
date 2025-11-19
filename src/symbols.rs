@@ -190,6 +190,8 @@ pub struct Symbols {
     // How long it took to load the symbols and how much memory it used.
     pub loading_duration_ns: usize,
     pub loading_memory_usage: Option<usize>,
+
+    pub unsupported_features: DwarfUnsupportedFeatures,
 }
 
 // Data structures for functions and inlined function calls.
@@ -972,6 +974,7 @@ struct SymbolsLoaderShard {
     functions_before_dedup: usize,
 
     warn: Limiter,
+    unsupported_features: DwarfUnsupportedFeatures,
 }
 
 struct FileDedup {
@@ -1077,7 +1080,7 @@ impl SymbolsLoader {
             sym: SymbolsShard {addr_to_line: BigVec::new(), line_to_addr: BigVec::new(), types: Types::new(), misc_arena: Arena::new(), local_variables: BigVec::new(), global_variables: Arena::new(), sorted_global_variable_names: StringTable::new(), subfunctions: BigVec::new(), subfunction_levels: BigVec::new(), mangled_name_to_function: BigVec::new()},
             addr_to_line_len_after_debug_line: 0,
             units: Vec::new(), symtab_ranges: Vec::new(), file_dedup: Vec::new(), file_used_lines: Vec::new(), types, base_types: Vec::new(), functions: Vec::new(), subfunctions_need_fixup: Vec::new(), vtables: Vec::new(), points_of_interest: HashMap::new(),
-            temp_global_var_arena: Arena::new(), max_function_end: 0, functions_before_dedup: 0, warn: Limiter::new()}).collect();
+            temp_global_var_arena: Arena::new(), max_function_end: 0, functions_before_dedup: 0, warn: Limiter::new(), unsupported_features: DwarfUnsupportedFeatures::empty()}).collect();
 
         let mut round_robin_shard = 0usize;
         let mut round_robin_offset = 0usize;
@@ -1135,7 +1138,7 @@ impl SymbolsLoader {
 
         prepare_time_per_stage_ns[0] = start_time.elapsed().as_nanos() as usize;
         Ok(SymbolsLoader {
-            num_shards: shards.len(), binary_id, sym: Symbols {elves, dwarf, units, files: Vec::new(), file_paths: StringTable::new(), path_to_used_file: HashMap::new(), functions: BigVec::new(), shards: Vec::new(), builtin_types: BuiltinTypes::invalid(), base_types: Vec::new(), vtables: Vec::new(), points_of_interest: HashMap::new(), loading_duration_ns: 0, loading_memory_usage: None, code_addr_range},
+            num_shards: shards.len(), binary_id, sym: Symbols {elves, dwarf, units, files: Vec::new(), file_paths: StringTable::new(), path_to_used_file: HashMap::new(), functions: BigVec::new(), shards: Vec::new(), builtin_types: BuiltinTypes::invalid(), base_types: Vec::new(), vtables: Vec::new(), points_of_interest: HashMap::new(), loading_duration_ns: 0, loading_memory_usage: None, code_addr_range, unsupported_features: DwarfUnsupportedFeatures::empty()},
             shards: shards.into_iter().map(|s| SyncUnsafeCell::new(CachePadded::new(s))).collect(), die_to_function_shards: (0..num_shards).map(|_| SyncUnsafeCell::new(CachePadded::new(Vec::new()))).collect(), types: types_loader, send_global_variable_names, strtab_symtab, status, progress_per_stage,
             abbreviations_shared, prepare_time_per_stage_ns, run_time_per_stage_ns, shard_progress_ppm: (0..num_shards).map(|_| CachePadded::new(AtomicUsize::new(0))).collect(), stage: 0, types_before_dedup: 0, type_offsets: 0, type_offset_maps_bytes: 0, type_dedup_maps_bytes: 0})
     }
@@ -1226,7 +1229,12 @@ impl SymbolsLoader {
     }
 
     pub fn into_result(mut self) -> Symbols {
-        self.sym.shards = self.shards.into_iter().map(|s| s.into_inner().into_inner().sym).collect();
+        self.sym.unsupported_features = self.abbreviations_shared.unsupported_features;
+        for shard in self.shards.into_iter() {
+            let shard = shard.into_inner().into_inner();
+            self.sym.unsupported_features.insert(shard.unsupported_features);
+            self.sym.shards.push(shard.sym);
+        }
         self.sym
     }
 
@@ -2511,7 +2519,11 @@ impl<'a> DwarfLoader<'a> {
 
                 // This tag means that the debug info is split into a separate file using DWARF's complicated mechanism for that.
                 // Not sure if this is worth supporting, since simpler ways of splitting are available: debuglink, or just providing an unstripped executable on the side.
-                DW_TAG_skeleton_unit => return err!(NotImplemented, "skeleton units not supported (too spooky)"),
+                DW_TAG_skeleton_unit => {
+                    skip_subtree = self.stacks.main.len;
+                    cursor.skip_attributes(abbrev, &attribute_context)?;
+                    self.shard.unsupported_features.insert(DwarfUnsupportedFeatures::SKELETON_UNITS);
+                }
 
                 // Namespaces.
                 DW_TAG_namespace => {

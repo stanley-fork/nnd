@@ -183,7 +183,11 @@ impl ElfFile {
     }
 }
 
-pub fn parse_elf_note<'a>(data: &'a [u8]) -> Result<(ElfNote<'a>, /*remainder*/ &'a [u8])> {
+pub fn parse_elf_note<'a>(data: &'a [u8]) -> Result<Option<(ElfNote<'a>, /*remainder*/ &'a [u8])>> {
+    if data.len() < 12 {
+        // `.note.qt.metadata` sometimes has 4 null bytes after the last note. I don't know what that means.
+        return Ok(None);
+    }
     let mut reader = io::Cursor::new(data);
     let name_len = reader.read_u32()? as usize;
     let desc_len = reader.read_u32()? as usize;
@@ -194,7 +198,7 @@ pub fn parse_elf_note<'a>(data: &'a [u8]) -> Result<(ElfNote<'a>, /*remainder*/ 
     if pos + name_len_padded + desc_len_padded > data.len() {
         return err!(MalformedExecutable, "ELF note is too short");
     }
-    Ok((ElfNote {type_, name: &data[pos..pos+name_len], desc: &data[pos+name_len_padded..pos+name_len_padded+desc_len]}, &data[pos+name_len_padded+desc_len_padded..]))
+    Ok(Some((ElfNote {type_, name: &data[pos..pos+name_len], desc: &data[pos+name_len_padded..pos+name_len_padded+desc_len]}, &data[pos+name_len_padded+desc_len_padded..])))
 }
 
 impl ElfSection {
@@ -232,8 +236,7 @@ pub fn parse_core_dump(elf: Arc<ElfFile>) -> Result<(CoreDumpMemReader, Vec<(pid
             }
         } else if segment.segment_type == PT_NOTE {
             let mut data = &elf.data[segment.offset..segment.offset+segment.size_in_file];
-            while !data.is_empty() {
-                let (note, remainder) = parse_elf_note(data)?;
+            while let Some((note, remainder)) = parse_elf_note(data)? {
                 data = remainder;
                 notes.push(note);
             }
@@ -454,7 +457,7 @@ pub fn extract_build_id_from_mapped_elf(memory: &MemReader, addr: usize, len: us
 
         let mut offset = segment.p_offset as usize;
         let end_offset = offset.saturating_add(segment.p_filesz as usize);
-        while offset < end_offset {
+        while offset + 12 <= end_offset {
             if offset.saturating_add(12) > len {
                 have_notes_out_of_bounds = true;
                 break;
@@ -750,9 +753,8 @@ fn open_elf(name: String, file: Option<(&File, /*file_len*/ usize)>, mut owned: 
     for section_idx in 0..elf.sections.len() {
         if elf.sections[section_idx].section_type == SHT_NOTE {
             let mut data = elf.section_data(section_idx)?;
-            while !data.is_empty() {
-                let note;
-                (note, data) = parse_elf_note(data)?;
+            while let Some((note, remainder)) = parse_elf_note(data)? {
+                data = remainder;
                 match note.type_ {
                     NT_GNU_BUILD_ID if note.name == b"GNU\0" => if !note.desc.is_empty() {
                         build_id = Some(note.desc.to_owned());

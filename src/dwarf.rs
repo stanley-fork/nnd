@@ -2,6 +2,7 @@ use crate::{*, error::{*, Result, Error}, log::*, util::*, types::LanguageFamily
 use gimli::{*, constants::DwForm};
 use std::{str, borrow::Cow, fmt, sync::{Mutex, Arc}, collections::{HashSet, HashMap, hash_map::Entry}, mem, ptr, ops::Range, arch::x86_64::*};
 use rand::random;
+use bitflags::bitflags;
 
 // DWARF parsing.
 // Currently we use some things from gimli, while most hot paths are reimplemented in a different way for speed (and incidentally some convenience). We should probably get rid of gimli altogether, for simplicity, compilation speed, and executable size.
@@ -17,6 +18,28 @@ use rand::random;
 
 // We currently don't support .debug_types section. If we were to support it, we would pack section id and offset into one 8-byte value and use that as DieOffset (just like UnitSectionOffset, but 8 bytes instead of 16).
 pub type DieOffset = DebugInfoOffset<usize>;
+
+// Set of unsupported DWARF features that we've encountered in a file, so that we can show a warning about it.
+bitflags! { pub struct DwarfUnsupportedFeatures: usize {
+    const TYPE_SIGNATURES = 0x1;
+    const SUPPLEMENTARY_OBJECT_FILES = 0x2;
+    const SKELETON_UNITS = 0x4;
+}}
+impl fmt::Display for DwarfUnsupportedFeatures {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let mut first = true;
+        for (val, name) in [(Self::TYPE_SIGNATURES, "type signatures"), (Self::SUPPLEMENTARY_OBJECT_FILES, "supplementary object files"), (Self::SKELETON_UNITS, "skeleton units (spooky)")] {
+            if self.contains(val) {
+                if !first {
+                    write!(f, ", ")?;
+                }
+                first = false;
+                write!(f, "{}", name)?;
+            }
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy)]
 pub struct DwarfSlice {
@@ -273,7 +296,8 @@ impl SliceReader {
                 let layout_idx = action.param >> 16;
                 let name = DwAt((action.param & 0xffff) as u16);
                 let layout = &context.shared.layouts.layouts[layout_idx].1;
-                action = prepare_attribute_action(AttributeSpecification {name, form, implicit_const_value}, layout, context.unit.unit.header.encoding(), &context.shared.warnings, &mut flags)?;
+                let mut ignore_unsupported_features = DwarfUnsupportedFeatures::empty(); // hopefully there aren't executables where some features are used only behind DW_FORM_indirect
+                action = prepare_attribute_action(AttributeSpecification {name, form, implicit_const_value}, layout, context.unit.unit.header.encoding(), &context.shared.warnings, &mut ignore_unsupported_features, &mut flags)?;
             }
 
             let out_field = out.add(action.field_offset as usize);
@@ -347,7 +371,6 @@ impl SliceReader {
                     let s = context.dwarf.debug_str.reader().get_null_terminated_slice(offset)?;
                     set_slice(s, action.param != 0);
                 }
-                DW_EXTRA_FORM_strp_sup4 | DW_EXTRA_FORM_strp_sup8 => return err!(NotImplemented, "DWARF 'supplementary' files are not supported (not to be confused with simply providing unstripped executable on the side - use -m <path> for that)"),
                 DW_EXTRA_FORM_line_strp4 => {
                     let offset = self.read_u32_or_zero() as usize;
                     let s = context.dwarf.debug_line_str.reader().get_null_terminated_slice(offset)?;
@@ -421,11 +444,13 @@ impl SliceReader {
                 // These are unexpected here because prepare_attribute_action() converts them to other forms.
                 // DW_FORM_ref_addr | DW_FORM_sec_offset => ,
 
-                // These are not supported:
+                // These are not supported, prepare_attribute_action() converts them into DW_EXTRA_FORM_skip_* forms.
                 // DW_FORM_ref_sig8 => ,
                 // DW_FORM_ref_sup4 => ,
                 // DW_FORM_ref_sup8 => ,
                 // DW_FORM_GNU_ref_alt => ,
+                // DW_EXTRA_FORM_strp_sup4 => ,
+                // DW_EXTRA_FORM_strp_sup8 => ,
 
                 _ => panic!("unexpected attribute form in prepared action: {}", action.form), // (we already validated action.form in prepare_attribute_action())
             }
@@ -620,7 +645,7 @@ impl AllAttributeStructLayouts {
 
 #[derive(Default)]
 struct FormWarningLimiter {
-    warnings_printed: Mutex<HashSet<(DwAt, DwForm)>>,    
+    warnings_printed: Mutex<HashSet<(DwAt, DwForm)>>,
 }
 impl FormWarningLimiter {
     fn warn(&self, name: DwAt, form: DwForm) -> bool {
@@ -633,6 +658,7 @@ impl FormWarningLimiter {
 pub struct AbbreviationsSharedData {
     layouts: AllAttributeStructLayouts,
     warnings: FormWarningLimiter,
+    pub unsupported_features: DwarfUnsupportedFeatures,
 
     actions_pool: Vec<AttributeAction>,
     abbreviations_pool: Vec<Abbreviation>,
@@ -885,7 +911,7 @@ dwarf_struct!{ UnitLateAttributes {
 }}
 
 pub fn list_units(dwarf: &mut Dwarf<DwarfSlice>, binary_name: &str, layouts: AllAttributeStructLayouts) -> Result<(Vec<DwarfUnit>, AbbreviationsSharedData)> {
-    let mut shared = AbbreviationsSharedData {layouts, warnings: FormWarningLimiter::default(), actions_pool: Vec::new(), abbreviations_pool: Vec::new(), code_to_idx_pool: Vec::new()};
+    let mut shared = AbbreviationsSharedData {layouts, warnings: FormWarningLimiter::default(), unsupported_features: DwarfUnsupportedFeatures::empty(), actions_pool: Vec::new(), abbreviations_pool: Vec::new(), code_to_idx_pool: Vec::new()};
 
     let mut unit_headers: Vec<(UnitHeader<DwarfSlice>, AbbreviationSet)> = Vec::new();
     let mut abbrev_offsets: Vec<((/*offset*/ usize, Encoding), /*unit_idx*/ usize)> = Vec::new();
@@ -1231,7 +1257,7 @@ const DW_FORM_GNU_str_index: DwForm = DwForm(0x1f02);
 const DW_FORM_GNU_ref_alt: DwForm = DwForm(0x1f20);
 const DW_FORM_GNU_strp_alt: DwForm = DwForm(0x1f21);
 
-// These are not actual DWARF forms, I made these numbers up. If future versions of the standard clash with these values, change them. (Or, if you're philosophically opposed to this, change the type to u32 and use values >= 2^16.)
+// These are not actual DWARF forms, I made these numbers up. If future versions of the standard clash with these values, change them. (Or change the type to u32 and use values >= 2^16.)
 const DW_EXTRA_FORM_skip_bytes: DwForm = DwForm(0xfe00);
 const DW_EXTRA_FORM_skip_leb128: DwForm = DwForm(0xfe01);
 const DW_EXTRA_FORM_skip_block: DwForm = DwForm(0xfe02);
@@ -1247,16 +1273,34 @@ const DW_EXTRA_FORM_strp_sup4: DwForm = DwForm(0xfe0b);
 const DW_EXTRA_FORM_strp_sup8: DwForm = DwForm(0xfe0c);
 
 
-fn prepare_attribute_action(attr: AttributeSpecification, layout: &AttributeStructLayout, encoding: Encoding, warnings: &FormWarningLimiter, flags: &mut u32) -> Result<AttributeAction> {
+fn prepare_attribute_action(attr: AttributeSpecification, layout: &AttributeStructLayout, encoding: Encoding, warnings: &FormWarningLimiter, unsupported_features: &mut DwarfUnsupportedFeatures, flags: &mut u32) -> Result<AttributeAction> {
     assert!(attr.form != DW_FORM_indirect);
+
+    let unsupported_form = match attr.form {
+        DW_FORM_ref_sig8 => {
+            unsupported_features.insert(DwarfUnsupportedFeatures::TYPE_SIGNATURES);
+            true
+        }
+        DW_FORM_ref_sup4 | DW_FORM_ref_sup8 | DW_FORM_GNU_ref_alt | DW_FORM_strp_sup | DW_EXTRA_FORM_strp_sup4 | DW_EXTRA_FORM_strp_sup8 | DW_FORM_GNU_strp_alt =>
+        {
+            unsupported_features.insert(DwarfUnsupportedFeatures::SUPPLEMENTARY_OBJECT_FILES);
+            true
+        }
+        _ => false,
+    };
+
     let mut found_name = false;
     for i in 0..layout.fields.len() {
         let &(field_offset, attr_name, attr_type) = &layout.fields[i];
         if attr_name != attr.name{
             continue;
         }
-
         found_name = true;
+
+        if unsupported_form {
+            break;
+        }
+        
         let mut found_match = true;
         let mut form = attr.form;
         let mut param = 0usize;
@@ -1363,8 +1407,8 @@ fn prepare_attribute_action(attr: AttributeSpecification, layout: &AttributeStru
                 DW_FORM_GNU_addr_index => form = DW_FORM_addrx,
                 DW_FORM_ref_addr | DW_FORM_sec_offset => form = if encoding.format.word_size() == 4 {DW_FORM_data4} else {DW_FORM_data8},
                 DW_FORM_strp => form = if encoding.format.word_size() == 4 {DW_EXTRA_FORM_strp4} else {DW_EXTRA_FORM_strp8},
-                DW_FORM_strp_sup | DW_FORM_GNU_strp_alt => form = if encoding.format.word_size() == 4 {DW_EXTRA_FORM_strp_sup4} else {DW_EXTRA_FORM_strp_sup8},
                 DW_FORM_line_strp => form = if encoding.format.word_size() == 4 {DW_EXTRA_FORM_line_strp4} else {DW_EXTRA_FORM_line_strp8},
+                DW_FORM_strp_sup | DW_FORM_GNU_strp_alt => form = if encoding.format.word_size() == 4 {DW_EXTRA_FORM_strp_sup4} else {DW_EXTRA_FORM_strp_sup8},
                 _ => (),
             }
 
@@ -1419,7 +1463,7 @@ fn prepare_abbreviation_actions(attributes: &[AttributeSpecification], layout_id
             continue;
         }
 
-        let action = prepare_attribute_action(*attr, layout, encoding, &shared.warnings, &mut flags_value)?;
+        let action = prepare_attribute_action(*attr, layout, encoding, &shared.warnings, &mut shared.unsupported_features, &mut flags_value)?;
         if action.form == DW_EXTRA_FORM_skip_bytes {
             if action.param == 0 {
                 continue;

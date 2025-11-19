@@ -199,8 +199,9 @@ impl SymbolsRegistry {
                         bin.unwind = Err(e.clone());
                     }
                 }
-                Message::Symbols {id, symbols, mut notices} => if let Some((bin, _)) = &mut self.binaries[id] {
+                Message::Symbols {id, symbols, mut notices, mut warnings} => if let Some((bin, _)) = &mut self.binaries[id] {
                     bin.notices.append(&mut notices);
+                    bin.warnings.append(&mut warnings);
                     bin.symbols = symbols.map(|x| Arc::new(x));
                 }
                 Message::Unwind {id, unwind} => if let Some((bin, _)) = &mut self.binaries[id] {
@@ -283,7 +284,7 @@ struct Shared {
 
 enum Message {
     Elf {id: usize, elves: Result<Vec<Arc<ElfFile>>>, notices: Vec<String>, warnings: Vec<String>},
-    Symbols {id: usize, symbols: Result<Symbols>, notices: Vec<String>},
+    Symbols {id: usize, symbols: Result<Symbols>, notices: Vec<String>, warnings: Vec<String>},
     Unwind {id: usize, unwind: Result<UnwindInfo>},
 }
 
@@ -675,12 +676,18 @@ impl LoadScheduler {
     // Called exactly once, by whoever sets self.failed to true, or at the end of successful loading.
     fn complete(&self, res: Result<Symbols>) {
         let mut notices: Vec<String> = Vec::new();
+        let mut warnings: Vec<String> = Vec::new();
         match &res {
             Err(e) => eprintln!("warning: failed to load symbols for {}: {}", self.name, e),
-            Ok(s) => notices.push(format!("loaded in {:.3}s{}", s.loading_duration_ns as f64 / 1e9, if let &Some(mem) = &s.loading_memory_usage {format!(", peak memory usage {}", PrettySize(mem))} else {String::new()})),
+            Ok(s) => {
+                notices.push(format!("loaded in {:.3}s{}", s.loading_duration_ns as f64 / 1e9, if let &Some(mem) = &s.loading_memory_usage {format!(", peak memory usage {}", PrettySize(mem))} else {String::new()}));
+                if !s.unsupported_features.is_empty() {
+                    warnings.push(format!("unsupported: {}", s.unsupported_features));
+                }
+            }
         }
         let mut lock = self.shared.to_main_thread.lock().unwrap();
-        lock.push_back(Message::Symbols {id: self.id, symbols: res, notices});
+        lock.push_back(Message::Symbols {id: self.id, symbols: res, notices, warnings});
         self.shared.wake_main_thread.write(1);
     }
 }
