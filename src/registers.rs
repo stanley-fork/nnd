@@ -337,8 +337,12 @@ static mut CACHED_XSAVE_HI16_ZMM_OFFSET: usize = 0;
 fn precalc_xsave_component_offset(component: u32, expected_size: usize) -> usize {
     let res = unsafe {core::arch::x86_64::__cpuid_count(0xd, component)};
     let (offset, actual_size) = (res.ebx as usize, res.eax as usize);
-    assert!(offset != 0 && actual_size >= expected_size, "you seem to have a very weird cpu");
-    assert!(offset + expected_size <= XSAVE_SIZE_UPPER_BOUND, "you seem to have a weird cpu, we may need to make a simple change to the debugger to make it work here, please report");
+    if actual_size == 0 || offset == 0 {
+        // The CPU doesn't support this instruction set.
+        return 0;
+    }
+    assert!(actual_size >= expected_size, "you seem to have a very weird cpu");
+    assert!(offset + expected_size <= XSAVE_SIZE_UPPER_BOUND, "you seem to have a weird cpu, we may need to make a simple change to the debugger to make it work, please report");
     offset
 }
 pub fn precalc_globals_registers() {
@@ -347,10 +351,10 @@ pub fn precalc_globals_registers() {
     unsafe {CACHED_XSAVE_ZMM_HI256_OFFSET = precalc_xsave_component_offset(XFEATURE_ZMM_HI256, XSAVE_ZMM_HI256_SIZE)};
     unsafe {CACHED_XSAVE_HI16_ZMM_OFFSET = precalc_xsave_component_offset(XFEATURE_HI16_ZMM, XSAVE_HI16_ZMM_SIZE)};
 }
-pub fn xsave_ymm_offset() -> usize { let r = unsafe {CACHED_XSAVE_YMM_OFFSET}; debug_assert!(r != 0); r }
-pub fn xsave_opmask_offset() -> usize { let r = unsafe {CACHED_XSAVE_OPMASK_OFFSET}; debug_assert!(r != 0); r }
-pub fn xsave_zmm_hi256_offset() -> usize { let r = unsafe {CACHED_XSAVE_ZMM_HI256_OFFSET}; debug_assert!(r != 0); r }
-pub fn xsave_hi16_zmm_offset() -> usize { let r = unsafe {CACHED_XSAVE_HI16_ZMM_OFFSET}; debug_assert!(r != 0); r }
+pub fn xsave_ymm_offset() -> Option<usize> { let r = unsafe {CACHED_XSAVE_YMM_OFFSET}; if r == 0 {None} else {Some(r)} }
+pub fn xsave_opmask_offset() -> Option<usize> { let r = unsafe {CACHED_XSAVE_OPMASK_OFFSET}; if r == 0 {None} else {Some(r)} }
+pub fn xsave_zmm_hi256_offset() -> Option<usize> { let r = unsafe {CACHED_XSAVE_ZMM_HI256_OFFSET}; if r == 0 {None} else {Some(r)} }
+pub fn xsave_hi16_zmm_offset() -> Option<usize> { let r = unsafe {CACHED_XSAVE_HI16_ZMM_OFFSET}; if r == 0 {None} else {Some(r)} }
 
 impl ExtraRegisters {
     pub fn has(&self, idx: ExtraRegisterIdx) -> bool {
@@ -412,19 +416,20 @@ impl ExtraRegisters {
         if xcomp_bv != 0 {
             return err!(ProcessState, "Unexpected compacted XSAVE state");
         }
-        let mask = u64::from_le_bytes(prefix[512..512+8].try_into().unwrap());
+        let mut mask = u64::from_le_bytes(prefix[512..512+8].try_into().unwrap());
         let mut n = XSAVE_PREFIX_SIZE;
-        if mask & (1 << XFEATURE_HI16_ZMM) != 0 {
-            n = n.max(xsave_hi16_zmm_offset() + XSAVE_HI16_ZMM_SIZE);
-        }
-        if mask & (1 << XFEATURE_ZMM_HI256) != 0 {
-            n = n.max(xsave_zmm_hi256_offset() + XSAVE_ZMM_HI256_SIZE);
-        }
-        if mask & (1 << XFEATURE_OPMASK) != 0 {
-            n = n.max(xsave_opmask_offset() + XSAVE_OPMASK_SIZE);
-        }
-        if mask & (1 << XFEATURE_YMM) != 0 {
-            n = n.max(xsave_ymm_offset() + XSAVE_YMM_SIZE);
+        for (feat, size, offset) in [
+            (XFEATURE_YMM, XSAVE_YMM_SIZE, xsave_ymm_offset()),
+            (XFEATURE_OPMASK, XSAVE_OPMASK_SIZE, xsave_opmask_offset()),
+            (XFEATURE_ZMM_HI256, XSAVE_ZMM_HI256_SIZE, xsave_zmm_hi256_offset()),
+            (XFEATURE_HI16_ZMM, XSAVE_HI16_ZMM_SIZE, xsave_hi16_zmm_offset())] {
+            if mask & (1 << feat) != 0 {
+                if let Some(off) = offset {
+                    n = n.max(off + size);
+                } else {
+                    mask ^= 1 << feat;
+                }
+            }
         }
         Ok((n, mask))
     }
@@ -449,7 +454,7 @@ impl ExtraRegisters {
             }
         }
         if mask & (1 << XFEATURE_YMM) != 0 {
-            let start_offset = xsave_ymm_offset();
+            let start_offset = xsave_ymm_offset().unwrap();
             for i in 0..16 {
                 let off = start_offset + i*16;
                 let ymm = ExtraRegisterIdx::ymm(i);
@@ -459,7 +464,7 @@ impl ExtraRegisters {
             }
         }
         if mask & (1 << XFEATURE_OPMASK) != 0 {
-            let start_offset = xsave_opmask_offset();
+            let start_offset = xsave_opmask_offset().unwrap();
             for i in 0..8 {
                 let off = start_offset + i*8;
                 let slice = [u64::from_le_bytes(xsave[off..off+8].try_into().unwrap())];
@@ -467,7 +472,7 @@ impl ExtraRegisters {
             }
         }
         if mask & (1 << XFEATURE_ZMM_HI256) != 0 {
-            let start_offset = xsave_zmm_hi256_offset();
+            let start_offset = xsave_zmm_hi256_offset().unwrap();
             for i in 0..16 {
                 let off = start_offset + i*32;
                 let zmm = ExtraRegisterIdx::zmm(i);
@@ -478,7 +483,7 @@ impl ExtraRegisters {
             }
         }
         if mask & (1 << XFEATURE_HI16_ZMM) != 0 {
-            let start_offset = xsave_hi16_zmm_offset();
+            let start_offset = xsave_hi16_zmm_offset().unwrap();
             // (This loop should just be a memcpy, but I don't feel like fighting llvm right now.)
             for i in 0..16 {
                 let off = start_offset + i*64;
