@@ -448,7 +448,7 @@ pub fn ptrace_getregs(tid: pid_t) -> Result<Registers> {
 
 pub fn ptrace_get_extra_regs(tid: pid_t) -> ExtraRegisters {
     unsafe {
-        let mut buf = [0u8; XSAVE_MAX_SIZE];
+        let mut buf = [0u8; XSAVE_SIZE_UPPER_BOUND];
         let mut iov = libc::iovec {iov_base: buf.as_mut_ptr() as *mut libc::c_void, iov_len: buf.len()};
         if let Err(e) = ptrace(PTRACE_GETREGSET, tid, NT_X86_XSTATE as u64, &mut iov as *mut libc::iovec as u64) {
             return ExtraRegisters::from_error(e);

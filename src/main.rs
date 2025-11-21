@@ -43,7 +43,7 @@ pub mod dwarf;
 pub mod core_dumper;
 pub mod os;
 
-use crate::{elf::*, error::*, debugger::*, util::*, ui::*, log::*, process_info::*, symbols::*, symbols_registry::*, procfs::*, unwind::*, range_index::*, settings::*, context::*, executor::*, persistent::*, doc::*, terminal::*, common_ui::*, core_dumper::*, os::*};
+use crate::{elf::*, error::*, debugger::*, util::*, ui::*, log::*, process_info::*, symbols::*, symbols_registry::*, procfs::*, unwind::*, range_index::*, settings::*, context::*, executor::*, persistent::*, doc::*, terminal::*, common_ui::*, core_dumper::*, os::*, registers::*};
 use std::{rc::Rc, mem, str, fs, os::fd::{FromRawFd}, io::Read, io, io::Write, panic, process, thread, thread::ThreadId, cell::UnsafeCell, ptr, pin::Pin, sync::Arc, str::FromStr, path::PathBuf, collections::HashSet};
 use libc::{self, STDIN_FILENO, pid_t};
 #[cfg(target_env = "musl")]
@@ -118,6 +118,7 @@ fn parse_arg(args: &mut &[String], seen_args: &mut HashSet<String>, long_name: &
 fn main() {
     unsafe {std::env::set_var("RUST_BACKTRACE", "short")};
     precalc_globals_os();
+    precalc_globals_registers();
 
     let mut settings = Settings::default();
     let mut attach_pid: Option<pid_t> = None;

@@ -309,30 +309,48 @@ impl Registers {
 
 // "XSAVE area" is how SSE and AVX registers are laid out, obtained through ptrace(PTRACE_GETREGSET), or NT_X86_XSTATE note in core dump, or fpregs in signal context.
 // Format:
-//  * 512 bytes - user_fpregs_struct,
-//  * 64 bytes - xsave header, which is a bitmask telling which register sets are present,
-//  * ? bytes - xsave extended area, where the available register sets live at fixed offsets and sizes.
+//  * 512 bytes - FXSAVE legacy region, ~same layout as user_fpregs_struct,
+//  * 64 bytes - XSAVE header, which is a bitmask telling which register sets are present,
+//  * ? bytes - extended area, where the available register sets live; the offset and size for each register set can be obtained using instruction CPID.(EAX=0xd, ECX=XFEATURE_*) -> (size=EAX, offset=EBX).
 // The highest-offset register set we support is AVX-512 Hi16_ZMM, at offset 1152, containing 16 x 64-byte register values.
-pub const XSAVE_PREFIX_SIZE: usize = 512 + 64;
-pub const XSAVE_MAX_SIZE: usize = XSAVE_HI16_ZMM_OFFSET + XSAVE_HI16_ZMM_SIZE;
+const XSAVE_PREFIX_SIZE: usize = 512 + 64;
+const XSAVE_XMM_OFFSET: usize = 8 * 20;
+const XSAVE_MXCSR_OFFSET: usize = 8 * 3;
 
-pub const XSAVE_XMM_OFFSET: usize = 8 * 20;
-pub const XSAVE_MXCSR_OFFSET: usize = 8 * 3;
-pub const XSAVE_YMM_OFFSET: usize = XSAVE_PREFIX_SIZE;
-pub const XSAVE_YMM_SIZE: usize = 16 * 16;
-// These 3 offsets may in theory vary across cpus, but for now we hardcode tham and hope they don't.
-pub const XSAVE_OPMASK_OFFSET: usize = 1088;
-pub const XSAVE_OPMASK_SIZE: usize = 8 * 8;
-pub const XSAVE_ZMM_HI256_OFFSET: usize = 1152;
-pub const XSAVE_ZMM_HI256_SIZE: usize = 16 * 32;
-pub const XSAVE_HI16_ZMM_OFFSET: usize = 1664;
-pub const XSAVE_HI16_ZMM_SIZE: usize = 64 * 16;
-//pub const XSTATE_BIT_FP: usize = 0x1;
-pub const XSTATE_BIT_SSE: u64 = 0x2;
-pub const XSTATE_BIT_YMM: u64 = 0x4;
-pub const XSTATE_BIT_OPMASK: u64 = 0x20;
-pub const XSTATE_BIT_ZMM_HI256: u64 = 0x40;
-pub const XSTATE_BIT_HI16_ZMM: u64 = 0x80;
+const XFEATURE_SSE: u32 = 1;
+const XFEATURE_YMM: u32 = 2;
+const XFEATURE_OPMASK: u32 = 5;
+const XFEATURE_ZMM_HI256: u32 = 6;
+const XFEATURE_HI16_ZMM: u32 = 7;
+
+pub const XSAVE_SIZE_UPPER_BOUND: usize = 3072; // expect that all XSAVE components we're interested in are within the first this many bytes; not guaranteed in principle, but should be ok in practice
+const XSAVE_YMM_SIZE: usize = 16 * 16;
+const XSAVE_OPMASK_SIZE: usize = 8 * 8;
+const XSAVE_ZMM_HI256_SIZE: usize = 16 * 32;
+const XSAVE_HI16_ZMM_SIZE: usize = 64 * 16;
+
+// Cache the cpuid results, just in case.
+static mut CACHED_XSAVE_YMM_OFFSET: usize = 0;
+static mut CACHED_XSAVE_OPMASK_OFFSET: usize = 0;
+static mut CACHED_XSAVE_ZMM_HI256_OFFSET: usize = 0;
+static mut CACHED_XSAVE_HI16_ZMM_OFFSET: usize = 0;
+fn precalc_xsave_component_offset(component: u32, expected_size: usize) -> usize {
+    let res = unsafe {core::arch::x86_64::__cpuid_count(0xd, component)};
+    let (offset, actual_size) = (res.ebx as usize, res.eax as usize);
+    assert!(offset != 0 && actual_size >= expected_size, "you seem to have a very weird cpu");
+    assert!(offset + expected_size <= XSAVE_SIZE_UPPER_BOUND, "you seem to have a weird cpu, we may need to make a simple change to the debugger to make it work here, please report");
+    offset
+}
+pub fn precalc_globals_registers() {
+    unsafe {CACHED_XSAVE_YMM_OFFSET = precalc_xsave_component_offset(XFEATURE_YMM, XSAVE_YMM_SIZE)};
+    unsafe {CACHED_XSAVE_OPMASK_OFFSET = precalc_xsave_component_offset(XFEATURE_OPMASK, XSAVE_OPMASK_SIZE)};
+    unsafe {CACHED_XSAVE_ZMM_HI256_OFFSET = precalc_xsave_component_offset(XFEATURE_ZMM_HI256, XSAVE_ZMM_HI256_SIZE)};
+    unsafe {CACHED_XSAVE_HI16_ZMM_OFFSET = precalc_xsave_component_offset(XFEATURE_HI16_ZMM, XSAVE_HI16_ZMM_SIZE)};
+}
+pub fn xsave_ymm_offset() -> usize { let r = unsafe {CACHED_XSAVE_YMM_OFFSET}; debug_assert!(r != 0); r }
+pub fn xsave_opmask_offset() -> usize { let r = unsafe {CACHED_XSAVE_OPMASK_OFFSET}; debug_assert!(r != 0); r }
+pub fn xsave_zmm_hi256_offset() -> usize { let r = unsafe {CACHED_XSAVE_ZMM_HI256_OFFSET}; debug_assert!(r != 0); r }
+pub fn xsave_hi16_zmm_offset() -> usize { let r = unsafe {CACHED_XSAVE_HI16_ZMM_OFFSET}; debug_assert!(r != 0); r }
 
 impl ExtraRegisters {
     pub fn has(&self, idx: ExtraRegisterIdx) -> bool {
@@ -384,14 +402,6 @@ impl ExtraRegisters {
     //       uint64_t xcomp_bv;        // Compaction mode (should be 0 for user space)
     //       uint64_t reserved[6];     // Reserved for future use
     //   };
-    //
-    //   // Bitmap values for xstate_bv:
-    //   #define XSTATE_BIT_FP        0x1
-    //   #define XSTATE_BIT_SSE       0x2
-    //   #define XSTATE_BIT_YMM       0x4
-    //   #define XSTATE_BIT_OPMASK    0x20
-    //   #define XSTATE_BIT_ZMM_Hi256 0x40
-    //   #define XSTATE_BIT_Hi16_ZMM  0x80
 
     // Given the first XSAVE_PREFIX_SIZE bytes, tell how many more bytes to read.
     pub fn calculate_xsave_full_size(prefix: &[u8]) -> Result<(/*suffix_size*/ usize, /*xstate_bv*/ u64)> {
@@ -403,17 +413,19 @@ impl ExtraRegisters {
             return err!(ProcessState, "Unexpected compacted XSAVE state");
         }
         let mask = u64::from_le_bytes(prefix[512..512+8].try_into().unwrap());
-        let n = if mask & XSTATE_BIT_HI16_ZMM != 0 {
-            XSAVE_HI16_ZMM_OFFSET + XSAVE_HI16_ZMM_SIZE
-        } else if mask & XSTATE_BIT_ZMM_HI256 != 0 {
-            XSAVE_ZMM_HI256_OFFSET + XSAVE_ZMM_HI256_SIZE
-        } else if mask & XSTATE_BIT_OPMASK != 0 {
-            XSAVE_OPMASK_OFFSET + XSAVE_OPMASK_SIZE
-        } else if mask & XSTATE_BIT_YMM != 0 {
-            XSAVE_YMM_OFFSET + XSAVE_YMM_SIZE
-        } else {
-            XSAVE_PREFIX_SIZE
-        };
+        let mut n = XSAVE_PREFIX_SIZE;
+        if mask & (1 << XFEATURE_HI16_ZMM) != 0 {
+            n = n.max(xsave_hi16_zmm_offset() + XSAVE_HI16_ZMM_SIZE);
+        }
+        if mask & (1 << XFEATURE_ZMM_HI256) != 0 {
+            n = n.max(xsave_zmm_hi256_offset() + XSAVE_ZMM_HI256_SIZE);
+        }
+        if mask & (1 << XFEATURE_OPMASK) != 0 {
+            n = n.max(xsave_opmask_offset() + XSAVE_OPMASK_SIZE);
+        }
+        if mask & (1 << XFEATURE_YMM) != 0 {
+            n = n.max(xsave_ymm_offset() + XSAVE_YMM_SIZE);
+        }
         Ok((n, mask))
     }
 
@@ -429,32 +441,35 @@ impl ExtraRegisters {
             let slice = [u32::from_le_bytes(xsave[off..off+4].try_into().unwrap()) as u64];
             res.set(ExtraRegisterIdx::mxcsr(), &slice, /*dubious*/ false);
         }
-        if mask & XSTATE_BIT_SSE != 0 {
+        if mask & (1 << XFEATURE_SSE) != 0 {
             for i in 0..16 {
                 let off = XSAVE_XMM_OFFSET + i*16;
                 let slice = [u64::from_le_bytes(xsave[off..off+8].try_into().unwrap()), u64::from_le_bytes(xsave[off+8..off+16].try_into().unwrap())];
                 res.set(ExtraRegisterIdx::xmm(i), &slice, /*dubious*/ false);
             }
         }
-        if mask & XSTATE_BIT_YMM != 0 {
+        if mask & (1 << XFEATURE_YMM) != 0 {
+            let start_offset = xsave_ymm_offset();
             for i in 0..16 {
-                let off = XSAVE_YMM_OFFSET + i*16;
+                let off = start_offset + i*16;
                 let ymm = ExtraRegisterIdx::ymm(i);
                 // Upper half of ymm.
                 res.a[ymm.start+2] = u64::from_le_bytes(xsave[off..off+8].try_into().unwrap());
                 res.a[ymm.start+3] = u64::from_le_bytes(xsave[off+8..off+16].try_into().unwrap());
             }
         }
-        if mask & XSTATE_BIT_OPMASK != 0 {
+        if mask & (1 << XFEATURE_OPMASK) != 0 {
+            let start_offset = xsave_opmask_offset();
             for i in 0..8 {
-                let off = XSAVE_OPMASK_OFFSET + i*8;
+                let off = start_offset + i*8;
                 let slice = [u64::from_le_bytes(xsave[off..off+8].try_into().unwrap())];
                 res.set(ExtraRegisterIdx::opmask_element(i), &slice, /*dubious*/ false);
             }
         }
-        if mask & XSTATE_BIT_ZMM_HI256 != 0 {
+        if mask & (1 << XFEATURE_ZMM_HI256) != 0 {
+            let start_offset = xsave_zmm_hi256_offset();
             for i in 0..16 {
-                let off = XSAVE_ZMM_HI256_OFFSET + i*32;
+                let off = start_offset + i*32;
                 let zmm = ExtraRegisterIdx::zmm(i);
                 res.a[zmm.start+4] = u64::from_le_bytes(xsave[off..off+8].try_into().unwrap());
                 res.a[zmm.start+5] = u64::from_le_bytes(xsave[off+8..off+16].try_into().unwrap());
@@ -462,10 +477,11 @@ impl ExtraRegisters {
                 res.a[zmm.start+7] = u64::from_le_bytes(xsave[off+24..off+32].try_into().unwrap());
             }
         }
-        if mask & XSTATE_BIT_HI16_ZMM != 0 {
+        if mask & (1 << XFEATURE_HI16_ZMM) != 0 {
+            let start_offset = xsave_hi16_zmm_offset();
             // (This loop should just be a memcpy, but I don't feel like fighting llvm right now.)
             for i in 0..16 {
-                let off = XSAVE_HI16_ZMM_OFFSET + i*64;
+                let off = start_offset + i*64;
                 let zmm = ExtraRegisterIdx::zmm(16 + i);
                 for j in 0..8 {
                     res.a[zmm.start + j] = u64::from_le_bytes(xsave[off+j*8..off+j*8+8].try_into().unwrap());
