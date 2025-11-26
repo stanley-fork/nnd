@@ -246,6 +246,7 @@ pub struct BreakpointLocation {
     // If empty, we should deactivate and remove this location; this operation can be deferred until any thread is suspended (see "PTRACE_POKETEXT is dumb").
     pub breakpoints: Vec<BreakpointRef>,
     pub error: Option<Error>,
+    pub no_retry: bool, // got an ~unretriable error, don't try activating this location in handle_breakpoints()
 }
 
 #[derive(Clone, Debug, Default)]
@@ -458,8 +459,12 @@ impl Debugger {
     }
 
     pub fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {
-        for (id, bp) in self.breakpoints.iter() {
-            if !bp.hidden && !bp.on.is_data() { // data breakpoint addresses usually become obsolete on program restart or recompilation, just delete data breakpoints on restart
+        // Don't save data breakpoints because their addresses usually become obsolete on program restart or recompilation.
+        let mut ids: Vec<BreakpointId> = self.breakpoints.iter().filter(|(_, b)| !b.hidden && !b.on.is_data()).map(|p| p.0).collect();
+        ids.sort_by_key(|id| id.seqno); // preserve order as seen in UI
+        for id in ids {
+            let bp = self.breakpoints.get(id);
+            if !bp.hidden && !bp.on.is_data() {
                 out.write_u8(1)?;
                 bp.save_state(out)?;
             }
@@ -2331,7 +2336,7 @@ impl Debugger {
                 }
             };
 
-            self.breakpoint_locations.insert(idx, BreakpointLocation {addr, original_byte, hardware: false, active: false, breakpoints: vec![breakpoint], error: None});
+            self.breakpoint_locations.insert(idx, BreakpointLocation {addr, original_byte, hardware: false, active: false, breakpoints: vec![breakpoint], error: None, no_retry: false});
         }
     }
 
@@ -2486,6 +2491,9 @@ impl Debugger {
         }
 
         for idx in 0..self.breakpoint_locations.len() {
+            if self.breakpoint_locations[idx].no_retry {
+                continue;
+            }
             match self.activate_breakpoint_location(idx, self.pid) {
                 Ok(()) => self.breakpoint_locations[idx].error = None,
                 Err(e) => {
@@ -2513,30 +2521,115 @@ impl Debugger {
         Ok(())
     }
 
-    fn set_debug_registers_for_thread(&mut self, tid: pid_t) -> Result<()> {
-        let mut dr7 = 1u64 << 10;
-        for i in 0..4 {
-            let b = &self.hardware_breakpoints[i];
-            if !b.active || b.thread_specific.is_some_and(|x| x != tid) {
-                continue;
-            }
-            unsafe { ptrace(PTRACE_POKEUSER, tid, (offsetof!(libc::user, u_debugreg) + i * 8) as u64, b.addr as u64)? };
-            dr7 |= 1 << (i*2);
+    fn get_debug_register_values_for_hardware_breakpoint(b: &HardwareBreakpoint, i: usize, tid: pid_t) -> Option<(/*addr*/ u64, /*dr7*/ u64)> {
+        if !b.active || b.thread_specific.is_some_and(|x| x != tid) {
+            return None;
+        }
+        let mut dr7 = 1 << (i*2);
+        if b.data_breakpoint_id.is_some() {
+            dr7 |= (if b.stop_on_read {3} else {1}) << (16 + i*4);
+            let size_code: u64 = match b.data_size {
+                1 => 0,
+                2 => 1,
+                4 => 3,
+                8 => 2,
+                _ => panic!("unexpected data breakpoint size"),
+            };
+            dr7 |= size_code << (18 + i*4);
+        }
+        Some((b.addr as u64, dr7))
+    }
 
-            if b.data_breakpoint_id.is_some() {
-                dr7 |= (if b.stop_on_read {3} else {1}) << (16 + i*4);
-                let size_code: u64 = match b.data_size {
-                    1 => 0,
-                    2 => 1,
-                    4 => 3,
-                    8 => 2,
-                    _ => panic!("unexpected data breakpoint size"),
-                };
-                dr7 |= size_code << (18 + i*4);
+    fn set_debug_registers_for_thread(&mut self, tid: pid_t) -> Result<()> {
+        // TODO: Remember last assigned values if dr0-3 and dr7 to avoid doing these syscalls again if nothing changed.
+        //       Then also clear dr6 when changing hw breakpoints, to not report incorrect hits based on stale bp indices.
+
+        let dr7_common_bits = 1u64 << 10;
+        let mut dr7 = dr7_common_bits;
+
+        // Disable all breakpoints (clear dr7) before modifying their addresses.
+        // Because ptrace_set_debugreg is weird about validating inputs, in a way I don't fully understand. E.g. scenario:
+        //  1. Set dr0 to unmapped address, then dr1 to valid executable address, then dr7 to enable data breakpoint 0 and exec breakpoint 1. Success
+        //  2. Possibly repeat step 1, it keeps succeeding.
+        //  3. [The data breakpoint was removed, we shifted the exec breakpoint from hw bp 1 to 0, and are going to set dr0 = valid executable address, then dr7 to enable only bp 0. So we...]
+        //     Set dr0 to a valid executable address (same as dr1 in step 1) - and ptrace returns EINVAL. What?
+        //     (Is it because the previous dr0 address was unmapped or because the new dr0 == dr1? I didn't check. Either way the solution to clear dr7.)
+        unsafe {ptrace(PTRACE_POKEUSER, tid, (offsetof!(libc::user, u_debugreg) + 7*8) as u64, dr7)? };
+        let mut assigned_dr7 = dr7; // last successfully written dr7 value
+
+        for i in 0..4 {
+            if let Some((addr, d7)) = Self::get_debug_register_values_for_hardware_breakpoint(&self.hardware_breakpoints[i], i, tid) {
+                unsafe { ptrace(PTRACE_POKEUSER, tid, (offsetof!(libc::user, u_debugreg) + i * 8) as u64, addr)? };
+                dr7 |= d7;
             }
         }
-        unsafe { ptrace(PTRACE_POKEUSER, tid, (offsetof!(libc::user, u_debugreg) + 7*8) as u64, dr7)? };
-        Ok(())
+
+        // Now we just need to do PTRACE_POKEUSER to write `dr7`.
+        // But we had to wrap it in a retry loop to work around the following inconvent ptrace behavior.
+        //
+        // Writes to dr7 may fail with EINVAL if one of the breakpoints has invalid address.
+        // The error doesn't say which of the breakpoints is the culprit, so we try to activate breakpoints one by one and disable the ones that fail.
+        // Other threads may be running during this, so more addresses may get mapped or unmapped during this, so we do a few retries juuust in case.
+        // (Although I've seen this only with addresses below 4096 or above (1<<56); unmapped addresses seem fine.)
+        // (Alternatively, we could validate addresses ourselves, but I don't want to rely on exactly matching ptrace's validation logic.)
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+
+            if dr7 == assigned_dr7 {
+                // The desired dr7 value was already written.
+                // This happend is there are no active hw breakpoints, or if we activated the only active breakpoint on previous iteration of the loop.
+                return Ok(());
+            }
+
+            // Try to activate all enabled breakpoints.
+            let mut error: Option<Error>;
+            match unsafe { ptrace(PTRACE_POKEUSER, tid, (offsetof!(libc::user, u_debugreg) + 7*8) as u64, dr7) } {
+                Ok(_) => return Ok(()),
+                Err(e) if e.is_io_invalid_input() && attempts < 6 => error = Some(e),
+                Err(e) => return Err(e),
+            }
+            // Failed with EINVAL.
+
+            // Try to activate breakpoints one at a time.
+            let mut new_dr7 = dr7_common_bits;
+            for i in 0..4 {
+                if let Some((_, d7)) = Self::get_debug_register_values_for_hardware_breakpoint(&self.hardware_breakpoints[i], i, tid) {
+                    let single_dr7 = d7 | dr7_common_bits;
+                    if single_dr7 == dr7 {
+                        // There's only one enabled breakpoint, we already tried to activate it above and got EINVAL, no need to try again.
+                    } else {
+                        match unsafe { ptrace(PTRACE_POKEUSER, tid, (offsetof!(libc::user, u_debugreg) + 7*8) as u64, single_dr7) } {
+                            Ok(_) => {
+                                assigned_dr7 = single_dr7;
+                                new_dr7 |= d7;
+                                continue;
+                            }
+                            Err(e) if e.is_io_invalid_input() => error = Some(e),
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    assert!(error.is_some());
+
+                    // Got EINVAL when activating this breakpoint alone. Disable the breakpoint and store error such that it's visible in the UI.
+                    if let &Some(id) = &self.hardware_breakpoints[i].data_breakpoint_id {
+                        self.deactivate_breakpoint(id);
+                        self.breakpoints.get_mut(id).addrs = Err(mem::take(&mut error).unwrap());
+                    } else {
+                        let addr = self.hardware_breakpoints[i].addr;
+                        let location_idx = self.find_breakpoint_location(addr).unwrap();
+                        assert!(self.breakpoint_locations[location_idx].hardware);
+                        self.deactivate_breakpoint_location(location_idx, tid).unwrap();
+                        let location = &mut self.breakpoint_locations[location_idx];
+                        location.error = mem::take(&mut error);
+                        location.no_retry = true;
+                    }
+                    assert!(!self.hardware_breakpoints[i].active);
+                }
+            }
+            // All remaining active breakpoints.
+            dr7=new_dr7;
+        }
     }
 
     fn handle_step_breakpoint_hit(step: &StepState, type_: StepBreakpointType, request_single_step: &mut bool) {

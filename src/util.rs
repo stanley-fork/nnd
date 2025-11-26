@@ -8,7 +8,7 @@ pub unsafe fn ptrace(request: i32, pid: pid_t, addr: u64, data: u64) -> Result<i
     //eprintln!("trace: ptrace({}, {}, 0x{:x}, 0x{:x}) -> 0x{:x}", ptrace_request_name(request), pid, addr, data, r);
     if r == -1 {
         if (*libc::__errno_location()) != 0 {
-            return errno_err!("ptrace({}) failed", ptrace_request_name(request));
+            return errno_err!("ptrace({}, {}, {}, {}) failed", ptrace_request_name(request), pid, addr, data);
         }
         assert!([PTRACE_PEEKDATA, PTRACE_PEEKSIGINFO, PTRACE_PEEKTEXT, PTRACE_PEEKUSER].contains(&request));
     }

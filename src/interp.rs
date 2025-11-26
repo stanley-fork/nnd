@@ -477,6 +477,8 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                     Type::Pointer(p) => {
                         let addr = lhs.val.into_value(8, &mut context.memory)?.get_usize()?;
                         let stride = unsafe {(*p.type_).calculate_size()};
+                        if stride == 0 { return err!(TypeMismatch, "array element type has size 0"); }
+                        if idx > (usize::MAX - addr) / stride { return err!(Runtime, "array size causes overflow"); }
                         if op == BinaryOperator::Index {
                             Value {val: AddrOrValueBlob::Addr(addr + idx * stride), type_: p.type_, flags: lhs.flags.inherit()}
                         } else { // Slicify
@@ -695,7 +697,7 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                             BinaryOperator::Rem => x.rem_euclid(y),
                             _ => panic!("huh"),
                         })
-                    } else if b.cast_to_usize() == 0 {
+                    } else if b.cast_to_usize() == 0 && (op == BinaryOperator::Div || op == BinaryOperator::Rem) {
                         return err!(Runtime, "integer division by zero");
                     } else if a.is_isize() || b.is_isize() {
                         let (x, y) = (a.cast_to_isize(), b.cast_to_isize());
