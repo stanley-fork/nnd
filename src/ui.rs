@@ -277,7 +277,7 @@ impl DebuggerUI {
         }
 
         self.ui.end_build(&mut buffer);
-        let build_tsc = timer.restart(&debugger.prof.bucket) - self.ui.prof_render_tsc;
+        let build_tsc = timer.restart(&debugger.prof.bucket).saturating_sub(self.ui.prof_render_tsc);
 
         let commands = self.terminal.prepare_command_buffer(&buffer, self.ui.should_show_cursor.clone());
         debugger.prof.bucket.ui_output_bytes += commands.len();
@@ -2786,7 +2786,7 @@ impl HintsWindow {
             } else {
                 let a = &debugger.prof.buckets[debugger.prof.buckets.len().saturating_sub(chart_width)];
                 let b = debugger.prof.buckets.back().unwrap();
-                (b.end_time - a.start_time).as_secs_f64() / (b.end_tsc - a.start_tsc) as f64
+                (b.end_time - a.start_time).as_secs_f64() / (b.end_tsc.max(a.start_tsc + 1) - a.start_tsc) as f64
             };
 
             for i in 0..chart_width.min(debugger.prof.buckets.len()) {
