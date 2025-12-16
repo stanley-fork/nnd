@@ -1,4 +1,4 @@
-use crate::{error::*, terminal::*, log::*, common_ui::*, settings::*, imgui::*, ui::*, *};
+use crate::{error::*, terminal::*, log::*, common_ui::*, settings::*, imgui::*, ui::*, license::*, *};
 use std::{io, io::Write, mem, ops::Range, fmt::Write as fmtWrite};
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -14,6 +14,7 @@ pub enum HelpParagraph {
     Files,
     Tty,
     Features,
+    Licenses,
 }
 
 pub struct HelpChapter {
@@ -36,6 +37,7 @@ static HELP_CHAPTERS: &'static [HelpChapter] = &[
     HelpChapter {cli: "--help-files", dialog: "files", description: "files in ~/.nnd/ - keys config, log file, default stdout/stderr redirects, saved state", paragraphs: &[HelpParagraph::Files]},
     HelpChapter {cli: "--help-tty", dialog: "tty", description: "how to debug interactive programs that require a terminal (e.g. using this debugger to debug itself)", paragraphs: &[HelpParagraph::Tty]},
     HelpChapter {cli: "--help-features", dialog: "appendix: feature dump", description: "raw list of features (not very readable)", paragraphs: &[HelpParagraph::Features]},
+    HelpChapter {cli: "--licenses", dialog: "licenses", description: "boring legal info", paragraphs: &[HelpParagraph::Licenses]},
 ];
 
 pub fn get_cli_help_chapter(name: &str) -> Option<String> {
@@ -157,7 +159,7 @@ Limitations:
  * Linux only
  * x86 only
  * 64-bit only
- * TUI only (no REPL, no GUI)
+ * TUI only (no REPL, GUI, or DAP)
  * no remote debugging (but works fine over ssh)
  * single process (doesn't follow forks)
  * no record-replay or other backwards stepping
@@ -165,14 +167,12 @@ Limitations:
 Properties:
  * Not based on gdb or lldb, implemented mostly from scratch.
    (Uses libraries for a few well-isolated things like disassembling, DWARF parsing, and demangling.)
-   (Many tricky things are handcrafted, e.g.: stepping (and dealing with inlined functions), breakpoints (and switching between hw/sw breakpoints as needed to make things work),
-    debug info handling (data structures, parallel loading), type system (parallel loading and deduplication), watch expression interpreter, all of UI.)
  * Fast.
    Operations that can be instantaneous should be instantaneous. I.e. snappy UI, no random freezes, no long waits.
    (Known exception: if the program has >~2k threads things become pretty slow, can be improved.)
    Operations that can't be instantaneous (e.g. loading debug info) should be reasonably efficient, multi-threaded, asynchronous, cancellable, and have progress bars.
  * Works on large executables (tested mostly on 2.5 GB clickhouse).
- * Reasonably careful error reporting.
+ * Reasonably careful error reporting (as opposed to e.g. showing an empty list or saying "unknown error" or getting stuck).
 
 # Getting started
 
@@ -448,6 +448,7 @@ removing breakpoints on exit
   otherwise the detached process will get SIGTRAP and crash as soon as it hits one of the leftover breakpoints
   nnd correctly removes breakpoints when exiting normally, or exiting with an error, or exiting with a panic (e.g. failed assert)
   but it doesn't remove breakpoints if the debugger receives a fatal signal (e.g. SIGSEGV or SIGKILL)"###),
+        HelpParagraph::Licenses => styled_write!(text, palette.default_dim, "{}", LICENSES_DOC),
     }
 }
 

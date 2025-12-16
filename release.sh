@@ -1,6 +1,12 @@
 #!/bin/bash
 set -e
 
+# Prerequisites:
+#  * `rustup target add x86_64-unknown-linux-musl`
+#  * github CLI (`gh`)
+#  * `cargo install cargo-about`
+#  * `cd` to the directory with Cargo.toml etc
+
 COMMIT_MESSAGE=''
 TAG_NUM=''
 while [[ $# -gt 0 ]]; do
@@ -60,6 +66,9 @@ sed -i.bak "s/^version = \"0\.[0-9]\+\.0\" # \[\[this version number is written 
 
 # Pass build time to the env!() in main.rs, passed-through by cargo.
 export NND_BUILD_TIME=`date --utc +"%Y-%m-%d %H:%M:%S-%Z"`
+
+# Generate boring legal info. This has to be after updating version number above.
+cargo about generate about.hbs -o src/license.rs
 
 # Build in all the modes, with musl and glibc.
 for target in "" "--target=x86_64-unknown-linux-musl"

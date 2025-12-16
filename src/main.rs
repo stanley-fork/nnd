@@ -42,6 +42,7 @@ pub mod terminal;
 pub mod dwarf;
 pub mod core_dumper;
 pub mod os;
+pub mod license;
 
 use crate::{elf::*, error::*, debugger::*, util::*, ui::*, log::*, process_info::*, symbols::*, symbols_registry::*, procfs::*, unwind::*, range_index::*, settings::*, context::*, executor::*, persistent::*, doc::*, terminal::*, common_ui::*, core_dumper::*, os::*, registers::*};
 use std::{rc::Rc, mem, str, fs, os::fd::{FromRawFd}, io::Read, io, io::Write, panic, process, thread, thread::ThreadId, cell::UnsafeCell, ptr, pin::Pin, sync::Arc, str::FromStr, path::PathBuf, collections::HashSet};

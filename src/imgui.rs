@@ -943,7 +943,7 @@ impl UI {
                 } else if w.axes[Axis::Y].max_size != usize::MAX {
                     w.axes[Axis::Y].max_size
                 } else {
-                    1000
+                    100000
                 };
                 let r = text.line_wrap(w.draw_text.clone().unwrap(), w.axes[Axis::X].size, max_lines, &palette.line_wrap_indicator, &palette.truncation_indicator, None);
                 w.line_wrapped_text = Some(r.clone());
