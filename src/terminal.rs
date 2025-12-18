@@ -4,7 +4,7 @@ use bitflags::*;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy)]
 pub struct ScreenCell {
     pub style: Style,
 
@@ -72,6 +72,16 @@ impl ScreenBuffer {
             &self.long_graphemes[u32::from_le_bytes(cell.data.clone()) as usize..]
         };
         (unsafe {str::from_utf8_unchecked(&slice[..len as usize])}, cell.len_and_width >> 6)
+    }
+
+    fn cell_equals(&self, cell: &ScreenCell, other: &Self, cell2: &ScreenCell) -> bool {
+        if (cell.style, cell.len_and_width) != (cell2.style, cell2.len_and_width) {
+            return false;
+        }
+        if cell.len_and_width & 64 <= 4 {
+            return cell.data == cell2.data;
+        }
+        return self.unpack_grapheme(cell).0 == other.unpack_grapheme(cell2).0;
     }
 
     pub fn fill(&mut self, rect: Rect, grapheme: &str, style: Style) {
@@ -287,7 +297,7 @@ impl Terminal {
                 let width = buffer.width;
                 while x < width {
                     let idx = y*buffer.width + x;
-                    if buffer.cells[idx] == self.prev_buffer.cells[idx] {
+                    if buffer.cell_equals(&buffer.cells[idx], &self.prev_buffer, &self.prev_buffer.cells[idx]) {
                         if x > x1 {
                             let xx = write_range(y, x1, x, &buffer, &mut commands);
                             if xx > x {
