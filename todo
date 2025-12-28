@@ -37,6 +37,7 @@ test with watches window filled with long arrays (I saw 50ms frames when there a
 investigate unresponsive ui when conditional breakpoint is hit at a high rate
 
 todo:
+avoid flickering when typing in dialogs, somehow
 in type search, dedup builtin types so that they're not listed once for each binary
 tooltip in status window with more log lines and more space for last error
 try with odin
@@ -70,14 +71,12 @@ hotkey to switch between .h/.cpp (/.cc/.hh/.hpp/.cxx - maybe just anything after
 maximizing windows
 meta functions like checking for field presence of superclass type for use in conditions
 key to freeze value in watches window; can also be used for controlling when to run the expression if it has side effects
-key to add watch value as new watch, maybe cast to type, e.g. *(0x1234 as *DB::Block)
 allow expressions (especially conditions) to have multiple statements separated by ';'
 "unexpectedly big memory read" (16 bytes) for f64 local variables on the stack in rust
 some kind of non-stop mode to prevent clickhouse server from losing keeper connection when stepping through the code
 allow navigating from source to variables (especially global) and types declared there
 allow to put breakpoint on a whole file (by adding breakpoint on the first line, since there's never any real code on first line in practice; have a new icon for it; internally use line 0 to cover the garbage LineInfo-s with line 0; or maybe put breakpoint only on function entry points instead of everything)
 handle tail calls: if you step-into a tail call (by single-stepping from instruction pointed by DW_AT_call_pc of a DW_TAG_call_site with DW_AT_call_tail_call), the tail-callee should be added to stack digest (so its stack frame is selected instead of parent)
-find function by address (like addr2line)
 use actual function name instead of "_" in namespace path, or do something else to make function-static variables usable
 show number of function inlined sites in disassembly window, allow setting breakpoint on it, allow opening inline-only functions
 follow forks, maybe even support multiple processes
@@ -90,7 +89,6 @@ in disassembly window, make 'left' key jump to the start of inlined function
 maximizing windows (hot key and button in a corner)
 signal breakpoints
 make source window autoscroll horizontally in addition to vertically
--v for build datetime
 handle partially-optimized-out struct values (common in rust)
 read color scheme from file
 color threads based on stack hash

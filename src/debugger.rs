@@ -267,7 +267,6 @@ pub struct HardwareBreakpoint {
 #[derive(Debug, Clone)]
 pub struct LineBreakpoint {
     pub path: PathBuf,
-    pub file_version: FileVersionInfo,
     pub line: usize,
     // If the `line` corresponds to no machine instructions (e.g. it points to a comment or it's optimized out), we put the breakpoint on the next line that has code and point `adjusted_line` to that line, and the UI shows different breakpoint markers on both lines.
     // We don't modify `line` because that would be confusing in the UI in case when breakpoint is set before symbols are loaded (e.g. in a dynamic library), and we can't adjust the line right away.
@@ -345,7 +344,6 @@ impl Breakpoint {
             BreakpointOn::Line(b) => {
                 out.write_u8(0)?;
                 out.write_path(&b.path)?;
-                b.file_version.save_state(out)?;
                 out.write_usize(b.line)?;
             }
             BreakpointOn::Instruction(b) => {
@@ -385,7 +383,7 @@ impl Breakpoint {
 
     fn load_state(inp: &mut &[u8]) -> Result<Breakpoint> {
         let on = match inp.read_u8()? {
-            0 => BreakpointOn::Line(LineBreakpoint {path: inp.read_path()?, file_version: FileVersionInfo::load_state(inp)?, line: inp.read_usize()?, adjusted_line: None}),
+            0 => BreakpointOn::Line(LineBreakpoint {path: inp.read_path()?, line: inp.read_usize()?, adjusted_line: None}),
             1 => {
                 let function = if inp.read_bool()? {
                     Some((FunctionLocator::load_state(inp)?, inp.read_usize()?))

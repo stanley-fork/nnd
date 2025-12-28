@@ -67,7 +67,7 @@ impl KeyHint {
 
 struct SourceScrollTarget {
     path: PathBuf,
-    version: FileVersionInfo,
+    version: Option<FileVersionInfo>,
     line: usize,
     cascade: bool, // scroll disassembly as well
 }
@@ -1144,7 +1144,7 @@ impl WatchesWindow {
         match action {
             ValueClickAction::None => panic!("huh"),
             ValueClickAction::CodeLocation(line) => {
-                let target = SourceScrollTarget {path: line.path.clone(), version: line.version.clone(), line: line.line.line(), cascade: true};
+                let target = SourceScrollTarget {path: line.path.clone(), version: Some(line.version.clone()), line: line.line.line(), cascade: true};
                 state.should_scroll_source = Some((Some(target), /*only_if_on_error_tab*/ false));
                 ui.should_redraw = true;
             }
@@ -2251,7 +2251,7 @@ impl DisassemblyWindow {
             }
             if let Some(line) = source_line_info {
                 let file = &symbols.files[line.file_idx().unwrap()];
-                source_line = Some(SourceScrollTarget {path: file.path.to_owned(), version: file.version.clone(), line: line.line(), cascade: false});
+                source_line = Some(SourceScrollTarget {path: file.path.to_owned(), version: Some(file.version.clone()), line: line.line(), cascade: false});
             }
         }
         let key = (binary.id, function_idx, tab.area_state.cursor, tab.selected_subfunction_level);
@@ -3615,7 +3615,7 @@ impl WindowContent for StackWindow {
             let cur = (state.selected_thread, thr.1, frame.addr);
             scroll_source_and_disassembly |= cur != self.seen;
             if scroll_source_and_disassembly || rerequest_scroll {
-                state.should_scroll_source = Some((subframe.line.as_ref().map(|line| SourceScrollTarget {path: line.path.clone(), version: line.version.clone(), line: line.line.line(), cascade: false}), !scroll_source_and_disassembly));
+                state.should_scroll_source = Some((subframe.line.as_ref().map(|line| SourceScrollTarget {path: line.path.clone(), version: Some(line.version.clone()), line: line.line.line(), cascade: false}), !scroll_source_and_disassembly));
                 state.should_scroll_disassembly = Some((match (&frame.binary_id, &state.stack.subframes[frame.subframes.end - 1].function_idx) {
                     (Err(e), _) => Err(e.clone()),
                     (_, Err(e)) => Err(e.clone()),
@@ -3681,7 +3681,9 @@ struct CodeTab {
     title: String,
     identity: usize,
     path_in_symbols: PathBuf, // empty if not known
-    version_in_symbols: FileVersionInfo,
+    // None if we haven't seen this file in symbols yet (i.e. the tab info is loaded from save file).
+    // Can change if version in symbols changes, e.g. if the program was recompiled.
+    version_in_symbols: Option<FileVersionInfo>,
     ephemeral: bool,
     area_state: AreaState,
 }
@@ -3775,7 +3777,7 @@ impl CodeSearch {
 struct CodeWindow {
     tabs: Vec<CodeTab>,
     tabs_state: TabsState,
-    file_cache: HashMap<(PathBuf, FileVersionInfo), SourceFile>,
+    file_cache: HashMap<(PathBuf, Option<FileVersionInfo>), SourceFile>,
 
     search_dialog: Option<SearchDialog>,
 
@@ -3783,15 +3785,15 @@ struct CodeWindow {
     go_to_line_bar: SearchBar,
 
     // When this changes (usually because the user moved the cursor around the file), we scroll disassembly to the address corresponding to the selected line.
-    disassembly_scrolled_to: Option<(PathBuf, FileVersionInfo, /*cursor*/ usize)>,
+    disassembly_scrolled_to: Option<(PathBuf, Option<FileVersionInfo>, /*cursor*/ usize)>,
 }
 // TODO: Column cursor mode, to set breakpoints on columns. And/or clickable statements.
 impl CodeWindow {
-    fn find_or_open_file<'a>(file_cache: &'a mut HashMap<(PathBuf, FileVersionInfo), SourceFile>, path_in_symbols: &Path, version: &FileVersionInfo, debugger: &Debugger, palette: &Palette) -> &'a SourceFile {
+    fn find_or_open_file<'a>(file_cache: &'a mut HashMap<(PathBuf, Option<FileVersionInfo>), SourceFile>, path_in_symbols: &Path, version: &Option<FileVersionInfo>, debugger: &Debugger, palette: &Palette) -> &'a SourceFile {
         file_cache.entry((path_in_symbols.to_owned(), version.clone())).or_insert_with(|| Self::open_file(path_in_symbols, version, debugger, palette))
     }
 
-    fn open_file(path_in_symbols: &Path, version: &FileVersionInfo, debugger: &Debugger, palette: &Palette) -> SourceFile {
+    fn open_file(path_in_symbols: &Path, version: &Option<FileVersionInfo>, debugger: &Debugger, palette: &Palette) -> SourceFile {
         let mut res = SourceFile {header: StyledText::default(), text: StyledText::default(), local_path: PathBuf::new(), widest_line: 0, num_lines_in_local_file: 0};
 
         if path_in_symbols.as_os_str().is_empty() {
@@ -3811,18 +3813,20 @@ impl CodeWindow {
 
                 match Self::read_and_format_file(&mut file, debugger, &mut res, path_in_symbols, palette) {
                     Ok((len, md5)) => {
-                        let mut warn = true;
-                        if version.size != 0 && version.size as usize != len {
-                            write!(res.header.chars, "file doesn't match debug symbols (different size: {} vs {})", len, version.size).unwrap();
-                        } else if version.md5.is_some() && version.md5 != Some(md5) {
-                            write!(res.header.chars, "file doesn't match debug symbols (md5 mismatch)").unwrap();
-                        } else {
-                            // We don't check modification time because it's usually not preserved by version control systems, so the check would only work if the binary was built locally.
-                            warn = false;
-                        }
-                        if warn {
-                            res.header.close_span(palette.warning);
-                            res.header.close_line();
+                        if let Some(version) = version {
+                            let mut warn = true;
+                            if version.size != 0 && version.size as usize != len {
+                                write!(res.header.chars, "file doesn't match debug symbols (different size: {} vs {})", len, version.size).unwrap();
+                            } else if version.md5.is_some() && version.md5 != Some(md5) {
+                                write!(res.header.chars, "file doesn't match debug symbols (md5 mismatch)").unwrap();
+                            } else {
+                                // (We don't check modification time because it's usually not preserved by version control systems, so the check would only work if the binary was built locally.)
+                                warn = false;
+                            }
+                            if warn {
+                                res.header.close_span(palette.warning);
+                                res.header.close_line();
+                            }
                         }
                     }
                     Err(e) => {
@@ -3992,8 +3996,24 @@ impl CodeWindow {
         }
     }
 
-    fn switch_to_file(&mut self, path_in_symbols: &Path, version: &FileVersionInfo, debugger: &Debugger) {
-        if let Some(i) = self.tabs.iter().position(|t| &t.path_in_symbols == path_in_symbols && &t.version_in_symbols == version) {
+    fn switch_to_file(&mut self, path_in_symbols: &Path, version: &Option<FileVersionInfo>, debugger: &Debugger) {
+        if let Some(i) = self.tabs.iter().position(|t| &t.path_in_symbols == path_in_symbols && (t.version_in_symbols.is_none() || version.is_none() || &t.version_in_symbols == version)) {
+            if self.tabs[i].version_in_symbols.is_none() {
+                // Scenario:
+                //  * User opens a file, it gets a valid FileVersionInfo from debug info.
+                //  * Debugger is closed, program is recompiled, debugger is opened again.
+                //  * CodeTab loaded from save file.
+                //  * File contents are read from file and checked against the CodeTab's FileVersionInfo, any mismatch is rendered in UI.
+                //    Should the FileVersionInfo be loaded from save file? No, otherwise we'd show a bogus mismatch warning at this point.
+                //    So CodeTab's version_in_symbols is None here.
+                //  * File is auto-opened e.g. based on stack trace. Now we have an up-to-date FileVersionInfo that comes from currently running program's debug info.
+                //    We want to re-check file contents against it to show a mismatch warning if needed.
+                //    So we assign it here. Since it's included in file_cache key, this automatically triggers re-reading and re-checking the file on render.
+                //    (Re-reading is unnecessary, but avoiding it wouldn't be worth the added complexity.)
+                // But another scenario: debug info has two files with the same path but different FileVersionInfo, and we keep switching the version_in_symbols on each auto-open;
+                // suboptimal but rare and acceptable.
+                self.tabs[i].version_in_symbols = version.clone();
+            }
             self.tabs_state.select(i);
             return;
         }
@@ -4051,13 +4071,13 @@ impl CodeWindow {
     }
 
     fn make_breakpoint_for_current_line(tab: &CodeTab) -> LineBreakpoint {
-        LineBreakpoint {path: tab.path_in_symbols.clone(), file_version: tab.version_in_symbols.clone(), line: tab.area_state.cursor + 1, adjusted_line: None}
+        LineBreakpoint {path: tab.path_in_symbols.clone(), line: tab.area_state.cursor + 1, adjusted_line: None}
     }
 
     fn evict_cache(&mut self) {
         if self.file_cache.len().saturating_sub(self.tabs.len()) > 100 {
             // Drop half of the cached files that don't have tabs open.
-            let in_use: HashSet<(PathBuf, FileVersionInfo)> = self.tabs.iter().map(|t| (t.path_in_symbols.clone(), t.version_in_symbols.clone())).collect();
+            let in_use: HashSet<(PathBuf, Option<FileVersionInfo>)> = self.tabs.iter().map(|t| (t.path_in_symbols.clone(), t.version_in_symbols.clone())).collect();
             let mut i = 0;
             self.file_cache.retain(
                 |k, _|
@@ -4071,7 +4091,7 @@ impl CodeWindow {
         }
     }
 
-    fn disassembly_scroll_key(&self) -> Option<(PathBuf, FileVersionInfo, usize)> {
+    fn disassembly_scroll_key(&self) -> Option<(PathBuf, Option<FileVersionInfo>, usize)> {
         match self.tabs.get(self.tabs_state.selected) {
             Some(t) if !t.path_in_symbols.as_os_str().is_empty() => Some((t.path_in_symbols.clone(), t.version_in_symbols.clone(), t.area_state.cursor)),
             _ => None,
@@ -4204,7 +4224,7 @@ impl CodeWindow {
         if let Some(res) = mem::take(&mut d.should_open_document) {
             let file = &res.symbols.files[res.id];
             let go_to_line = d.search.query.go_to_line.clone();
-            self.switch_to_file(&res.file, &file.version, debugger);
+            self.switch_to_file(&res.file, &Some(file.version.clone()), debugger);
             let tab = &mut self.tabs[self.tabs_state.selected];
             tab.ephemeral = false;
             if let Some(n) = go_to_line {
@@ -4462,7 +4482,7 @@ impl WindowContent for CodeWindow {
 
         match switch_to {
             None => (),
-            Some(None) => self.switch_to_file(Path::new(""), &FileVersionInfo::default(), debugger),
+            Some(None) => self.switch_to_file(Path::new(""), &None, debugger),
             Some(Some(target)) => {
                 self.switch_to_file(&target.path, &target.version, debugger);
                 let tab = &mut self.tabs[self.tabs_state.selected];
@@ -4523,8 +4543,8 @@ impl WindowContent for CodeWindow {
             }
             out.write_u8(if i == self.tabs_state.selected {2} else {1})?;
             out.write_path(&tab.path_in_symbols)?;
-            tab.version_in_symbols.save_state(out)?;
             tab.area_state.save_state(out)?;
+            // Don't save version_in_symbols because we want it to come from debug info of the currently running program, not from some previous run of the debugger.
         }
         out.write_u8(0)?;
         Ok(())
@@ -4538,7 +4558,7 @@ impl WindowContent for CodeWindow {
             }
             let path_in_symbols = inp.read_path()?;
             let title = Self::make_title(&path_in_symbols);
-            self.tabs.push(CodeTab {identity: random(), title, path_in_symbols, version_in_symbols: FileVersionInfo::load_state(inp)?, area_state: AreaState::load_state(inp)?, ephemeral: false});
+            self.tabs.push(CodeTab {identity: random(), title, path_in_symbols, version_in_symbols: None, area_state: AreaState::load_state(inp)?, ephemeral: false});
         }
         // Prevent auto-scrolling the disassembly window before any input is made.
         self.disassembly_scrolled_to = self.disassembly_scroll_key();
@@ -4798,7 +4818,7 @@ impl WindowContent for BreakpointsWindow {
             if let &Some(id) = &self.selected_breakpoint {
                 match &debugger.breakpoints.get(id).on {
                     BreakpointOn::Line(on) => {
-                        state.should_scroll_source = Some((Some(SourceScrollTarget {path: on.path.clone(), version: on.file_version.clone(), line: on.line, cascade: true}), false));
+                        state.should_scroll_source = Some((Some(SourceScrollTarget {path: on.path.clone(), version: None, line: on.line, cascade: true}), false));
                     }
                     BreakpointOn::Instruction(on) => {
                         if let Some((locator, offset)) = &on.function {
@@ -4824,7 +4844,7 @@ impl WindowContent for BreakpointsWindow {
                                 for &static_addr in static_addrs {
                                     if let Some(line) = symbols.find_line(static_addr) {
                                         let file = &symbols.files[line.file_idx().unwrap()];
-                                        state.should_scroll_source = Some((Some(SourceScrollTarget {path: file.path.to_owned(), version: file.version.clone(), line: line.line(), cascade: true}), false));
+                                        state.should_scroll_source = Some((Some(SourceScrollTarget {path: file.path.to_owned(), version: Some(file.version.clone()), line: line.line(), cascade: true}), false));
                                         found = true;
                                         break;
                                     }
