@@ -479,7 +479,7 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                         let addr = lhs.val.into_value(8, &mut context.memory)?.get_usize()?;
                         let stride = unsafe {(*p.type_).calculate_size()} as isize;
                         if stride == 0 { return err!(TypeMismatch, "array element type has size 0"); }
-                        let addr_offset = isize::checked_mul(idx, stride).flat_map(|res| isize::checked_add(addr as isize, res));
+                        let addr_offset = isize::checked_mul(idx, stride).and_then(|res| isize::checked_add(addr as isize, res));
                         let addr_offset = match addr_offset {
                             Some(v) => v as usize,
                             None => return err!(Runtime, "array size or index is too big"),
