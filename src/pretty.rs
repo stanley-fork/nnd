@@ -1322,14 +1322,22 @@ fn recognize_libcpp_deque(substruct: &mut Substruct, val: &mut Cow<Value>, state
     let value_type = find_nested_type("value_type", unsafe {(*type_).nested_names})?;
     let mut map = find_struct_field(&["map"], substruct)?;
     let start_field = find_int_field(&["start"], substruct)?;
-    let size_field = find_int_field(&["size"], substruct)?;
+    let size_field = match optional_field(find_int_field(&["size"], substruct))? {
+        Some(x) => x,
+        None => {
+            // size field is sometimes wrapped in anon struct.
+            let mut anon = find_struct_field(&[""], substruct)?;
+            find_int_field(&["size"], &mut anon)?
+        }
+    };
     substruct.check_all_fields_used()?;
 
     let mut value_ptr_type: *const TypeInfo = ptr::null();
     find_pointer_field(&["first"], &mut map, &mut value_ptr_type)?;
     let begin_field = find_pointer_field(&["begin"], &mut map, &mut value_ptr_type)?;
     find_pointer_field(&["end"], &mut map, &mut value_ptr_type)?;
-    find_pointer_field(&["end_cap"], &mut map, &mut value_ptr_type)?;
+    optional_field(find_pointer_field(&["end_cap"], &mut map, &mut value_ptr_type))?;
+    optional_field(find_struct_field(&[""], &mut map))?;
     map.check_all_fields_used()?;
 
     match unsafe {&(*value_ptr_type).t} {
