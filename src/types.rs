@@ -1359,7 +1359,7 @@ impl TypesLoader {
                 }
                 end += 1;
             }
-            let suffix_helper = DisambiguatingSuffixes::new(end - start);
+            let suffix_helper = DisambiguatingSuffixes::new(num_types);
             let mut suffix_idx = 0;
             for i in start..end {
                 if i > start && names[i].type_ == names[i-1].type_ {

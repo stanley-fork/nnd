@@ -238,10 +238,8 @@ impl SymbolsRegistry {
     fn find_matching_supplementary_binaries(&self, locator: &BinaryLocator, build_id: &Option<Vec<u8>>, is_first: bool, notices: &mut Vec<String>, warnings: &mut Vec<String>) -> Vec<Arc<ElfFile>> {
         let mut res: Vec<Arc<ElfFile>> = Vec::new();
         let file_name = Path::new(&locator.path).file_name();
-        let mut saw_matching_name = false;
         for b in &self.supplementary_binaries.v {
             let name_matches = file_name.is_some() && &Path::new(&b.path).file_name() == &file_name;
-            saw_matching_name |= name_matches;
             if build_id.is_some() {
                 if build_id == &b.elf.build_id {
                     res.push(b.elf.clone());

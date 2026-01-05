@@ -176,10 +176,10 @@ impl PersistentState {
 
     pub fn process_events(debugger: &mut Debugger, ui: &mut DebuggerUI) {
         if let Some(fd) = &debugger.persistent.config_change_fd {
-            let (mut keys_changed, mut colors_changed) = (false, false);
+            let (mut keys_changed, mut _colors_changed) = (false, false);
             for (ev, name) in fd.read() {
                 keys_changed |= &name == b"keys";
-                colors_changed |= &name == b"colors";
+                _colors_changed |= &name == b"colors";
             }
             if keys_changed {
                 if let Some(binds) = Self::read_keys_config(debugger, ui) {
