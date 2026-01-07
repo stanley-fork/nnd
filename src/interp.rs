@@ -1,5 +1,6 @@
 use crate::{*, types::*, expr::*, error::*, procfs::*, pretty::*, registers::*};
 use std::{ops::Range, mem, borrow::Cow, fmt::Write as fmtWrite};
+use bitflags::*;
 
 pub struct Expression {
     ast: Vec<ASTNode>,
@@ -24,6 +25,12 @@ pub fn parse_watch_expression(s: &str) -> Result<Expression> {
     if !t.is_eof() {
         return err!(Syntax, "unexpected {:?} after expression at {}", t, r.start);
     }
+
+    let root_range = &expr.ast[expr.root.0].range;
+    let is_whitespace = |c: char| c == ' ' || c == '\n' || c == '\r' || c == '\t';
+    debug_assert!(s[..root_range.start].chars().all(|c| is_whitespace(c)), "AST root is not encapsulating entire string at start! String: {}, Range start: {}", s, root_range.start);
+    debug_assert!(s[root_range.end..].chars().all(|c| is_whitespace(c)), "AST root is not encapsulating entire string at end! String: {}, Range end: {}", s, root_range.end);
+
     Ok(expr)
 }
 
@@ -42,13 +49,8 @@ pub fn eval_parsed_expression(expr: &Expression, state: &mut EvalState, context:
 pub fn adjust_expression_for_appending_child_path(expr_str: &str) -> Result<String> {
     let expr = parse_watch_expression(expr_str)?;
     let node = &expr.ast[expr.root.0];
-    let parentheses = match &node.a {
-        // These don't need parentheses.
-        AST::Literal(_) | AST::Variable {..} | AST::Field {..} | AST::Array | AST::Tuple | AST::StructExpression(_) | AST::TupleIndexing(_) | AST::Call(_) | AST::Block | AST::TypeInfo => false,
-        AST::BinaryOperator(BinaryOperator::Index) | AST::BinaryOperator(BinaryOperator::Slicify) => false,
-        // These are unexpected at top level of a watch expression.
-        AST::Type {..} | AST::PointerType | AST::ArrayType(_) | AST::Continue | AST::Break | AST::Return => false,
 
+    let parentheses = match &node.a {
         // For variable assignment, just use the variable name.
         AST::BinaryOperator(BinaryOperator::Assign) => {
             if let AST::Variable {name, quoted, from_any_frame} = &expr.ast[node.children[0].0].a {
@@ -58,6 +60,13 @@ pub fn adjust_expression_for_appending_child_path(expr_str: &str) -> Result<Stri
             }
             true
         }
+
+        _ if node.flags.contains(ASTNodeFlags::HAS_PARENS) => false,
+        // These don't need parentheses.
+        AST::Literal(_) | AST::Variable {..} | AST::Field {..} | AST::Array | AST::Tuple | AST::StructExpression(_) | AST::TupleIndexing(_) | AST::Call(_) | AST::Block | AST::TypeInfo => false,
+        AST::BinaryOperator(BinaryOperator::Index) | AST::BinaryOperator(BinaryOperator::Slicify) => false,
+        // These are unexpected at top level of a watch expression.
+        AST::Type {..} | AST::PointerType | AST::ArrayType(_) | AST::Continue | AST::Break | AST::Return => false,
 
         // These need parentheses.
         AST::UnaryOperator(_) | AST::BinaryOperator(_) | AST::TypeCast | AST::While | AST::For(_) | AST::If | AST::Let {..} | AST::FunctionDefinition {..} | AST::StructDefinition {..} => true,
@@ -468,7 +477,7 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
             }
             let mut rhs = eval_expression(expr, node.children[1], state, context, false)?;
             follow_references_and_prettify(&mut rhs, None, false, state, context)?;
-            if op == BinaryOperator::Index || op == BinaryOperator::Slicify {
+            if op == BinaryOperator::Index || op == BinaryOperator::Slicify || op == BinaryOperator::Comma {
                 let b = to_basic(&rhs, &mut context.memory, "index with")?;
                 if b.is_f64() { return err!(TypeMismatch, "can't index with float"); }
                 let idx = b.cast_to_usize();
@@ -1017,6 +1026,7 @@ enum BinaryOperator {
 
     Index, // [n]
     Slicify, // .[n]
+    Comma, // ,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
@@ -1067,10 +1077,15 @@ enum AST {
     },
 }
 
+bitflags! { struct ASTNodeFlags: u8 {
+    const HAS_PARENS = 0x1; // is this node directly wrapped in any number of parens
+}}
+
 struct ASTNode {
     range: Range<usize>,
     a: AST,
     children: Vec<ASTIdx>,
+    flags: ASTNodeFlags,
 }
 
 struct InputStream<'a> {
@@ -1136,10 +1151,10 @@ impl<'a> Lexer<'a> {
                 return Ok((r.clone(), t));
             }
 
+            let start = self.input.pos;
             let c = match self.input.eat() {
                 None => return Ok((self.input.pos..self.input.pos, &Token::Eof)),
                 Some(c) => c };
-            let start = self.input.pos;
             let previous_dot = mem::take(&mut self.previous_dot);
             let token = match c {
                 ' ' | '\t' | '\n' | '\r' => continue,
@@ -1156,7 +1171,8 @@ impl<'a> Lexer<'a> {
                 '=' => Token::BinaryOperator(if self.input.eat_if_eq('=') { BinaryOperator::Eq } else { BinaryOperator::Assign }),
                 '.' => if self.input.eat_if_eq('.') { Token::BinaryOperator(BinaryOperator::Range) } else { self.previous_dot = true; Token::Char('.') },
                 '!' => if self.input.eat_if_eq('=') { Token::BinaryOperator(BinaryOperator::Ne) } else { Token::UnaryOperator(UnaryOperator::Not) },
-                ',' | '(' | ')' | '[' | ']' | '{' | '}' | ';' | '@' => Token::Char(c),
+                ',' => Token::BinaryOperator(BinaryOperator::Comma),
+                '(' | ')' | '[' | ']' | '{' | '}' | ';' | '@' => Token::Char(c),
                 ':' if self.input.peek() != Some(':') => Token::Char(':'),
                 '"' => {
                     let mut s = String::new();
@@ -1371,11 +1387,11 @@ impl Token {
 
 fn parse_block(lex: &mut Lexer, expr: &mut Expression) -> Result<ASTIdx> {
     let (range, _) = lex.expect("'{'", |t| t.is_char('{'))?;
-    let mut node = ASTNode {range, children: Vec::new(), a: AST::Block};
+    let mut node = ASTNode {range, children: Vec::new(), a: AST::Block, flags: ASTNodeFlags::empty()};
     loop {
         if let Some((range, _)) = lex.eat_if(|t| t.is_char('}'))? {
             // Either "{}" or ";}". The block returns an empty tuple.
-            expr.ast.push(ASTNode {range, children: Vec::new(), a: AST::Tuple});
+            expr.ast.push(ASTNode {range, children: Vec::new(), a: AST::Tuple, flags: ASTNodeFlags::empty()});
             node.children.push(ASTIdx(expr.ast.len()-1));
             break;
         }
@@ -1395,7 +1411,7 @@ fn parse_block(lex: &mut Lexer, expr: &mut Expression) -> Result<ASTIdx> {
 
 fn parse_type(lex: &mut Lexer, expr: &mut Expression) -> Result<ASTIdx> {
     let (range, token) = lex.eat(1)?;
-    let mut node = ASTNode {range, children: Vec::new(), a: AST::Tuple};
+    let mut node = ASTNode {range, children: Vec::new(), a: AST::Tuple, flags: ASTNodeFlags::empty()};
     node.a = match token {
         Token::BinaryOperator(op) if op == BinaryOperator::Mul => {
             node.children.push(parse_type(lex, expr)?);
@@ -1432,7 +1448,7 @@ fn parse_type(lex: &mut Lexer, expr: &mut Expression) -> Result<ASTIdx> {
 
 fn parse_expression(lex: &mut Lexer, expr: &mut Expression, outer_precedence: Precedence) -> Result<ASTIdx> {
     let (range, token) = lex.eat(1)?;
-    let mut node = ASTNode {range, children: Vec::new(), a: AST::Tuple};
+    let mut node = ASTNode {range: range.clone(), children: Vec::new(), a: AST::Tuple, flags: ASTNodeFlags::empty()};
     let mut replace: Option<ASTIdx> = None; // ignore `node` and use this node as the initial expression
     node.a = match token {
         Token::Literal(value) => AST::Literal(value),
@@ -1457,7 +1473,7 @@ fn parse_expression(lex: &mut Lexer, expr: &mut Expression, outer_precedence: Pr
                                     field_names.push(name);
                                     node.children.push(ex);
 
-                                    if lex.eat_if(|t| t.is_char(','))?.is_none() {
+                                    if lex.eat_if(|t| t.is_binary_operator(BinaryOperator::Comma))?.is_none() {
                                         lex.peek_expect("'}'", |t| t.is_char('}'))?;
                                     }
                                 }
@@ -1477,7 +1493,7 @@ fn parse_expression(lex: &mut Lexer, expr: &mut Expression, outer_precedence: Pr
                                     lex.expect("':'", |t| t.is_char(':'))?;
                                     node.children.push(parse_type(lex, expr)?);
 
-                                    if lex.eat_if(|t| t.is_char(','))?.is_none() {
+                                    if lex.eat_if(|t| t.is_binary_operator(BinaryOperator::Comma))?.is_none() {
                                         lex.peek_expect("'}'", |t| t.is_char('}'))?;
                                     }
                                 }
@@ -1490,7 +1506,7 @@ fn parse_expression(lex: &mut Lexer, expr: &mut Expression, outer_precedence: Pr
                     "break" => ast = AST::Break,
                     "return" => {
                         match lex.peek(1)?.1 {
-                            Token::Eof | Token::Char(';') | Token::Char(',') | Token::Char('}') | Token::Char(')') => (),
+                            Token::Eof | Token::Char(';') | Token::BinaryOperator(BinaryOperator::Comma) | Token::Char('}') | Token::Char(')') => (),
                             _ => node.children.push(parse_expression(lex, expr, Precedence::Return)?),
                         }
                         ast = AST::Return;
@@ -1604,27 +1620,18 @@ fn parse_expression(lex: &mut Lexer, expr: &mut Expression, outer_precedence: Pr
             match t {
                 Token::Char(')') => { // expression in parens
                     replace = Some(e);
+                    expr.ast[e.0].range.start = range.start;
+                    expr.ast[e.0].range.end = r.end;
+                    expr.ast[e.0].flags.insert(ASTNodeFlags::HAS_PARENS);
                     AST::Tuple // ignored
                 }
-                Token::Char(',') => { // tuple
-                    lex.eat(1)?;
-                    node.children.push(e);
-                    while lex.eat_if(|t| t.is_char(')'))?.is_none() {
-                        node.children.push(parse_expression(lex, expr, Precedence::Weakest)?);
-                        if lex.eat_if(|t| t.is_char(','))?.is_none() {
-                            lex.expect("')'", |t| t.is_char(')'))?;
-                            break;
-                        }
-                    }
-                    AST::Tuple
-                }
-                _ => return err!(Syntax, "expected ',' or ')', got {:?} at {}", t, r.start),
+                _ => return err!(Syntax, "expected or ')', got {:?} at {}", t, r.start),
             }
         }
         Token::Char('[') => {
             while lex.eat_if(|t| t.is_char(']'))?.is_none() {
                 node.children.push(parse_expression(lex, expr, Precedence::Weakest)?);
-                if lex.eat_if(|t| t.is_char(','))?.is_none() {
+                if lex.eat_if(|t| t.is_binary_operator(BinaryOperator::Comma))?.is_none() {
                     lex.peek_expect("']'", |t| t.is_char(']'))?;
                 }
             }
@@ -1650,7 +1657,7 @@ fn parse_expression(lex: &mut Lexer, expr: &mut Expression, outer_precedence: Pr
                 }
                 lex.eat(1)?;
                 let rhs = parse_expression(lex, expr, precedence)?;
-                let node = ASTNode {range: expr.ast[node_idx.0].range.start..expr.ast[rhs.0].range.end, children: vec![node_idx, rhs], a: AST::BinaryOperator(op)};
+                let node = ASTNode {range: expr.ast[node_idx.0].range.start..expr.ast[rhs.0].range.end, children: vec![node_idx, rhs], a: AST::BinaryOperator(op), flags: ASTNodeFlags::empty()};
                 expr.ast.push(node);
                 node_idx = ASTIdx(expr.ast.len()-1);
             }
@@ -1670,7 +1677,7 @@ fn parse_expression(lex: &mut Lexer, expr: &mut Expression, outer_precedence: Pr
                             while !lex.peek(1)?.1.is_char(')') {
                                 let ex = parse_expression(lex, expr, Precedence::Weakest)?;
                                 expr.ast[node_idx.0].children.push(ex);
-                                if lex.eat_if(|t| t.is_char(','))?.is_none() {
+                                if lex.eat_if(|t| t.is_binary_operator(BinaryOperator::Comma))?.is_none() {
                                     lex.peek_expect("')'", |t| t.is_char(')'))?;
                                 }
                             }
@@ -1689,7 +1696,7 @@ fn parse_expression(lex: &mut Lexer, expr: &mut Expression, outer_precedence: Pr
                 lex.eat(1)?;
                 let rhs = parse_expression(lex, expr, Precedence::Weakest)?;
                 lex.expect("']'", |t| t.is_char(']'))?;
-                let node = ASTNode {range: expr.ast[node_idx.0].range.start..expr.ast[rhs.0].range.end, children: vec![node_idx, rhs], a: AST::BinaryOperator(BinaryOperator::Index)};
+                let node = ASTNode {range: expr.ast[node_idx.0].range.start..expr.ast[rhs.0].range.end, children: vec![node_idx, rhs], a: AST::BinaryOperator(BinaryOperator::Index), flags: ASTNodeFlags::empty()};
                 expr.ast.push(node);
                 node_idx = ASTIdx(expr.ast.len()-1);
             }
@@ -1699,7 +1706,7 @@ fn parse_expression(lex: &mut Lexer, expr: &mut Expression, outer_precedence: Pr
                 }
                 lex.eat(1)?;
                 let (r, t) = lex.eat(1)?;
-                let mut node = ASTNode {range: expr.ast[node_idx.0].range.start..r.end, children: vec![node_idx], a: AST::Tuple};
+                let mut node = ASTNode {range: expr.ast[node_idx.0].range.start..r.end, children: vec![node_idx], a: AST::Tuple, flags: ASTNodeFlags::empty()};
                 let a = match t {
                     Token::Identifier {s, quoted} => {
                         AST::Field {name: s, quoted}
@@ -1724,12 +1731,13 @@ fn parse_expression(lex: &mut Lexer, expr: &mut Expression, outer_precedence: Pr
                 }
                 lex.eat(1)?;
                 let type_idx = parse_type(lex, expr)?;
-                let node = ASTNode {range: expr.ast[node_idx.0].range.start..expr.ast[type_idx.0].range.end, children: vec![node_idx, type_idx], a: AST::TypeCast};
+                let node = ASTNode {range: expr.ast[node_idx.0].range.start..expr.ast[type_idx.0].range.end, children: vec![node_idx, type_idx], a: AST::TypeCast, flags: ASTNodeFlags::empty()};
                 expr.ast.push(node);
                 node_idx = ASTIdx(expr.ast.len()-1);
             }
             _ => break,
         }
+        expr.ast[node_idx.0].range.end = lex.previous_token_end;
     }
 
     Ok(node_idx)
@@ -1741,6 +1749,7 @@ enum Precedence {
     Weakest,
 
     Return, // return
+    Comma, // ,
     Assign, // = += -= *= /= %= &= |= ^= <<= >>=
     Range, // .. ..=
     LazyOr, // ||
@@ -1776,6 +1785,7 @@ fn binary_operator_precedence(op: BinaryOperator) -> Precedence {
         BinaryOperator::Range => Precedence::Range,
         BinaryOperator::Index => Precedence::CallOrIndex,
         BinaryOperator::Slicify => Precedence::Field,
+        BinaryOperator::Comma => Precedence::Comma,
     }
 }
 
