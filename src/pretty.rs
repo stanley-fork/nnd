@@ -1336,7 +1336,7 @@ fn recognize_libcpp_deque(substruct: &mut Substruct, val: &mut Cow<Value>, state
     find_pointer_field(&["first"], &mut map, &mut value_ptr_type)?;
     let begin_field = find_pointer_field(&["begin"], &mut map, &mut value_ptr_type)?;
     find_pointer_field(&["end"], &mut map, &mut value_ptr_type)?;
-    optional_field(find_pointer_field(&["end_cap"], &mut map, &mut value_ptr_type))?;
+    optional_field(find_pointer_field(&["end_cap", "cap"], &mut map, &mut value_ptr_type))?;
     optional_field(find_struct_field(&[""], &mut map))?;
     map.check_all_fields_used()?;
 
