@@ -15,6 +15,11 @@ pub unsafe fn ptrace(request: i32, pid: pid_t, addr: u64, data: u64) -> Result<i
     Ok(r)
 }
 
+// libc::close_range is missing for x86_64-unknown-linux-musl for some reason.
+pub unsafe fn close_range(first: u32, last: u32, flags: u32) -> i32 {
+    unsafe {libc::syscall(libc::SYS_close_range, first, last, flags) as i32}
+}
+
 // Epoll fd. Closed in destructor.
 pub struct Epoll {
     fd: i32,
@@ -23,7 +28,7 @@ pub struct Epoll {
 impl Epoll {
     pub fn new() -> Result<Epoll> {
         unsafe {
-            let fd = libc::epoll_create1(0);
+            let fd = libc::epoll_create1(libc::EPOLL_CLOEXEC);
             if fd < 0 { return errno_err!("epoll_create1(0) failed"); }
             Ok(Epoll {fd: fd})
         }

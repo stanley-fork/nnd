@@ -1,5 +1,5 @@
 use crate::{imgui::Axis, util::FmtString};
-use std::{ops::Range, fmt::Write as fmtWrite};
+use std::{ops::Range, fmt::Write as fmtWrite, io::Write as ioWrite};
 use bitflags::*;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -20,6 +20,7 @@ impl Rect {
     pub fn bottom(&self) -> isize { self.end(Axis::Y) }
     pub fn center(&self) -> [isize; 2] { [self.pos[0] + self.size[0] as isize / 2, self.pos[1] + self.size[1] as isize / 2] }
     pub fn y_range(&self) -> Range<isize> { self.pos[Axis::Y]..self.pos[Axis::Y]+self.size[Axis::Y] as isize }
+    pub fn x_range(&self) -> Range<isize> { self.pos[Axis::X]..self.pos[Axis::X]+self.size[Axis::X] as isize }
 
     pub fn intersection(mut self, r: Rect) -> Rect {
         for axis in 0..2 {
@@ -51,35 +52,93 @@ impl Rect {
     }
 }
 
-// RGB. (We always use RGB instead of terminal palette colors because the palette is not big enough for us, and mixing palette with RGB colors would look terrible with non-default palette.)
-#[derive(Clone, Copy, Eq, PartialEq, Debug, Default)]
-pub struct Color(pub u8, pub u8, pub u8);
+// Colors that can appear in ANSI escape codes.
+// For debugger UI, we always use RGB instead of terminal palette colors. The palette is not big enough for us, and mixing palette with RGB colors would look terrible with non-default palette.
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+pub enum Color {
+    Rgb(u8, u8, u8),    // ESC[(38|48);2;<r>;<g>;<b>m
+    Palette256(u8),     // ESC[(38|48);5;<r>m
+    Palette8(u8),       // ESC[(30-37|40-47)m
+    Palette8Bright(u8), // ESC[(90-97|100-107)m
+    TerminalDefault,    // ESC[(39|49)m
+}
+impl Default for Color { fn default() -> Self { Self::Rgb(0, 0, 0) } }
 impl Color {
-    pub fn white() -> Self { Self(255, 255, 255) }
-    pub fn black() -> Self { Self(0, 0, 0) }
+    pub fn white() -> Self { Self::Rgb(255, 255, 255) }
+    pub fn black() -> Self { Self::Rgb(0, 0, 0) }
     pub fn darker(self) -> Self {
         let f = |x| (x as usize * 2 / 3) as u8;
-        Self(f(self.0), f(self.1), f(self.2))
+        match self {
+            Color::Rgb(r, g, b) => Self::Rgb(f(r), f(g), f(b)),
+            _ => self,
+        }
+    }
+    // bg_or_fg is 0 for foreground color, 10 for background color.
+    pub fn write_ansi(self, out: &mut Vec<u8>, bg_or_fg: u8) {
+        (match self {
+            Color::Rgb(r, g, b)      => write!(out, "{};2;{};{};{};", 38 + bg_or_fg, r, g, b),
+            Color::Palette256(n)     => write!(out, "{};5;{};"      , 38 + bg_or_fg, n),
+            Color::Palette8(n)       => write!(out, "{};"           , 30 + bg_or_fg + n),
+            Color::Palette8Bright(n) => write!(out, "{};"           , 90 + bg_or_fg + n),
+            Color::TerminalDefault   => write!(out, "{};"           , 39 + bg_or_fg),
+        }).unwrap();
     }
 }
 
+// Style flags that can appear in ANSI escape codes.
+// Almost none of them are consistently supported even across the top few popular terminals,
+// so we shouldn't rely on them in the debugger UI. They're present in the enum only for passing through
+// to the console window if the debuggee outputs these ANSI codes.
 bitflags! {
 #[derive(Default)]
 pub struct Modifier: u8 {
-    // These would correspond to various ANSI escape codes for text style... but pretty much
-    // none of such codes are universally supported across even the top few popular terminals,
-    // so we only have the bare minimum here.
-
-    // Avoid using this in a load-bearing way, in case some terminals don't support it.
+    // Avoid using this in a load-bearing way.
     // E.g. undim the fg color or alter bg color in addition to using the modifier.
-    const BOLD = 0x1;
+    const BOLD          = 0x1;
 
     // We use this in a load-bearing way occasionally (e.g. for current column in source code window), but maybe we shouldn't.
-    const UNDERLINED = 0x2;
+    const UNDERLINED    = 0x2;
 
-    // ITALIC would be nice, but it's not widely supported, e.g. doesn't work over ssh+tmux. So we avoid it.
-    // DIM is also not widely supported. We manually alter the RGB colors instead.
+    const DIM           = 0x4; // some terminals ignore it
+    const ITALIC        = 0x8; // doesn't work over ssh+tmux
+    const SLOW_BLINK    = 0x10;
+    const RAPID_BLINK   = 0x20;
+    const INVERT        = 0x40;
+    const STRIKETHROUGH = 0x80;
 }}
+pub fn modifier_diff_write_ansi(old: Modifier, new: Modifier, out: &mut Vec<u8>) {
+    let diff = old ^ new;
+    if diff.is_empty() {
+        return;
+    }
+    if diff.intersects(Modifier::BOLD | Modifier::DIM) { // these two can only be disabled together
+        write!(out, "22;").unwrap();
+        if new.contains(Modifier::BOLD) {
+            write!(out, "1;").unwrap();
+        }
+        if new.contains(Modifier::DIM) {
+            write!(out, "2;").unwrap();
+        }
+    }
+    if diff.intersects(Modifier::SLOW_BLINK | Modifier::RAPID_BLINK) {
+        write!(out, "25;").unwrap();
+        if new.contains(Modifier::SLOW_BLINK) {
+            write!(out, "5;").unwrap();
+        }
+        if new.contains(Modifier::RAPID_BLINK) {
+            write!(out, "6;").unwrap();
+        }
+    }
+    let mut handle = |bit, on, off| {
+        if diff.contains(bit) {
+            write!(out, "{};", if new.contains(bit) {on} else {off}).unwrap();
+        }
+    };
+    handle(Modifier::ITALIC       , 3, 23);
+    handle(Modifier::UNDERLINED   , 4, 24);
+    handle(Modifier::INVERT       , 7, 27);
+    handle(Modifier::STRIKETHROUGH, 9, 29);
+}
 
 #[derive(Clone, Copy, Eq, PartialEq, Default)]
 pub struct Style {
@@ -106,9 +165,14 @@ impl StyleAdjustment {
             *x = y.saturating_add(*x as i16).max(0).min(255) as u8;
         };
         let add3 = |x: &mut Color, y: &(i16, i16, i16)| {
-            add(&mut x.0, y.0);
-            add(&mut x.1, y.1);
-            add(&mut x.2, y.2);
+            match x {
+                Color::Rgb(r, g, b) => {
+                    add(r, y.0);
+                    add(g, y.1);
+                    add(b, y.2);
+                }
+                _ => (),
+            }
         };
         add3(&mut s.fg, &self.add_fg);
         add3(&mut s.bg, &self.add_bg);
@@ -134,17 +198,19 @@ pub fn str_width(s: &str) -> usize {
     // We could just do s.width(), but there are probably some unicode shenanigans that sometimes make string width different from the sum of its grapheme widths.
     s.graphemes(true).map(|c| c.width()).sum()
 }
-// Max i such that str_width(&s[..i]) <= width.
-pub fn str_prefix_with_width(s: &str, width: usize) -> (/*bytes*/ usize, /*width*/ usize) {
+// Max i such that str_width(&s[..i]) <= width. And the byte size and width of the next grapheme after that.
+pub fn str_prefix_with_width(s: &str, width: usize) -> (/*bytes*/ usize, /*width*/ usize, /*next_bytes*/ usize, /*next_width*/ usize) {
     let mut w = 0usize;
-    for (i, c) in s.grapheme_indices(true) {
-        let ww = w + c.width();
-        if ww > width {
-            return (i, w);
+    let mut it = s.grapheme_indices(true);
+    while let Some((i, c)) = it.next() {
+        let next_w = w + c.width();
+        if next_w > width {
+            let next_i = it.next().map_or(s.len(), |(i, _)| i);
+            return (i, w, next_i - i, next_w - w);
         }
-        w = ww;
+        w = next_w;
     }
-    (s.len(), w)
+    (s.len(), w, 0, 0)
 }
 // Min i such that str_width(&s[i..]) <= width.
 pub fn str_suffix_with_width(s: &str, width: usize) -> (/*start_byte_idx*/ usize, /*width*/ usize) {
@@ -379,7 +445,13 @@ impl StyledText {
                 let (n, w) = if remaining_width <= width {
                     (line_end - pos, remaining_width)
                 } else {
-                    str_prefix_with_width(&self.chars[pos..line_end], width.saturating_sub(str_width(&end_indicator.1)))
+                    let (n, w, nn, ww) = str_prefix_with_width(&self.chars[pos..line_end], width.saturating_sub(str_width(&end_indicator.1)));
+                    if n == 0 {
+                        // Line is not wide enough even for one grapheme. Put one grapheme anyway.
+                        (nn, ww)
+                    } else {
+                        (n, w)
+                    }
                 };
 
                 let wrapped_end = pos + n;
@@ -450,5 +522,12 @@ impl StyledText {
 
     pub fn ensure_padded(&mut self) {
         self.chars.reserve(64);
+    }
+
+    pub fn append_repeated(&mut self, s: &str, count: usize, style: Style) {
+        for _ in 0..count {
+            self.chars.push_str(s);
+        }
+        self.close_span(style);
     }
 }

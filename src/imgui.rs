@@ -1,4 +1,4 @@
-use crate::{*, common_ui::*, terminal::*, settings::*, util::*, log::*, pool::*};
+use crate::{*, common_ui::*, terminal::*, settings::*, util::*, log::*, pool::*, term_emu::*};
 use std::{mem, ops::Range, collections::HashMap, time::{Instant, Duration}, hash::Hash};
 use bitflags::*;
 
@@ -50,7 +50,7 @@ pub struct Axis {
     pub rel_pos: isize, // relative to parent widget
 
     // Position relative to the screen. Calculated only at the end of the frame, when rendering. Any value assigned before that is ignored.
-    abs_pos: isize,
+    pub abs_pos: isize,
 }
 impl Default for Axis { fn default() -> Self { Self {flags: AxisFlags::empty(), auto_size: AutoSize::Parent, min_size: 0, max_size: usize::MAX, size: 0, rel_pos: 0, abs_pos: 0} } }
 impl Axis {
@@ -125,7 +125,7 @@ pub struct WidgetFlags: u32 {
     // Any simple character key presses (no modifier keys, no special keys like tab or enter) are captured by this Widget as if they were in capture_keys.
     // Doesn't include text navigation keys like arrow keys, home/end, etc; they should be requested through capture_keys as usual.
     const CAPTURE_TEXT_INPUT_KEYS = 0x200;
-    // Capture all keys that reach this Widget (i.e. if this widget is focused and keys are not captured by focused descendants first).
+    // Invert `capture_keys`: capture all keys except those.
     const CAPTURE_ALL_KEYS = 0x400;
 
     // Trigger redraw is this Widget gets focused or unfocused.
@@ -167,6 +167,7 @@ pub struct MouseActions : u16 {
     // HOVER on this Widget or any descendant. E.g. for highlighting a table row even when hovering over some button inside that row.
     const HOVER_SUBTREE = 0x80;
     const MIDDLE_CLICK = 0x100;
+    const RIGHT_CLICK = 0x200;
 }}
 
 // Identifies a thing that is being drag'n'dropped.
@@ -211,6 +212,8 @@ pub struct Widget {
     // The f64 is in [0, 1]. Style fg is for the left side of the progress bar, bg is for the right side.
     // If draw_text is set, the text is drawn at the center, using the progress bar's style (text color is the opposite fg/bg color of the progress bar); the text's style is ignored, only the first line is used.
     pub draw_progress_bar: Option<(f64, Style)>,
+
+    pub draw_terminal: Option<Rc<TerminalEmulator>>,
 
     pub draw_cursor_if_focused: Option<[isize; 2]>,
 
@@ -288,7 +291,7 @@ impl Widget {
     // ("Questionable" because I'm not sure it's a good idea to allow this, and am not sure it'll work well.)
     pub fn make_questionable_copy(&self) -> Self {
         let mut r = Self {
-            identity: self.identity, source_line: self.source_line, axes: self.axes.clone(), flags: self.flags, draw_text: self.draw_text.clone(), style_adjustment: self.style_adjustment, draw_fill: self.draw_fill.clone(), draw_progress_bar: self.draw_progress_bar.clone(), draw_frame: self.draw_frame.clone(),
+            identity: self.identity, source_line: self.source_line, axes: self.axes.clone(), flags: self.flags, draw_text: self.draw_text.clone(), style_adjustment: self.style_adjustment, draw_fill: self.draw_fill.clone(), draw_progress_bar: self.draw_progress_bar.clone(), draw_frame: self.draw_frame.clone(), draw_terminal: None,
             parent: WidgetIdx::invalid(), depth: 0, children: Vec::new(), position_next_to: None, focus_children: Vec::new(), capture_keys: Vec::new(), keys: Vec::new(), capture_mouse: MouseActions::empty(), mouse: MouseActions::empty(), scroll: 0, mouse_pos: [0, 0], drag_out_what: DragWhat::default(), drag_in_what: DragWhat::default(), scroll_bar_drag_offset: 0, line_wrapped_text: None, draw_cursor_if_focused: None, focus_frame_idx: 0};
         r.flags.remove(WidgetFlags::REDRAW_IF_FOCUS_CHANGES);
         for axis in &mut r.axes {
@@ -388,13 +391,22 @@ pub struct UI {
     prev_root: WidgetIdx,
     prev_focus_chain: Vec<WidgetIdx>,
 
+    // All keyboard/mouse input events that happened since the last frame.
+    // Used only for passthrough to the nested tty in the console window.
+    pub frame_events: Vec<EventInfo>,
+
+    // Our best guess at the current state of the mouse and terminal, based on previously seen Event-s.
+    pub mouse_pos: [isize; 2],
+    pub mouse_buttons_held: Vec<MouseButton>,
+    pub is_terminal_unfocused: bool,
+
     // Key presses not dispatched to widgets yet.
     input_buffer: Vec<KeyEx>,
 
     // Information about mouse events that happened since last frame. If there were multiple clicks, we only keep the last one.
-    mouse_pos: [isize; 2],
     mouse_click: Option<[isize; 2]>, // coordinates separate from mouse_pos, to be precise if a click happened in the middle of a fast motion
     mouse_middle_click: Option<[isize; 2]>,
+    mouse_right_click: Option<[isize; 2]>,
     mouse_scroll: isize,
     mouse_drag_out_widget: Option<usize>,
     mouse_drop_pos: Option<[isize; 2]>, // mouse coordinates when mouse button was released, if mouse_drag_out_widget is Some
@@ -405,37 +417,45 @@ pub struct UI {
 }
 impl UI {
     // Returns true if any of the input was significant enough that we should redraw.
-    pub fn buffer_input(&mut self, events: &[Event]) -> bool {
+    pub fn buffer_input(&mut self, events: &[EventInfo]) -> bool {
         let mut any_significant = false;
         for e in events {
-            let mut significant = true;
-            match e {
+            match &e.ev {
                 Event::Key(key) => self.input_buffer.push(key.clone()),
                 Event::FocusIn | Event::FocusOut => {
                     self.mouse_drag_out_widget = None;
+                    self.is_terminal_unfocused = e.ev == Event::FocusOut;
                 }
-                Event::Mouse(MouseEventEx {pos, button, event, ..}) => {
-                    if button == &MouseButton::Left && event == &MouseEvent::Press {
-                        self.mouse_click = Some(pos.clone());
-                    } else if button == &MouseButton::Left && event == &MouseEvent::Release {
+                Event::Mouse(MouseEventEx {pos, event: MouseEvent::Move, ..}) if *pos == self.mouse_pos => continue, // mouse move within the same terminal cell, ignore these
+                &Event::Mouse(MouseEventEx {pos, button, event, ..}) => {
+                    if button == MouseButton::Left && event == MouseEvent::Press {
+                        self.mouse_click = Some(pos);
+                    } else if button == MouseButton::Left && event == MouseEvent::Release {
                         if self.mouse_drag_out_widget.is_some() {
                             self.mouse_drop_pos = Some(pos.clone());
-                        } else {
-                            significant = false;
                         }
-                    } else if button == &MouseButton::Middle && event == &MouseEvent::Press {
+                    } else if button == MouseButton::Middle && event == MouseEvent::Press {
                         self.mouse_middle_click = Some(pos.clone());
-                    } else if event == &MouseEvent::ScrollUp {
+                    } else if button == MouseButton::Right && event == MouseEvent::Press {
+                        self.mouse_right_click = Some(pos.clone());
+                    } else if event == MouseEvent::ScrollUp {
                         self.mouse_scroll -= 1;
-                    } else if event == &MouseEvent::ScrollDown {
+                    } else if event == MouseEvent::ScrollDown {
                         self.mouse_scroll += 1
-                    } else {
-                        significant = pos != &self.mouse_pos;
                     }
                     self.mouse_pos = pos.clone();
+                    if event == MouseEvent::Release {
+                        self.mouse_buttons_held.retain(|b| *b != button);
+                    }
+                    if event == MouseEvent::Press {
+                        if !self.mouse_buttons_held.iter().find(|b| **b == button).is_none() {
+                            self.mouse_buttons_held.push(button);
+                        }
+                    }
                 }
             }
-            any_significant |= significant;
+            self.frame_events.push(e.clone());
+            any_significant = true;
         }
         any_significant
     }
@@ -509,7 +529,9 @@ impl UI {
             w.mouse = MouseActions::empty();
             w.scroll = 0;
             w.mouse_pos = [0, 0];
+            w.draw_terminal = None;
         }
+        self.frame_events.clear();
     }
 
     pub fn add(&mut self, mut w: Widget) -> WidgetIdx {
@@ -723,9 +745,11 @@ impl UI {
     // Requests input for cur_parent for next frame, returns input that was requested on previous frame.
     // Multiple such calls for different keys can coexist on the same Widget; each call will return only the actions that it requested.
     pub fn check_keys(&mut self, actions: &[KeyAction]) -> Vec<KeyAction> {
-        let req = self.key_binds.normal.actions_to_keys(actions);
         let w = &mut self.tree[self.cur_parent.0];
-        w.capture_keys.extend_from_slice(&req);
+        if !w.flags.contains(WidgetFlags::CAPTURE_ALL_KEYS) {
+            let req = self.key_binds.normal.actions_to_keys(actions);
+            w.capture_keys.extend_from_slice(&req);
+        }
         let mut res: Vec<KeyAction> = Vec::new();
         w.keys.retain(|key| {
             match self.key_binds.normal.key_to_action.get(key) {
@@ -744,7 +768,9 @@ impl UI {
             Some(x) => x,
             None => return false };
         let w = &mut self.tree[self.cur_parent.0];
-        w.capture_keys.extend_from_slice(keys);
+        if !w.flags.contains(WidgetFlags::CAPTURE_ALL_KEYS) {
+            w.capture_keys.extend_from_slice(keys);
+        }
         let mut res = false;
         w.keys.retain(|key| {
             match keys.iter().position(|k| k == key) {
@@ -843,6 +869,21 @@ impl UI {
         }))
     }
 
+    // Checks whether there's a relatively-focused widget with draw_cursor_if_focused set, in the given widget's subtree.
+    pub fn subtree_has_cursor(&self, root: WidgetIdx) -> bool {
+        let mut stack: Vec<WidgetIdx> = vec![root];
+        while let Some(idx) = stack.pop() {
+            let w = &self.tree[idx.0];
+            if w.draw_cursor_if_focused.is_some() {
+                return true;
+            }
+            for &c in w.focus_children.iter().rev() {
+                stack.push(c);
+            }
+        }
+        false
+    }
+
     fn calculate_bottom_up_sizes(&mut self, root: WidgetIdx, ax: usize, all: bool) {
         let mut stack: Vec<(WidgetIdx, /*pass*/ u8)> = vec![(root, 0)];
         while let Some((idx, pass)) = stack.pop() {
@@ -938,14 +979,17 @@ impl UI {
         match &w.line_wrapped_text {
             Some(x) => x.clone(),
             None => {
-                let max_lines = if w.axes[Axis::Y].flags.contains(AxisFlags::SIZE_KNOWN) {
+                let width = w.axes[Axis::X].size;
+                let max_lines = if width == 0 {
+                    0
+                } else if w.axes[Axis::Y].flags.contains(AxisFlags::SIZE_KNOWN) {
                     w.axes[Axis::Y].size
                 } else if w.axes[Axis::Y].max_size != usize::MAX {
                     w.axes[Axis::Y].max_size
                 } else {
                     100000
                 };
-                let r = text.line_wrap(w.draw_text.clone().unwrap(), w.axes[Axis::X].size, max_lines, &palette.line_wrap_indicator, &palette.truncation_indicator, None);
+                let r = text.line_wrap(w.draw_text.clone().unwrap(), width, max_lines, &palette.line_wrap_indicator, &palette.truncation_indicator, None);
                 w.line_wrapped_text = Some(r.clone());
                 r
             }
@@ -1043,8 +1087,16 @@ impl UI {
             let w = &mut self.tree[idx.0];
             w.axes[0].abs_pos = pos[0];
             w.axes[1].abs_pos = pos[1];
+
+            let rect = Rect {pos: pos.clone(), size: [w.axes[0].size, w.axes[1].size]};
+            let mut clip = clip.intersection(rect);
+
             if draw_text.is_some() && w.flags.contains(WidgetFlags::LINE_WRAP) {
-                draw_text = Some(Self::get_line_wrapped_text(w, &mut self.text, &self.palette));
+                if clip.is_empty() {
+                    draw_text = None;
+                } else {
+                    draw_text = Some(Self::get_line_wrapped_text(w, &mut self.text, &self.palette));
+                }
                 show_horizontal_text_truncation_indicator = false;
                 show_vertical_text_truncation_indicator = false;
             }
@@ -1053,9 +1105,6 @@ impl UI {
             }
 
             let w = &self.tree[idx.0];
-
-            let rect = Rect {pos: pos.clone(), size: [w.axes[0].size, w.axes[1].size]};
-            let mut clip = clip.intersection(rect);
 
             if w.flags.contains(WidgetFlags::RESET_STYLE_ADJUSTMENT) {
                 style_adjustment = StyleAdjustment::default();
@@ -1207,6 +1256,71 @@ impl UI {
                 }
             }
 
+            if let Some(term) = &w.draw_terminal {
+                let vt_screen = term.vt.screen();
+                for y in clip.y_range() {
+                    let ty = y - rect.y();
+                    if ty > u16::MAX as isize {
+                        break;
+                    }
+                    for x in clip.x_range() {
+                        let tx = x - rect.x();
+                        if tx > u16::MAX as isize {
+                            break;
+                        }
+                        let mut contents = " ";
+                        let mut width = 1;
+                        let mut style = Style::default();
+                        match vt_screen.cell(ty as u16, tx as u16) {
+                            None => style = Style {fg: Color::TerminalDefault, bg: Color::TerminalDefault, modifier: Modifier::empty()},
+                            Some(cell) => {
+                                if cell.has_contents() {
+                                    contents = cell.contents();
+                                }
+                                if cell.is_wide() {
+                                    width = 2;
+                                }
+
+                                let convert_color = |c: vt100::Color| -> Color {
+                                    match c {
+                                        vt100::Color::Default => Color::TerminalDefault,
+                                        vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+                                        vt100::Color::Idx(i) => {
+                                            if i < 8 {
+                                                Color::Palette8(i)
+                                            } else if i < 16 {
+                                                Color::Palette8Bright(i - 8)
+                                            } else {
+                                                Color::Palette256(i)
+                                            }
+                                        }
+                                    }
+                                };
+                                style.fg = convert_color(cell.fgcolor());
+                                style.bg = convert_color(cell.bgcolor());
+
+                                if cell.bold() {
+                                    style.modifier.insert(Modifier::BOLD);
+                                }
+                                if cell.dim() {
+                                    style.modifier.insert(Modifier::DIM);
+                                }
+                                if cell.italic() {
+                                    style.modifier.insert(Modifier::ITALIC);
+                                }
+                                if cell.underline() {
+                                    style.modifier.insert(Modifier::UNDERLINED);
+                                }
+                                if cell.inverse() {
+                                    style.modifier.insert(Modifier::INVERT);
+                                }
+                            }
+                        }
+                        screen.put_cell(contents, width, style, x, y);
+                    }
+                }
+            }
+
             if let &Some(p) = &w.draw_cursor_if_focused {
                 let p = [rect.pos[0] + p[0], rect.pos[1] + p[1]];
                 if w.focus_frame_idx == self.frame_idx + 1 && p[0] >= clip.pos[0] && p[1] >= clip.pos[1] && p[0] <= clip.right() && p[1] < clip.bottom() { // can't use clip.contains(p) because of the `<=` on this line (because we use bar cursor rather than block cursor)
@@ -1258,14 +1372,15 @@ impl UI {
                 break;
             }
             let w = &mut self.prev_tree[idx.0];
-            if w.flags.contains(WidgetFlags::CAPTURE_ALL_KEYS) {
-                w.keys.append(&mut keys);
-                break;
-            }
+            let invert = w.flags.contains(WidgetFlags::CAPTURE_ALL_KEYS);
             let text_input = w.flags.contains(WidgetFlags::CAPTURE_TEXT_INPUT_KEYS);
-            if !w.capture_keys.is_empty() || text_input {
+            if !w.capture_keys.is_empty() || text_input || invert {
                 keys.retain(|key| {
-                    if (text_input && key.mods.is_empty() && key.key.is_ordinary_char()) || w.capture_keys.iter().find(|k| k.key == key.key && (k.mods.contains(ModKeys::ANY) || k.mods == key.mods)).is_some() {
+                    let mut matches = (text_input && key.mods.is_empty() && key.key.is_ordinary_char()) || w.capture_keys.iter().find(|k| k.key == key.key && (k.mods.contains(ModKeys::ANY) || k.mods == key.mods)).is_some();
+                    if invert {
+                        matches = !matches;
+                    }
+                    if matches {
                         w.keys.push(key.clone());
                         false
                     } else {
@@ -1282,19 +1397,22 @@ impl UI {
         let hovered_idx = self.find_widget_at_cursor(self.mouse_pos);
         let mut scroll = mem::take(&mut self.mouse_scroll);
 
-        if let Some(middle_click_pos) = mem::take(&mut self.mouse_middle_click) {
-            let mut idx = if middle_click_pos == self.mouse_pos {
-                hovered_idx
-            } else {
-                self.find_widget_at_cursor(middle_click_pos)
-            };
-            while idx.is_valid() {
-                let w = &mut self.prev_tree[idx.0];
-                if w.capture_mouse.contains(MouseActions::MIDDLE_CLICK) {
-                    report_event(w, MouseActions::MIDDLE_CLICK, middle_click_pos);
-                    break;
+        // Dispatch middle click and right click.
+        for (mouse_action, click_pos) in [(MouseActions::MIDDLE_CLICK, mem::take(&mut self.mouse_middle_click)), (MouseActions::RIGHT_CLICK, mem::take(&mut self.mouse_right_click))] {
+            if let Some(click_pos) = click_pos {
+                let mut idx = if click_pos == self.mouse_pos {
+                    hovered_idx
+                } else {
+                    self.find_widget_at_cursor(click_pos)
+                };
+                while idx.is_valid() {
+                    let w = &mut self.prev_tree[idx.0];
+                    if w.capture_mouse.contains(mouse_action) {
+                        report_event(w, mouse_action, click_pos);
+                        break;
+                    }
+                    idx = w.parent;
                 }
-                idx = w.parent;
             }
         }
         

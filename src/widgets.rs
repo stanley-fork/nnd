@@ -93,6 +93,10 @@ pub fn scrolling_navigation(scroll: &mut isize, scroll_to: Option<Range<isize>>,
     // ╇  ╈  │
     // │  ╇  ╈
     // ╵  ╵  ┻
+    // TODO: Do rounding/biases such that the bar is placed in the top/bottom position only if the scroll position is exactly at the top/bottom.
+    //       E.g. if we're scrolled one line away from the bottom of the content, it would be helpful for the scroll bar to indicate that,
+    //       even if the content is long enough that one line of content corresponds to much less than one unit of scroll bar position.
+    //       Similarly, make scroll bar always at least 2 units shorter than the available space, to distinguish at least among: top, bottom, neither.
     if scroll_bar.is_valid() && content_height > viewport_height {
         with_parent!(ui, scroll_bar, {
             let bar_height = ui.calculate_size(scroll_bar, Axis::Y).saturating_sub(1); // -1 because top and bottom half-characters are empty
@@ -1336,7 +1340,7 @@ impl TextInput {
             // Exclude the '\n'.
             range.end -= 1;
         }
-        let (j, _) = str_prefix_with_width(&self.text[range.clone()], (pos[0] - start_x).max(0) as usize);
+        let (j, _, _, _) = str_prefix_with_width(&self.text[range.clone()], (pos[0] - start_x).max(0) as usize);
         range.start + j
     }
 

@@ -41,6 +41,7 @@ pub mod dwarf;
 pub mod core_dumper;
 pub mod os;
 pub mod license;
+pub mod term_emu;
 
 use crate::{elf::*, error::*, debugger::*, util::*, ui::*, log::*, process_info::*, symbols::*, symbols_registry::*, procfs::*, unwind::*, range_index::*, settings::*, context::*, executor::*, persistent::*, doc::*, terminal::*, common_ui::*, core_dumper::*, os::*, registers::*};
 use std::{rc::Rc, mem, str, fs, os::fd::{FromRawFd}, io::Read, io, io::Write, panic, process, thread, thread::ThreadId, cell::UnsafeCell, ptr, pin::Pin, sync::Arc, str::FromStr, path::PathBuf, collections::HashSet};
@@ -142,7 +143,9 @@ fn main() {
                 }
                 Ok(x) => Some(x),
             };
-        } else if let Some(v) = parse_arg(&mut args, &mut seen_args, "--tty", "-t", false, false) {
+        } else if let Some(_) = parse_arg(&mut args, &mut seen_args, "--no-pty", "", true, false) {
+            settings.use_tty = false;
+        } else if let Some(v) = parse_arg(&mut args, &mut seen_args, "--external-tty", "-t", false, false) {
             tty_file = Some(v);
         } else if let Some(v) = parse_arg(&mut args, &mut seen_args, "--stdin", "", false, false) {
             settings.stdin_file = Some(v);
@@ -433,7 +436,7 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, core_dump_path: Option<Str
     let num_threads = calculate_num_threads(&settings.num_threads);
     let context = Arc::new(Context {settings, executor: Executor::new(num_threads), wake_main_thread: Arc::new(EventFD::new())});
 
-    let epoll = Rc::new(Epoll::new()?);
+    let epoll = Epoll::new()?;
 
     // Forward some signals into pipes that wake up the main loop.
     // SIGCHLD is raised when we need to frob ptrace.
@@ -478,6 +481,7 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, core_dump_path: Option<Str
     configure_terminal(context.settings.mouse_mode)?;
 
     let mut debugger: Pin<Box<Debugger>>;
+    let mut should_start_child = false;
     if let &Some(pid) = &attach_pid {
         debugger = Pin::new(Box::new(Debugger::attach(pid, context.clone(), persistent, supplementary_binaries)?));
         #[allow(static_mut_refs)]
@@ -486,16 +490,7 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, core_dump_path: Option<Str
         debugger = Pin::new(Box::new(Debugger::open_core_dump(path, context.clone(), persistent, supplementary_binaries)?));
     } else {
         debugger = Pin::new(Box::new(Debugger::from_command_line(&command_line.unwrap(), context.clone(), persistent, supplementary_binaries)));
-
-        // Apply this only for the first time we start the program. For subsequent starts, the user can use steps instead (e.g. 's' to start and run to main()).
-        let initial_step = if context.settings.stop_on_initial_exec {
-            Some(BreakpointOn::InitialExec)
-        } else if context.settings.stop_on_main {
-            Some(BreakpointOn::PointOfInterest(PointOfInterest::MainFunction))
-        } else {
-            None
-        };
-        debugger.start_child(initial_step)?;
+        should_start_child = true;
     }
     defer! {
         #[allow(static_mut_refs)]
@@ -515,6 +510,8 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, core_dump_path: Option<Str
     if let &Some(fd) = &config_change_fd {
         epoll.add(fd, libc::EPOLLIN, fd as u64)?;
     }
+
+    let mut pty_seen_start_count: usize = usize::MAX;
 
     // Throttle rendering to <= fps. Render only when something changes.
     let mut pending_render = true;
@@ -580,8 +577,10 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, core_dump_path: Option<Str
                 debugger.prof.advance_bucket();
             } else if &Some(fd) == &config_change_fd {
                 PersistentState::process_events(&mut debugger, &mut ui);
+            } else if debugger.pty.as_ref().is_some_and(|pty| pty.master_fd == fd) {
+                debugger.pty.as_mut().unwrap().do_io(&epoll)?;
             } else {
-                return err!(Internal, "epoll returned unexpected data: {}", fd);
+                eprintln!("warning: epoll returned unexpected data: {}", fd);
             }
         }
 
@@ -629,6 +628,43 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, core_dump_path: Option<Str
                 debugger.drop_caches()?;
                 ui.drop_caches();
                 debugger.prof.bucket.other_tsc += prof.finish(&debugger.prof.bucket);
+            }
+
+            if should_start_child {
+                // Starting child on startup is deferred until after the first ui.update_and_render() call.
+                // This is awkward, but currently seems better than alternatives.
+                // The dependency chain is:
+                //  * Debugger needs to create a pty for the child.
+                //  * The pty needs to know the window size, which is the size of the terminal window (pane) in the UI.
+                //    (We could create a pty with default size, then resize it on first render, same as when the terminal window is resized at runtime.
+                //     But this may be very confusing for the user e.g. when debugging a TUI program that queries terminal size on startup and doesn't handle resizing.)
+                //  * The window layout code is intermixed with UI build code, so it's simplest to do a whole UI build just to lay out the windows.
+                //    (We could separate it out (in Layout::build()), it's not a big deal, but that would be more code and some risk of bugs where the two layout code paths don't quite match.)
+
+                // Apply initial_step only the first time we start the program. For subsequent starts, the user can use steps instead (e.g. 's' to start and run to main()).
+                let initial_step = if context.settings.stop_on_initial_exec {
+                    Some(BreakpointOn::InitialExec)
+                } else if context.settings.stop_on_main {
+                    Some(BreakpointOn::PointOfInterest(PointOfInterest::MainFunction))
+                } else {
+                    None
+                };
+                should_start_child = false;
+                debugger.start_child(initial_step)?;
+            }
+        }
+
+        let start_count = debugger.start_count;
+        if let Some(ref mut pty) = &mut debugger.pty {
+            // If child was restarted, add the new pty to the epoll set.
+            // We don't remove the old one, relying on it being auto-removed when the fd is closed.
+            if start_count != pty_seen_start_count { // (checking start_count instead of master_fd because the fd number can be reused)
+                pty.add_to_epoll(&epoll)?;
+                pty_seen_start_count = start_count;
+            }
+
+            if render_now {
+                pty.flush_out_buf_if_needed(&epoll)?;
             }
         }
 

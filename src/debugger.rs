@@ -1,4 +1,4 @@
-use crate::{*, elf::*, error::*, util::*, log::*, symbols::*, process_info::*, symbols_registry::*, unwind::*, procfs::*, registers::*, disassembly::*, pool::*, settings::*, context::*, disassembly::*, expr::*, persistent::*, interp::*, os::*};
+use crate::{*, elf::*, error::*, util::*, log::*, symbols::*, process_info::*, symbols_registry::*, unwind::*, procfs::*, registers::*, disassembly::*, pool::*, settings::*, context::*, disassembly::*, expr::*, persistent::*, interp::*, os::*, term_emu::*};
 use libc::{pid_t, c_char, c_void};
 use iced_x86::FlowControl;
 use std::{io, ptr, rc::Rc, collections::{HashMap, VecDeque, HashSet, hash_map::Entry}, mem, path::{Path, PathBuf}, sync::Arc, ffi::CStr, ops::Range, os::fd::AsRawFd, fs, time::{Instant, Duration}};
@@ -120,10 +120,16 @@ pub struct Debugger {
     command_line: Vec<String>,
     pub context: Arc<Context>,
 
+    // If context.settings.use_tty, we create a pseudoterminal for the child process (openpty() + login_tty()). It's created anew every time we restart the child.
+    pub pty: Option<Pty>,
+    pub tty_size: [u16; 2], // [width, height] to use when creating `pty`
+
     pub pid: pid_t,
     // What we would like threads to be doing: run or be suspended. If a thread gets stopped spuriously (e.g. by a signal or a thread spawn), but we want threads to be running, we resume the thread immediately.
     // Whoever changes this state must also suspend/resume all threads accordingly.
     pub target_state: ProcessState,
+    // How many times we started a new child process.
+    pub start_count: usize,
 
     pub next_thread_idx: usize,
     pub threads: HashMap<pid_t, Thread>,
@@ -440,7 +446,7 @@ impl Thread {
 }
 
 impl Debugger {
-    fn new(mode: RunMode, command_line: Vec<String>, context: Arc<Context>, symbols: SymbolsRegistry, mut breakpoints: Pool<Breakpoint>, persistent: PersistentState, my_resource_stats: ResourceStats, prof: Profiling) -> Self {
+    fn new(mode: RunMode, command_line: Vec<String>, tty_size: [u16; 2], context: Arc<Context>, symbols: SymbolsRegistry, mut breakpoints: Pool<Breakpoint>, persistent: PersistentState, my_resource_stats: ResourceStats, prof: Profiling) -> Self {
         if breakpoints.is_empty() {
             // Add default breakpoints.
 
@@ -453,7 +459,7 @@ impl Debugger {
             assert!(breakpoints.iter().filter(|(_, b)| b.hidden).count() == 1);
         }
 
-        Debugger {mode, command_line, context, pid: 0, target_state: ProcessState::NoProcess, log: Log::new(), prof, threads: HashMap::new(), pending_wait_events: VecDeque::new(), next_thread_idx: 1, info: ProcessInfo::default(), my_resource_stats, symbols, memory: MemReader::Invalid, waiting_for_initial_sigstop: false, initial_exec_failed: false, stepping: None, pending_step: None, breakpoint_locations: Vec::new(), breakpoints, stopping_to_handle_breakpoints: false, stopped_until_symbols_are_loaded: None, hardware_breakpoints: std::array::from_fn(|_| HardwareBreakpoint::default()), persistent}
+        Debugger {mode, command_line, pty: None, tty_size, context, pid: 0, target_state: ProcessState::NoProcess, log: Log::new(), prof, threads: HashMap::new(), pending_wait_events: VecDeque::new(), next_thread_idx: 1, info: ProcessInfo::default(), my_resource_stats, symbols, memory: MemReader::Invalid, waiting_for_initial_sigstop: false, initial_exec_failed: false, stepping: None, pending_step: None, breakpoint_locations: Vec::new(), breakpoints, stopping_to_handle_breakpoints: false, stopped_until_symbols_are_loaded: None, hardware_breakpoints: std::array::from_fn(|_| HardwareBreakpoint::default()), persistent, start_count: 0}
     }
 
     pub fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {
@@ -511,11 +517,11 @@ impl Debugger {
     }
 
     pub fn from_command_line(args: &[String], context: Arc<Context>, persistent: PersistentState, supp: SupplementaryBinaries) -> Self {
-        Self::new(RunMode::Run, args.into(), context.clone(), SymbolsRegistry::new(context, supp), Pool::new(), persistent, ResourceStats::default(), Profiling::new())
+        Self::new(RunMode::Run, args.into(), [0, 0], context.clone(), SymbolsRegistry::new(context, supp), Pool::new(), persistent, ResourceStats::default(), Profiling::new())
     }
 
     pub fn attach(pid: pid_t, context: Arc<Context>, persistent: PersistentState, supp: SupplementaryBinaries) -> Result<Self> {
-        let mut r = Self::new(RunMode::Attach, Vec::new(), context.clone(), SymbolsRegistry::new(context, supp), Pool::new(), persistent, ResourceStats::default(), Profiling::new());
+        let mut r = Self::new(RunMode::Attach, Vec::new(), [0, 0], context.clone(), SymbolsRegistry::new(context, supp), Pool::new(), persistent, ResourceStats::default(), Profiling::new());
         r.pid = pid;
         r.target_state = ProcessState::Running;
         r.memory = MemReader::Pid(PidMemReader::new(pid));
@@ -565,7 +571,7 @@ impl Debugger {
         let metadata = file.metadata()?;
         let elf = ElfFile::from_file(core_dump_path.to_string(), &file, metadata.len())?;
         let (memory, threads, maps) = parse_core_dump(Arc::new(elf))?;
-        let mut r = Self::new(RunMode::CoreDump, Vec::new(), context.clone(), SymbolsRegistry::new(context, supp), Pool::new(), persistent, ResourceStats::default(), Profiling::new());
+        let mut r = Self::new(RunMode::CoreDump, Vec::new(), [0, 0], context.clone(), SymbolsRegistry::new(context, supp), Pool::new(), persistent, ResourceStats::default(), Profiling::new());
         r.pid = 0; // (we could use pid from core dump, but that would just be inviting bugs; if we ever want to show it in ui, we should put it somewhere other than this field and and special-case it in ui)
         r.target_state = ProcessState::CoreDump;
         r.info.maps = maps;
@@ -591,7 +597,6 @@ impl Debugger {
         {
             // Clear all fields but a few. I guess this suggests that these fields should be grouped into a struct (or a few). Would probably
             // make sense to split things up somewhat (in particular, probably separate breakpoints from threads), but not go overboard and nest everything 10 layers deep.
-            let mode = self.mode;
             let command_line = mem::take(&mut self.command_line);
             let context = mem::replace(&mut self.context, Context::invalid());
             let symbols = mem::replace(&mut self.symbols, SymbolsRegistry::new(Context::invalid(), SupplementaryBinaries::default()));
@@ -604,7 +609,14 @@ impl Debugger {
                 b.addrs = err!(NotCalculated, "");
                 b.active = false;
             }
-            *self = Debugger::new(mode, command_line, context, symbols, breakpoints, persistent, my_resource_stats, prof);
+            let mut new_debugger = Debugger::new(self.mode, command_line, self.tty_size.clone(), context, symbols, breakpoints, persistent, my_resource_stats, prof);
+            new_debugger.start_count = self.start_count + 1;
+            *self = new_debugger;
+        }
+
+        if self.context.settings.use_tty {
+            // (Create a new one for each child restart. Reusing seems fragile because a tty can't be a controlling terminal of multiple session leaders, so we'd have to be super careful that the previous process is fully exited before starting a new one; and even then maybe linux doesn't guarantee it.)
+            self.pty = Some(Pty::new(self.tty_size)?);
         }
 
         let pid;
@@ -621,37 +633,40 @@ impl Debugger {
             c_args.push(0 as *const c_char);
 
             let stdin_file = match &self.context.settings.stdin_file {
-                None => open_dev_null()?,
-                Some(path) => match fs::File::open(path) {
+                None if self.pty.is_some() => None,
+                None => Some(open_dev_null()?),
+                Some(path) => Some(match fs::File::open(path) {
                     Ok(x) => x,
                     Err(e) => {
                         log!(self.log, "stdin failed: {}", e);
                         eprintln!("failed to open stdin file '{}': {}", path, e);
                         open_dev_null()?
                     }
-                }
+                })
             };
             let stdout_file = match &self.context.settings.stdout_file {
-                None => self.persistent.open_or_create_file("stdout")?,
-                Some(path) => match fs::File::create(path) {
+                None if self.pty.is_some() => None,
+                None => Some(self.persistent.open_or_create_file("stdout")?),
+                Some(path) => Some(match fs::File::create(path) {
                     Ok(x) => x,
                     Err(e) => {
                         log!(self.log, "stdout failed: {}", e);
                         eprintln!("failed to create stdout file '{}': {}", path, e);
                         open_dev_null()?
                     }
-                }
+                })
             };
             let stderr_file = match &self.context.settings.stderr_file {
-                None => self.persistent.open_or_create_file("stderr")?,
-                Some(path) => match fs::File::create(path) {
+                None if self.pty.is_some() => None,
+                None => Some(self.persistent.open_or_create_file("stderr")?),
+                Some(path) => Some(match fs::File::create(path) {
                     Ok(x) => x,
                     Err(e) => {
                         log!(self.log, "stderr failed: {}", e);
                         eprintln!("failed to create stderr file '{}': {}", path, e);
                         open_dev_null()?
                     }
-                }
+                })
             };
             let disable_aslr = self.context.settings.disable_aslr;
 
@@ -660,8 +675,6 @@ impl Debugger {
             if pid == 0 {
                 // Child process. Do as little as possible here, avoid memory allocations,
                 // and always end with either a successful exec or a hard exit.
-
-                // We should probably close file descriptors here.
 
                 let msg: &[u8];
 
@@ -683,18 +696,32 @@ impl Debugger {
                         break 'child;
                     }
 
-                    // Redirect debuggee's stdout and stderr to files, otherwise they'd mess up the debugger UI.
-                    if libc::dup2(stdin_file.as_raw_fd(), 0) < 0 {
-                        msg = b"child: dup2 stdin failed\0";
-                        break 'child;
+                    // Set the child's controlling terminal to a pty we've created.
+                    // E.g. if the child writes to /dev/tty it won't mess up the debugger UI.
+                    if let Some(pty) = &self.pty {
+                        if libc::login_tty(pty.slave_fd) != 0 {
+                            msg = b"child: failed to set tty\0";
+                            break 'child;
+                        }
                     }
-                    if libc::dup2(stdout_file.as_raw_fd(), 1) < 0 {
-                        msg = b"child: dup2 stdout failed\0";
-                        break 'child;
+
+                    if let Some(f) = &stdin_file {
+                        if libc::dup2(f.as_raw_fd(), 0) < 0 {
+                            msg = b"child: dup2 stdin failed\0";
+                            break 'child;
+                        }
                     }
-                    if libc::dup2(stderr_file.as_raw_fd(), 2) < 0 {
-                        msg = b"child: dup2 stderr failed\0";
-                        break 'child;
+                    if let Some(f) = &stdout_file {
+                        if libc::dup2(f.as_raw_fd(), 1) < 0 {
+                            msg = b"child: dup2 stdout failed\0";
+                            break 'child;
+                        }
+                    }
+                    if let Some(f) = &stderr_file {
+                        if libc::dup2(f.as_raw_fd(), 2) < 0 {
+                            msg = b"child: dup2 stderr failed\0";
+                            break 'child;
+                        }
                     }
 
                     // SIGSTOP ourselves to make sure the PTRACE_SEIZE reliably happens before the execvp.
@@ -702,6 +729,8 @@ impl Debugger {
                         msg = b"child: raise(SIGSTOP) failed\0";
                         break 'child;
                     }
+
+                    close_range(3, u32::MAX, 0);
 
                     libc::execvp(c_args[0], c_args.as_ptr());
                     msg = b"child: exec failed\0";
@@ -1026,6 +1055,27 @@ impl Debugger {
         }
 
         Ok((stopped_early, drop_caches))
+    }
+
+    pub fn set_tty_size(&mut self, size: [u16; 2]) {
+        if size == self.tty_size {
+            return;
+        }
+        self.tty_size = size;
+        if let Some(pty) = &mut self.pty {
+            match pty.resize(size) {
+                Ok(()) => match self.target_state {
+                    ProcessState::NoProcess | ProcessState::Starting | ProcessState::Exiting | ProcessState::CoreDump => (),
+                    ProcessState::Running | ProcessState::Suspended | ProcessState::Stepping => {
+                        let r = unsafe {libc::kill(self.pid, libc::SIGWINCH)};
+                        if r != 0 {
+                            eprintln!("warning: failed to send SIGWINCH after resizing pty: {}", io::Error::last_os_error());
+                        }
+                    }
+                }
+                Err(e) => eprintln!("warning: pty resize failed: {}", e),
+            }
+        }
     }
 
     pub fn refresh_all_resource_stats(&mut self) {

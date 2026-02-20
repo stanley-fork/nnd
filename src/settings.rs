@@ -36,6 +36,9 @@ pub struct Settings {
     pub stdout_file: Option<String>,
     pub stderr_file: Option<String>,
 
+    pub use_tty: bool,
+    pub tty_scrollback: usize,
+
     pub disable_aslr: bool,
 
     pub fixed_fps: bool, // render `fps` times per second even if nothing changes
@@ -65,6 +68,9 @@ impl Default for Settings {
         stdin_file: None,
         stdout_file: None,
         stderr_file: None,
+
+        use_tty: true,
+        tty_scrollback: 1000,
 
         disable_aslr: true,
 
@@ -169,6 +175,8 @@ pub struct Palette {
 
     pub window_border: Style,
     pub window_border_active: Style,
+    pub window_border_captured: Style,
+    pub window_border_super_captured: Style,
     pub window_title_active: Style,
     pub window_title_selected: Style,
     pub window_title_deselected: Style,
@@ -204,20 +212,22 @@ pub struct Palette {
     pub thread_crash: StyleAdjustment,
     pub breakpoint_error: StyleAdjustment,
     pub breakpoint_builtin: StyleAdjustment,
+
+    pub button: Style,
 }
 impl Default for Palette {
     fn default() -> Self {
-        let black = Color(0, 0, 0);
-        let white = Color(0xff, 0xff, 0xff);
-        let red = Color(255, 50, 50);
-        let green = Color(0, 0xaa, 0);
-        let blue = Color(0x63, 0x84, 0xff);
-        let yellow = Color(0xaa, 0x55, 0);
-        let cyan = Color(0, 0xaa, 0xaa);
-        let magenta = Color(0xaa, 0, 0xaa);
-        let dark_gray = Color(0x55, 0x55, 0x55);
-        let light_green = Color(0x55, 0xff, 0x55);
-        let light_blue = Color(0x55, 0x55, 0xff);
+        let black = Color::Rgb(0, 0, 0);
+        let white = Color::Rgb(0xff, 0xff, 0xff);
+        let red = Color::Rgb(255, 50, 50);
+        let green = Color::Rgb(0, 0xaa, 0);
+        let blue = Color::Rgb(0x63, 0x84, 0xff);
+        let yellow = Color::Rgb(0xaa, 0x55, 0);
+        let cyan = Color::Rgb(0, 0xaa, 0xaa);
+        let magenta = Color::Rgb(0xaa, 0, 0xaa);
+        let dark_gray = Color::Rgb(0x55, 0x55, 0x55);
+        let light_green = Color::Rgb(0x55, 0xff, 0x55);
+        let light_blue = Color::Rgb(0x55, 0x55, 0xff);
 
         Self {
             default: Style {fg: white, ..D!()},
@@ -242,8 +252,8 @@ impl Default for Palette {
             state_other: Style {bg: yellow, fg: black, ..D!()},
 
             hint_global: Style {fg: white.darker(), ..D!()},
-            hint_state_dependent: Style {fg: Color(120, 80, 120), ..D!()},
-            hint_window_dependent: Style {fg: Color(80, 120, 80), ..D!()},
+            hint_state_dependent: Style {fg: Color::Rgb(120, 80, 120), ..D!()},
+            hint_window_dependent: Style {fg: Color::Rgb(80, 120, 80), ..D!()},
 
             selected: StyleAdjustment {add_fg: (50, 50, 50), add_bg: (50, 50, 50), ..D!()},
             hovered: StyleAdjustment {add_fg: (20, 20, 20), add_bg: (25, 25, 25), ..D!()},
@@ -253,7 +263,7 @@ impl Default for Palette {
             //striped_table: StyleAdjustment {add_fg: (0, 0, 0), add_bg: (20, 20, 20), ..D!()},
             striped_table: StyleAdjustment::default(),
 
-            tab_selected: Style {fg: white, bg: Color(40, 40, 40), modifier: Modifier::BOLD, ..D!()},
+            tab_selected: Style {fg: white, bg: Color::Rgb(40, 40, 40), modifier: Modifier::BOLD, ..D!()},
             tab_ephemeral: ("∗".to_string(), Style {fg: white, ..D!()}),
             tab_deselected: Style {fg: white.darker(), ..D!()},
             tab_separator: (" | ".to_string(), Style {fg: white.darker(), ..D!()}),
@@ -264,7 +274,7 @@ impl Default for Palette {
             hscroll_indicator: (("❮".to_string(), "❯".to_string(), Style {fg: white.darker(), ..D!()})),
             line_wrap_indicator: ("↳".to_string(), "↵".to_string(), Style {fg: white.darker(), ..D!()}),
 
-            progress_bar: Style {fg: blue, bg: Color(30, 30, 30), ..D!()},
+            progress_bar: Style {fg: blue, bg: Color::Rgb(30, 30, 30), ..D!()},
             scroll_bar_background: Style {fg: white.darker(), ..D!()},
             scroll_bar_slider: Style {fg: white.darker(), ..D!()},
 
@@ -280,8 +290,10 @@ impl Default for Palette {
 
             window_border: Style {fg: white.darker(), ..D!()},
             window_border_active: Style {fg: white, modifier: Modifier::BOLD, ..D!()},
-            window_title_active: Style {fg: white, bg: Color(30, 30, 30), modifier: Modifier::BOLD, ..D!()},
-            window_title_selected: Style {fg: white, bg: Color(30, 30, 30), ..D!()},
+            window_border_captured: Style {fg: white, bg: blue.darker(), modifier: Modifier::BOLD, ..D!()},
+            window_border_super_captured: Style {fg: white, bg: yellow, modifier: Modifier::BOLD, ..D!()},
+            window_title_active: Style {fg: white, bg: Color::Rgb(30, 30, 30), modifier: Modifier::BOLD, ..D!()},
+            window_title_selected: Style {fg: white, bg: Color::Rgb(30, 30, 30), ..D!()},
             window_title_deselected: Style {fg: white.darker(), ..D!()},
             window_title_separator: (" | ".to_string(), Style {fg: white.darker(), ..D!()}),
 
@@ -315,6 +327,8 @@ impl Default for Palette {
             thread_crash: StyleAdjustment {add_fg: (100, 100, 100), add_bg: (150, 50, 50), ..D!()},
             breakpoint_error: StyleAdjustment {add_fg: (100, 100, 100), add_bg: (150, 50, 50), ..D!()},
             breakpoint_builtin: StyleAdjustment {add_fg: (10, 10, 10), add_bg: (30, 30, 30), ..D!()},
+
+            button: Style {fg: white, bg: dark_gray.darker().darker(), ..D!()},
        }
     }
 }

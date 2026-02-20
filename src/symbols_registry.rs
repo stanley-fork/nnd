@@ -8,6 +8,7 @@ pub struct Binary {
     pub build_id: Option<Vec<u8>>,
     // Unique identifier of this bundle of ElfFile, Symbols, etc. In particular, this number changes if we destroy and re-load the Symbols.
     pub id: usize,
+    pub is_main_binary: bool,
 
     // These 3 things can be loaded asynchronously separately. While loading, Err(Loading).
     // `elves` is either nonempty or Err; there can be more than one if unstripped binary was found e.g. through debuglink.
@@ -110,7 +111,7 @@ impl SymbolsRegistry {
         self.priority_order.iter().map(|id| &self.binaries[*id].as_ref().unwrap().0)
     }
 
-    pub fn add(&mut self, locator: BinaryLocator, memory: &MemReader, custom_path: Option<String>, build_id: Option<Vec<u8>>, is_first: bool, reconstruction: Option<BinaryReconstructionInput>) -> &mut Binary {
+    pub fn add(&mut self, locator: BinaryLocator, memory: &MemReader, custom_path: Option<String>, build_id: Option<Vec<u8>>, is_main_binary: bool, reconstruction: Option<BinaryReconstructionInput>) -> &mut Binary {
         let id = self.binaries.len();
         let mut elf_contents_maybe: Result<Vec<u8>> = err!(Internal, "no contents");
         match &locator.special {
@@ -124,13 +125,13 @@ impl SymbolsRegistry {
             }
         }
 
-        let mut binary = Binary {locator: locator.clone(), build_id: build_id.clone(), id, elves: err!(Loading, "loading symbols"), symbols: err!(Loading, "loading symbols"), unwind: err!(Loading, "loading symbols"), is_mapped: false, addr_map: AddrMap::default(), tls_offset: err!(Loading, "TLS offset not known"), mmap_idx: 0, priority_idx: 0, notices: Vec::new(), warnings: Vec::new()};
+        let mut binary = Binary {locator: locator.clone(), build_id: build_id.clone(), id, elves: err!(Loading, "loading symbols"), symbols: err!(Loading, "loading symbols"), unwind: err!(Loading, "loading symbols"), is_main_binary, is_mapped: false, addr_map: AddrMap::default(), tls_offset: err!(Loading, "TLS offset not known"), mmap_idx: 0, priority_idx: 0, notices: Vec::new(), warnings: Vec::new()};
 
         if let Some(id) = &build_id {
             binary.notices.push(format!("build id: {}", hexdump(id, 1000)));
         }
 
-        let additional_elves = self.find_matching_supplementary_binaries(&locator, &build_id, is_first, &mut binary.notices, &mut binary.warnings);
+        let additional_elves = self.find_matching_supplementary_binaries(&locator, &build_id, is_main_binary, &mut binary.notices, &mut binary.warnings);
 
         // Kick off symbols loading.
         let status = Arc::new(SymbolsLoadingStatus::new());
@@ -163,7 +164,7 @@ impl SymbolsRegistry {
         }
         self.priority_order.sort_unstable_by_key(|id| {
             let b = &self.binaries[*id].as_ref().unwrap().0;
-            (!b.is_mapped, b.mmap_idx)
+            (!b.is_mapped, !b.is_main_binary, b.mmap_idx)
         });
         for (idx, id) in self.priority_order.iter().enumerate() {
             self.binaries[*id].as_mut().unwrap().0.priority_idx = idx;
@@ -235,7 +236,7 @@ impl SymbolsRegistry {
         true
     }
 
-    fn find_matching_supplementary_binaries(&self, locator: &BinaryLocator, build_id: &Option<Vec<u8>>, is_first: bool, notices: &mut Vec<String>, warnings: &mut Vec<String>) -> Vec<Arc<ElfFile>> {
+    fn find_matching_supplementary_binaries(&self, locator: &BinaryLocator, build_id: &Option<Vec<u8>>, is_main_binary: bool, notices: &mut Vec<String>, warnings: &mut Vec<String>) -> Vec<Arc<ElfFile>> {
         let mut res: Vec<Arc<ElfFile>> = Vec::new();
         let file_name = Path::new(&locator.path).file_name();
         for b in &self.supplementary_binaries.v {
@@ -258,9 +259,9 @@ impl SymbolsRegistry {
             }
         }
 
-        // If build ids are missing, and file names don't match, we fall back to matching the first mapped binary to the first supplementary binary.
+        // If build ids are missing, and file names don't match, we fall back to matching the executable to the first supplementary binary.
         // E.g. maybe the user doesn't know or care that we support passing in multiple binaries and just wants to provide the unstripped main executable to use.
-        if res.is_empty() && is_first && !self.supplementary_binaries.v.is_empty() {
+        if res.is_empty() && is_main_binary && !self.supplementary_binaries.v.is_empty() {
             if build_id.is_none() {
                 res.push(self.supplementary_binaries.v[0].elf.clone());
                 notices.push(format!("supplementary binary {} (build id missing, guessed by order)", res[0].name));

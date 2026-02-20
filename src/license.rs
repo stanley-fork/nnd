@@ -7,9 +7,9 @@ Source code is available at https://github.com/al13n321/nnd
 It uses open source libraries under various licenses.
 
 Overview:
- * Apache License 2.0 (38)
+ * Apache License 2.0 (41)
+ * MIT License (5)
  * ISC License (3)
- * MIT License (3)
  * BSD 3-Clause "New" or "Revised" License (1)
  * Mozilla Public License 2.0 (1)
 
@@ -231,7 +231,7 @@ Used by:
 ======================== Apache License 2.0 ========================
 
 Used by:
- * nnd 0.69.0
+ * nnd 0.70.0
    https://github.com/al13n321/nnd
  * ureq 3.0.6
    https://github.com/algesten/ureq
@@ -1289,6 +1289,8 @@ limitations under the License.
 ======================== Apache License 2.0 ========================
 
 Used by:
+ * arrayvec 0.7.6
+   https://github.com/bluss/arrayvec
  * base64 0.22.1
    https://github.com/marshallpierce/rust-base64
  * bitflags 1.3.2
@@ -1328,6 +1330,8 @@ Used by:
  * unicode-segmentation 1.10.1
    https://github.com/unicode-rs/unicode-segmentation
  * unicode-width 0.1.10
+   https://github.com/unicode-rs/unicode-width
+ * unicode-width 0.2.2
    https://github.com/unicode-rs/unicode-width
 
 
@@ -2159,7 +2163,7 @@ limitations under the License.
 ======================== Apache License 2.0 ========================
 
 Used by:
- * itoa 1.0.14
+ * itoa 1.0.17
    https://github.com/dtolnay/itoa
  * libc 0.2.170
    https://github.com/rust-lang/libc
@@ -2173,6 +2177,8 @@ Used by:
    https://github.com/algesten/ureq-proto
  * utf-8 0.7.6
    https://github.com/SimonSapin/rust-utf8
+ * vte 0.15.0
+   https://github.com/alacritty/vte
 
 
 Apache License
@@ -2459,6 +2465,68 @@ LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE A
 EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
 IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
 USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
+
+======================== MIT License ========================
+
+Used by:
+ * memchr 2.7.6
+   https://github.com/BurntSushi/memchr
+
+
+The MIT License (MIT)
+
+Copyright (c) 2015 Andrew Gallant
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+
+
+======================== MIT License ========================
+
+Used by:
+ * vt100 0.16.2
+   https://github.com/doy/vt100-rust
+
+
+The MIT License (MIT)
+
+Copyright (c) 2016 Jesse Luehrs
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
 
 

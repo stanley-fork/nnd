@@ -596,7 +596,7 @@ impl Layout {
                     });
                 }
                 RegionContent::Split(_) => {
-                    self.build_split(region_id, &mut should_relocate_window, ui);
+                    self.build_split(region_id, &mut should_relocate_window, Some(ui));
                     for &child_id in self.regions.get(region_id).content.as_split().children.iter().rev() {
                         assert_eq!(self.regions.get(child_id).parent, Some(region_id));
                         stack.push(child_id);
@@ -715,6 +715,30 @@ impl Layout {
                 }
             }
         }
+    }
+
+    pub fn outline_window(&mut self, window_id: WindowId, style: Style, ui: &mut UI) {
+        let rect = self.windows.get(window_id).area;
+        // left=1, right=2, up=4, down=8
+        let mul = 17; // 1 for single line, 16 for double line, 17 for bold single line
+        let l = styled_writeln!(ui.text, style, "{}", BOX_DRAWING_LUT[10*mul]); // top left
+        ui.add(widget!().text(l).fixed_x(rect.x() - 1).fixed_y(rect.y() - 1).fixed_width(1).fixed_height(1));
+        let l = styled_writeln!(ui.text, style, "{}", BOX_DRAWING_LUT[9*mul]); // top right
+        ui.add(widget!().text(l).fixed_x(rect.right()).fixed_y(rect.y() - 1).fixed_width(1).fixed_height(1));
+        let l = styled_writeln!(ui.text, style, "{}", BOX_DRAWING_LUT[6*mul]); // bottom left
+        ui.add(widget!().text(l).fixed_x(rect.x() - 1).fixed_y(rect.bottom()).fixed_width(1).fixed_height(1));
+        let l = styled_writeln!(ui.text, style, "{}", BOX_DRAWING_LUT[5*mul]); // bottom right
+        ui.add(widget!().text(l).fixed_x(rect.right()).fixed_y(rect.bottom()).fixed_width(1).fixed_height(1));
+
+        let mut buf = [0u8; 4];
+        ui.text.append_repeated(BOX_DRAWING_LUT[3*mul].encode_utf8(&mut buf), rect.width(), style); // top and bottom
+        let l = ui.text.close_line();
+        ui.add(widget!().text(l).fixed_x(rect.x()).fixed_y(rect.y() - 1).fixed_width(rect.width()).fixed_height(1));
+        ui.add(widget!().text(l).fixed_x(rect.x()).fixed_y(rect.bottom()).fixed_width(rect.width()).fixed_height(1));
+
+        let l = styled_writeln!(ui.text, style, "{}", BOX_DRAWING_LUT[12*mul]); // left and right
+        ui.add(widget!().text(l).fixed_x(rect.x() - 1).fixed_y(rect.y()).fixed_width(1).fixed_height(rect.height()).flags(WidgetFlags::REPEAT_TEXT_VERTICALLY));
+        ui.add(widget!().text(l).fixed_x(rect.right()).fixed_y(rect.y()).fixed_width(1).fixed_height(rect.height()).flags(WidgetFlags::REPEAT_TEXT_VERTICALLY));
     }
 
     fn relocate_window(&mut self, window_id: WindowId, region_id: RegionId, relocation: WindowRelocation) {
@@ -846,7 +870,8 @@ impl Layout {
         }
     }
 
-    fn build_split(&mut self, region_id: RegionId, should_relocate_window: &mut Option<(WindowId, RegionId, WindowRelocation, bool)>, ui: &mut UI) {
+    // (If `ui` is None, just do layout and assign regions' `area`s.)
+    fn build_split(&mut self, region_id: RegionId, should_relocate_window: &mut Option<(WindowId, RegionId, WindowRelocation, bool)>, mut ui: Option<&mut UI>) {
         let region = self.regions.get(region_id);
         let split = region.content.as_split();
         assert!(!split.children.is_empty());
@@ -906,54 +931,59 @@ impl Layout {
 
         // Create inner walls, handle mouse-drag resizing.
         let mut resized = false;
-        for i in 1..walls.len()-1 {
-            let (pos, movable) = calculate_wall_pos(i, &cumsum);
-            walls[i] = (Self::build_wall(axis, region.area, pos, hash(&('w', region_id, i)), &mut self.wall_widgets, ui), pos);
+        if let Some(ref mut ui) = ui {
+            for i in 1..walls.len()-1 {
+                let (pos, movable) = calculate_wall_pos(i, &cumsum);
+                walls[i] = (Self::build_wall(axis, region.area, pos, hash(&('w', region_id, i)), &mut self.wall_widgets, ui), pos);
 
-            with_parent!(ui, walls[i].0, {
-                if movable {
-                    ui.cur_mut().flags.insert(WidgetFlags::HIGHLIGHT_ON_HOVER);
-                    if let Some(p) = ui.check_drag_out(DragWhat::NoDrop) {
-                        let p = p[axis];
-                        if p != 0 {
-                            let (fixed_left, fixed) = (cumsum[i].0, cumsum.last().unwrap().0);
-                            let (flexible_left, flexible) = (cumsum[i].1, cumsum.last().unwrap().1);
+                with_parent!(ui, walls[i].0, {
+                    if movable {
+                        ui.cur_mut().flags.insert(WidgetFlags::HIGHLIGHT_ON_HOVER);
+                        if let Some(p) = ui.check_drag_out(DragWhat::NoDrop) {
+                            let p = p[axis];
+                            if p != 0 {
+                                let (fixed_left, fixed) = (cumsum[i].0, cumsum.last().unwrap().0);
+                                let (flexible_left, flexible) = (cumsum[i].1, cumsum.last().unwrap().1);
 
-                            let p = pos + p; // where we want the wall to be
-                            let p = (p.max(fixed_left as isize) as usize).min(size - fixed + fixed_left); // clamp
-                            // Find the flexible_left that solves the linear equation calculate_wall_pos(...) = p.
-                            let target_left = flexible * (p - fixed_left) / (size - fixed);
+                                let p = pos + p; // where we want the wall to be
+                                let p = (p.max(fixed_left as isize) as usize).min(size - fixed + fixed_left); // clamp
+                                // Find the flexible_left that solves the linear equation calculate_wall_pos(...) = p.
+                                let target_left = flexible * (p - fixed_left) / (size - fixed);
 
-                            // Adjust flexible sizes of the two children on either side of this wall (skipping fixed-size children).
-                            let (mut prev, mut next) = (i-1, i);
-                            while children[prev].0 {
-                                prev -= 1;
+                                // Adjust flexible sizes of the two children on either side of this wall (skipping fixed-size children).
+                                let (mut prev, mut next) = (i-1, i);
+                                while children[prev].0 {
+                                    prev -= 1;
+                                }
+                                while children[next].0 {
+                                    next += 1;
+                                }
+                                assert_eq!(cumsum[next+1].1 - cumsum[prev].1, children[prev].1 + children[next].1);
+                                let target_left = target_left.max(cumsum[prev].1 + 1).min(cumsum[next+1].1 - 1);
+                                children[prev].1 = target_left - cumsum[prev].1;
+                                children[next].1 = cumsum[next+1].1 - target_left;
+                                
+                                resized = true;
+                                cumsum = calculate_cumsum(&children);
                             }
-                            while children[next].0 {
-                                next += 1;
-                            }
-                            assert_eq!(cumsum[next+1].1 - cumsum[prev].1, children[prev].1 + children[next].1);
-                            let target_left = target_left.max(cumsum[prev].1 + 1).min(cumsum[next+1].1 - 1);
-                            children[prev].1 = target_left - cumsum[prev].1;
-                            children[next].1 = cumsum[next+1].1 - target_left;
-                            
-                            resized = true;
-                            cumsum = calculate_cumsum(&children);
                         }
                     }
-                }
 
-                if let Some((DragWhat::Window(window_id), _pos, drop)) = ui.check_drag_in() {
-                    *should_relocate_window = Some((window_id, region_id, WindowRelocation::AddToExistingSplit(i), drop));
-                }
-            });
+                    if let Some((DragWhat::Window(window_id), _pos, drop)) = ui.check_drag_in() {
+                        *should_relocate_window = Some((window_id, region_id, WindowRelocation::AddToExistingSplit(i), drop));
+                    }
+                });
+            }
         }
+
         // Move wall widgets into final positions and add the lines.
         for i in 1..walls.len()-1 {
             let pos = calculate_wall_pos(i, &cumsum).0;
             walls[i].1 = pos;
-            ui.get_mut(walls[i].0).axes[axis].rel_pos = region.area.pos[axis] + pos;
-            Self::trace_wall(axis, region.area, pos, false, &mut self.wall_masks, &self.wall_area);
+            if let Some(ref mut ui) = ui {
+                ui.get_mut(walls[i].0).axes[axis].rel_pos = region.area.pos[axis] + pos;
+                Self::trace_wall(axis, region.area, pos, false, &mut self.wall_masks, &self.wall_area);
+            }
         }
 
         // Propagate information to children.

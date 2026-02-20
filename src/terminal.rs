@@ -125,6 +125,10 @@ impl ScreenBuffer {
         x
     }
 
+    pub fn put_cell(&mut self, s: &str, wid: usize, style: Style, x: isize, y: isize) {
+        self.cells[y as usize * self.width + x as usize] = self.pack_grapheme(s, wid, style);
+    }
+
     pub fn get_cell(&self, x: usize, y: usize) -> (&str, /*extra_width*/ u8, Style) {
         let cell = &self.cells[y*self.width + x];
         let (s, extra_width) = self.unpack_grapheme(cell);
@@ -152,13 +156,12 @@ const STYLE_RESET_TO_BLACK: &'static str = "\x1B[0;38;2;0;0;0;48;2;0;0;0m";
 // Mouse parameters we use:
 //  1002 - SET_BTN_EVENT_MOUSE - report mouse button presses/releases and mouse movement when any button is held (only if the cursor moved to a different cell in the terminal). OR ...
 //  1003 - SET_ANY_EVENT_MOUSE - report all mouse movement (even if the cursor moved by one pixel, even though pixel coordinates are not reported).
-//  1007 - SET_ALTERNATE_SCROLL - report mouse scroll wheel events (instead of scrolling the terminal).
 //  1006 - SET_SGR_EXT_MODE_MOUSE - changes mouse events encoding to support coordinates > 223.
 //  1004 - SET_FOCUS_EVENT_MOUSE - notify when the terminal loses and gains focus (useful if the user alt-tabs while holding mouse button - we don't get mouse release event in this case, so have to assume mouse release based on focus loss).
-const MOUSE_ENABLE_COMMON: &'static str = "\x1b[?1007h\x1b[?1006h\x1b[?1004h";
+const MOUSE_ENABLE_COMMON: &'static str = "\x1b[?1006h\x1b[?1004h";
 const MOUSE_BUTTON_EVENT_MODE: &'static str = "\x1b[?1002h";
 const MOUSE_ANY_EVENT_MODE: &'static str = "\x1b[?1003h";
-const MOUSE_DISABLE: &'static str = "\x1b[?1003l\x1b[?1002l\x1b[?1007l\x1b[?1006l\x1b[?1004l";
+const MOUSE_DISABLE: &'static str = "\x1b[?1003l\x1b[?1002l\x1b[?1006l\x1b[?1004l";
 
 static TERMINAL_STATE_TO_RESTORE: SyncUnsafeCell<[u8; mem::size_of::<libc::termios>()]> = SyncUnsafeCell::new([0u8; mem::size_of::<libc::termios>()]);
 static TERMINAL_STATE_RESTORED: AtomicBool = AtomicBool::new(true);
@@ -256,24 +259,12 @@ impl Terminal {
                 if style != cur_style {
                     write!(commands, "\x1B[").unwrap();
                     if style.fg != cur_style.fg {
-                        write!(commands, "38;2;{};{};{};", style.fg.0, style.fg.1, style.fg.2).unwrap();
+                        style.fg.write_ansi(commands, 0);
                     }
                     if style.bg != cur_style.bg {
-                        write!(commands, "48;2;{};{};{};", style.bg.0, style.bg.1, style.bg.2).unwrap();
+                        style.bg.write_ansi(commands, 10);
                     }
-
-                    if style.modifier.contains(Modifier::BOLD) && !cur_style.modifier.contains(Modifier::BOLD) {
-                        write!(commands, "1;").unwrap();
-                    }
-                    if !style.modifier.contains(Modifier::BOLD) && cur_style.modifier.contains(Modifier::BOLD) {
-                        write!(commands, "22;").unwrap();
-                    }
-                    if style.modifier.contains(Modifier::UNDERLINED) && !cur_style.modifier.contains(Modifier::UNDERLINED) {
-                        write!(commands, "4;").unwrap();
-                    }
-                    if !style.modifier.contains(Modifier::UNDERLINED) && cur_style.modifier.contains(Modifier::UNDERLINED) {
-                        write!(commands, "24;").unwrap();
-                    }
+                    modifier_diff_write_ansi(cur_style.modifier, style.modifier, commands);
 
                     cur_style = style;
                     *commands.last_mut().unwrap() = b'm'; // replace trailing ';' with 'm'
@@ -368,6 +359,9 @@ pub enum Key {
     End,
     Insert,
     Delete,
+
+    // Failed to parse, skipped bytes (available in EventInfo::bytes). This is a Key rather than Event just for convenience of propagating it through `UI` into TerminalWindow.
+    Unknown,
 }
 impl Key {
     pub fn mods(self, mods: ModKeys) -> KeyEx { KeyEx {key: self, mods} }
@@ -383,6 +377,7 @@ impl Key {
             _ => false,
         }
     }
+    pub fn is_arrow_key(self) -> bool { match self { Key::Left | Key::Right | Key::Up | Key::Down => true, _ => false } }
 }
 impl Display for Key {
     fn fmt(&self, f: &mut Formatter<'_>) -> result::Result<(), fmt::Error> {
@@ -406,6 +401,7 @@ impl Display for Key {
             Key::Char('\\') => "\\\\", //////// ////////////////
             Key::Char(c) if c.is_ascii() && !c.is_ascii_control() => return write!(f, "{}", c), 
             Key::Char(c) => return write!(f, "\\x{:02x}", c as u32),
+            Key::Unknown => "unknown",
         };
         write!(f, "{}", s)
     }
@@ -527,7 +523,7 @@ pub enum MouseEvent {
     ScrollDown,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum MouseButton {
     Left,
     Middle,
@@ -537,7 +533,7 @@ pub enum MouseButton {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct MouseEventEx {
-    pub pos: [isize; 2],
+    pub pos: [isize; 2], // [x, y], 0-based
     pub button: MouseButton,
     pub event: MouseEvent,
     pub mods: ModKeys,
@@ -555,6 +551,43 @@ impl Event {
     pub fn is_key(&self) -> bool { match self { Self::Key(_) => true, _ => false } }
 }
 
+// u8 array with small vec optimization. 24 bytes. 22 bytes of inline storage.
+// Can be implemented more carefully to be 16 bytes (with 15 bytes of inline storage, which is just enough for EventInfo), and maybe unified with ValueBlob.
+#[derive(Clone)]
+pub enum SmallArray {
+    Short {data: [u8; 22], len: u8},
+    Long(Box<[u8]>),
+}
+impl SmallArray {
+    pub fn new(data: &[u8]) -> Self {
+        if data.len() <= 22 {
+            let mut d = [0u8; 22];
+            d[..data.len()].copy_from_slice(data);
+            Self::Short {data: d, len: data.len() as u8}
+        } else {
+            Self::Long(Box::from(data))
+        }
+    }
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Short {data, len} => &data[..*len as usize],
+            Self::Long(b) => &b,
+        }
+    }
+}
+impl Default for SmallArray { fn default() -> Self { Self::Short {data: [0; 22], len: 0} } }
+
+#[derive(Clone)]
+pub struct EventInfo {
+    pub ev: Event,
+    pub bytes: SmallArray,
+}
+impl EventInfo {
+    pub fn new(ev: Event, bytes: &[u8]) -> Self {
+        Self {ev, bytes: SmallArray::new(bytes)}
+    }
+}
+
 pub struct InputReader {
     start: usize,
     end: usize,
@@ -565,7 +598,7 @@ impl InputReader {
     pub fn new() -> Self { Self {start: 0, end: 0, buf: [0; 128], saw_extra_escape: false} }
 
     // Reads readily available input from stdin, doesn't block.
-    pub fn read(&mut self, out: &mut Vec<Event>, prof: &mut ProfileBucket, mut out_raw_bytes: Option<&mut Vec<(Vec<u8>, /*skipped*/ bool)>>) -> Result<usize> {
+    pub fn read(&mut self, out: &mut Vec<EventInfo>, prof: &mut ProfileBucket) -> Result<usize> {
         let mut bytes_read = 0usize;
         loop {
             if self.start * 2 > self.buf.len() {
@@ -598,25 +631,14 @@ impl InputReader {
                     }
                 }
                 if mem::take(&mut self.saw_extra_escape) && e != Err(true) {
-                    out.push(Event::Key(Key::Escape.plain()));
-                    if let Some(ref mut raw) = out_raw_bytes {
-                        raw.push((self.buf[start..start+1].to_owned(), false));
-                    }
+                    out.push(EventInfo::new(Event::Key(Key::Escape.plain()), &self.buf[start..start+1]));
                     start += 1;
                 }
 
                 match e {
-                    Ok(e) => {
-                        out.push(e);
-                        if let Some(ref mut raw) = out_raw_bytes {
-                            raw.push((self.buf[start..self.start].to_owned(), false));
-                        }
-                    }
-                    Err(false) => { // quietly skip unrecognized escape sequence
-                        if let Some(ref mut raw) = out_raw_bytes {
-                            raw.push((self.buf[start..self.start].to_owned(), true));
-                        }
-                    }
+                    Ok(e) => out.push(EventInfo::new(e, &self.buf[start..self.start])),
+                    // Quietly skip unrecognized escape sequence.
+                    Err(false) => out.push(EventInfo::new(Event::Key(Key::Unknown.plain()), &self.buf[start..self.start])),
                     Err(true) => {
                         // Do rollback here so that parse_event() can just eat chars and not worry about peek/advance.
                         self.start = start;
@@ -814,6 +836,10 @@ impl InputReader {
                     // F1-F4
                     b'O' => match self.eat()? {
                         c @ b'P'..=b'S' => Event::Key(Key::F(1 + c - b'P').plain()),
+                        b'A' => Event::Key(Key::Up.plain()),
+                        b'B' => Event::Key(Key::Down.plain()),
+                        b'C' => Event::Key(Key::Right.plain()),
+                        b'D' => Event::Key(Key::Left.plain()),
                         _ => return Err(false),
                     }
                     // Alt+[

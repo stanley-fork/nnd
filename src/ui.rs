@@ -1,5 +1,5 @@
-use crate::{*, debugger::*, error::*, log::*, symbols::*, symbols_registry::*, util::*, registers::*, procfs::*, unwind::*, disassembly::*, pool::*, layout::*, settings::*, context::*, types::*, expr::*, widgets::*, search::*, arena::*, interp::*, imgui::*, common_ui::*, terminal::*, doc::*, os::*};
-use std::{io::{self, Write, BufRead, BufReader, Read}, mem::{self, take}, collections::{HashSet, HashMap, hash_map::Entry}, os::fd::AsRawFd, path, path::{Path, PathBuf}, fs::File, fmt::Write as FmtWrite, borrow::Cow, ops::Range, str, os::unix::ffi::OsStrExt, sync::{Arc}, time::Duration};
+use crate::{*, debugger::*, error::*, log::*, symbols::*, symbols_registry::*, util::*, registers::*, procfs::*, unwind::*, disassembly::*, pool::*, layout::*, settings::*, context::*, types::*, expr::*, widgets::*, search::*, arena::*, interp::*, imgui::*, common_ui::*, terminal::*, doc::*, os::*, term_emu::*};
+use std::{io::{self, Write, BufRead, BufReader, Read}, mem::{self, take}, collections::{HashSet, HashMap, hash_map::Entry, VecDeque}, os::fd::AsRawFd, path, path::{Path, PathBuf}, fs::File, fmt::Write as FmtWrite, borrow::Cow, ops::Range, str, os::unix::ffi::OsStrExt, sync::{Arc}, time::Duration};
 use libc::{self, pid_t};
 use rand::random;
 
@@ -21,7 +21,13 @@ pub struct DebuggerUI {
 #[derive(Default)]
 pub struct UIState {
     last_error: String, // reset on next key press
+
     key_hints: Vec<KeyHint>,
+    // If terminal window is active, it captures most keys, overriding most global hotkeys.
+    // In such case, this is the list of keys that are *not* captured and should still be shown in the hints window.
+    key_hint_filter: Option<Vec<KeyAction>>,
+    // Override the whole Hints window contents.
+    custom_hints_text: Option<Range<usize>>,
     profiler_enabled: bool,
 
     selected_thread: pid_t,
@@ -87,6 +93,7 @@ pub trait WindowContent {
     fn drop_caches(&mut self) {}
 
     fn get_key_hints(&self, out: &mut Vec<KeyHint>, debugger: &Debugger) {}
+    fn get_window_outline(&self, ui: &UI) -> Option<Style> {None}
 
     fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {Ok(())}
     fn load_state(&mut self, inp: &mut &[u8]) -> Result<()> {Ok(())}
@@ -108,9 +115,10 @@ pub enum WindowType {
 
     Locations = 6,
     Watches = 7,
-    Hints = 8,
+    Terminal = 8, // before Hints
+    Hints = 9,
 
-    Status = 9,
+    Status = 10,
 }
 impl WindowType {
     pub fn title(self) -> &'static str {
@@ -124,6 +132,7 @@ impl WindowType {
             Self::Locations => "locations",
             Self::Watches => "watches",
             Self::Hints => "controls",
+            Self::Terminal => "console",
             Self::Status => "status",
         }
     }
@@ -151,6 +160,7 @@ impl WindowType {
             WindowType::Binaries => Box::new(BinariesWindow::default()),
             WindowType::Breakpoints => Box::new(BreakpointsWindow::default()),
             WindowType::Stack => Box::new(StackWindow::default()),
+            WindowType::Terminal => Box::new(TerminalWindow::default()),
             WindowType::Threads => Box::new(ThreadsWindow::default()),
         }
     }
@@ -164,7 +174,7 @@ pub struct RequiredWindowInfo {
 
 pub const REQUIRED_WINDOWS: &'static [RequiredWindowInfo] = &[
     RequiredWindowInfo {type_: WindowType::Hints, hotkey_number: None, fixed_height: None},
-    RequiredWindowInfo {type_: WindowType::Status, hotkey_number: None, fixed_height: Some(7)},
+    RequiredWindowInfo {type_: WindowType::Status, hotkey_number: None, fixed_height: Some(8)},
     RequiredWindowInfo {type_: WindowType::Watches, hotkey_number: Some(1), fixed_height: None},
     RequiredWindowInfo {type_: WindowType::Locations, hotkey_number: None, fixed_height: None},
     RequiredWindowInfo {type_: WindowType::Disassembly, hotkey_number: Some(2), fixed_height: None},
@@ -172,6 +182,7 @@ pub const REQUIRED_WINDOWS: &'static [RequiredWindowInfo] = &[
     RequiredWindowInfo {type_: WindowType::Binaries, hotkey_number: None, fixed_height: None},
     RequiredWindowInfo {type_: WindowType::Breakpoints, hotkey_number: Some(4), fixed_height: None},
     RequiredWindowInfo {type_: WindowType::Stack, hotkey_number: Some(5), fixed_height: None},
+    RequiredWindowInfo {type_: WindowType::Terminal, hotkey_number: Some(0), fixed_height: None},
     RequiredWindowInfo {type_: WindowType::Threads, hotkey_number: Some(6), fixed_height: None},
 ];
 
@@ -206,10 +217,10 @@ impl DebuggerUI {
 
     fn default_layout() -> Layout {
         // +---------+-------+-------------+
-        // |  hints  |       |  binaries   |
+        // |  hints  |       |   console   |
         // |         |       | breakpoints |
-        // +---------+ disas +-------------+
-        // | status  |       |             |
+        // +---------+ disas |   binaries  |
+        // | status  |       +-------------+
         // +---------+-------+    stack    |
         // |         |       |             |
         // | watches | code  +-------------+
@@ -223,19 +234,20 @@ impl DebuggerUI {
         let cols = layout.split(layout.root, Axis::X, vec![0.3, 0.75], 0);
 
         let rows = layout.split(cols[0], Axis::Y, vec![0.3, 0.4], 0);
-        let hints_window = layout.new_window(Some(rows[0]), WindowType::Hints);
-        let status_window = layout.new_window(Some(rows[1]), WindowType::Status);
-        let watches_window = layout.new_window(Some(rows[2]), WindowType::Watches);
+        layout.new_window(Some(rows[0]), WindowType::Hints);
+        layout.new_window(Some(rows[1]), WindowType::Status);
+        layout.new_window(Some(rows[2]), WindowType::Watches);
         layout.new_window(Some(rows[2]), WindowType::Locations);
 
         let rows = layout.split(cols[1], Axis::Y, vec![0.4], 0);
-        let disassembly_window = layout.new_window(Some(rows[0]), WindowType::Disassembly);
-        let code_window = layout.new_window(Some(rows[1]), WindowType::Code);
+        layout.new_window(Some(rows[0]), WindowType::Disassembly);
+        layout.new_window(Some(rows[1]), WindowType::Code);
 
         let rows = layout.split(cols[2], Axis::Y, vec![0.25, 0.75], 0);
+        layout.new_window(Some(rows[0]), WindowType::Terminal); // TODO: hide if attaching or opening core dump
+        layout.new_window(Some(rows[0]), WindowType::Breakpoints);
         layout.new_window(Some(rows[0]), WindowType::Binaries);
-        let breakpoints_window = layout.new_window(Some(rows[0]), WindowType::Breakpoints);
-        let stack_window = layout.new_window(Some(rows[1]), WindowType::Stack);
+        layout.new_window(Some(rows[1]), WindowType::Stack);
         let threads_window = layout.new_window(Some(rows[2]), WindowType::Threads);
 
         layout.active_window = Some(threads_window);
@@ -244,13 +256,13 @@ impl DebuggerUI {
     }
 
     pub fn buffer_input(&mut self, prof: &mut ProfileBucket) -> Result<bool> {
-        let mut evs: Vec<Event> = Vec::new();
-        let bytes = self.input.read(&mut evs, prof, None)?;
+        let mut evs: Vec<EventInfo> = Vec::new();
+        let bytes = self.input.read(&mut evs, prof)?;
         prof.ui_input_bytes += bytes;
 
         let mut significant = false;
         for e in &evs {
-            match e {
+            match &e.ev {
                 Event::Key(_) => significant = true,
                 Event::Mouse(m) if m.event == MouseEvent::Press => significant = true,
                 _ => (),
@@ -377,6 +389,9 @@ impl DebuggerUI {
 
         // Hints for all key binds. Used for both hints window and help dialog.
         // Keep it brief, there's not much space.
+        self.state.key_hints.clear();
+        self.state.key_hint_filter = None;
+        self.state.custom_hints_text = None;
         let mut hints = Vec::new();
         hints.push(KeyHint::key(KeyAction::Quit, match debugger.mode {
             RunMode::CoreDump => "quit",
@@ -402,23 +417,54 @@ impl DebuggerUI {
         hints.push(KeyHint::key(KeyAction::StepIntoLine, "run to main()").conditional(startable, startable_text));
         hints.push(KeyHint::key(KeyAction::StepIntoInstruction, "run to early start").conditional(startable, startable_text));
         hints.push(KeyHint::keys(&[KeyAction::Kill, KeyAction::SendSigint], "kill/sigint").conditional(debugger.mode == RunMode::Run && debugger.target_state.process_ready(), "if child exists"));
-        for (id, win) in self.layout.sorted_windows() {
-            let start = hints.len();
-            win.content.get_key_hints(&mut hints, debugger);
-            for h in &mut hints[start..] {
-                h.window = Some(win.type_);
-                if &Some(id) != &self.layout.active_window {
-                    h.hidden = true;
-                }
+
+        // Propagate console window size to Debugger so it can create correctly sized pty from the start.
+        // Use Layout's Region size instead of Window size, so that we get a meaningful size even if the Terminal tab is not selected in its Region
+        // (this is why this is done here rather than in TerminalWindow::build() - it doesn't have access to Layout).
+        if let Some(window_id) = self.layout.any_window_by_type(WindowType::Terminal) {
+            if let Some(region_id) = self.layout.windows.get(window_id).region.clone() {
+                let area: Rect = self.layout.regions.get(region_id).area;
+                debugger.set_tty_size(TerminalWindow::get_tty_size(area.size));
             }
         }
-        self.state.key_hints = hints;
 
         // Build windows.
-        for (_, win) in self.layout.sorted_windows_mut() {
+        let window_ids: Vec<WindowId> = self.layout.sorted_windows().iter().map(|(id, _)| *id).collect();
+        for &id in &window_ids {
+            if self.layout.windows.get(id).type_ == WindowType::Hints && self.state.key_hints.is_empty() {
+                // Populate hints as late as possible, after building most windows, just before building Hints window.
+                // This way the hints reflect the post-update state of those windows.
+                // Without this, we'd need `should_redraw = true` in more places.
+                for &id in &window_ids {
+                    let start = hints.len();
+                    let win = self.layout.windows.get(id);
+                    win.content.get_key_hints(&mut hints, debugger);
+                    for h in &mut hints[start..] {
+                        h.window = Some(win.type_);
+                        if &Some(id) != &self.layout.active_window {
+                            h.hidden = true;
+                        }
+                    }
+                }
+                self.state.key_hints = mem::take(&mut hints);
+            }
+
+            let win = self.layout.windows.get_mut(id);
             with_parent!(self.ui, win.widget, {
                 win.content.build(&mut self.state, debugger, &mut self.ui);
             });
+
+            if &Some(id) == &self.layout.active_window {
+                let mut outline = win.content.get_window_outline(&self.ui);
+                if outline.is_none() && self.ui.subtree_has_cursor(win.widget) {
+                    // If the window is showing cursor, it's presumably doing text input and capturing input.
+                    // We outline the window in this case to emphasize that hotkeys are not available in current state.
+                    outline = Some(self.ui.palette.window_border_captured);
+                }
+                if let Some(style) = outline {
+                    self.layout.outline_window(id, style, &mut self.ui);
+                }
+            }
         }
 
         if let Some(widget_idx) = make_dialog_frame(open_help, AutoSize::Remainder(0.75), AutoSize::Remainder(0.83), self.ui.palette.dialog, self.ui.palette.default, "halp!", &mut self.ui) {
@@ -2643,7 +2689,7 @@ fn close_excess_ephemeral_tabs<T, F: FnMut(&T) -> bool>(tabs: &mut Vec<T>, tabs_
 struct StatusWindow {}
 impl WindowContent for StatusWindow {
     fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
-        ui.cur_mut().axes[Axis::Y].flags.insert(AxisFlags::STACK);
+        ui.cur_mut().set_vstack();
 
         let mut symbols_progress_pct = 0;
         if debugger.target_state.process_ready() {
@@ -2700,7 +2746,56 @@ impl WindowContent for StatusWindow {
             Err(e) if e.is_disabled() => ui_writeln!(ui, default_dim, "{}", e),
             Err(e) => ui_writeln!(ui, error, "{}", e),
         };
+        let end = ui.text.num_lines();
+        ui.add(widget!().text_lines(start..end).height(AutoSize::Text));
 
+        // Debug info loading progress and warnings. Only for the main executable, not dynamic libraries.
+        with_parent!(ui, ui.add(widget!().min_height(2).height(AutoSize::Children).vstack()), {
+            if let Some(binary) = debugger.symbols.iter().find(|b| b.is_main_binary) {
+                let mut indicated_loading = false;
+                if binary.symbols.as_ref().is_err_and(|e| e.is_loading()) {
+                    let (progress_ppm, loading_stage) = debugger.symbols.get_progress(binary.id);
+                    let l = ui_writeln!(ui, default, "loading: {}%", (progress_ppm + 5000) / 10000);
+                    let mut w = widget!().height(AutoSize::Text).text(l);
+                    w.draw_progress_bar = Some((progress_ppm as f64 / 1e6, ui.palette.progress_bar));
+                    ui.add(w);
+                    indicated_loading = true;
+                }
+
+                // Error and warnings.
+                let start = ui.text.num_lines();
+                let mut print_error = |e: &Error| {
+                    if e.is_loading() {
+                        if !indicated_loading {
+                            ui_writeln!(ui, default_dim, "loading");
+                            indicated_loading = true;
+                        }
+                    } else {
+                        let style = if e.is_missing_symbols() {ui.palette.default_dim} else {ui.palette.error};
+                        styled_writeln!(ui.text, style, "debug info error: {}", e);
+                    }
+                };
+                if let Err(e) = &binary.elves {
+                    print_error(e);
+                } else {
+                    if let Err(e) = &binary.unwind {
+                        print_error(e);
+                    }
+                    if let Err(e) = &binary.symbols {
+                        print_error(e);
+                    }
+                }
+                for w in &binary.warnings {
+                    ui_writeln!(ui, default_dim, "{}", w);
+                }
+                let end = ui.text.num_lines();
+                if end > start {
+                    ui.add(widget!().height(AutoSize::Text).text_lines(start..end));
+                }
+            }
+        });
+
+        let start = ui.text.num_lines();
         if state.last_error != "" {
             ui_writeln!(ui, error, "{}", state.last_error);
         } else {
@@ -2708,7 +2803,6 @@ impl WindowContent for StatusWindow {
         }
         ui.text.close_line();
         let end = ui.text.num_lines();
-
         ui.add(widget!().text_lines(start..end).height(AutoSize::Text));
         let log_widget = ui.add(widget!().height(AutoSize::Remainder(1.0)));
         ui.layout_children(Axis::Y);
@@ -2885,13 +2979,32 @@ impl WindowContent for HintsWindow {
             return;
         }
 
+        if let Some(lines) = &state.custom_hints_text {
+            let w = ui.cur_mut();
+            w.draw_text = Some(lines.clone());
+            w.flags.insert(WidgetFlags::LINE_WRAP);
+            return;
+        }
+        
         let start = ui.text.num_lines();
         let mut column_breaks: Vec<usize> = Vec::new();
         column_breaks.push(start);
-        for hint in &state.key_hints {
+        for mut hint in &state.key_hints {
             if hint.hidden || (hint.if_not_core_dump && debugger.mode == RunMode::CoreDump) {
                 continue;
             }
+
+            // If terminal window is active, show only keys that it doesn't capture.
+            let mut adjusted_hint;
+            if let Some(filter) = &state.key_hint_filter {
+                adjusted_hint = hint.clone();
+                adjusted_hint.key_ranges.retain(|r| filter.iter().find(|k| k == &&r[0] || k == &&r[1]).is_some());
+                hint = &adjusted_hint;
+                if hint.key_ranges.is_empty() {
+                    continue;
+                }
+            }
+
             if hint.window.is_some() {
                 // Currently we put all non-window-specific hints in the left column and all window-specific ones in the right one.
                 // It happens to fit just right for the current set of hints.
@@ -2983,7 +3096,7 @@ impl WindowContent for BinariesWindow {
 
             // Path, progress bar, error message.
             with_parent!(ui, table.start_cell(ui), {
-                ui.cur_mut().axes[Axis::Y].flags.insert(AxisFlags::STACK);
+                ui.cur_mut().set_vstack();
 
                 // Path.
                 let style = if binary.is_mapped {ui.palette.default} else {ui.palette.default_dim};
@@ -3009,10 +3122,10 @@ impl WindowContent for BinariesWindow {
                             ui_writeln!(ui, default_dim, "loading");
                             indicated_loading = true;
                         }
-                        return;
+                    } else {
+                        let style = if e.is_missing_symbols() {ui.palette.default_dim} else {ui.palette.error};
+                        styled_writeln!(ui.text, style, "{}", e);
                     }
-                    let style = if e.is_missing_symbols() {ui.palette.default_dim} else {ui.palette.error};
-                    styled_writeln!(ui.text, style, "{}", e);
                 };
                 if let Err(e) = &binary.elves {
                     print_error(e);
@@ -4858,6 +4971,416 @@ impl WindowContent for BreakpointsWindow {
                     BreakpointOn::InitialExec | BreakpointOn::Data(_) => (),
                 }
             }
+        }
+    }
+}
+
+// When terminal window is active, which keys go to the pty? (The other keys go to the debugger UI.)
+#[derive(Default, Clone, Copy, Eq, PartialEq)]
+enum TerminalKeyCapture {
+    Unfocused, // terminal window not focused, no capture
+    // Default to this rather than Unfocused, so that the tty window doesn't start capturing keys on startup as that would be disorienting.
+    #[default]
+    NoCapture,
+    MostKeys,
+    AllKeys,
+}
+
+#[derive(Default)]
+struct TerminalWindow {
+    capture: TerminalKeyCapture,
+    term: Rc<TerminalEmulator>,
+    seen_start_count: usize,
+
+    reported_mouse_buttons: Vec<MouseButton>, // which mouse buttons were reported to the tty as being held down
+    not_first_frame: bool, // workaround for focus quirk on startup
+}
+impl TerminalWindow {
+    const SCROLL_BAR_WIDTH: usize = 1;
+    const HEADER_HEIGHT: usize = 2;
+
+    fn get_tty_size(window_size: [usize; 2]) -> [u16; 2] {
+        [window_size[0].saturating_sub(Self::SCROLL_BAR_WIDTH).min(u16::MAX as usize).max(16) as u16, window_size[1].saturating_sub(Self::HEADER_HEIGHT).min(u16::MAX as usize).max(7) as u16]
+    }
+
+    fn encode_mouse_event(ev: &MouseEventEx, encoding: vt100::MouseProtocolEncoding, out: &mut VecDeque<u8>) {
+        let mut cb: u8 = match ev.event {
+            MouseEvent::ScrollUp => 64,
+            MouseEvent::ScrollDown => 65,
+            _ => match ev.button {
+                MouseButton::Left => 0,
+                MouseButton::Middle => 1,
+                MouseButton::Right => 2,
+                MouseButton::None => 3,
+            },
+        };
+        if ev.mods.contains(ModKeys::SHIFT) {
+            cb |= 4;
+        }
+        if ev.mods.contains(ModKeys::ALT) {
+            cb |= 8;
+        }
+        if ev.mods.contains(ModKeys::CTRL) {
+            cb |= 16;
+        }
+        if matches!(ev.event, MouseEvent::Move) {
+            cb += 32;
+        }
+
+        let col = ev.pos[0].max(0) as usize + 1;
+        let row = ev.pos[1].max(0) as usize + 1;
+        match encoding {
+            vt100::MouseProtocolEncoding::Sgr => {
+                let suffix = if ev.event == MouseEvent::Release {
+                    b'm'
+                } else {
+                    b'M'
+                };
+                write!(out, "\x1b[<{};{};{}{}", cb, col, row, suffix as char).unwrap();
+            }
+            vt100::MouseProtocolEncoding::Default => {
+                if ev.event == MouseEvent::Release {
+                    cb = 3;
+                }
+                out.extend(b"\x1b[M");
+                out.push_back(cb + 32);
+                out.push_back((col + 32).min(u8::MAX as usize) as u8);
+                out.push_back((row + 32).min(u8::MAX as usize) as u8);
+            }
+            vt100::MouseProtocolEncoding::Utf8 => {
+                if ev.event == MouseEvent::Release {
+                    cb = 3;
+                }
+                out.extend(b"\x1b[M");
+                out.push_back(cb + 32);
+                // Encode coordinates as UTF-8 codepoints.
+                let encode_coord = |val: usize, out: &mut VecDeque<u8>| {
+                    let c = char::from_u32((val as u32) + 32).unwrap_or('!');
+                    let mut buf = [0u8; 4];
+                    let s = c.encode_utf8(&mut buf);
+                    out.extend(s.as_bytes());
+                };
+                encode_coord(col, out);
+                encode_coord(row, out);
+            }
+        }
+    }
+
+    fn is_tty_disabled(debugger: &Debugger) -> Option<String> {
+        if !debugger.context.settings.use_tty {
+            Some("with --no-pty".to_string())
+        } else if debugger.mode != RunMode::Run {
+            Some(format!("in {} mode", debugger.mode.human_string()))
+        } else {
+            None
+        }
+    }
+}
+impl WindowContent for TerminalWindow {
+    fn build(&mut self, state: &mut UIState, debugger: &mut Debugger, ui: &mut UI) {
+        if let Some(reason) = Self::is_tty_disabled(debugger) {
+            let l = ui_writeln!(ui, default_dim, "(tty is disabled {})", reason);
+            ui.add(widget!().text(l));
+            return;
+        }
+
+        let term = Rc::get_mut(&mut self.term).unwrap();
+
+        term.set_size_and_scrollback(debugger.tty_size, debugger.context.settings.tty_scrollback);
+
+        if debugger.start_count > self.seen_start_count {
+            self.seen_start_count = debugger.start_count;
+            term.program_restarted();
+            self.reported_mouse_buttons.clear();
+        }
+
+        // Set up the widget tree:
+        //   root
+        //     header
+        //     viewport_and_scroll_bar
+        //       viewport
+        //         dummy_content - captures keys to send to the pty (higher priority than viewport and root)
+        //       scroll_bar
+
+        let viewport_height = term.size[1] as usize;
+
+        ui.cur_mut().set_vstack();
+
+        let header = ui.add(widget!().fixed_height(Self::HEADER_HEIGHT).vstack());
+        let header_first_line = ui.add(widget!().parent(header).fixed_height(1));
+        let header_second_line = ui.add(widget!().parent(header).fixed_height(1).hstack());
+        let header_second_line_text = ui.add(widget!().parent(header_second_line).width(AutoSize::Remainder(1.0)));
+        let full_capture_button = ui.add(widget!().parent(header_second_line).width(AutoSize::Text).flags(WidgetFlags::HIGHLIGHT_ON_HOVER));
+
+        let viewport_and_scroll_bar = ui.add(widget!().fixed_height(viewport_height).hstack());
+        let (viewport, scroll_bar);
+        with_parent!(ui, viewport_and_scroll_bar, {
+            viewport = ui.add(widget!().fixed_width(term.size[0] as usize).fixed_height(viewport_height));
+            scroll_bar = ui.add(widget!().fixed_width(Self::SCROLL_BAR_WIDTH));
+        });
+        let dummy_content = with_parent!(ui, viewport, {
+            ui.add(widget!())
+        });
+
+        // Determine what keys to capture (i.e. send to the pty, as opposed to processing them by the debugger UI).
+        // Behaviors:
+        //  * When switching to the terminal window, enable MostKeys capture.
+        //  * When switching to another window, stop capturing keys.
+        //  * If escape key is pressed while the terminal window is active, stop capturing keys. Then start again if any of these happens:
+        //     - the terminal window is clicked,
+        //     - Enter key is pressed,
+        //     - the window gets switched back and forth.
+        //  * "Capture all keys" button (requires mouse) toggles AllKeys capture mode.
+        let not_first_frame = mem::replace(&mut self.not_first_frame, true);
+        if !ui.check_focus() && not_first_frame {
+            self.capture = TerminalKeyCapture::Unfocused;
+        } else if self.capture == TerminalKeyCapture::Unfocused {
+            self.capture = TerminalKeyCapture::MostKeys;
+        }
+        if (ui.check_mouse(MouseActions::CLICK_SUBTREE) || ui.check_key(KeyAction::Enter)) && self.capture == TerminalKeyCapture::NoCapture {
+            self.capture = TerminalKeyCapture::MostKeys;
+        }
+        if ui.check_key(KeyAction::Cancel) && self.capture == TerminalKeyCapture::MostKeys {
+            self.capture = TerminalKeyCapture::NoCapture;
+        }
+        with_parent!(ui, full_capture_button, {
+            if ui.check_mouse(MouseActions::CLICK) {
+                if self.capture == TerminalKeyCapture::AllKeys {
+                    self.capture = TerminalKeyCapture::NoCapture;
+                } else {
+                    self.capture = TerminalKeyCapture::AllKeys;
+                }
+            }
+        });
+
+        // At this point `capture` is final. Fill out the status line and hints window.
+
+        {
+            // First status line says something like "stdout, stderr, stdin go here".
+            let mut count = 0;
+            let s = &debugger.context.settings;
+            for (name, redirected) in [("stdin", s.stdin_file.is_some()), ("stdout", s.stdout_file.is_some()), ("stderr", s.stderr_file.is_some())] {
+                if !redirected {
+                    if count > 0 {
+                        ui_write!(ui, default_dim, ", ");
+                    }
+                    ui_write!(ui, default_dim, "{}", name);
+                    count += 1;
+                }
+            }
+            let l = if count == 0 {
+                // (Even in this case the program is in principle able to access the tty through /dev/tty)
+                ui_writeln!(ui, default_dim, "stdin, stdout, stderr are redirected to files")
+            } else {
+                ui_writeln!(ui, default_dim, " go here")
+            };
+            ui.get_mut(header_first_line).draw_text = Some(l..l+1);
+        }
+        // Second status line says something like "Enter to focus  [click to capture all keys]".
+        let l = ui_writeln!(ui, button, "[click to {}]", if self.capture == TerminalKeyCapture::AllKeys {"release"} else {"capture all keys"});
+        ui.get_mut(full_capture_button).draw_text = Some(l..l+1);
+        let capturing = match self.capture {
+            TerminalKeyCapture::Unfocused => false,
+            TerminalKeyCapture::NoCapture => {
+                let l = ui_writeln!(ui, default_dim, "{} to focus", ui.key_binds.normal.action_to_key_name(KeyAction::Enter));
+                ui.get_mut(header_second_line_text).draw_text = Some(l..l+1);
+                false
+            }
+            TerminalKeyCapture::MostKeys => {
+                state.key_hint_filter = Some(vec![
+                    KeyAction::Quit,
+                    KeyAction::Cancel,
+                    KeyAction::WindowUp,
+                    KeyAction::WindowDown,
+                    KeyAction::WindowLeft,
+                    KeyAction::WindowRight,
+                    KeyAction::NextTab,
+                    KeyAction::PreviousTab,
+                    KeyAction::DropCaches,
+                ]);
+                true
+            }
+            TerminalKeyCapture::AllKeys => {
+                state.key_hint_filter = Some(Vec::new());
+
+                let start = ui.text.num_lines();
+                ui_writeln!(ui, default, "All keyboard input goes to the console.");
+                ui_writeln!(ui, default, "Click outside console to return to normal.");
+                let end = ui.text.num_lines();
+                state.custom_hints_text = Some(start..end);
+
+                let l = ui_writeln!(ui, default, "capturing all keys");
+                ui.get_mut(header_second_line_text).draw_text = Some(l..l+1);
+
+                true
+            }
+        };
+
+        // Pass inputs to the pty.
+        let mut scroll_to_bottom = false;
+        let mut capture_mouse = MouseActions::empty();
+        if let Some(ref mut pty) = &mut debugger.pty {
+            let (report_mouse, report_button_motion, report_any_motion) = match term.vt.screen().mouse_protocol_mode() {
+                vt100::MouseProtocolMode::None => (false, false, false),
+                // Don't support X10 mouse reporting.
+                vt100::MouseProtocolMode::Press => (false, false, false),
+                vt100::MouseProtocolMode::PressRelease => (true, false, false),
+                vt100::MouseProtocolMode::ButtonMotion => (true, true, false),
+                vt100::MouseProtocolMode::AnyMotion => (true, true, true),
+            };
+            if report_mouse {
+                // Note: if the debuggee enabled mouse reporting but didn't enable alternate screen, should we send scroll events to the tty or should we scroll the scrollback?
+                //       Different terminals behave differently in this case. Currently we send scroll events to the tty.
+                //       To change this behavior, just remove SCROLL in the next line (conditionally on not being in alternate screen).
+                capture_mouse = MouseActions::CLICK | MouseActions::MIDDLE_CLICK | MouseActions::RIGHT_CLICK | MouseActions::SCROLL;
+            }
+            let term_rect = if report_mouse {
+                let w = ui.get(viewport);
+                Rect {pos: [w.axes[Axis::X].abs_pos, w.axes[Axis::Y].abs_pos], size: [w.axes[Axis::X].size, w.axes[Axis::Y].size]}
+            } else {
+                Rect::default() // just an optimization
+            };
+
+            let mut arrow_key_encoding = [b'\x1b', b'[', b'A'];
+            if term.vt.screen().application_cursor() {
+                arrow_key_encoding[1] = b'O';
+            }
+
+            // Look at all events we've got from the terminal this frame.
+            // We rely on ConsoleWindow::build() being called on every frame (start_build()/end_build() pair) at all times.
+            // We do a weird hybrid thing where we look at raw input events, but check them against the higher-level events reported by the UI dispatch for our widget,
+            // to pick out events destined for the console window (e.g. captured keys or mouse events over the console window rect).
+
+            let captured_keys: HashSet<KeyEx> = ui.get(dummy_content).keys.iter().cloned().collect();
+            let captured_mouse_actions = ui.get(dummy_content).mouse;
+            let captured_scroll = ui.get(dummy_content).scroll;
+            for ev in &ui.frame_events {
+                match &ev.ev {
+                    Event::Key(key) if !captured_keys.contains(key) => (),
+                    Event::Key(key) if key.mods.is_empty() && key.key.is_arrow_key() => {
+                        // Re-encode arrow keys because of a silly pointless historical compatibility thing: "\x1b[A" in one mode, "\x1bOA" in the other mode.
+                        arrow_key_encoding[2] = match key.key {
+                            Key::Up    => b'A',
+                            Key::Down  => b'B',
+                            Key::Right => b'C',
+                            Key::Left  => b'D',
+                            _ => panic!("huh"),
+                        };
+                        pty.out_buf.extend(&arrow_key_encoding);
+                        scroll_to_bottom = true;
+                    }
+                    Event::Key(_) => {
+                        pty.out_buf.extend(ev.bytes.as_slice());
+                        scroll_to_bottom = true;
+                    }
+                    Event::Mouse(_) if !report_mouse => (),
+                    Event::Mouse(mouse) => {
+                        let mut mouse = mouse.clone();
+                        let send = match mouse.event {
+                            MouseEvent::Press => {
+                                let action = match mouse.button {
+                                    MouseButton::Left   => MouseActions::CLICK,
+                                    MouseButton::Middle => MouseActions::MIDDLE_CLICK,
+                                    MouseButton::Right  => MouseActions::RIGHT_CLICK,
+                                    MouseButton::None   => MouseActions::CLICK,
+                                };
+                                // Report click only if it was dispatched to this widget. E.g. don't report clicks outside the console window's rect or clicks on a dialog covering the console window.
+                                // This check is not fully precise: if there were multiple clicks at different locations in one frame, we'll dispatch them all based on the location of one of them; it's ok in practice.
+                                let send = captured_mouse_actions.contains(action);
+                                if send {
+                                    if self.reported_mouse_buttons.iter().find(|b| **b == mouse.button).is_none() {
+                                        self.reported_mouse_buttons.push(mouse.button);
+                                    }
+                                    scroll_to_bottom = true;
+                                }
+                                send
+                            }
+                            MouseEvent::Release => {
+                                // If we previously sent a Press event, send the corresponding Release event even if it's outside the console window.
+                                let mut send = false;
+                                self.reported_mouse_buttons.retain(|b|
+                                    if *b == mouse.button {
+                                        send = true;
+                                        false
+                                    } else {
+                                        true
+                                    });
+                                send
+                            }
+                            MouseEvent::Move => (report_any_motion || (report_button_motion && !self.reported_mouse_buttons.is_empty())) && term_rect.contains(mouse.pos),
+                            MouseEvent::ScrollUp | MouseEvent::ScrollDown => captured_scroll != 0 && term_rect.contains(mouse.pos),
+                        };
+                        if send {
+                            // Get position relative to the console window, clamped to be inside the rect.
+                            for ax in 0..2 {
+                                mouse.pos[ax] = (mouse.pos[ax] - term_rect.pos[ax]).min(term_rect.size[ax] as isize - 1).max(0);
+                            }
+                            Self::encode_mouse_event(&mouse, term.vt.screen().mouse_protocol_encoding(), &mut pty.out_buf);
+                        }
+                    }
+                    Event::FocusIn | Event::FocusOut => (), // vt100 lib doesn't propagate the mode flag for this
+                }
+            }
+
+            term.process_input(&mut pty.in_buf);
+        }
+
+        // This must be after passing inputs to pty (pty.enqueue()), because that may add lines to scrollback.
+        let scrollback_len = term.get_scrollback_len();
+        let content_height = viewport_height + scrollback_len;
+
+        // Set up key and mouse capture in ui.
+        with_parent!(ui, dummy_content, {
+            ui.cur_mut().set_fixed_height(content_height);
+            ui.focus();
+            if let Some(exceptions) = &state.key_hint_filter {
+                ui.cur_mut().flags.insert(WidgetFlags::CAPTURE_ALL_KEYS);
+                let keys = ui.key_binds.normal.actions_to_keys(exceptions);
+                ui.cur_mut().capture_keys = keys;
+            }
+            ui.cur_mut().capture_mouse = capture_mouse;
+        });
+
+        let mut scroll = (scrollback_len - term.vt.screen().scrollback()) as isize;
+        if scroll_to_bottom {
+            scroll = scrollback_len as isize;
+        }
+        let root = ui.cur_parent;
+        with_parent!(ui, viewport, {
+            cursorless_scrolling_navigation(&mut scroll, None, root, scroll_bar, ui);
+        });
+        term.vt.screen_mut().set_scrollback(scrollback_len - scroll as usize);
+
+        let draw_cursor = if capturing && !term.vt.screen().hide_cursor() {
+            let p = term.vt.screen().cursor_position();
+            let p = [p.1 as isize, p.0 as isize + term.vt.screen().scrollback() as isize];
+            Some(p)
+        } else {
+            None
+        };
+        
+        let v = ui.get_mut(viewport);
+        v.draw_terminal = Some(self.term.clone());
+        v.draw_cursor_if_focused = draw_cursor;
+    }
+
+    fn get_key_hints(&self, out: &mut Vec<KeyHint>, _debugger: &Debugger) {
+        match self.capture {
+            TerminalKeyCapture::Unfocused | TerminalKeyCapture::AllKeys => (),
+            TerminalKeyCapture::NoCapture => out.extend([
+                KeyHint::key(KeyAction::Enter, "capture keys"),
+            ]),
+            TerminalKeyCapture::MostKeys => out.extend([
+                KeyHint::key(KeyAction::Cancel, "stop capturing keys"),
+            ]),
+        }
+    }
+
+    fn get_window_outline(&self, ui: &UI) -> Option<Style> {
+        match self.capture {
+            TerminalKeyCapture::Unfocused | TerminalKeyCapture::NoCapture => None,
+            TerminalKeyCapture::MostKeys => Some(ui.palette.window_border_captured),
+            TerminalKeyCapture::AllKeys => Some(ui.palette.window_border_super_captured),
         }
     }
 }

@@ -150,7 +150,7 @@ pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) -> /*binaries_add
         debugger.info.exe_inode = m.ino();
         if debugger.info.exe_inode == 0 {
             eprintln!("error: stat({}) returned inode number 0", path);
-            debugger.info.exe_inode = 1;
+            debugger.info.exe_inode = u64::MAX;
         }
     }
 
@@ -174,14 +174,12 @@ pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) -> /*binaries_add
     let prev_mapped = debugger.symbols.mark_all_as_unmapped();
 
     let mut new_elves: Vec<(Range<usize>, /*offset*/ usize, Arc<ElfFile>)> = Vec::new();
-    let mut is_first_mapped_binary = true;
+    let mut found_main_binary = false;
     for (idx, map) in maps.maps.iter_mut().enumerate() {
         let locator = match &map.binary_locator {
             None => continue,
             Some(b) => b,
         };
-        let is_first = is_first_mapped_binary;
-        is_first_mapped_binary = false;
         let bin = match debugger.symbols.locator_to_id.get(locator) {
             Some(id) => debugger.symbols.get_mut(*id).unwrap(),
             None => {
@@ -206,7 +204,14 @@ pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) -> /*binaries_add
                 } else {
                     None
                 };
-                debugger.symbols.add(locator.clone(), &debugger.memory, custom_path, build_id, is_first, reconstruction)
+                // Guess which binary is the main executable. (If this turns out unreliable, we can switch to determining this from ELF header instead (which is less convenient because we currently parse ELF header after we use this info).)
+                let is_main_binary = !found_main_binary && if debugger.mode == RunMode::CoreDump {
+                    locator.special.is_none() // take the first binary on the list, except [vdso]
+                } else {
+                    locator.inode == debugger.info.exe_inode
+                };
+                found_main_binary |= is_main_binary;
+                debugger.symbols.add(locator.clone(), &debugger.memory, custom_path, build_id, is_main_binary, reconstruction)
             }
         };
         map.binary_id = Some(bin.id);

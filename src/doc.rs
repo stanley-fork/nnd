@@ -12,8 +12,7 @@ pub enum HelpParagraph {
     KnownProblems,
     Watches,
     Files,
-    Tty,
-    Features,
+    Misc,
     Licenses,
 }
 
@@ -35,8 +34,7 @@ static HELP_CHAPTERS: &'static [HelpChapter] = &[
     HelpChapter {cli: "--help-known-problems", dialog: "known problems", description: "some known bugs and missing features", paragraphs: &[HelpParagraph::KnownProblems]},
     HelpChapter {cli: "--help-watches", dialog: "watch expressions", description: "watch expression language documentation", paragraphs: &[HelpParagraph::Watches]},
     HelpChapter {cli: "--help-files", dialog: "files", description: "files in ~/.nnd/ - keys config, log file, default stdout/stderr redirects, saved state", paragraphs: &[HelpParagraph::Files]},
-    HelpChapter {cli: "--help-tty", dialog: "tty", description: "how to debug interactive programs that require a terminal (e.g. using this debugger to debug itself)", paragraphs: &[HelpParagraph::Tty]},
-    HelpChapter {cli: "--help-features", dialog: "appendix: feature dump", description: "raw list of features (not very readable)", paragraphs: &[HelpParagraph::Features]},
+    HelpChapter {cli: "--help-misc", dialog: "misc", description: "additional random notes", paragraphs: &[HelpParagraph::Misc]},
     HelpChapter {cli: "--licenses", dialog: "licenses", description: "boring legal info", paragraphs: &[HelpParagraph::Licenses]},
 ];
 
@@ -90,7 +88,7 @@ fn write_help_paragraph(paragraph: HelpParagraph, palette: &Palette, key_binds: 
         HelpParagraph::Greeting => {
             styled_write!(text, palette.default, r###"Hi, I'm a debugger.
 
-Please (pretty please!) report all bugs, usability issues, slowness, first impressions, improvement ideas, feature requests, etc.
+Please (pretty please!) report all bugs, usability issues, slowness, improvement ideas, feature requests, etc.
 Create an issue at https://github.com/al13n321/nnd/issues"###);
             styled_write!(text, palette.default_dim, " or send an email to mk.al13n+nnd@gmail.com");
         }
@@ -102,11 +100,10 @@ nnd --dump-core [--mode=direct|live|fork] -p pid > out   - instead of running th
 
 Additional arguments:
 --stdin/--stdout/--stderr path   - redirect stdin/stdout/stderr to file
---tty path   - redirect stdin, stdout, and stderr to path, see --help-tty
 -s   - stop on main() (only applies to the first time the program starts; when starting it again from UI, press 'step' key instead of 'run' to stop on main())
--S   - stop early in process startup sequence (long before main(), but after loading dynamic libraries)
+-S   - stop early in the process startup sequence (long before main(), but after loading dynamic libraries)
 -d path   - directory in which to look for source code; if specified multiple times, multiple directories will be searched; default: current directory
---module path   - path to executable or dynamic library from which to load debug symbols; useful if the running executable is stripped and you have an unstripped version on the side; can be specified multiple times to provide multiple dynamic libraries (they'll be automatically matched by build id)
+--module path   - path to executable or dynamic library from which to load debug symbols; e.g. an unstripped executable; can be used multiple times for multiple dynamic libraries (auto matched by build id)
 -o   - try to get debug info from debuginfod server at https://debuginfod.elfutils.org/ ; alternatively, set environment variable DEBUGINFOD_URLS to a space-separated list of URLs to use
 --mouse full|no-hover|disabled   - mouse mode; 'no-hover' to react only to clicking and dragging, 'disabled' to disable mouse altogether; default is 'full' (if it doesn't work, check if mouse reporting is enabled in the terminal application)
 -n name   - session name, to identify saved state like open files and breakpoints; "-" for temporary session that doesn't save state; "--" to avoid touching any files at all (at ~/.nnd/)
@@ -177,7 +174,7 @@ Properties:
 # Getting started
 
 When running the debugger for the first time, notice:
- 1. The UI consists of windows. There's an 'active' window, indicated with bright outline.
+ 1. The UI consists of windows. There's an active window, indicated with bright outline.
     The active window can be selected using digit keys (window numbers are shown in their titles), or using alt+arrows, or with the mouse.
  2. The 'controls' window in top left lists (almost) all available key combinations.
     Some of them are global, others depend on the active window.
@@ -191,22 +188,22 @@ UI tips:
  * There's mouse support. If it's not working, check if mouse reporting is enabled in the terminal application settings.
  * When mouse is enabled, click+dragging usually doesn't select text (to copy it out of the terminal). But terminal applications usually have a way to override this and select text anyway.
    Try shift+drag (in GNOME Terminal or kitty) or option+drag (in iTerm2).
- * In 'controls' window, prefix "C-" means ctrl key, "M-" means alt/option, "S-" means shift.
+ * In the 'controls' window, prefix "C-" means ctrl key, "M-" means alt/option, "S-" means shift.
    On Mac OS you may need to change terminal settings to make the option key work, e.g. in kitty set "macos_option_as_alt both".
    Key bindings can be changed through config file, see --help-files
  * If you use tmux, the escape key is unreliable, consider using ctrl-g instead. Tmux adds 0.5s delay before passing the escape key through, and if you press another key during that time,
    the two key presses get incorrectly interpreted as alt+keypress (that's how ansi escape codes work, unfortunately).
  * Windows can be resized by dragging the boundaries with the mouse, and rearranged by drag'n'dropping from window title to anywhere. Mouse is required for this.
- * Press 'tab' to open a tooltip. Supported in tables (binaries, stack, etc) and watches window. Useful for copying long values or paths, and might contain additional information. Also available in search dialogs.
+ * Press 'tab' to open a tooltip. Supported in tables (binaries, stack, etc) and 'watches' window. Useful for copying long values or paths, and might contain additional information. Also available in search dialogs.
 
 Debugging tips:
- * The highlighted characters in the source code window are locations of statements and inlined function calls, as listed in the debug info.
+ * The highlighted characters in the 'code' window are locations of statements and inlined function calls, as listed in the debug info.
    These are all the places where the control can stop, e.g. if you step repeatedly or add a breakpoint.
  * 'Step over column' ('m' key) runs until the control moves to a different line+column location. Similar to how 'step over line' runs until the control moves to a different line.
    Useful for stepping into a function call when its arguments are nontrivial expressions - you'd do step-over-column to skip over evaluating the arguments,
    then step-into when the current column is at the function call you're interested in.
-   (Is there a way to put a breakpoint on a column? Not directly, but you can put breakpoint on the disassembly instruction corresponding to the column. Find it by cycling through line's disassembly locations by pressing '.'/',' in code window.)
- * Steps are stack-frame-dependent: step-out steps out of the *currently selected* stack frame (as seen in the threads window on the right), not the innermost stack frame.
+   (Is there a way to put a breakpoint on a column? Not directly, but you can put breakpoint on the disassembly instruction corresponding to the column. Find it by cycling through line's disassembly locations by pressing '.'/',' in the 'code' window.)
+ * Steps are stack-frame-dependent: step-out steps out of the *currently selected* stack frame (as seen in the 'threads' window), not the innermost stack frame.
    Step-over steps over the calls inside the currently selected stack frame, i.e. it may involve an internal step-out.
    (This may seem like an unnecessary feature, but if you think through how stepping interacts with inlined functions, it's pretty much required, things get very confusing otherwise.)
  * While a step is in progress, breakpoints are automatically disabled for the duration of the step.
@@ -214,28 +211,32 @@ Debugging tips:
  * Run-to-cursor works like a step: it runs until the selected (not any) thread hits the requested line, and it disables other breakpoints for the duration of the step.
  * To start the program and run to start of main(), press step-into ('s' key) when the program is not running (e.g. after killing it with 'C-k' key).
  * Step-into-instruction ('S' key) works no matter what, even if there's no debug info or if disassembly or stack unwinding fails. Use it when other steps fail.
- * Breakpoints are preserved across debugger restarts, but they're put into disabled state on startup. Use Enter key in breakpoints window to reactivate.
- * To make a conditional breakpoint, press M-enter on a regular breakpoint and edit the condition expression (in breakpoints window).
+ * Breakpoints are preserved across debugger restarts, but they're put into disabled state on startup. Use Enter key in the 'breakpoints' window to reactivate.
+ * To make a conditional breakpoint, press M-enter on a regular breakpoint and edit the condition expression (in the 'breakpoints' window).
    Conditional breakpoint stops the program if the condition expression evaluates to nonzero or fails to evaluate.
    If you don't want to stop on evaluation error, wrap the expression in 'try(...)' (it returns 0 if evaluation failed for any reason).
    E.g.: 'try(abstract_class_ptr.concrete_class_field)' will stop only if abstract_class_ptr was auto-downcast to a class that has the given field, and the field is nonzero.
  * There are default special breakpoints for exceptions (C++, disabled by default) and panics (Rust, enabled by default). They can be enabled/disabled/conditioned like normal breakpoints.
    Quirk: panic breakpoint is not activated until debug info is loaded, so it may fail to trigger if a panic happens very soon after debugger startup.
- * The function search (in disassembly window, 'o' key) currently does fuzzy search over *mangled* function names, for peformance reasons.
+ * The function search (in the 'disassembly' window, 'o' key) currently does fuzzy search over *mangled* function names, for peformance reasons.
    The search results display demangled names, i.e. slightly different from what's actually searched. Press tab to see mangled name.
- * In watches window, on non-root tree nodes press Enter to add a corresponding watch. E.g. for local variable or struct field or array element.
- * In watches window, press 'b' to add data breakpoint (aka watchpoint) on the address of the curent value. 'b' for write-only, 'B' for read/write. Conditional data breakpoints are allowed as well. Limitations:
+ * In the 'watches' window, on non-root tree nodes press Enter to add a corresponding watch. E.g. for local variable or struct field or array element.
+ * In the 'watches' window, press 'b' to add data breakpoint (aka watchpoint) on the address of the curent value. 'b' for write-only, 'B' for read/write. Conditional data breakpoints are allowed as well. Limitations:
     * There can be at most 2-3 active data breakpoints. (x86 supports 4 hardware breakpoints, but the debugger transintly uses some of them for regular breakpoints and stepping.)
     * Data breakpoints only catch memory reads/writes. If a variable resides in a register for all or part of its lifetime, data breakpoints won't work on it during that time.
     * Data breakpoints don't catch writes by syscalls, e.g. read() writing to the buffer.
     * When data breakpoint is hit, control stops just *after* the instruction that did the write, after the value is changed.
-    * Data breakpoints aren't automatically removed when the variable goes out of scope. Use breakpoints window to clean up obsolete data breakpoints.
- * In watches window, press shift-d to take the pointer to the current value and add a watch on it. E.g. pressing enter on `my_thing_ptr.buffer` would add a watch `*(0x12345 as *[u8; 1024])`, where 0x12345 is the current address of `my_thing_ptr.buffer`, and `[u8; 1024]` is the type of `my_thing.buffer`. Useful for data breakpoints, as this watch will work regardless of the selected thread and stack frame, not relying on `my_thing` being visible.
- * Expect debugger's memory usage around 3x the size of the executable. E.g. ~7 GB for 2.3 GB clickhouse, release build. This is mostly debug information.
+    * Data breakpoints aren't automatically removed when the variable goes out of scope. Use the 'breakpoints' window to clean up obsolete data breakpoints.
+ * In the 'watches' window, press shift-d to take the pointer to the current value and add a watch on it. E.g. pressing enter on `my_thing_ptr.buffer` would add a watch `*(0x12345 as *[u8; 1024])`, where 0x12345 is the current address of `my_thing_ptr.buffer`, and `[u8; 1024]` is the type of `my_thing.buffer`. Useful for data breakpoints, as this watch will work regardless of the selected thread and stack frame, not relying on `my_thing` being visible.
+ * Expect debugger's memory usage around 4x the size of the executable. E.g. 20 GB for 5 GB clickhouse, release build. This is mostly debug information.
    (If you're curious, see ~/.nnd/<number>/log for a breakdown of which parts of the debug info take how much memory and take how long to load.)
  * For clickhouse server, use CLICKHOUSE_WATCHDOG_ENABLE=0. Otherwise it forks on startup, and the debugger doesn't follow forks."###),
         HelpParagraph::KnownProblems => styled_write!(text, palette.default, r###"Current limitations:
- * Thread filter ('/' in the threads window) is too limited: just a substring match in function name, file name, and thread name. Need to extend it enough to be able to e.g. filter out idle threads waiting for work or epoll.
+ * When a source code line maps to multiple machine code locations, breakpoint sometimes picks a wrong one and doesn't work. Sometimes it's because of bad debug info produced by compiler, sometimes it's nnd's fault for not supporting multiple locations.
+   If you run into this problem, use ',' and '.' keys on the line in the 'code' window to cycle through the corresponding locations in the 'disassembly' window; find the correct one(s) and put a disassembly breakpoint on it.
+   (Note: we could simply put breakpoints on all locations, but that would be worse: when continuing after hitting a breakpoint, we'd likely immediately reach another location of the same breakpoint and re-hit the same breakpoint again, which is confusing.
+    To properly fix it we'd need special logic when continuing after hitting a breakpoint, to detect when control leaves the machine code ranges "covered" by the breakpoint.)
+ * Thread filter ('/' in the 'threads' window) is limited: just a substring match in function name, file name, and thread name. Would be nice to add regex search and negative filters (e.g. to filter out threads blocked on epoll).
  * In watch expressions, type names (for casts or type info) have to be spelled *exactly* the same way as they appear in the debug info.
    E.g. `std::vector<int>` doesn't work, you have to write `std::__1::vector<int, std::__1::allocator<int> >` (whitespace matters).
    The plan is to add a fuzzy search dialog for type names, similar to file and function search.
@@ -245,7 +246,7 @@ Debugging tips:
  * No whole-file breakpoints, signal breakpoints (except for always-on stop on fatal signals).
  * Conditional breakpoints are not super fast: a few thousand evaluations per second.
  * Inside libraries that were dlopen()ed at runtime, breakpoints get disabled on program restart. Manually disable-enable the breakpoint after the dlopen() to reactivate it.
- * The disassembly window can only open functions that appear in .symtab or debug info. Can't disassemble arbitrary memory, e.g. JIT-generated code or code from binaries without .symtab or debug info.
+ * The 'disassembly' window can only open functions that appear in .symtab or debug info. Can't disassemble arbitrary memory, e.g. JIT-generated code or code from binaries without .symtab or debug info.
  * The debugger gets noticeably slow when the program has > 1K threads, and unusably slow with 20K threads. Part of it is inevitable syscalls
    (to start/stop all n threads we have to do n*const syscalls, then wait for n notifications - that takes a while), but there's a lot of room for improvement anyway
    (reduce the const, do the syscalls in parallel, avoid the remaining O(n^2) work on our side).
@@ -255,14 +256,14 @@ Debugging tips:
    (I'm not sure what exactly to do about this. Fully separating the debugger-agent from UI+debuginfo would increase the code complexity a lot and make performance worse.
     Maybe I'll instead run the ~whole debugger on the server and have a thin client that just streams the rendered 'image' (text) from the server and sends the source code files on demand.
     This removes the need to scp the source code to the server, but leaves all the other problems.)"###),
-        HelpParagraph::Watches => styled_write!(text, palette.default, r###"In the watches window, you can enter expressions to be evaluated. It uses a custom scripting language, documented here.
+        HelpParagraph::Watches => styled_write!(text, palette.default, r###"In the 'watches' window, you can enter expressions to be evaluated. It uses a custom scripting language, documented here.
 
 Currently the language has no loops or conditionals, just expressions. The syntax is C-like/Rust-like.
 
 (Throughout this document, single quotes '' denote example watch expressions. The quotes themselves are not part of the expression.)
 
 General info:
- * Can access the debugged program's local variables (as seen in the locals window), global variables (including thread-locals and static variables in functions), and registers: 'my_local_var', 'rdi'.
+ * Can access the debugged program's local variables (as seen in the 'locals' window), global variables (including thread-locals and static variables in functions), and registers: 'my_local_var', 'rdi'.
    If a local variable is not found, it's probably optimized out. Fields of 'this' are accessible as 'this.my_field', not 'my_field'.
  * Has basic C-like things you'd expect: arithmetic and logical operators, literals, array indexing, pointer arithmetic, '&x' to take address, '*x' to dereference.
  * Type cast: 'p as *u8'. Casts are very permissive, ~any value can be reinterpreted as ~any type.
@@ -275,12 +276,12 @@ General info:
  * 'var(x)' shows additional information about variable x, e.g. its declaration site.
 
 Gotchas:
- * 'var(x)' and 'type(t)'/'typeof(x)' show variable/type declaration site (if present in debug info). Press enter on it (or click) to open in code window.
+ * 'var(x)' and 'type(t)'/'typeof(x)' show variable/type declaration site (if present in debug info). Press enter on it (or click) to open in the 'code' window.
  * If a variable has the same name as a register, use `` to refer to the variable: '`rax`'.
  * If a global variable has the same name as a local variable, use :: prefix to refer to the global variable: '::foo'.
  * Currently only fully-qualified type names and global variable names are recognized.
  * Currently types and global variables nested inside functions are difficult to access. The recognized "fully-qualified" name has a "_" instead of the function name.
-   Use variable search (watches window, 'o' key); optionally, start the query with '@' to search by filename, add ":<number>" to filter by line number.
+   Use variable search ('watches' window, 'o' key); optionally, start the query with '@' to search by filename, add ":<number>" to filter by line number.
  * Be careful with operator precedence when combining casts and pointer arithmetic (casts have higher precedence):
    'offset + (my_u64_ptr as *u8)' and 'offset + my_u64_ptr as *u8' produce different result.
 
@@ -349,8 +350,6 @@ Key bindings can be customized by creating ~/.nnd/keys . Read the comments in ~/
 Things like watches, breakpoints, open files, etc persist when closing and reopening the debugger. Such state is associated with a "session" and is saved at '~/.nnd/<session-name>/state'.
 Each session can have at most one debugger process running at any given time (synchronized by '~/.nnd/<session-name>/lock').
 The session directory also contains these files:
- * 'stdout', 'stderr' - redirected stdout and stderr of the debugged program, unless overridden with --stdout/--stderr/--tty.
-   (stdin is redirected to /dev/null by default.)
  * 'log' - diagnostic messages from the debugger itself. Sometimes useful for debugging the debugger. Sometimes there are useful stats about debug info.
    On crash, error message and stack trace go to this file. Please include this file when reporting bugs, especially crashes.
 
@@ -362,15 +361,35 @@ On startup, the debugger picks the session-name to use, which can be controlled 
  * If --session=-, a "temporary" session is used, named "temp-<number>". The only difference from default mode is that state is not saved.
  * If --session=--, the debugger won't touch any files at all (won't create `~/.nnd` etc). The debugged program's stdout and stderr are redirected to /dev/null. The log file is not written.
 
-Session directory path is shown in UI in the status window (on the left).
+Session directory path is shown in UI in the 'status' window (on the left).
 
 When using `sudo nnd -p`, keep in mind that the `~/.nnd` will be in the home directory of the root user, not the current user."###),
-        HelpParagraph::Tty => styled_write!(text, palette.default, r###"The debugger occupies the whole terminal with its TUI. But what if the debugged program also wants to use the terminal in an interactive way?
-E.g. how to use nnd to debug itself?
+        HelpParagraph::Misc => styled_write!(text, palette.default, r###"Appendix: additional random notes.
 
-One way is to just attach using -p <pid>.
+Additional flags:
+  --no-pty   - don't create a tty for the debugged program; instead, redirect its stdout and stderr to files in ~/.nnd/<session-name>/{{stdout,stderr}}, and stdin to /dev/null
+  --external-tty <file>   - redirect stdout, stderr, and stdin to the same file
+  --echo-input   - run a tool that prints names of all pressed keys, in format suitable for the key bindings config file (see ~/.nnd/keys.default); --mouse-mode can be specified *before* --echo-input to also print mouse events (which can't be used in key config)
+  --load-symbols <path>   - load debug info from a given binary and exit; useful for benchmarking or debugging debug info loading
+  --fixed-fps, --period <seconds>   - some rendering debug options
+  --verbose   - print more info to ~/.nnd/<session-name>/log
+  --num-threads <n>   - how many threads to use for things like loading debug info; default is the number of cpu cores (or hyperthreads) minus one
+  --aslr   - do not disable address space layout randomization
+  --version   - print version number and build time
 
-But what if you need to set breakpoints before the program starts, e.g. to debug a crash on startup? Then you can do the following:
+When debugging a large executable (a few GB):
+ * Debugger will use a lot of memory, ~4x the executable size. E.g. ~20 GB for a 5 GB executable.
+ * Debugger will spend the first few seconds to tens of seconds loading debug info. During this time, the program can already run, and the UI is usable,
+   and you can already see the list of threads and pause the program etc, but you won't see source code and can't use breakpoints and stepping.
+   Loading speed scales well with the number of CPU cores (e.g. runs very fast on a 64-core threadripper).
+
+Thread search ('/' in the 'threads' window) is not fuzzy, searches through the whole stack trace of each thread, matching function names and file names.
+
+File search ('o' in the 'code' window) only sees files mentioned in the debug info, it doesn't look at the filesystem.
+
+When debugging a terminal application, the terminal can be seen and interacted with in the 'console' window. It uses a terminal emulator built into nnd.
+This can be nested to arbitrarily depth, e.g. you can do `nnd nnd nnd nnd` and see a matryoshka of 4 nnd TUIs, all functioning and interactable (using the '[click to capture all keys]' button on all levels).
+Alternatively, you can make the debuggee use tty of another terminal window (e.g. another tab in iTerm2 or kitty), like this:
  1. Open a terminal window (in terminal application or tmux or whatever). Let's call this window A. This is where you'll be able interact with the debugged program.
  2. This terminal window is attached to some 'pty' pseudo-device in /dev/pts/ . Figure out which one:
      $ ls -l /proc/$$/fd | grep /dev/pts/
@@ -378,77 +397,21 @@ But what if you need to set breakpoints before the program starts, e.g. to debug
  3. Pacify the shell in this terminal window (to prevent it from eating input):
      $ sleep inf
  4. In another terminal window (B) run the debugger:
-     $ nnd --tty /dev/pts/2 the_program_to_debug
+     $ nnd --external-tty /dev/pts/2 the_program_to_debug
  5. Now you have the debugger running in window B while the debugged program inhabits the terminal in window A
     (which will come to life when you resume the program in the debugger, `sleep` notwithstanding).
-
-The latter approach is often more convenient than -p, even when both approaches are viable.
-
 This doesn't work if the program uses /dev/tty, which doesn't get redirected.
+(This can even be chained multiple levels deep: `nnd --external-tty /dev/pts/1 nnd --external-tty /dev/pts/2 my_program`. The longest chain I've used in practice is 4 nnd-s + 1 other program.)
 
-(This can even be chained multiple levels deep: `nnd --tty /dev/pts/1 nnd --tty /dev/pts/2 my_program`. The longest chain I've used in practice is 4 nnd-s + 1 other program.)"###),
-        HelpParagraph::Features => styled_write!(text, palette.default, r###"Appendix: raw list of features (optional reading) (a little outdated)
+Underdeveloped feature: locations window. Tells where each variable lives (register, memory location, expression, etc), for the selected line in the 'disassembly' window. Currently it just prints the DWARF expression, which is inconvenient to read.
 
-loading debug info
-  progress bar in the binaries window (top right)
-  multithreaded, reasonably fast
-  debugger is functional while debug info is loading, but there won't be line numbers or function names, etc
-  after debug info is loaded, everything is automatically refreshed, so things like function names and source code appear
-  supports DWARF 4 and 5, debuglink, compressed ELF sections
-threads window (bottom right)
-  color tells the stop reason
-  search
-    not fuzzy
-    matches function name and file name
-stack trace window (right)
-  when switching frame, jumps to the location in disassembly and source code
-source code window (bottom)
-  makes some attempts to guess the correct path, if it doesn't match between the debug info and the local filesystem
-  file search
-    fuzzy
-    only sees files mentioned in the debug info
-  shows statements and inlined calls
-  scrolls disassembly window when moving cursor
-    can cycle through locations if multiple
-    prioritizes locations close to disassembly window cursor
-  breakpoints
-  shows URL for rust standard library files
-stepping
-  into-instruction, into-line, over-instruction, over-line, over-column (useful for function arguments), out of inlined function, out of real function
-  aware of inlined functions
-  frame-dependent (e.g. step-out steps out of the selected stack frame, not the top stack frame; similar for step-over)
-    disables breakpoints for the duration of the step
-disassembly window (top)
-  shows inlined functions
-  scrolls source window when moving cursor
-    can change inline depth
-  function search
-    fuzzy
-    mangled :(
-    shows file:line
-  shows breakpoint locations (for breakpoints added in the source code window)
-watches, locals, registers (bottom left)
-  tree
-  automatic downcasting of virtual classes to the most concrete type
-  expression language (see --help-watches)
-breakpoints (top right, second tab)
-  aware of inlined functions
-  can be disabled
-  jump to location when selecting in the breakpoints window
-  shows adjusted line
-data breakpoints
-autosaving/restoring state
-  see --help-files
-obscure feature: locations window
-  tells where each variable lives (register, memory location, expression, etc) (actually it just prints the DWARF expression)
-  for selected disassembly line
-secret feature: C-p for self-profiler
-secret feature: C-l to drop caches and redraw
-removing breakpoints on exit
-  if the debugger is attached with -p, and some breakpoints are active, it's an important job of the debugger to deactivate all breakpoints when detaching
-  otherwise the detached process will get SIGTRAP and crash as soon as it hits one of the leftover breakpoints
-  nnd correctly removes breakpoints when exiting normally, or exiting with an error, or exiting with a panic (e.g. failed assert)
-  but it doesn't remove breakpoints if the debugger receives a fatal signal (e.g. SIGSEGV or SIGKILL)"###),
+Secret feature: C-p for self-profiler.
+
+Secret feature: C-l to drop caches, redraw, and re-read source code files from disk. If this key helps for anything other than reloading updated source code (e.g. ui gets messed up, and hitting this key unbreaks it), it's a bug (please report it).
+
+Removing breakpoints on exit. If the debugger is attached with -p, and some breakpoints are active, it's an important job of the debugger to deactivate all breakpoints when detaching.
+Otherwise the detached process will get SIGTRAP and crash as soon as it hits one of the leftover breakpoints. nnd correctly removes breakpoints when exiting normally, or exiting with an error, or exiting with a panic (e.g. failed assert).
+But it doesn't remove breakpoints if the debugger receives a fatal signal (e.g. SIGSEGV or SIGKILL)."###),
         HelpParagraph::Licenses => styled_write!(text, palette.default_dim, "{}", LICENSES_DOC),
     }
 }
@@ -463,34 +426,25 @@ pub fn run_input_echo_tool(mouse_mode: MouseMode) -> Result<()> {
     let mut commands: Vec<u8> = Vec::new();
     loop {
         // Read keys.
-        let mut evs: Vec<Event> = Vec::new();
-        let mut raw: Vec<(Vec<u8>, /*skipped*/ bool)> = Vec::new();
-        reader.read(&mut evs, &mut prof, Some(&mut raw))?;
+        let mut evs: Vec<EventInfo> = Vec::new();
+        reader.read(&mut evs, &mut prof)?;
 
-        let mut evs_idx = 0;
-        for (bytes, skipped) in raw {
-            let mut line;
-            if skipped {
-                line = "unknown".to_string();
-            } else {
-                line = match evs[evs_idx] {
-                    Event::Key(key) => {
-                        // Exit on 'q'.
-                        if key.key == Key::Char('q') && key.mods.is_empty() {
-                            return Ok(());
-                        }
-                        format!("{}", key)
+        for ev in evs {
+            let mut line = match &ev.ev {
+                Event::Key(key) => {
+                    // Exit on 'q'.
+                    if key.key == Key::Char('q') && key.mods.is_empty() {
+                        return Ok(());
                     }
-                    Event::Mouse(mouse) => format!("{:?}", mouse),
-                    Event::FocusIn => "focus in".to_string(),
-                    Event::FocusOut => "focus out".to_string(),
-                };
-                evs_idx += 1;
-            }
-            write!(line, "  0x{}", hexdump(&bytes, 100)).unwrap();
+                    format!("{}", key)
+                }
+                Event::Mouse(mouse) => format!("{:?}", mouse),
+                Event::FocusIn => "focus in".to_string(),
+                Event::FocusOut => "focus out".to_string(),
+            };
+            write!(line, "  0x{}", hexdump(ev.bytes.as_slice(), 100)).unwrap();
             lines.push(line);
         }
-        assert_eq!(evs_idx, evs.len());
 
         if lines.len() > 200 {
             lines.drain(..lines.len()-200);

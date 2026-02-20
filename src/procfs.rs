@@ -46,7 +46,8 @@ impl Ord for SpecialSegmentId {
 }
 impl PartialOrd for SpecialSegmentId { fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) } }
 impl SpecialSegmentId {
-    fn is_vdso(&self) -> bool { match self { Self::Vdso(_) => true, _ => false } }
+    pub fn is_none(&self) -> bool { match self { Self::None => true, _ => false } }
+    pub fn is_vdso(&self) -> bool { match self { Self::Vdso(_) => true, _ => false } }
 }
 
 // VMA from /proc/<pid>/maps . (This codebase uses the word "mmap" or "map" instead of "VMA" because I didn't know what they're called, sorry, feel free to rename.)
