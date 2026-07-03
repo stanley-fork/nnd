@@ -54,7 +54,6 @@ pub struct ElfFile {
     pub text_section: Option<usize>,
 
     pub is_core_dump: bool,
-    pub is_reconstructed: bool, // fake ELF assembled from pieces available in a core dump
 
     pub build_id: Option<Vec<u8>>,
 
@@ -484,150 +483,6 @@ pub fn extract_build_id_from_mapped_elf(memory: &MemReader, addr: usize, len: us
     err!(MalformedExecutable, "{}", if have_notes_out_of_bounds {"NOTE segment not mapped"} else {"no NOTE segment"})
 }
 
-// Situation: the user opened a core dump produced on another machine, and the crashed process used some dynamic libraries that is not available on this machine (e.g. a different version of libc),
-// and we failed to find it in debuginfod etc. If we do nothing, the debugger won't even be able to unwind stack through this library, which usually makes the debugger useless.
-// We really want to at least get .eh_frame, and maybe also .dynsym and .dynstr (for function names). But they're usually mapped and resident in memory, so are usually present in the core dump.
-// This function extracts these sections (whichever are available) and puts them together into a fake "ElfFile".
-// ... After implementing this, I noticed that usually core dumps don't have .eh_frame anyway. Either it's usually not resident or the core dump code excludes it. Oops. This code can probably be removed.
-pub fn reconstruct_elf_from_mapped_parts(name: String, memory: &Arc<CoreDumpMemReader>, maps: MemMapsInfo, elf_prefix_addr: Range<usize>) -> Result<ElfFile> {
-    let mut reader = CachedMemReader::new(MemReader::CoreDump(memory.clone()));
-    let mut header: libc::Elf64_Ehdr;
-    unsafe {
-        header = mem::zeroed();
-        reader.read(elf_prefix_addr.start, slice::from_raw_parts_mut(&raw mut header as *mut u8, mem::size_of::<libc::Elf64_Ehdr>()))?;
-    }
-    if &header.e_ident[..4] != &[0x7f, 0x45, 0x4c, 0x46] { return err!(MalformedExecutable, "invalid ELF magic bytes: {}", hexdump(&header.e_ident[..4], 100)); }
-    let phdr_size = mem::size_of::<libc::Elf64_Phdr>();
-    if (header.e_phentsize as usize) < phdr_size { return err!(MalformedExecutable, "section header size too small: {}", header.e_phentsize); }
-
-    let mut elf = ElfFile {name, segments: Vec::new(), sections: Vec::new(), entry_point: 0, section_by_offset: Vec::new(), section_by_name: HashMap::new(), text_section: None, is_core_dump: false, is_reconstructed: true, build_id: None, mmapped: None, owned: Vec::new(), data: &[], r_debug_ptr_addr: None, interp: None};
-
-    // Find .eh_frame, .text (very roughly), .dynstr, .dynsym.
-
-    // Assume that all segments that we care about are loaded at addresses with the same offset relative to their addresses in segment headers.
-    // And that one of the segments starts at file offset 0, which is how we're able to get the elf file header at all.
-    // And that the file-offset-0 segment is listed earlier than any other segments we care about.
-    let mut addr_static_to_dynamic = 0usize;
-    let mut found_map_at_offset_zero = false;
-
-    let mut longest_executable_segment: (Vec<u8>, /*addr*/ usize, /*offset*/ usize) = (Vec::new(), 0, 0);
-    for idx in 0..header.e_phnum as usize {
-        let offset = idx.saturating_mul(header.e_phentsize as usize).saturating_add(header.e_phoff as usize);
-        if offset.saturating_add(phdr_size) > elf_prefix_addr.len() {
-            return err!(MalformedExecutable, "segment header is outside of mapped range");
-        }
-        let mut segment: libc::Elf64_Phdr;
-        unsafe {
-            segment = mem::zeroed();
-            reader.read(offset.saturating_add(elf_prefix_addr.start), slice::from_raw_parts_mut(&raw mut segment as *mut u8, phdr_size))?;
-        }
-
-        if segment.p_memsz == 0 || segment.p_filesz == 0 {
-            continue;
-        }
-
-        if segment.p_offset == 0 {
-            addr_static_to_dynamic = elf_prefix_addr.start.wrapping_sub(segment.p_vaddr as usize);
-            found_map_at_offset_zero = true;
-        }
-        let segment_addr = (segment.p_vaddr as usize).wrapping_add(addr_static_to_dynamic);
-
-        match segment.p_type {
-            PT_GNU_EH_FRAME => {
-                if !found_map_at_offset_zero { return err!(Dwarf, "got .eh_frame before segment with offset zero"); }
-
-                // EH_FRAME segment is .eh_frame_hdr section. But we want .eh_frame, which is usually somewhere in the middle of another segment.
-                // Parse the beginning of .eh_frame_hdr to get the address of .eh_frame start.
-                let mut buf = [0u8; 4];
-                match reader.read(segment_addr, &mut buf) {
-                    Ok(()) => (),
-                    Err(_) => return err!(ProcessState, "EH_FRAME segment is not in the core dump (addr 0x{:x} + 0x{:x})", segment.p_vaddr, addr_static_to_dynamic),
-                }
-                let encoding = buf[1];
-                let mut addr = segment_addr + 4;
-                let eh_frame_addr = match encoding & 0xf {
-                    0xf => return err!(Dwarf, "EH_FRAME doesn't have a pointer to .eh_frame"),
-                    0x1 => reader.eat_uleb128(&mut addr)?,
-                    0x9 => reader.eat_sleb128(&mut addr)? as usize,
-                    0x2 => reader.read_u16(addr)? as usize,
-                    0x3 => reader.read_u32(addr)? as usize,
-                    0x4 | 0xc => reader.read_usize(addr)?,
-                    0xa => reader.read_u16(addr)? as i16 as isize as usize,
-                    0xb => reader.read_u32(addr)? as i32 as isize as usize,
-                    _ => return err!(Dwarf, "EH_FRAME has unexpected pointer encoding: {}", encoding),
-                };
-                let eh_frame_addr = match encoding & 0xf0 {
-                    0x00 => eh_frame_addr,
-                    0x10 => eh_frame_addr.wrapping_add(segment_addr + 4),
-                    0x30 => eh_frame_addr.wrapping_add(segment_addr),
-                    _ => return err!(Dwarf, "EH_FRAME has unexpected pointer encoding: {}", encoding),
-                };
-
-                // Neither .eh_frame_hdr nor .eh_frame header has the size of .eh_frame, ugh. So we scan .eh_frame to find the null terminator (idk whether it's always present, but in the one binary I looked at it was).
-                let mut data: Vec<u8> = Vec::new();
-                loop {
-                    let len = reader.read_u32(eh_frame_addr + data.len())?;
-                    data.extend_from_slice(&len.to_le_bytes());
-                    if len == 0 {
-                        break;
-                    }
-                    let mut len = len as usize;
-                    if len == u32::MAX as usize {
-                        len = reader.read_usize(eh_frame_addr + data.len())? as usize;
-                        data.extend_from_slice(&len.to_le_bytes());
-                    }
-                    if data.len().saturating_add(len) > 1<<32 {
-                        return err!(Sanity, "suspiciously long .eh_frame in core dump: >= {} + {} bytes", data.len(), len);
-                    }
-                    let prev_len = data.len();
-                    data.resize(data.len() + len, 0u8);
-                    reader.read(eh_frame_addr + prev_len, &mut data[prev_len..])?;
-                }
-
-                let section = ElfSection {idx: elf.sections.len(), name: ".eh_frame".to_string(), section_type: SHT_PROGBITS, flags: 0, address: eh_frame_addr.wrapping_sub(addr_static_to_dynamic), offset: elf.owned.len(), size: data.len(), link: 0, info: 0, alignment: 0, entry_size: 0, name_offset_in_strtab: 0, compression_header: None, decompressed_data: OnceLock::new()};
-                elf.owned.append(&mut data);
-                elf.sections.push(section);
-            }
-            PT_DYNAMIC => {
-                if !found_map_at_offset_zero { return err!(Dwarf, "got .dynamic before segment with offset zero"); }
-                // (Here we should parse the contents of this segment to find address+size of .dynstr and address of .dynsym)
-            }
-            _ if segment.p_flags & PF_X != 0 => {
-                if !found_map_at_offset_zero { return err!(Dwarf, "got executable segment before segment with offset zero"); }
-
-                if segment.p_memsz > 16<<30 {
-                    return err!(Sanity, "suspiciously long executable segment: {} bytes", segment.p_memsz);
-                }
-                if segment.p_memsz as usize > longest_executable_segment.0.len() {
-                    longest_executable_segment.0.resize(segment.p_memsz as usize, 0u8);
-                    memory.read_best_effort(segment_addr, &mut longest_executable_segment.0[..]);
-                    longest_executable_segment.1 = segment_addr;
-                    longest_executable_segment.2 = segment.p_offset as usize;
-                }
-            }
-            _ => (),
-        }
-    }
-
-    let section = ElfSection {idx: elf.sections.len(), name: ".text".to_string(), section_type: SHT_PROGBITS, flags: 0, address: longest_executable_segment.1.wrapping_sub(addr_static_to_dynamic), offset: longest_executable_segment.2, size: longest_executable_segment.0.len(), link: 0, info: 0, alignment: 0, entry_size: 0, name_offset_in_strtab: 0, compression_header: None, decompressed_data: OnceLock::new()};
-    elf.owned.append(&mut longest_executable_segment.0);
-    elf.text_section = Some(elf.sections.len());
-    elf.sections.push(section);
-
-    for idx in 0..elf.sections.len() {
-        let section = &elf.sections[idx];
-        if section.size > 0 {
-            elf.section_by_offset.push((section.offset, section.offset + section.size, idx));
-        }
-        elf.section_by_name.insert(section.name.clone(), idx);
-    }
-    elf.section_by_offset.sort_unstable_by_key(|t| t.0);
-    elf.owned.reserve_exact(ELF_PAD_RIGHT);
-    elf.data = unsafe {mem::transmute(&elf.owned[..])};
-
-    Ok(elf)
-}
-
 // Read the ELF headers.
 fn open_elf(name: String, file: Option<(&File, /*file_len*/ usize)>, mut owned: Vec<u8>) -> Result<ElfFile> {
     let len;
@@ -703,7 +558,7 @@ fn open_elf(name: String, file: Option<(&File, /*file_len*/ usize)>, mut owned: 
 
     let data: &'static [u8] = unsafe {mem::transmute(data)};
 
-    let mut elf = ElfFile {name, mmapped, owned, data, segments, sections, entry_point, section_by_offset: Vec::new(), section_by_name: HashMap::new(), text_section: None, is_core_dump, is_reconstructed: false, build_id: None, r_debug_ptr_addr: None, interp: None};
+    let mut elf = ElfFile {name, mmapped, owned, data, segments, sections, entry_point, section_by_offset: Vec::new(), section_by_name: HashMap::new(), text_section: None, is_core_dump, build_id: None, r_debug_ptr_addr: None, interp: None};
 
     for idx in 0..elf.sections.len() {
         let name = unsafe{elf.str_from_strtab(elf.sections[header.e_shstrndx as usize].offset, elf.sections[idx].name_offset_in_strtab as usize)?}.to_string();

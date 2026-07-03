@@ -14,7 +14,7 @@ impl Executor {
         let mut exec = Self {num_threads, shared: Arc::new(Shared {tasks: Mutex::new(VecDeque::new()), wake_workers: Condvar::new()}), threads: Vec::new()};
         for i in 0..num_threads {
             let shared_clone = exec.shared.clone();
-            exec.threads.push(thread::Builder::new().name("debworker".into()).spawn(|| Self::worker_thread(shared_clone)).unwrap());
+            exec.threads.push(thread::Builder::new().name("nndworker".into()).spawn(|| Self::worker_thread(shared_clone)).unwrap());
         }
         exec
     }

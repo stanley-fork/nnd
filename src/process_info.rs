@@ -184,14 +184,10 @@ pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) -> /*binaries_add
             Some(id) => debugger.symbols.get_mut(*id).unwrap(),
             None => {
                 let mut build_id: Option<Vec<u8>> = None;
-                let mut reconstruction: Option<BinaryReconstructionInput> = None;
                 if map.offset == 0 {
                     match extract_build_id_from_mapped_elf(&debugger.memory, map.start, map.len) {
                         Ok(id) => build_id = Some(id),
                         Err(e) => eprintln!("warning: couldn't extract build id from mapped binary {}: {}", locator.path, e),
-                    }
-                    if let MemReader::CoreDump(mem) = &debugger.memory {
-                        reconstruction = Some(BinaryReconstructionInput {memory: mem.clone(), maps: debugger.info.maps.clone(), elf_prefix_addr: map.start..map.start+map.len});
                     }
                 }
                 if let Some(id) = &build_id {
@@ -211,7 +207,7 @@ pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) -> /*binaries_add
                     locator.inode == debugger.info.exe_inode
                 };
                 found_main_binary |= is_main_binary;
-                debugger.symbols.add(locator.clone(), &debugger.memory, custom_path, build_id, is_main_binary, reconstruction)
+                debugger.symbols.add(locator.clone(), &debugger.memory, custom_path, build_id, is_main_binary)
             }
         };
         map.binary_id = Some(bin.id);
@@ -223,9 +219,7 @@ pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) -> /*binaries_add
         if !map.elf_seen {
             if let Ok(elves) = &bin.elves {
                 map.elf_seen = true;
-                if !elves[0].is_reconstructed {
-                    new_elves.push((map.start..map.start+map.len, map.offset, elves[0].clone()));
-                }
+                new_elves.push((map.start..map.start+map.len, map.offset, elves[0].clone()));
             }
         }
     }
