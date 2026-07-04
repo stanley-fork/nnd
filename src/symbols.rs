@@ -2358,7 +2358,13 @@ impl<'a> DwarfLoader<'a> {
     // `fields` must use the same field numbering as CommonAttributes.
     fn chase_origin_pointers(shard: &mut SymbolsLoaderShard, loader: &SymbolsLoader, initial_attribute_context: &AttributeContext, mut specification_or_origin: DwarfReference, name: &mut &'static str, linkage_name: &mut &'static str, type_: &mut usize, decl: &mut DwarfCodeLocation, fields: &mut u32) -> Result<()> {
         let mut attribute_context = Cow::Borrowed(initial_attribute_context);
+        let mut steps = 0usize;
         while *fields & DwarfReference::HAS_SPECIFICATION_OR_ABSTRACT_ORIGIN != 0 {
+            // Guard against cycles in malformed DWARF.
+            steps += 1;
+            if steps > 100 {
+                return err!(Dwarf, "specification/abstract_origin chain too long or cyclic");
+            }
             let next_offset = if *fields & DwarfReference::GLOBAL != 0 {
                 let unit_idx = loader.sym.units.partition_point(|u| u.offset.0 <= specification_or_origin.offset);
                 let u = &loader.sym.units[unit_idx.saturating_sub(1)];

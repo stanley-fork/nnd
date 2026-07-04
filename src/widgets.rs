@@ -1338,8 +1338,7 @@ impl TextInput {
         }
         let i = pos[1].max(0).min(self.lines.len() as isize - 1) as usize;
         let (start_x, mut range) = self.lines[i].clone();
-        if i + 1 < self.lines.len() {
-            // Exclude the '\n'.
+        if self.text[..range.end].ends_with('\n') {
             range.end -= 1;
         }
         let (j, _, _, _) = str_prefix_with_width(&self.text[range.clone()], (pos[0] - start_x).max(0) as usize);

@@ -2314,8 +2314,11 @@ impl DisassemblyWindow {
                 }
             }
             if let Some(line) = source_line_info {
-                let file = &symbols.files[line.file_idx().unwrap()];
-                source_line = Some(SourceScrollTarget {path: file.path.to_owned(), version: Some(file.version.clone()), line: line.line(), cascade: false});
+                // file_idx() can be None, e.g. if the subfunction's DW_AT_call_file is missing or invalid.
+                if let Some(file_idx) = line.file_idx() {
+                    let file = &symbols.files[file_idx];
+                    source_line = Some(SourceScrollTarget {path: file.path.to_owned(), version: Some(file.version.clone()), line: line.line(), cascade: false});
+                }
             }
         }
         let key = (binary.id, function_idx, tab.area_state.cursor, tab.selected_subfunction_level);
@@ -4057,12 +4060,25 @@ impl CodeWindow {
                 if line_chars_start + column >= text.chars.len() {
                     unsafe {text.chars.as_mut_vec().resize(line_chars_start + column + 1, b' ');}
                 }
-                let prev_span_end = text.spans.last().unwrap().0;
-                assert!(line_chars_start + column >= prev_span_end);
-                if line_chars_start + column > prev_span_end {
-                    text.spans.push((line_chars_start + column, palette.default));
+                // The column is untrusted and may be misaligned with the rendered line (tab expansion, from_utf8_lossy replacements, character- vs byte-based columns), so it can point into the middle of a multibyte character. Snap to char boundaries.
+                let mut start_pos = line_chars_start + column;
+                while !text.chars.is_char_boundary(start_pos) {
+                    start_pos -= 1;
                 }
-                text.spans.push((line_chars_start + column + 1, if marker.flags().contains(LineFlags::INLINED_FUNCTION) {palette.code_inlined_site} else {palette.code_statement}));
+                let mut end_pos = start_pos + 1;
+                while !text.chars.is_char_boundary(end_pos) {
+                    end_pos += 1;
+                }
+                let prev_span_end = text.spans.last().unwrap().0;
+                if start_pos < prev_span_end {
+                    // Landed on a character already covered by the previous marker.
+                    *marker_idx += 1;
+                    continue;
+                }
+                if start_pos > prev_span_end {
+                    text.spans.push((start_pos, palette.default));
+                }
+                text.spans.push((end_pos, if marker.flags().contains(LineFlags::INLINED_FUNCTION) {palette.code_inlined_site} else {palette.code_statement}));
                 *marker_idx += 1;
             }
             text.close_span(palette.default);

@@ -1044,6 +1044,10 @@ impl TypesLoader {
         self.units.partition_point(|u| u.data[0] <= key).saturating_sub(1)
     }
     fn find_offset(&self, offset: DieOffset) -> (/*shard*/ usize, /*unit*/ usize, Option<&TypeLoadState>) {
+        if offset.0 >> 48 != 0 {
+            // Garbage offset from malformed DWARF; take the graceful "<bad DIE offset>" path instead of tripping the assert in offset_comparison_key().
+            return (0, 0, None);
+        }
         let i = self.offset_to_unit(offset);
         let u = &self.units[i];
         let s = u.shard();
