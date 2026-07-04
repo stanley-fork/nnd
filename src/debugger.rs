@@ -972,7 +972,7 @@ impl Debugger {
                         if self.context.settings.trace_logging { eprintln!("trace: thread {} stopped by signal {} {}", tid, signal, signal_name(signal)); }
                         thread.pending_signal = Some(signal);
 
-                        if [libc::SIGSEGV, libc::SIGABRT, libc::SIGILL, libc::SIGFPE].contains(&signal) {
+                        if [libc::SIGSEGV, libc::SIGABRT, libc::SIGILL, libc::SIGFPE, libc::SIGBUS, libc::SIGSYS].contains(&signal) {
                             let mut si: libc::siginfo_t;
                             si = mem::zeroed();
                             ptrace(PTRACE_GETSIGINFO, tid, 0, &mut si as *mut _ as u64)?;

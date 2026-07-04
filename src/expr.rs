@@ -243,7 +243,7 @@ impl AddrOrValueBlob {
 
     pub fn byte_range(&self, offset: Range<usize>, memory: &mut CachedMemReader) -> Result<Self> {
         match self {
-            &Self::Addr(addr) if addr > usize::MAX - offset.start => err!(ProcessState, "address overflow: 0x{} + {}", addr, offset.start),
+            &Self::Addr(addr) if addr > usize::MAX - offset.start => err!(ProcessState, "address overflow: 0x{:x} + {}", addr, offset.start),
             &Self::Addr(addr) => Ok(Self::Addr(addr + offset.start)),
             Self::Blob(blob) => Ok(Self::Blob(blob.byte_range(offset)?)),
         }
@@ -255,8 +255,8 @@ impl AddrOrValueBlob {
         let byte_offset = bit_offset.start/8..(bit_offset.end+7)/8;
         match self {
             Self::Blob(b) => {
-                if bit_offset.end > b.capacity() * 64 {
-                    return err!(Dwarf, "value too short: ~{} < {}", b.capacity(), (bit_offset.end + 63) / 64);
+                if bit_offset.end > b.capacity() * 8 {
+                    return err!(Dwarf, "value too short: ~{} < {}", b.capacity(), (bit_offset.end + 7) / 8);
                 }
                 a[..byte_offset.len()].copy_from_slice(&b.as_slice()[byte_offset.clone()]);
             }

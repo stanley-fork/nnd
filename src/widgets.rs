@@ -151,7 +151,7 @@ pub fn scrolling_navigation(scroll: &mut isize, scroll_to: Option<Range<isize>>,
                     } else if i as isize > slider_y && (i as isize) < slider_y + slider_height as isize {
                         styled_write!(ui.text, ui.palette.scroll_bar_slider, "┃");
                     } else {
-                        styled_write!(ui.text, ui.palette.scroll_bar_slider, "│");
+                        styled_write!(ui.text, ui.palette.scroll_bar_background, "│");
                     }
                     ui.text.close_line();
                 }

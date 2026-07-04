@@ -466,8 +466,8 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                     let mut x = to_basic(&lhs, &mut context.memory, "&&/||")?.cast_to_usize() != 0;
                     if x == (op == BinaryOperator::LazyAnd) {
                         // Not ideal that short-circuiting also skips typechecking.
-                        let rhs = eval_expression(expr, node.children[1], state, context, false)?;
-                        follow_references_and_prettify(&mut lhs, None, false, state, context)?;
+                        let mut rhs = eval_expression(expr, node.children[1], state, context, false)?;
+                        follow_references_and_prettify(&mut rhs, None, false, state, context)?;
                         x = to_basic(&rhs, &mut context.memory, "&&/||")?.cast_to_usize() != 0;
                     }
                     let type_ = state.builtin_types.bool_;
@@ -718,8 +718,8 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                         let (x, y) = (a.cast_to_isize(), b.cast_to_isize());
                         BasicValue::I(match op {
                             BinaryOperator::Mul => x.wrapping_mul(y),
-                            BinaryOperator::Div => x.div_euclid(y),
-                            BinaryOperator::Rem => x.rem_euclid(y),
+                            BinaryOperator::Div => x.wrapping_div_euclid(y),
+                            BinaryOperator::Rem => x.wrapping_rem_euclid(y),
                             _ => panic!("huh"),
                         })
                     } else {

@@ -250,6 +250,7 @@ pub fn parse_core_dump(elf: Arc<ElfFile>) -> Result<(CoreDumpMemReader, Vec<(pid
             ranges[i-1].size = diff;
         }
     }
+    ranges.retain(|r| r.size > 0);
 
     let mut threads: Vec<(pid_t, ThreadInfo, Option<i32>)> = Vec::new();
     let mut maps: Vec<MemMapInfo> = Vec::new();
@@ -437,7 +438,7 @@ pub fn extract_build_id_from_mapped_elf(memory: &MemReader, addr: usize, len: us
     }
     if &header.e_ident[..4] != &[0x7f, 0x45, 0x4c, 0x46] { return err!(MalformedExecutable, "invalid ELF magic bytes: {}", hexdump(&header.e_ident[..4], 100)); }
     let phdr_size = mem::size_of::<libc::Elf64_Phdr>();
-    if (header.e_phentsize as usize) < phdr_size { return err!(MalformedExecutable, "section header size too small: {}", header.e_phentsize); }
+    if (header.e_phentsize as usize) < phdr_size { return err!(MalformedExecutable, "program header entry size too small: {}", header.e_phentsize); }
 
     let mut have_notes_out_of_bounds = false;
     for idx in 0..header.e_phnum as usize {

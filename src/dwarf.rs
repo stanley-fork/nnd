@@ -225,7 +225,7 @@ impl SliceReader {
     pub fn skip_leb128(&mut self) {
         let chunk = unsafe {ptr::read_unaligned(self.p as *const usize)};
         let mut bytes = ((((!chunk) & 0x8080808080808080).trailing_zeros() >> 3) + 1) as usize;
-        if bytes == 8 {
+        if bytes == 9 {
             let high: u8 = unsafe {*self.p.add(8)};
             bytes += (high >> 7) as usize;
         }

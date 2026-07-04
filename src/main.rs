@@ -325,7 +325,7 @@ fn main() {
     }
 
     if attach_pid.is_none() && command_line.is_none() && core_dump_path.is_none() {
-        eprintln!("usage: {} (-p pid | executable_path [args..] | [-c] core_dump_path [[--exe] executable_path] | --help)", all_args[0]);
+        eprintln!("usage: {} (-p pid | executable_path [args..] | [-c] core_dump_path [executable_path] | --help)", all_args[0]);
         process::exit(1);
     }
     if (attach_pid.is_some() as usize) + (command_line.is_some() as usize) + (core_dump_path.is_some() as usize) > 1 {
@@ -333,7 +333,7 @@ fn main() {
         process::exit(1);
     }
     if command_line.is_none() && (settings.stdin_file.is_some() || settings.stdout_file.is_some() || settings.stderr_file.is_some()) {
-        eprintln!("--stdin/--stdout/--stderr/--tty are not allowed with --pid or --core");
+        eprintln!("--stdin/--stdout/--stderr/--external-tty are not allowed with --pid or --core");
         process::exit(1);
     }
 

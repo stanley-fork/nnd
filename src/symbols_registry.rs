@@ -178,10 +178,8 @@ impl SymbolsRegistry {
     // Call after event_fd() was notified.
     // Returns true if something was loaded and the caller should drop caches.
     pub fn process_events(&mut self) -> bool {
-        {
-            let n = self.shared.wake_main_thread.read();
-            assert!(n > 0);
-        }
+        // (May return 0 on spurious epoll wakeup, that's fine, the message queue will just be empty.)
+        self.shared.wake_main_thread.read();
         let mut lock = self.shared.to_main_thread.lock().unwrap();
         while let Some(message) = lock.pop_front() {
             match message {
@@ -242,7 +240,7 @@ impl SymbolsRegistry {
                     break; // use just one supplementary binary, in case the user accidentally passed multiple copies of the same file
                 }
                 if name_matches {
-                    warnings.push(format!("supplementary build id mismatch: {} loaded in the program, {} in supplementary file {:?}", hexdump(build_id.as_ref().unwrap(), 1000), hexdump(b.elf.build_id.as_ref().unwrap(), 1000), file_name.clone().unwrap()));
+                    warnings.push(format!("supplementary build id mismatch: {} loaded in the program, {} in supplementary file {:?}", hexdump(build_id.as_ref().unwrap(), 1000), b.elf.build_id.as_ref().map_or("none".to_string(), |x| hexdump(x, 1000)), file_name.clone().unwrap()));
                 }
             } else if file_name.is_some() {
                 if name_matches {

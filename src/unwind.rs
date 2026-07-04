@@ -581,7 +581,7 @@ fn eval_register_rule(reg: Option<RegisterIdx>, rule: &RegisterRule<usize>, enco
     let val = match rule {
         RegisterRule::Undefined => return Ok(None),
         RegisterRule::SameValue => match &reg {
-            None => return err!(Dwarf, "got same-value rule for unrecognized register"),
+            None => return Ok(None),
             Some(reg) => match registers.get(*reg) {
                 Err(_) => return err!(Dwarf, "register {} optimized away (in reg)", reg),
                 Ok(x) => x,
@@ -706,7 +706,6 @@ fn parse_itanium_lsda(mut lsda: usize, sorted_addr_ranges: &Vec<Range<usize>>, f
             }
             action_ptr = (action_ptr as isize + action_offset) as usize;
         }
-        break;
     }
     Ok(())
 }

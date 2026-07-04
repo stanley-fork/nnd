@@ -312,7 +312,7 @@ impl Registers {
 //  * 512 bytes - FXSAVE legacy region, ~same layout as user_fpregs_struct,
 //  * 64 bytes - XSAVE header, which is a bitmask telling which register sets are present,
 //  * ? bytes - extended area, where the available register sets live; the offset and size for each register set can be obtained using instruction CPID.(EAX=0xd, ECX=XFEATURE_*) -> (size=EAX, offset=EBX).
-// The highest-offset register set we support is AVX-512 Hi16_ZMM, at offset 1152, containing 16 x 64-byte register values.
+// The highest-offset register set we support is AVX-512 Hi16_ZMM, at offset 1664, containing 16 x 64-byte register values.
 const XSAVE_PREFIX_SIZE: usize = 512 + 64;
 const XSAVE_XMM_OFFSET: usize = 8 * 20;
 const XSAVE_MXCSR_OFFSET: usize = 8 * 3;

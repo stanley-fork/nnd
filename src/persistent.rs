@@ -210,8 +210,7 @@ impl PersistentState {
         };
 
         let mut buf: Vec<u8> = Vec::new();
-        let len = file.read_to_end(&mut buf)?;
-        buf.truncate(len);
+        file.read_to_end(&mut buf)?;
 
         let mut hasher = DefaultHasher::new();
         buf.hash(&mut hasher);
@@ -315,7 +314,7 @@ impl PersistentState {
 const STATE_FILE_MAGIC_NUMBER: usize = 0xe4b84e6353eb8214;
 
 pub fn open_dev_null() -> Result<fs::File> {
-    let fd = unsafe {libc::open("/dev/null\0".as_ptr() as *const i8, libc::O_RDWR, libc::O_CLOEXEC)};
+    let fd = unsafe {libc::open("/dev/null\0".as_ptr() as *const i8, libc::O_RDWR | libc::O_CLOEXEC)};
     if fd == -1 {
         return errno_err!("failed to open /dev/null");
     }

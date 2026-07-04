@@ -587,7 +587,7 @@ impl CoreDumper {
             // Also exclude maps we can't read (at least not using process_vm_readv): maps with no read permission
             // (usually guard pages with no useful information), [vvar], and [vsyscall].
             let file_backed = map.path.as_ref().is_some_and(|p| !p.starts_with("["));
-            let unreadable = !map.perms.contains(MemMapPermissions::READ) || map.path.as_ref().is_some_and(|p| p == "[vvar]" || p == "[vsyscall]");
+            let unreadable = !map.perms.contains(MemMapPermissions::READ) || map.path.as_ref().is_some_and(|p| p == "[vvar]" || p == "[vvar_vclock]" || p == "[vsyscall]");
             let skip = (file_backed && map.len > (20<<20)) || unreadable;
             // (Surely /proc/pid/maps can't have unaligned address ranges, but let's be paranoid.)
             let start = map.start & !(page_size - 1);
@@ -612,7 +612,7 @@ impl CoreDumper {
             e_flags: 0,
             e_ehsize: mem::size_of::<libc::Elf64_Ehdr>() as u16,
             e_phentsize: mem::size_of::<libc::Elf64_Phdr>() as u16,
-            e_phnum: ranges.len() as u16,
+            e_phnum: (ranges.len() + 1) as u16,
             e_shentsize: 0,
             e_shnum: 0,
             e_shstrndx: 0,

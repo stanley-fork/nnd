@@ -399,7 +399,7 @@ fn unravel_struct(substruct: &mut Substruct) {
 }
 
 fn is_field_vtable_ptr(f: &StructField) -> bool {
-    f.flags.contains(FieldFlags::ARTIFICIAL) && f.name.starts_with("_vptr$")
+    f.flags.contains(FieldFlags::ARTIFICIAL) && (f.name.starts_with("_vptr$") || f.name.starts_with("_vptr."))
 }
 
 fn find_vtable_ptr_field_offset(t: &TypeInfo, s: &StructType) -> Option<usize> {

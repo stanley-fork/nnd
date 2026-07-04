@@ -125,6 +125,7 @@ impl fmt::Debug for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match &self.error {
             &ErrorEnum::Code(code) => write!(f, "{}: {}", code as i64, self.message),
+            ErrorEnum::IO(error) if self.message.is_empty() => write!(f, "{}", error),
             ErrorEnum::IO(error) => write!(f, "{}: {}", self.message, error),
         }
     }

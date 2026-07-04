@@ -298,7 +298,7 @@ impl Layout {
                 // Rescale the children to add up to the size of the region they used to comprise.
                 for &child_id in &children {
                     let child = self.regions.get_mut(child_id);
-                    child.relative_size = child.relative_size * relative_size / total_size;
+                    child.relative_size = (child.relative_size * relative_size / total_size).max(1);
                 }
 
                 let parent_split = self.regions.get_mut(parent_id).content.as_split_mut();

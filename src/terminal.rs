@@ -78,7 +78,7 @@ impl ScreenBuffer {
         if (cell.style, cell.len_and_width) != (cell2.style, cell2.len_and_width) {
             return false;
         }
-        if cell.len_and_width & 64 <= 4 {
+        if cell.len_and_width & 63 <= 4 {
             return cell.data == cell2.data;
         }
         return self.unpack_grapheme(cell).0 == other.unpack_grapheme(cell2).0;
@@ -405,7 +405,7 @@ impl Display for Key {
             Key::Char('\n') => "enter",
             Key::Char('\t') => "tab",
             Key::Char(' ') => "space",
-            Key::Char('\\') => "\\\\", //////// ////////////////
+            Key::Char('\\') => "\\",
             Key::Char(c) if c.is_ascii() && !c.is_ascii_control() => return write!(f, "{}", c), 
             Key::Char(c) => return write!(f, "\\x{:02x}", c as u32),
             Key::Unknown => "unknown",

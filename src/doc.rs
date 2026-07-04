@@ -96,7 +96,7 @@ Create an issue at https://github.com/al13n321/nnd/issues"###);
 nnd command [args...]   - run a program under the debugger (i.e. just prepend 'nnd' to the command line)
 sudo nnd -p pid   - attach to an existing process
 nnd -c core_dump_path [executable_path]   - open core dump; -o flag (see below) is recommended if the core was produced on a different machine (with different version of libc than available locally)
-nnd --dump-core [--mode=direct|live|fork] -p pid > out   - instead of running the debugger, make a core dump snapshot of a running program, similar to gdump
+nnd --dump-core [--mode=direct|live|fork] -p pid > out   - instead of running the debugger, make a core dump snapshot of a running program, similar to gcore
 
 Additional arguments:
 --stdin/--stdout/--stderr path   - redirect stdin/stdout/stderr to file
@@ -290,7 +290,7 @@ Types:
  * Common primitive types are also always available by the following names: void, u8, u16, u32, u64, i8, i16, i32, i64, f32, f64, char8, char32, bool.
  * '* MyType' (without quotes) is pointer to MyType.
  * '[MyType; 100]' is array of 100 MyType-s.
- * '[MyType]' is an array of unknown length of MyType-s. Useful for casting simd registers: 'ymm3 as [u16]' (equivalent to 'ymm as [u16; 16]'), or other values: 'my_struct as [u64]'.
+ * '[MyType]' is an array of unknown length of MyType-s. Useful for casting simd registers: 'ymm3 as [u16]' (equivalent to 'ymm3 as [u16; 16]'), or other values: 'my_struct as [u64]'.
  * 'char8' and arrays of 'char8' are shown as strings (UTF8), 'u8'/'i8' and their arrays are shown as numbers. Cast between them if needed,
    e.g. 'my_array as [char8]' to show as string, 'my_string as [u8]' to show as numbers.
 

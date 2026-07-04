@@ -598,7 +598,7 @@ impl LineInfo {
     }
     pub fn with_subfunction_level(mut self, subfunction_level: u16) -> Self {
         let subfunction_level = subfunction_level.min(SUBFUNCTION_LEVEL_MAX);
-        self.data[1] = (self.data[1] & ((1 << 12) - 1)) | (subfunction_level as usize);
+        self.data[1] = (self.data[1] & !((1 << 12) - 1)) | (subfunction_level as usize);
         self
     }
 
@@ -868,7 +868,7 @@ impl Symbols {
 
     pub fn find_vtable(&self, static_addr: usize) -> Result<VTableInfo> {
         let idx = self.vtables.partition_point(|v| v.end <= static_addr);
-        if idx > 0 && self.vtables[idx].start <= static_addr {
+        if idx < self.vtables.len() && self.vtables[idx].start <= static_addr {
             Ok(self.vtables[idx].clone())
         } else {
             err!(Dwarf, "no known vtable at address")
@@ -1824,8 +1824,8 @@ impl SymbolsLoader {
             let funcs_before_dedup: usize = self.shards.iter().map(|s| unsafe {(*s.get()).functions_before_dedup}).sum();
             let subfunctions_needed_fixup: usize = self.shards.iter().map(|s| unsafe {(*s.get()).subfunctions_need_fixup.len()}).sum();
             let misc_arena_size: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.misc_arena.capacity()}).sum();
-            let addr_to_lines: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.line_to_addr.len()}).sum();
-            let line_to_addrs: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.addr_to_line.len()}).sum();
+            let addr_to_lines: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.addr_to_line.len()}).sum();
+            let line_to_addrs: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.line_to_addr.len()}).sum();
             let lines_in_debug_line: usize = self.shards.iter().map(|s| unsafe {(*s.get()).addr_to_line_len_after_debug_line}).sum();
             let local_variables: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.local_variables.len()}).sum();
             let global_variables: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.global_variables.used() / mem::size_of::<Variable>()}).sum();

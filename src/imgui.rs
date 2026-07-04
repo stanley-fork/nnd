@@ -465,6 +465,7 @@ impl UI {
         assert!(self.tree.is_empty());
         self.dispatch_input();
         self.text.clear();
+        self.scratch_text.clear();
         self.tree.push(Widget::default()); // 0 is reserved as invalid index
         self.should_redraw = false;
         self.frame_idx += 1;

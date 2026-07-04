@@ -113,7 +113,7 @@ impl TimerFD {
             if r < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                 continue;
             }
-            // Once in a blue moon it fails with errno 11 (WOULDBLOCK). Idk why, guess timerfd just can cause spurious epoll wakeups. Let's ignore it.
+            // Once in a blue moon it fails with errno 11 (WOULDBLOCK) even after epoll reported the fd as readable. Idk why, guess timerfd just can cause spurious epoll wakeups. Let's ignore it.
             if r < 0 && io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock {
                 return 0;
             }
@@ -147,6 +147,9 @@ impl EventFD {
             let r = unsafe {libc::read(self.fd, &mut res as *mut usize as *mut libc::c_void, 8)};
             if r < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                 continue;
+            }
+            if r < 0 && io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock {
+                return 0;
             }
             if r != 8 { panic!("read() from eventfd returned {}: {:?}", r, io::Error::last_os_error()); }
             return res;
