@@ -107,9 +107,6 @@ pub struct Thread {
     // So, this field should only be assigned when a thread is stopped by a signal, and should always be delivered next time the thread is resumed.
     pending_signal: Option<i32>,
 
-    // Just for an assert around a minor race condition between attaching and creating threads.
-    attached_late: bool,
-
     // Got PTRACE_EVENT_EXIT, this thread will exit soon. If it's running, it may have already disappeared, so we shouldn't try to read its information from /proc/
     pub exiting: bool,
 }
@@ -441,7 +438,7 @@ impl StopReason {
 
 impl Thread {
     fn new(idx: usize, tid: pid_t, state: ThreadState) -> Self {
-        Thread {idx: idx, tid: tid, state: state, single_stepping: false, ignore_next_hw_breakpoint_hit_at_addr: None, stop_reasons: Vec::new(), info: ThreadInfo::default(), pending_signal: None, waiting_for_initial_stop: true, sent_interrupt: false, stop_count: 0, attached_late: false, exiting: false, subframe_to_select: None, is_after_user_debug_trap_instruction: false}
+        Thread {idx: idx, tid: tid, state: state, single_stepping: false, ignore_next_hw_breakpoint_hit_at_addr: None, stop_reasons: Vec::new(), info: ThreadInfo::default(), pending_signal: None, waiting_for_initial_stop: true, sent_interrupt: false, stop_count: 0, exiting: false, subframe_to_select: None, is_after_user_debug_trap_instruction: false}
     }
 }
 
@@ -528,6 +525,7 @@ impl Debugger {
 
         let mut seen_threads: HashSet<pid_t> = HashSet::new();
         for round in 0.. {
+            if round > 1000 { return err!(Sanity, "attach didn't converge after {} rounds, something must be broken", round); }
             let threads = match list_threads(pid) {
                 Ok(x) => x,
                 Err(e) if e.is_io_not_found() => return err!(ProcessState, "no process with pid {}", pid),
@@ -538,18 +536,26 @@ impl Debugger {
                 if !seen_threads.insert(tid) {
                     continue;
                 }
-                found_new_threads = true;
                 match unsafe {ptrace(PTRACE_SEIZE, tid, 0, (PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC | PTRACE_O_TRACEEXIT | PTRACE_O_TRACESYSGOOD) as u64)} {
                     Ok(_) => (),
-                    Err(e) if e.is_io_permission_denied() => return err!(Usage, "ptrace({}) failed: operation not permitted - missing sudo?", tid),
+                    // ESRCH probably means the thread exited between the time we saw it in /proc/<pid>/task/ and the ptrace call.
+                    Err(e) if e.is_io_esrch() => continue,
+                    Err(e) if e.is_io_permission_denied() => {
+                        // EPERM may mean one of:
+                        //  (a) actual permission error, or
+                        //  (b) the thread exited with nonzero code, or
+                        //  (c) the thread was auto-attached by PTRACE_O_TRACECLONE from a previously attached thread.
+                        // We assume actual permission error if it's the first thread we tried to attach.
+                        // Though technically it may (?) be case (b) instead, causing spurious attach failure if attached at just the wrong moment.
+                        if seen_threads.len() <= 1 { return err!(Usage, "ptrace({}) failed: operation not permitted - missing sudo?", tid); }
+                        // Otherwise assume the thread either exited or got auto-attached already (in which case we'll see a PTRACE_EVENT_CLONE later, so no need to add a thread here).
+                        continue;
+                    }
                     Err(e) => return Err(e),
                 }
-                let mut thread = Thread::new(r.next_thread_idx, tid, ThreadState::Running);
+                found_new_threads = true;
+                let thread = Thread::new(r.next_thread_idx, tid, ThreadState::Running);
                 r.next_thread_idx += 1;
-
-                // The newly appeared thread may also be noticed by PTRACE_O_TRACECLONE (if we already attached parent thread when it was spawned). Set a flag saying that it's ok.
-                thread.attached_late = round > 0;
-
                 r.threads.insert(tid, thread);
             }
             if !found_new_threads {
@@ -557,6 +563,8 @@ impl Debugger {
             }
             // New threads may have been spawned while we were attaching (before we attached to their parent thread), so list threads again and re-check.
         }
+
+        if r.threads.is_empty() { return err!(ProcessState, "failed to attach to any thread; this should be very rare, otherwise something's broken"); }
 
         refresh_maps_and_binaries_info(&mut r);
         for t in r.threads.values_mut() {
@@ -907,10 +915,8 @@ impl Debugger {
                                     new_tid = t;
                                 }
                                 if let Some(existing_thread) = self.threads.get(&new_tid) {
-                                    if !existing_thread.attached_late {
-                                        eprintln!("error: duplicate tid: {}", new_tid);
-                                        log!(self.log, "error: duplicate tid: {}", new_tid);
-                                    }
+                                    eprintln!("error: duplicate tid: {}", new_tid);
+                                    log!(self.log, "error: duplicate tid: {}", new_tid);
                                 } else {
                                     if self.context.settings.trace_logging { eprintln!("info: new thread: {}", new_tid); }
                                     let thread = Thread::new(self.next_thread_idx, new_tid, ThreadState::Running);
