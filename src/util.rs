@@ -474,6 +474,7 @@ impl<R: Read> Read for HashingBufReader<R> {
         let b = self.fill_buf()?;
         let n = b.len().min(buf.len());
         buf[..n].copy_from_slice(&b[..n]);
+        self.consume(n);
         Ok(n)
     }
 }
@@ -657,7 +658,11 @@ impl Mmap {
         let anon_map = unsafe {libc::mmap(ptr::null_mut(), mapped_len, libc::PROT_READ, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)};
         if anon_map == libc::MAP_FAILED { return errno_err!("anon mmap of size {} failed", mapped_len); }
         let file_map = unsafe {libc::mmap(anon_map, file_len, libc::PROT_READ, libc::MAP_PRIVATE | libc::MAP_FIXED, file.as_raw_fd(), 0)};
-        if file_map == libc::MAP_FAILED { return errno_err!("failed to mmap file of size {}", file_len); }
+        if file_map == libc::MAP_FAILED {
+            let e = errno_err!("failed to mmap file of size {}", file_len);
+            unsafe {libc::munmap(anon_map, mapped_len);}
+            return e;
+        }
         assert_eq!(anon_map, file_map);
 
         Ok(Mmap {ptr: file_map, file_len, mapped_len})

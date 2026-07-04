@@ -1166,8 +1166,10 @@ impl TextInput {
                 Some(KeyAction::Paste) => {
                     if !ui.clipboard.is_empty() {
                         self.delete_selection(false, false, ui);
-                        self.text.insert_str(self.cursor, &ui.clipboard);
-                        self.cursor += ui.clipboard.len();
+                        // Single-line input ignores '\n'-s, same as the Char handler below. (Otherwise they'd be rendered verbatim and garble the screen.)
+                        let pasted = if self.multiline {ui.clipboard.clone()} else {ui.clipboard.replace('\n', " ")};
+                        self.text.insert_str(self.cursor, &pasted);
+                        self.cursor += pasted.len();
                         self.mark = self.cursor;
                         edited = true;
                     }
@@ -1241,11 +1243,11 @@ impl TextInput {
                         killed = true;
                     }
                     Key::Up | Key::Down | Key::Char('n') | Key::Char('p') | Key::PageUp | Key::PageDown | Key::Char('v') | Key::Char('V') => {
-                        let select = key.mods.contains(ModKeys::SHIFT);
+                        let select = key.mods.contains(ModKeys::SHIFT) || key.key == Key::Char('V'); // uppercase means shift was held
                         let dy = match key.key {
                             Key::Up | Key::Char('p') => -1,
                             Key::Down | Key::Char('n') => 1,
-                            k if k == Key::PageUp || (k == Key::Char('v') && key.mods.contains(ModKeys::ALT)) => -(self.viewport_height.saturating_sub(2) as isize),
+                            k if k == Key::PageUp || ((k == Key::Char('v') || k == Key::Char('V')) && key.mods.contains(ModKeys::ALT)) => -(self.viewport_height.saturating_sub(2) as isize),
                             _ => self.viewport_height.saturating_sub(2) as isize,
                         };
 
@@ -1306,7 +1308,7 @@ impl TextInput {
 
     fn delete_selection(&mut self, to_clipboard: bool, kill: bool, ui: &mut UI) {
         let r = self.selection();
-        if to_clipboard {
+        if to_clipboard && !r.is_empty() { // don't wipe the clipboard on a no-op kill (e.g. ctrl-k at the end of text)
             if !kill || !self.killing_spree {
                 ui.clipboard.clear();
             }

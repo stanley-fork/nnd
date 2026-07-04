@@ -697,7 +697,7 @@ impl UnitInfo {
     fn new(offset: DieOffset, shard_idx: usize, offset_map_range: Range<usize>) -> Self { assert!(offset.0 >> 48 == 0 && shard_idx >> 16 == 0 && offset_map_range.start >> 32 == 0 && offset_map_range.len() >> 32 == 0); Self {data: [offset.0 << 16 | shard_idx, offset_map_range.start << 32 | offset_map_range.len()]} }
     fn offset(&self) -> DieOffset { DebugInfoOffset(self.data[0] >> 16) }
     fn shard(&self) -> usize { self.data[0] & 0xffff }
-    fn offset_map_range(&self) -> Range<usize> { self.data[1]>>32 .. self.data[1] & 0xffffffff }
+    fn offset_map_range(&self) -> Range<usize> { self.data[1]>>32 .. (self.data[1]>>32) + (self.data[1] & 0xffffffff) }
     fn offset_comparison_key(offset: DieOffset) -> usize { assert!(offset.0 >> 48 == 0); offset.0 << 16 | 0xffff }
 }
 

@@ -516,7 +516,7 @@ impl LazyExtraRegisters {
     pub fn get<'a>(&'a self) -> &'a ExtraRegisters {
         if let Some(tid) = self.tid.take() {
             let r = ptrace_get_extra_regs(tid);
-            unsafe {self.r.get().write(r);}
+            unsafe {*self.r.get() = r;}
         }
         unsafe {&*(self.r.get() as *const ExtraRegisters)}
     }

@@ -928,8 +928,9 @@ pub fn list_units(dwarf: &mut Dwarf<DwarfSlice>, binary_name: &str, layouts: All
         abbrev_offsets.sort_unstable_by_key(|((offset, encoding), _)| (*offset, encoding.address_size, encoding.format == Format::Dwarf64, encoding.version));
         let mut off_start = 0usize;
         let mut all_consecutive = true;
-        // serialized abbreviation -> index in abbreviations_pool
-        let mut abbrev_dedup: HashMap<&'static [u8], usize> = HashMap::new();
+        // (serialized abbreviation, encoding) -> index in abbreviations_pool
+        // (The encoding must be part of the key because prepare_abbreviation_actions bakes word sizes from it into the actions.)
+        let mut abbrev_dedup: HashMap<(&'static [u8], Encoding), usize> = HashMap::new();
         let mut attributes: Vec<AttributeSpecification> = Vec::new();
         while off_start < abbrev_offsets.len() {
             let &(offset, encoding) = &abbrev_offsets[off_start].0;
@@ -986,7 +987,7 @@ pub fn list_units(dwarf: &mut Dwarf<DwarfSlice>, binary_name: &str, layouts: All
                 }
 
                 let abbrev_slice = &abbrev_slice[..reader.offset_from(abbrev_slice)];
-                let abbrev_idx = match abbrev_dedup.entry(abbrev_slice) {
+                let abbrev_idx = match abbrev_dedup.entry((abbrev_slice, encoding)) {
                     Entry::Occupied(o) => *o.get(),
                     Entry::Vacant(v) => {
                         let mut actions = [AbbreviationActions::default(), AbbreviationActions::default(), AbbreviationActions::default()];

@@ -1887,7 +1887,11 @@ impl DisassemblyWindow {
             }
         }
 
-        let binary = debugger.symbols.get(target.binary_id).unwrap();
+        let binary = match debugger.symbols.get(target.binary_id) {
+            Some(x) => x,
+            // The binary may have been evicted after `target` was produced, e.g. if the debuggee re-execed, or a stale result was selected in the find-function dialog.
+            None => return err!(NoFunction, "binary was unloaded"),
+        };
         let symbols = binary.symbols.as_ref_clone_error()?;
         let function = &symbols.functions[target.function_idx];
         let demangled_name = function.demangle_name();
@@ -2031,6 +2035,7 @@ impl DisassemblyWindow {
         locator.mangled_name = function.mangled_name().to_vec();
         locator.demangled_name = function.demangle_name();
         locator.addr = function.addr;
+        tab.cached_function_idx = Some((binary.id, function_idx));
 
         Some((binary, function_idx))
     }
@@ -2588,7 +2593,9 @@ impl WindowContent for DisassemblyWindow {
                 suppress_code_autoscroll = true;
             }
 
-            self.open_function(target, debugger).unwrap();
+            if let Err(e) = self.open_function(target, debugger) {
+                log!(debugger.log, "{}", e);
+            }
 
             if let Some(i) = tab_to_restore {
                 self.tabs_state.selected = i;
@@ -3784,7 +3791,7 @@ impl WindowContent for StackWindow {
 fn rust_fake_path_to_url(path: &str) -> Option<String> {
     if path.len() < "/rustc/5680fa18feaa87f3ff04063800aec256c3d4b4be/".len() { return None; }
     if !path.starts_with("/rustc/") { return None; }
-    if !(&path[7..47]).chars().all(|c| c.is_digit(16)) { return None; }
+    if !path.get(7..47).is_some_and(|h| h.chars().all(|c| c.is_digit(16))) { return None; } // (get() in case byte 47 is not a char boundary)
     let mut res = "https://github.com/rust-lang/rust/blob/".to_string();
     res.push_str(&path[7..]);
     Some(res)
@@ -4344,7 +4351,7 @@ impl CodeWindow {
             }
 
             let idx = match selected_idx {
-                Some(i) => (i as isize + select) as usize % addrs.len(),
+                Some(i) => (i as isize + select).rem_euclid(addrs.len() as isize) as usize,
                 None => closest_idx,
             };
 
@@ -4471,7 +4478,11 @@ impl CodeWindow {
         let mut instruction_pointers: HashMap<(&Path, usize), (usize, bool, bool)> = HashMap::new();
         for (idx, subframe) in state.stack.subframes.iter().enumerate() {
             if let Some(info) = &subframe.line {
-                instruction_pointers.insert((&info.path, info.line.line()), (info.line.column(), idx == state.selected_subframe, idx == 0));
+                let key: (&Path, usize) = (&info.path, info.line.line());
+                // Multiple subframes may be on the same line (e.g. recursion); prefer the selected subframe's entry.
+                if idx == state.selected_subframe || !instruction_pointers.contains_key(&key) {
+                    instruction_pointers.insert(key, (info.line.column(), idx == state.selected_subframe, idx == 0));
+                }
             }
         }
 
@@ -4626,7 +4637,7 @@ impl WindowContent for CodeWindow {
         };
         let switch_to = match mem::take(&mut state.should_scroll_source) {
             Some((to, false)) => Some(to),
-            Some((to, true)) if self.tabs.is_empty() || self.tabs[self.tabs_state.selected].path_in_symbols.as_os_str().is_empty() => Some(to),
+            Some((to, true)) if self.tabs.get(self.tabs_state.selected).map_or(true, |t| t.path_in_symbols.as_os_str().is_empty()) => Some(to), // (get() because selected may be one past the end if the last tab was just closed)
             _ => None,
         };
 
@@ -4736,7 +4747,7 @@ impl WindowContent for BreakpointsWindow {
         if !mem::replace(&mut self.initialized, true) {
             // Put cursor on first non-builtin breakpoint on startup.
             for (id, b) in debugger.breakpoints.iter() {
-                if !b.hidden && !b.builtin && !self.selected_breakpoint.is_some_and(|idd| idd.seqno >= id.seqno) {
+                if !b.hidden && !b.builtin && !self.selected_breakpoint.is_some_and(|idd| idd.seqno <= id.seqno) {
                     self.selected_breakpoint = Some(id);
                 }
             }

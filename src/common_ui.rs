@@ -31,7 +31,7 @@ impl Rect {
         self
     }
 
-    pub fn is_empty(&self) -> bool { self.size[0] == 0 && self.size[1] == 0 }
+    pub fn is_empty(&self) -> bool { self.size[0] == 0 || self.size[1] == 0 }
 
     pub fn contains(&self, pos: [isize; 2]) -> bool { self.pos[0] <= pos[0] && self.end(0) > pos[0] && self.pos[1] <= pos[1] && self.end(1) > pos[1] }
 
@@ -427,6 +427,8 @@ impl StyledText {
                 }
                 if self.num_lines() - start + 1 >= max_lines && line_idx + 1 < lines.end {
                     styled_write!(self, truncation_indicator.2, "{}", truncation_indicator.1);
+                    self.close_line();
+                    return start..self.num_lines();
                 }
                 self.close_line();
                 continue;
@@ -442,7 +444,8 @@ impl StyledText {
                 let width = width.saturating_sub(out_line_start_x);
                 let last_line = self.num_lines() - start + 1 >= max_lines;
                 let end_indicator = if last_line {truncation_indicator} else {line_wrap_indicator};
-                let (n, w) = if remaining_width <= width {
+                let (n, w) = if remaining_width <= width && !(last_line && line_idx + 1 < lines.end) {
+                    // (The second condition is for when the line exactly fits, but a truncation indicator will be appended to it and needs room.)
                     (line_end - pos, remaining_width)
                 } else {
                     let (n, w, nn, ww) = str_prefix_with_width(&self.chars[pos..line_end], width.saturating_sub(str_width(&end_indicator.1)));

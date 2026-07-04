@@ -435,7 +435,7 @@ impl CoreDumper {
 
     fn parse_proc_stat(pid: pid_t, prpsinfo: &mut elf_prpsinfo) -> Result<()> {
         let s = fs::read(format!("/proc/{}/stat", pid))?;
-        let Some(name_end) = s.iter().copied().position(|c| c == b')') else {return err!(Internal, "no ')'")};
+        let Some(name_end) = s.iter().copied().rposition(|c| c == b')') else {return err!(Internal, "no ')'")}; // last ')', the comm itself may contain ')'
         let Some(name_start) = s[..name_end].iter().copied().position(|c| c == b'(') else {return err!(Internal, "no '('")};
         for (i, tok) in str::from_utf8(&s[name_end+1..])?.split_whitespace().enumerate() {
             match i {

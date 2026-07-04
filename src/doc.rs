@@ -369,7 +369,7 @@ When using `sudo nnd -p`, keep in mind that the `~/.nnd` will be in the home dir
 Additional flags:
   --no-pty   - don't create a tty for the debugged program; instead, redirect its stdout and stderr to files in ~/.nnd/<session-name>/{{stdout,stderr}}, and stdin to /dev/null
   --external-tty <file>   - redirect stdout, stderr, and stdin to the same file
-  --echo-input   - run a tool that prints names of all pressed keys, in format suitable for the key bindings config file (see ~/.nnd/keys.default); --mouse-mode can be specified *before* --echo-input to also print mouse events (which can't be used in key config)
+  --echo-input   - run a tool that prints names of all pressed keys, in format suitable for the key bindings config file (see ~/.nnd/keys.default); --mouse can be specified *before* --echo-input to also print mouse events (which can't be used in key config)
   --load-symbols <path>   - load debug info from a given binary and exit; useful for benchmarking or debugging debug info loading
   --fixed-fps, --period <seconds>   - some rendering debug options
   --verbose   - print more info to ~/.nnd/<session-name>/log

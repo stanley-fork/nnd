@@ -1012,7 +1012,7 @@ impl SymbolsLoader {
         let load_section = |id: SectionId| -> Result<DwarfSlice> {
             match find_section(id.name())? {
                 Some((data, _)) => Ok(DwarfSlice::new(unsafe {mem::transmute(data)})),
-                None => Ok(DwarfSlice::new(&[0u8;0][..])),
+                None => Ok(DwarfSlice::default()),
             }
         };
 

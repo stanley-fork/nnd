@@ -81,16 +81,17 @@ fn parse_arg(args: &mut &[String], seen_args: &mut HashSet<String>, long_name: &
     if args[0].is_empty() {
         return None;
     }
-    let check_duplicate = |seen_args: &mut HashSet<String>, long_name: &str, short_name: &str, name: &str, repeatable: bool| {
+    let check_duplicate = |seen_args: &mut HashSet<String>, long_name: &str, name: &str, repeatable: bool| {
         if !repeatable {
-            if !seen_args.insert(name.to_string()) {
+            // Key on long_name so that long and short spellings of the same option (e.g. -p and --pid) count as duplicates.
+            if !seen_args.insert(long_name.to_string()) {
                 eprintln!("{} can't be specified multiple times", name);
                 process::exit(1);
             }
         }
     };
     if !long_name.is_empty() && args[0].starts_with(long_name) && args[0][long_name.len()..].starts_with("=") {
-        check_duplicate(seen_args, long_name, short_name, long_name, repeatable);
+        check_duplicate(seen_args, long_name, long_name, repeatable);
         if bool_switch {
             eprintln!("{} doesn't accept a value", long_name);
             process::exit(1);
@@ -101,7 +102,7 @@ fn parse_arg(args: &mut &[String], seen_args: &mut HashSet<String>, long_name: &
     }
     if &args[0][..] == short_name || &args[0][..] == long_name {
         let name = if &args[0][..] == short_name {short_name} else {long_name};
-        check_duplicate(seen_args, long_name, short_name, name, repeatable);
+        check_duplicate(seen_args, long_name, name, repeatable);
         if bool_switch {
             *args = &args[1..];
             return Some(String::new());
@@ -545,7 +546,7 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, core_dump_path: Option<Str
         for event in &events[..n] {
             let fd = event.u64 as i32;
             let prof = TscScopeExcludingSyscalls::new(&debugger.prof.bucket);
-            schedule_render = true;
+            let mut event_schedules_render = true;
             if fd == signal_pipes_read[libc::SIGCHLD as usize] {
                 drain_signal_pipe(fd);
                 have_debugger_events = true;
@@ -556,7 +557,7 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, core_dump_path: Option<Str
             } else if fd == STDIN_FILENO {
                 let significant = ui.buffer_input(&mut debugger.prof.bucket)?;
                 if !significant {
-                    schedule_render = false;
+                    event_schedules_render = false;
                 } else if !pending_render && !context.settings.fixed_fps {
                     render_now = true;
                 }
@@ -586,6 +587,7 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, core_dump_path: Option<Str
             } else {
                 eprintln!("warning: epoll returned unexpected data: {}", fd);
             }
+            schedule_render |= event_schedules_render;
         }
 
         if have_debugger_events {

@@ -30,14 +30,14 @@ pub fn my_pid() -> pid_t {
 }
 
 pub fn precalc_globals_os() {
-    let assert_nonzero = |x: usize| -> usize {
-        assert!(x != 0);
-        x
+    let check = |x: libc::c_long| -> usize {
+        assert!(x != -1 && x != 0); // sysconf() signals errors with -1, and we sometimes use 0 as special value
+        x as usize
     };
-    
-    unsafe {SYSCONF_SC_CLK_TCK = assert_nonzero(libc::sysconf(libc::_SC_CLK_TCK) as usize)};
-    unsafe {SYSCONF_PAGE_SIZE = assert_nonzero(libc::sysconf(libc::_SC_PAGE_SIZE) as usize)};
-    unsafe {MY_PID = assert_nonzero(libc::getpid() as usize) as pid_t};
+
+    unsafe {SYSCONF_SC_CLK_TCK = check(libc::sysconf(libc::_SC_CLK_TCK))};
+    unsafe {SYSCONF_PAGE_SIZE = check(libc::sysconf(libc::_SC_PAGE_SIZE))};
+    unsafe {MY_PID = check(libc::getpid() as _) as pid_t};
 }
 
 pub const SHT_PROGBITS: u32 = 0x1;

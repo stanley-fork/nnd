@@ -148,6 +148,9 @@ impl Layout {
                 if num_children > 10000 {
                     return err!(Sanity, "too many children, can't feed them all");
                 }
+                if num_children == 0 {
+                    return err!(Sanity, "split region with no children"); // would fail an assert in build_split()
+                }
                 let mut children: Vec<RegionId> = Vec::new();
                 for i in 0..num_children {
                     children.push(self.regions.add(Region {parent: Some(region_id), ..Default::default()}).0);

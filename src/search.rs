@@ -251,6 +251,9 @@ impl SymbolSearcher {
 
         // First do filename search ('@' in the query) using one thread per binary. Then file_search_task() will schedule main search tasks.
         self.state.tasks_remaining.store(self.symbols.len(), Ordering::SeqCst);
+        if self.symbols.is_empty() {
+            self.state.results.lock().unwrap().complete = true;
+        }
         for symbols_idx in 0..self.symbols.len() {
             let (state, query, symbols, searcher, properties, context) = (self.state.clone(), self.query.clone(), self.symbols[symbols_idx].1.clone(), self.searcher.clone(), properties.clone(), self.context.clone());
             if query.filename.get().is_empty() {
@@ -357,6 +360,13 @@ impl Searcher for FunctionSearcher {
             if idx & 127 == 0 && cancel.load(Ordering::Relaxed) {
                 return;
             }
+            // (Count before any `continue`s because progress bar has total count in denominator.)
+            items_done += 1;
+            if items_done > (1 << 16) {
+                if !callback(mem::take(&mut res), mem::take(&mut items_done), 0, mem::take(&mut bytes_done)) {
+                    return;
+                }
+            }
             let function = &symbols.functions[idx];
             if function.flags.contains(FunctionFlags::SENTINEL) {
                 continue;
@@ -386,13 +396,7 @@ impl Searcher for FunctionSearcher {
             if let Some(score) = fuzzy_match(slice, &query.s, query.case_sensitive, &mut match_ranges) {
                 res.push(SearchResult {score: score + add_score, id: idx, symbols_idx});
             }
-            items_done += 1;
             bytes_done += slice.len();
-            if items_done > (1 << 16) {
-                if !callback(mem::take(&mut res), mem::take(&mut items_done), 0, mem::take(&mut bytes_done)) {
-                    return;
-                }
-            }
         }
         callback(res, items_done, 0, bytes_done);
     }
@@ -438,6 +442,12 @@ impl Searcher for GlobalVariableSearcher {
             if idx & 127 == 0 && cancel.load(Ordering::Relaxed) {
                 return;
             }
+            items_done += 1;
+            if items_done > (1 << 16) {
+                if !callback(mem::take(&mut res), mem::take(&mut items_done), 0, mem::take(&mut bytes_done)) {
+                    return;
+                }
+            }
 
             let mut add_score = 0usize;
             if query.search_line.is_some() || file_scores.is_some() {
@@ -463,13 +473,7 @@ impl Searcher for GlobalVariableSearcher {
             if let Some(score) = fuzzy_match(slice, &query.s, query.case_sensitive, &mut match_ranges) {
                 res.push(SearchResult {score: score + add_score, id: name.id, symbols_idx});
             }
-            items_done += 1;
             bytes_done += slice.len();
-            if items_done > (1 << 16) {
-                if !callback(mem::take(&mut res), mem::take(&mut items_done), 0, mem::take(&mut bytes_done)) {
-                    return;
-                }
-            }
         }
         callback(res, items_done, 0, bytes_done);
     }
@@ -505,6 +509,12 @@ impl Searcher for TypeSearcher {
                 if idx & 127 == 0 && cancel.load(Ordering::Relaxed) {
                     return;
                 }
+                items_done += 1;
+                if items_done > (1 << 16) {
+                    if !callback(mem::take(&mut res), mem::take(&mut items_done), 0, mem::take(&mut bytes_done)) {
+                        return;
+                    }
+                }
 
                 let mut add_score = 0usize;
                 if query.search_line.is_some() || file_scores.is_some() {
@@ -530,13 +540,7 @@ impl Searcher for TypeSearcher {
                     let id = shard_idx << 48 | table_idx << 47 | idx;
                     res.push(SearchResult {score: score + add_score, id, symbols_idx});
                 }
-                items_done += 1;
                 bytes_done += name.s.len();
-                if items_done > (1 << 16) {
-                    if !callback(mem::take(&mut res), mem::take(&mut items_done), 0, mem::take(&mut bytes_done)) {
-                        return;
-                    }
-                }
             }
         }
         callback(res, items_done, 0, bytes_done);

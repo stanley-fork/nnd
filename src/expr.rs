@@ -271,11 +271,12 @@ impl AddrOrValueBlob {
         if bit_offset.start%8 != 0 {
             r >>= (bit_offset.start%8) as u32;
         }
-        if bit_offset.end%8 != 0 {
-            let e = a[byte_offset.len() - 1];
-            let e = e & ((1u8 << (bit_offset.end%8) as u32) - 1);
-            r &= !(0xffusize << (bit_offset.len() - bit_offset.end%8) as u32);
-            r |= (e as usize) << (bit_offset.len() - bit_offset.end%8) as u32;
+        if byte_offset.len() > 8 {
+            // 9 bytes were read (this happens when start%8 != 0 and start%8 + len > 64); the 9th byte didn't make it into r.
+            r |= (a[8] as usize) << (64 - bit_offset.start%8) as u32;
+        }
+        if bit_offset.len() < 64 {
+            r &= (1usize << bit_offset.len() as u32) - 1;
         }
 
         Ok(r)
@@ -779,13 +780,9 @@ fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut Form
     let usize_prefix = if size == 0 {
         0
     } else {
-        match v.val.get_usize_prefix(&mut state.context.memory) {
-            Ok(mut x) => {
-                if size < 8 {
-                    x &= usize::MAX >> (64 - size as u32 * 8);
-                }
-                x
-            }
+        // (Not get_usize_prefix() because it would read 8 bytes even when size is smaller, spuriously failing if a small value sits within 8 bytes of the end of a mapped memory region.)
+        match v.val.bit_range(0..size.min(8)*8, &mut state.context.memory) {
+            Ok(x) => x,
             Err(e) => {
                 write_val_address_if_needed(&v.val, state);
                 styled_write!(state.out, state.palette.error, "<{}>", e);
@@ -923,7 +920,7 @@ fn format_value_recurse(v: &Value, address_already_shown: bool, state: &mut Form
                         while !t.name.is_char_boundary(i) {
                             i -= 1;
                         }
-                        styled_write!(state.out, state.palette.type_name, "{} ", t.name);
+                        styled_write!(state.out, state.palette.type_name, "{} ", &t.name[..i]);
                         styled_write!(state.out, state.palette.truncation_indicator.2, "{} ", state.palette.truncation_indicator.1);
                     }
                 }
@@ -1204,7 +1201,7 @@ fn try_format_as_string(value: &AddrOrValueBlob, element_type: *const TypeInfo, 
             };
             temp_storage = match memory.read_null_terminated(addr, limit) {
                 Ok((r, t)) => {
-                    terminated |= t;
+                    terminated = t;
                     r
                 }
                 Err(e) => {
@@ -1587,6 +1584,28 @@ pub fn flip_endianness_if_needed(x: &mut usize, size: usize, flags: ValueFlags) 
 #[cfg(test)]
 mod tests {
     use crate::expr::*;
+    use crate::procfs::{CachedMemReader, MemReader};
+
+    #[test]
+    fn bit_range_masking() {
+        let bytes: [u8; 16] = [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x0f, 0xed, 0xcb, 0xa9, 0x87, 0x65, 0x43, 0x21];
+        let val = AddrOrValueBlob::Blob(ValueBlob::from_slice(&bytes));
+        let mut memory = CachedMemReader::new(MemReader::Invalid);
+        for start in 0..64usize {
+            for len in 0..=64usize {
+                let end = start + len;
+                if end > bytes.len() * 8 {
+                    continue;
+                }
+                let mut expected = 0usize;
+                for i in 0..len {
+                    let bit = start + i;
+                    expected |= (((bytes[bit/8] >> (bit%8) as u32) & 1) as usize) << i as u32;
+                }
+                assert_eq!(val.bit_range(start..end, &mut memory).unwrap(), expected, "bit_range({}..{})", start, end);
+            }
+        }
+    }
 
     #[test]
     fn value_blob_nonsense() {

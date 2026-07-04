@@ -432,7 +432,8 @@ impl UI {
                     if button == MouseButton::Left && event == MouseEvent::Press {
                         self.mouse_click = Some(pos);
                     } else if button == MouseButton::Left && event == MouseEvent::Release {
-                        if self.mouse_drag_out_widget.is_some() {
+                        // (The mouse_click check is for when the press and release arrived in the same batch; the click will start a drag in the next dispatch_input(), and this drop position will immediately end it.)
+                        if self.mouse_drag_out_widget.is_some() || self.mouse_click.is_some() {
                             self.mouse_drop_pos = Some(pos.clone());
                         }
                     } else if button == MouseButton::Middle && event == MouseEvent::Press {
@@ -449,7 +450,7 @@ impl UI {
                         self.mouse_buttons_held.retain(|b| *b != button);
                     }
                     if event == MouseEvent::Press {
-                        if !self.mouse_buttons_held.iter().find(|b| **b == button).is_none() {
+                        if self.mouse_buttons_held.iter().find(|b| **b == button).is_none() {
                             self.mouse_buttons_held.push(button);
                         }
                     }

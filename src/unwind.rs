@@ -417,7 +417,7 @@ impl UnwindInfo {
             }
         }
         if seen_regs & 1usize << RegisterIdx::Rsp as u32 == 0 {
-            new_regs.set(RegisterIdx::Rsp, cfa as u64, false);
+            new_regs.set(RegisterIdx::Rsp, cfa as u64, cfa_dubious);
         }
         // Pass through fs_base, it's a property of a thread rather than stack frame. Maybe we should move it to ExtraRegisters (or maybe .eh_frame dwarf expressions may use it, idk).
         if seen_regs & 1usize << RegisterIdx::FsBase as u32 == 0 && frame.regs.has(RegisterIdx::FsBase) {
@@ -606,7 +606,7 @@ fn eval_register_rule(reg: Option<RegisterIdx>, rule: &RegisterRule<usize>, enco
         }
         RegisterRule::ValExpression(e) => {
             let e = Expression(DwarfSlice::new(&section.slice()[e.offset..e.offset+e.length]));
-            eval_dwarf_expression_as_u64(e, encoding, registers, memory, binary, /*skip_final_dereference*/ false)?
+            eval_dwarf_expression_as_u64(e, encoding, registers, memory, binary, /*skip_final_dereference*/ true)?
         }
         RegisterRule::Architectural => return err!(Dwarf, "architectural register rule"),
 
@@ -720,13 +720,15 @@ fn lsda_read_encoded_pointer(ptr: &mut usize, memory: &mut CachedMemReader, enco
         DW_EH_PE_absptr | DW_EH_PE_udata8 | DW_EH_PE_sdata8 => {res = memory.read_usize(*ptr)?; *ptr += 8;}
         DW_EH_PE_uleb128 => res = memory.eat_uleb128(ptr)?,
         DW_EH_PE_sleb128 => res = memory.eat_sleb128(ptr)? as usize,
-        DW_EH_PE_udata2 | DW_EH_PE_sdata2 => {res = memory.read_u16(*ptr)? as usize; *ptr += 2;}
-        DW_EH_PE_udata4 | DW_EH_PE_sdata4 => {res = memory.read_u32(*ptr)? as usize; *ptr += 4;}
+        DW_EH_PE_udata2 => {res = memory.read_u16(*ptr)? as usize; *ptr += 2;}
+        DW_EH_PE_sdata2 => {res = memory.read_u16(*ptr)? as i16 as isize as usize; *ptr += 2;} // sign-extend
+        DW_EH_PE_udata4 => {res = memory.read_u32(*ptr)? as usize; *ptr += 4;}
+        DW_EH_PE_sdata4 => {res = memory.read_u32(*ptr)? as i32 as isize as usize; *ptr += 4;} // sign-extend
         _ => return err!(Dwarf, "unexpected pointer encoding (low bits) in lsda: {}", encoding),
     }
     match DwEhPe(encoding & 0x70) {
         DW_EH_PE_absptr => (),
-        DW_EH_PE_pcrel => if res != 0 { res += initial_ptr; }
+        DW_EH_PE_pcrel => if res != 0 { res = res.wrapping_add(initial_ptr); } // wrapping in case res is negative
         // llvm-project/libcxxabi/src/cxa_personality.cpp doesn't support textrel and funcrel. I guess only pcrel is ever used.
         _ => return err!(Dwarf, "unexpected pointer encoding (high bits) in lsda: {}", encoding),
     }
