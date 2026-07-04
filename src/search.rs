@@ -650,13 +650,16 @@ unsafe fn memmem_maybe_case_sensitive_avx2(haystack: &[u8], needle: &PaddedStrin
         let needle_len = needle.len();
 
         // Create constants for case conversion.
-        let upper_a = _mm256_set1_epi8(b'A' as i8);
-        let twenty_six = _mm256_set1_epi8(26);
+        // Case-fold uppercase ASCII to lowercase in the haystack using the signed-range trick:
+        // bias every byte by -128 (subtract 'A'+128) so that only 'A'..='Z' lands in the bottom of the
+        // signed i8 range, then a single signed compare (biased_offset < 26-128) selects exactly 'A'..='Z'.
+        let upper_a_biased = _mm256_set1_epi8((b'A' as i8).wrapping_add(i8::MIN));
+        let twenty_six_biased = _mm256_set1_epi8(26i8.wrapping_add(i8::MIN));
         let lowercase_mask = _mm256_set1_epi8(if case_sensitive {0} else {32});
 
-        unsafe fn compare(mut hay: __m256i, need: __m256i, upper_a: __m256i, twenty_six: __m256i, lowercase_mask: __m256i) -> u32 {
-            let offset = _mm256_sub_epi8(hay, upper_a);
-            let is_upper = _mm256_cmpgt_epi8(twenty_six, offset);
+        unsafe fn compare(mut hay: __m256i, need: __m256i, upper_a_biased: __m256i, twenty_six_biased: __m256i, lowercase_mask: __m256i) -> u32 {
+            let offset = _mm256_sub_epi8(hay, upper_a_biased);
+            let is_upper = _mm256_cmpgt_epi8(twenty_six_biased, offset);
             hay = _mm256_or_si256(hay, _mm256_and_si256(is_upper, lowercase_mask));
             let cmp = _mm256_cmpeq_epi8(hay, need);
             _mm256_movemask_epi8(cmp) as u32
@@ -671,13 +674,13 @@ unsafe fn memmem_maybe_case_sensitive_avx2(haystack: &[u8], needle: &PaddedStrin
             for i in 0..=haystack.len() - needle_len {
                 // First 32 bytes.
                 let haystack_first = _mm256_loadu_si256(haystack[i..].as_ptr() as *const __m256i);
-                if compare(haystack_first, first_32, upper_a, twenty_six, lowercase_mask) != u32::MAX {
+                if compare(haystack_first, first_32, upper_a_biased, twenty_six_biased, lowercase_mask) != u32::MAX {
                     continue;
                 }
 
                 // Last 32 bytes (potentially overlapping other 32-byte ranges we're checking).
                 let haystack_last = _mm256_loadu_si256(haystack[i + needle_len - 32..].as_ptr() as *const __m256i);
-                if compare(haystack_last, last_32, upper_a, twenty_six, lowercase_mask) != u32::MAX {
+                if compare(haystack_last, last_32, upper_a_biased, twenty_six_biased, lowercase_mask) != u32::MAX {
                     continue;
                 }
 
@@ -686,7 +689,7 @@ unsafe fn memmem_maybe_case_sensitive_avx2(haystack: &[u8], needle: &PaddedStrin
                 while j < needle_len - 32 {
                     let haystack_chunk = _mm256_loadu_si256(haystack[i + j..].as_ptr() as *const __m256i);
                     let needle_chunk = _mm256_loadu_si256(needle[j..].as_ptr() as *const __m256i);
-                    if compare(haystack_chunk, needle_chunk, upper_a, twenty_six, lowercase_mask) != u32::MAX {
+                    if compare(haystack_chunk, needle_chunk, upper_a_biased, twenty_six_biased, lowercase_mask) != u32::MAX {
                         break;
                     }
                     j += 32;
@@ -715,7 +718,7 @@ unsafe fn memmem_maybe_case_sensitive_avx2(haystack: &[u8], needle: &PaddedStrin
             // Using a prefix of the register.
             for i in 0..switch_point.min(haystack.len() - needle_len + 1) {
                 let haystack_chunk = _mm256_loadu_si256(haystack[i..].as_ptr() as *const __m256i);
-                if compare(haystack_chunk, prefix_needle, upper_a, twenty_six, lowercase_mask) & prefix_mask == prefix_mask {
+                if compare(haystack_chunk, prefix_needle, upper_a_biased, twenty_six_biased, lowercase_mask) & prefix_mask == prefix_mask {
                     return Some(i);
                 }
             }
@@ -723,7 +726,7 @@ unsafe fn memmem_maybe_case_sensitive_avx2(haystack: &[u8], needle: &PaddedStrin
             // Using a suffix of the register.
             for i in switch_point..=haystack.len() - needle_len {
                 let haystack_chunk = _mm256_loadu_si256(haystack.as_ptr().add(i + needle_len).sub(32) as *const __m256i);
-                if compare(haystack_chunk, suffix_needle, upper_a, twenty_six, lowercase_mask) & suffix_mask == suffix_mask {
+                if compare(haystack_chunk, suffix_needle, upper_a_biased, twenty_six_biased, lowercase_mask) & suffix_mask == suffix_mask {
                     return Some(i);
                 }
             }
@@ -802,6 +805,23 @@ mod tests {
             let found = memmem_maybe_case_sensitive(hay.as_bytes(), &PaddedString::new(needle), case_sensitive);
 
             assert_eq!(expected, found, "{} {} {} {}", i, hay, needle, case_sensitive);
+        }
+    }
+
+    #[test]
+    fn memmem_case_insensitive_non_ascii() {
+        for (hay, needle) in [
+            ("memcpy@GLIBC_2.14", "memcpy@glibc"),
+            ("café_handler", "café"),
+            ("ns::Grüße::f", "grüße"),
+            ("path/to/file@2x.png", "file@2x"),
+            ("A\x01B\x1fC", "a\x01b\x1fc"),
+        ] {
+            let padded = PaddedString::new(needle);
+            let found = memmem_maybe_case_sensitive(hay.as_bytes(), &padded, false);
+            let expected = memmem_maybe_case_sensitive_fallback(hay.as_bytes(), &padded, false);
+            assert_eq!(found, expected, "avx2 vs fallback disagree: hay={:?} needle={:?}", hay, needle);
+            assert!(found.is_some(), "should find needle: hay={:?} needle={:?}", hay, needle);
         }
     }
 }

@@ -285,6 +285,9 @@ pub fn reflect_meta_value(val: &Value, state: &mut EvalState, context: &mut Eval
 }
 
 fn is_field_uninformative(mut f: &StructField) -> bool {
+    if f.flags.intersects(FieldFlags::DISCRIMINANT | FieldFlags::VARIANT | FieldFlags::DEFAULT_VARIANT) {
+        return false;
+    }
     for step in 0..100 {
         let bit_size = f.calculate_bit_size();
         if bit_size == 0 {
@@ -323,14 +326,19 @@ fn is_field_uninformative(mut f: &StructField) -> bool {
 // to distinguish between string and array of u8.
 // Returns the new set of fields if any changes were made, None otherwise.
 fn unravel_struct(substruct: &mut Substruct) {
-    let (mut has_inheritance, mut empty_fields) = (false, 0usize);
+    let (mut has_inheritance, mut empty_fields, mut has_anon_struct) = (false, 0usize, false);
     for f in substruct.fields.iter() {
         has_inheritance |= f.flags.contains(FieldFlags::INHERITANCE);
+        if f.name.is_empty() {
+            if let Type::Struct(_) = unsafe {&(*f.type_).t} {
+                has_anon_struct = true;
+            }
+        }
         if is_field_uninformative(f) {
             empty_fields += 1;
         }
     }
-    if !has_inheritance && empty_fields == 0 && substruct.fields.len() != 1 {
+    if !has_inheritance && !has_anon_struct && empty_fields == 0 && substruct.fields.len() != 1 {
         // Fast path.
         return;
     }

@@ -406,6 +406,9 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                     // Special cast to unsized array. Type of the result is a sized array of the ~same size as the left hand side.
                     // E.g. `ymm0 as [u8]` is the same as `ymm0 as [u8; 32]`.
                     let element_size = unsafe {(*a.type_).calculate_size()};
+                    if element_size == 0 {
+                        return err!(TypeMismatch, "array element type has size 0");
+                    }
                     let n = from_size / element_size;
                     let sized_array = state.types.add_array(a.type_, Some(n), ArrayFlags::empty());
                     if let AddrOrValueBlob::Blob(blob) = &mut from_val {
@@ -923,6 +926,10 @@ fn to_basic(val: &Value, memory: &mut CachedMemReader, what: &str) -> Result<Bas
                 })
             } else {
                 flip_endianness_if_needed(&mut x, size, val.flags);
+                if size < 8 {
+                    // (1/2/4-byte variables can live in 8-byte registers, sometimes with garbage in upper bytes.)
+                    x &= (1usize << size*8) - 1;
+                }
                 if f.contains(PrimitiveFlags::SIGNED) {
                     // Sign-extend.
                     if size < 8 && x & 1 << (size*8-1) as u32 != 0 {

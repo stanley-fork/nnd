@@ -370,6 +370,9 @@ fn parse_r_debug(ptr_addr: usize, memory: &MemReader, elf: &ElfFile) -> Result<O
     let mut link_map_ptr = cached_memory.read_usize(ptr + 8)?;
     let mut r_debug = RDebug {link_maps: Vec::new()};
     while link_map_ptr != 0 {
+        if r_debug.link_maps.len() >= 50000 {
+            return err!(ProcessState, "link_map list too long (>= {}), possibly a cycle", r_debug.link_maps.len());
+        }
         // Offsets of fields in link_map struct (extended version of the struct, from glibc/include/link.h).
         const L_LD_OFFSET: usize = 16;
         const L_NEXT_OFFSET: usize = 24;

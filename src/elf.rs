@@ -102,12 +102,19 @@ impl ElfFile {
         self.data as _
     }
 
-    pub unsafe fn bytes_from_strtab(&self, section_offset: usize, offset: usize) -> &[u8] {
-        std::ffi::CStr::from_ptr(self.data()[(section_offset + offset) as usize..].as_ptr() as *const i8).to_bytes()
+    // `offset` is an index into the string table section [section_offset, section_offset + section_size).
+    // The caller (open_elf) guarantees the section is in bounds and ends with a '\0', so scanning for the
+    // terminator stays within the section and we don't need to bounds-check each byte here. Out-of-range
+    // `offset` yields an empty slice rather than panicking.
+    pub unsafe fn bytes_from_strtab(&self, section_offset: usize, section_size: usize, offset: usize) -> &[u8] {
+        if offset >= section_size {
+            return &[];
+        }
+        std::ffi::CStr::from_ptr(self.data()[section_offset + offset..].as_ptr() as *const i8).to_bytes()
     }
 
-    pub unsafe fn str_from_strtab(&self, section_offset: usize, offset: usize) -> Result<&str> {
-        Ok(std::str::from_utf8(self.bytes_from_strtab(section_offset, offset))?)
+    pub unsafe fn str_from_strtab(&self, section_offset: usize, section_size: usize, offset: usize) -> Result<&str> {
+        Ok(std::str::from_utf8(self.bytes_from_strtab(section_offset, section_size, offset))?)
     }
 
     pub fn addr_to_offset(&self, addr: usize) -> Option<usize> {
@@ -561,8 +568,31 @@ fn open_elf(name: String, file: Option<(&File, /*file_len*/ usize)>, mut owned: 
 
     let mut elf = ElfFile {name, mmapped, owned, data, segments, sections, entry_point, section_by_offset: Vec::new(), section_by_name: HashMap::new(), text_section: None, is_core_dump, build_id: None, r_debug_ptr_addr: None, interp: None};
 
+    // Validate the section-name string table once, so bytes_from_strtab can scan it without per-byte bounds checks.
+    // If it's missing/out-of-bounds/not null-terminated, section names are left empty rather than risking a bad read.
+    let shstrndx = header.e_shstrndx as usize;
+    let shstrtab: Option<(/*offset*/ usize, /*size*/ usize)> = if shstrndx != 0 && shstrndx < elf.sections.len() {
+        let mut off = elf.sections[shstrndx].offset;
+        let mut size = elf.sections[shstrndx].size_in_file();
+        if off.saturating_add(size) > elf.data.len() {
+            off = off.min(elf.data.len());
+            size = size.min(elf.data.len() - off);
+        }
+        if size == 0 || elf.data[off + size - 1] != 0 {
+            eprintln!("warning: ELF section name string table is missing or not null-terminated in {}", elf.name);
+            None
+        } else {
+            Some((off, size))
+        }
+    } else {
+        None
+    };
+
     for idx in 0..elf.sections.len() {
-        let name = unsafe{elf.str_from_strtab(elf.sections[header.e_shstrndx as usize].offset, elf.sections[idx].name_offset_in_strtab as usize)?}.to_string();
+        let name = match shstrtab {
+            Some((off, size)) => unsafe {elf.str_from_strtab(off, size, elf.sections[idx].name_offset_in_strtab as usize)?}.to_string(),
+            None => String::new(),
+        };
         elf.sections[idx].name = name.clone();
 
         let s = &mut elf.sections[idx];

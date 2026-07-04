@@ -913,7 +913,7 @@ pub struct SymbolsLoader {
     // [sender][receiver] -> messages
     send_global_variable_names: Vec<CachePadded<SyncUnsafeCell<Vec<CachePadded<SyncUnsafeCell<Vec<GlobalVariableNameMessage>>>>>>>,
 
-    // [.strtab, .symtab], [.dynsym, .dynstr]
+    // [.strtab, .symtab], [.dynstr, .dynsym]
     strtab_symtab: Vec<[&'static [u8]; 2]>,
 
     // Things for management and bookkeeping.
@@ -1552,7 +1552,7 @@ impl SymbolsLoader {
 
                     // Function.
                     if sym.st_info & 0xf == STT_FUNC {
-                        let name_ref = if sym.st_name == 0 {
+                        let name_ref = if sym.st_name == 0 || sym.st_name as usize >= strtab.len() {
                             let mut out = shard.sym.misc_arena.write();
                             write!(out, "[function at {:x} (.symtab)]", addr)?;
                             out.finish()
@@ -1580,7 +1580,7 @@ impl SymbolsLoader {
                     }
 
                     // Vtable.
-                    if sym.st_info & 0xf == STT_OBJECT && sym.st_size != 0 && sym.st_name != 0 && strtab[sym.st_name as usize..].starts_with(b"_ZTV") {
+                    if sym.st_info & 0xf == STT_OBJECT && sym.st_size != 0 && sym.st_name != 0 && (sym.st_name as usize) < strtab.len() && strtab[sym.st_name as usize..].starts_with(b"_ZTV") {
                         let mangled = &strtab[sym.st_name as usize..];
                         let end = mangled.iter().position(|c| *c == b'\0').unwrap_or(mangled.len());
                         let mangled = &mangled[..end];
