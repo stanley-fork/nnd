@@ -670,6 +670,9 @@ impl KeyBinds {
                         Entry::Vacant(v) => {v.insert(action);}
                     }
                     action_to_keys.entry(action).or_default().push(k);
+                } else {
+                    // "unbind": add an empty entry so that the loop below doesn't re-add default keys for this action.
+                    action_to_keys.entry(action).or_default();
                 }
             }
             let map = if is_text_input == 0 {&mut res.normal} else {&mut res.text_input};
@@ -783,5 +786,26 @@ impl Default for KeyBinds {
             (Key::Char('\n').alt(), KeyAction::NewLine),
         ]);
         KeyBinds {normal, text_input, vscroll_sensitivity: 4, hscroll_sensitivity: 20}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unbind() {
+        let mut line = 0usize;
+        // Unbind removes the action's default keys.
+        let k = KeyBinds::parse_config("Find: unbind", &mut line).unwrap();
+        assert_eq!(k.normal.action_to_key_name(KeyAction::Find), "<unbound>");
+        assert!(k.normal.actions_to_keys(&[KeyAction::Find]).is_empty());
+        assert!(!k.normal.key_to_action.values().any(|a| *a == KeyAction::Find));
+        // Reassigning another action's default key, with the help of unbind.
+        let k = KeyBinds::parse_config("Find: s\nStepIntoLine: unbind", &mut line).unwrap();
+        assert_eq!(k.normal.key_to_action.get(&"s".parse::<KeyEx>().unwrap()), Some(&KeyAction::Find));
+        assert_eq!(k.normal.action_to_key_name(KeyAction::StepIntoLine), "<unbound>");
+        // Unrelated defaults are still merged in.
+        assert_eq!(k.normal.action_to_key_name(KeyAction::Quit), "C-q");
     }
 }
