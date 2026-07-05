@@ -3478,10 +3478,15 @@ impl WindowContent for ThreadsWindow {
 
             match t.state {
                 ThreadState::Running => {
-                    match &debugger.stepping {
-                        Some(step) if step.tid == tid => ui_writeln!(ui, state_other, "stepping"),
-                        _ => ui_writeln!(ui, state_running, "running"),
-                    };
+                    if t.exiting {
+                        // The thread got PTRACE_EVENT_EXIT and was force-resumed; it's on its way out (or a zombie thread-group leader).
+                        ui_writeln!(ui, state_other, "exiting");
+                    } else {
+                        match &debugger.stepping {
+                            Some(step) if step.tid == tid => ui_writeln!(ui, state_other, "stepping"),
+                            _ => ui_writeln!(ui, state_running, "running"),
+                        };
+                    }
                     table.text_cell(ui);
 
                     ui.text.close_line();

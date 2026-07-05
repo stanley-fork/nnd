@@ -137,6 +137,14 @@ pub struct Debugger {
 
     pub memory: MemReader,
 
+    // TID of any thread in `threads` with `exiting == false`.
+    // Use it for things like /proc/<pid>/ and process_vm_readv.
+    // (Normally this is just `pid`, i.e. the main thread's PID.
+    //  But if the main thread exits while other threads still run, it becomes a zombie, unusable for most operations,
+    //  while other threads may still be running normally indefinitely. In such case, we set this to TID of one of the threads
+    //  that are still alive (updating again if that thread exits, etc).)
+    pub any_live_tid: pid_t,
+
     // Stages of starting the child process that need some special handling.
     waiting_for_initial_sigstop: bool,
     initial_exec_failed: bool,
@@ -456,7 +464,7 @@ impl Debugger {
             assert!(breakpoints.iter().filter(|(_, b)| b.hidden).count() == 1);
         }
 
-        Debugger {mode, command_line, pty: None, tty_size, context, pid: 0, target_state: ProcessState::NoProcess, log: Log::new(), prof, threads: HashMap::new(), pending_wait_events: VecDeque::new(), next_thread_idx: 1, info: ProcessInfo::default(), my_resource_stats, symbols, memory: MemReader::Invalid, waiting_for_initial_sigstop: false, initial_exec_failed: false, stepping: None, pending_step: None, breakpoint_locations: Vec::new(), breakpoints, stopping_to_handle_breakpoints: false, stopped_until_symbols_are_loaded: None, hardware_breakpoints: std::array::from_fn(|_| HardwareBreakpoint::default()), persistent, start_count: 0}
+        Debugger {mode, command_line, pty: None, tty_size, context, pid: 0, any_live_tid: 0, target_state: ProcessState::NoProcess, log: Log::new(), prof, threads: HashMap::new(), pending_wait_events: VecDeque::new(), next_thread_idx: 1, info: ProcessInfo::default(), my_resource_stats, symbols, memory: MemReader::Invalid, waiting_for_initial_sigstop: false, initial_exec_failed: false, stepping: None, pending_step: None, breakpoint_locations: Vec::new(), breakpoints, stopping_to_handle_breakpoints: false, stopped_until_symbols_are_loaded: None, hardware_breakpoints: std::array::from_fn(|_| HardwareBreakpoint::default()), persistent, start_count: 0}
     }
 
     pub fn save_state(&self, out: &mut Vec<u8>) -> Result<()> {
@@ -520,6 +528,7 @@ impl Debugger {
     pub fn attach(pid: pid_t, context: Arc<Context>, persistent: PersistentState, supp: SupplementaryBinaries) -> Result<Self> {
         let mut r = Self::new(RunMode::Attach, Vec::new(), [0, 0], context.clone(), SymbolsRegistry::new(context, supp), Pool::new(), persistent, ResourceStats::default(), Profiling::new());
         r.pid = pid;
+        r.any_live_tid = pid;
         r.target_state = ProcessState::Running;
         r.memory = MemReader::Pid(PidMemReader::new(pid));
 
@@ -754,6 +763,7 @@ impl Debugger {
         }
 
         self.pid = pid;
+        self.any_live_tid = pid;
         self.target_state = ProcessState::Starting;
         self.pending_step = initial_step.map(|on| (pid, on));
         self.waiting_for_initial_sigstop = true;
@@ -854,6 +864,10 @@ impl Debugger {
                         log!(self.log, "{} {} was terminated by signal {} {}{}", if tid == self.pid {"process"} else {"thread"}, tid, signal, signal_name(signal), if core_dumped {" (core dumped)"} else {""});
                     }
                     self.threads.remove(&tid);
+                    if tid == self.any_live_tid {
+                        // (Normally already re-picked at PTRACE_EVENT_EXIT, but a thread may die without that event, e.g. on SIGKILL.)
+                        self.repick_any_live_tid();
+                    }
                     if self.threads.is_empty() {
                         self.target_state = ProcessState::NoProcess;
                         self.info.clear();
@@ -931,6 +945,9 @@ impl Debugger {
                                 }
                                 thread.exiting = true;
                                 force_resume = true;
+                                if tid == self.any_live_tid {
+                                    self.repick_any_live_tid();
+                                }
                                 if self.threads.iter().all(|(_, t)| t.exiting) {
                                     eprintln!("info: process exiting");
                                     if self.target_state == ProcessState::Starting {
@@ -1788,11 +1805,25 @@ impl Debugger {
 
     fn any_thread_in_state(&self, state: ThreadState) -> Option<pid_t> {
         for (tid, t) in &self.threads {
-            if t.state == state {
+            // Exiting threads don't count: they can linger in Running state indefinitely if the main thread exited
+            // while other threads keep running (it becomes an unwaitable zombie until the whole thread group exits).
+            if t.state == state && !t.exiting {
                 return Some(*tid);
             }
         }
         None
+    }
+
+    // Call when the thread `any_live_tid` points to starts exiting or is removed.
+    fn repick_any_live_tid(&mut self) {
+        self.any_live_tid = match self.threads.iter().find(|(_, t)| !t.exiting) {
+            Some((&tid, _)) => tid,
+            // No live threads left; the process is going away, so it doesn't matter much what we put here.
+            None => self.pid,
+        };
+        if let MemReader::Pid(_) = &self.memory {
+            self.memory = MemReader::Pid(PidMemReader::new(self.any_live_tid));
+        }
     }
 
     fn resume_threads_if_needed(&mut self, refresh_info: bool) -> Result<()> {
@@ -1830,7 +1861,7 @@ impl Debugger {
 
     pub fn get_stack_trace(&mut self, tid: pid_t, partial: bool) -> StackTrace {
         let t = match self.threads.get(&tid) {
-            Some(t) if t.state != ThreadState::Suspended => return StackTrace::error(error!(Usage, "running")),
+            Some(t) if t.state != ThreadState::Suspended => return StackTrace::error(error!(Usage, "{}", if t.exiting {"exiting"} else {"running"})),
             Some(t) => t,
             None if self.target_state == ProcessState::NoProcess => return StackTrace::error(error!(Usage, "no process")),
             None => return StackTrace::error(error!(Usage, "no thread")),
@@ -1855,7 +1886,7 @@ impl Debugger {
     fn unwind_stack(&self, tid: pid_t, partial: bool, stack: &mut StackTrace) -> Result<()> {
         let thread = self.threads.get(&tid).unwrap();
         if thread.state != ThreadState::Suspended {
-            return err!(ProcessState, "running");
+            return err!(ProcessState, "{}", if thread.exiting {"exiting"} else {"running"});
         }
 
         let mut regs = thread.info.regs.clone();
@@ -2486,7 +2517,7 @@ impl Debugger {
         let mut res_idx = 0usize;
         for idx in 0..self.breakpoint_locations.len() {
             if self.breakpoint_locations[idx].breakpoints.is_empty() {
-                self.deactivate_breakpoint_location(idx, self.pid)?;
+                self.deactivate_breakpoint_location(idx, self.any_live_tid)?;
             } else {
                 self.breakpoint_locations.swap(res_idx, idx);
                 res_idx += 1;
@@ -2518,12 +2549,12 @@ impl Debugger {
             let tids = thread_addresses.get(&loc.addr);
             if loc.hardware {
                 if tids.is_none() {
-                    self.deactivate_breakpoint_location(idx, self.pid)?;
+                    self.deactivate_breakpoint_location(idx, self.any_live_tid)?;
                     self.breakpoint_locations[idx].hardware = false;
                 }
             } else {
                 if let Some(tids) = tids {
-                    self.deactivate_breakpoint_location(idx, self.pid)?;
+                    self.deactivate_breakpoint_location(idx, self.any_live_tid)?;
                     self.breakpoint_locations[idx].hardware = true;
 
                     for tid in tids {
@@ -2548,7 +2579,7 @@ impl Debugger {
             if self.breakpoint_locations[idx].no_retry {
                 continue;
             }
-            match self.activate_breakpoint_location(idx, self.pid) {
+            match self.activate_breakpoint_location(idx, self.any_live_tid) {
                 Ok(()) => self.breakpoint_locations[idx].error = None,
                 Err(e) => {
                     self.breakpoint_locations[idx].error = Some(e.clone());
@@ -2563,7 +2594,7 @@ impl Debugger {
         }
 
         if self.hardware_breakpoints.iter().any(|b| b.active && !b.pushed_to_threads) {
-            let tids: Vec<pid_t> = self.threads.keys().copied().collect();
+            let tids: Vec<pid_t> = self.threads.iter().filter(|(_, t)| !t.exiting).map(|(tid, _)| *tid).collect();
             for tid in tids {
                 self.set_debug_registers_for_thread(tid)?;
             }

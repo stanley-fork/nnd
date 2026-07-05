@@ -140,7 +140,7 @@ impl ThreadInfo {
 
 pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) -> /*binaries_added*/ bool {
     if debugger.info.exe_inode == 0 && debugger.target_state.process_ready() {
-        let path = format!("/proc/{}/exe", debugger.pid);
+        let path = format!("/proc/{}/exe", debugger.any_live_tid);
         let m = match fs::metadata(&path) {
             Err(e) => {
                 eprintln!("error: failed to read {}: {}", path, e);
@@ -162,7 +162,8 @@ pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) -> /*binaries_add
         // Because the plan is to support downloading binaries from debuginfod, which is not necessarily fast, so we shouldn't lock up the UI.
         debugger.info.maps.clone()
     } else {
-        match MemMapsInfo::read_proc_maps(debugger.pid) {
+        // (any_live_tid rather than pid because for a zombie main thread /proc/<pid>/maps is empty.)
+        match MemMapsInfo::read_proc_maps(debugger.any_live_tid) {
             Err(e) => {
                 eprintln!("error: failed to read maps: {}", e);
                 return false;
@@ -196,7 +197,7 @@ pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) -> /*binaries_add
                 let custom_path = if debugger.mode != RunMode::CoreDump && locator.inode == debugger.info.exe_inode {
                     // Use this special symlink instead of the regular path because it's available even after the file is deleted.
                     // Useful when recompiling the program without closing the debugger.
-                    Some(format!("/proc/{}/exe", debugger.pid))
+                    Some(format!("/proc/{}/exe", debugger.any_live_tid))
                 } else {
                     None
                 };
