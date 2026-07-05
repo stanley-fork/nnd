@@ -922,11 +922,11 @@ impl Debugger {
                                 }
                             }
                             PTRACE_EVENT_CLONE => {
-                                let new_tid;
-                                {
-                                    let mut t: pid_t = 0;
-                                    ptrace(PTRACE_GETEVENTMSG, tid, 0, &mut t as *mut pid_t as u64)?;
-                                    new_tid = t;
+                                let mut new_tid: pid_t = 0;
+                                match ptrace(PTRACE_GETEVENTMSG, tid, 0, &mut new_tid as *mut pid_t as u64) {
+                                    Ok(_) => (),
+                                    Err(e) if e.is_io_esrch() => continue,
+                                    Err(e) => return Err(e),
                                 }
                                 if let Some(existing_thread) = self.threads.get(&new_tid) {
                                     eprintln!("error: duplicate tid: {}", new_tid);
@@ -964,14 +964,22 @@ impl Debugger {
                     } else if signal == libc::SIGTRAP { // hit a breakpoint
                         let mut si: libc::siginfo_t;
                         si = mem::zeroed();
-                        ptrace(PTRACE_GETSIGINFO, tid, 0, &mut si as *mut _ as u64)?;
+                        match ptrace(PTRACE_GETSIGINFO, tid, 0, &mut si as *mut _ as u64) {
+                            Ok(_) => (),
+                            Err(e) if e.is_io_esrch() => continue,
+                            Err(e) => return Err(e),
+                        }
 
                         if self.context.settings.trace_logging { eprintln!("trace: thread {} got SIGTRAP ({}) at 0x{:x}", tid, trap_si_code_name(si.si_code), si.si_addr() as usize); }
 
                         let thread_single_stepping = mem::take(&mut thread.single_stepping);
                         let thread_ignore_next_hw_breakpoint_hit_at_addr = mem::take(&mut thread.ignore_next_hw_breakpoint_hit_at_addr);
 
-                        let (hit, refresh_process_info, _regs, stack_digest_to_select) = self.handle_breakpoint_trap(tid, si.si_code, thread_single_stepping, thread_ignore_next_hw_breakpoint_hit_at_addr)?;
+                        let (hit, refresh_process_info, _regs, stack_digest_to_select) = match self.handle_breakpoint_trap(tid, si.si_code, thread_single_stepping, thread_ignore_next_hw_breakpoint_hit_at_addr) {
+                            Ok(x) => x,
+                            Err(e) if e.is_io_esrch() => continue,
+                            Err(e) => return Err(e),
+                        };
 
                         if hit || self.stopping_to_handle_breakpoints {
                             if hit || self.target_state == ProcessState::Running || self.stepping.as_ref().is_some_and(|s| !s.keep_other_threads_suspended || s.tid != tid) {
@@ -998,7 +1006,11 @@ impl Debugger {
                         if [libc::SIGSEGV, libc::SIGABRT, libc::SIGILL, libc::SIGFPE, libc::SIGBUS, libc::SIGSYS].contains(&signal) {
                             let mut si: libc::siginfo_t;
                             si = mem::zeroed();
-                            ptrace(PTRACE_GETSIGINFO, tid, 0, &mut si as *mut _ as u64)?;
+                            match ptrace(PTRACE_GETSIGINFO, tid, 0, &mut si as *mut _ as u64) {
+                                Ok(_) => (),
+                                Err(e) if e.is_io_esrch() => continue,
+                                Err(e) => return Err(e),
+                            }
 
                             thread.stop_reasons.push(StopReason::Signal(signal));
                             log!(self.log, "thread {} got {} at 0x{:x}", tid, signal_name(signal), si.si_addr() as usize);
@@ -1191,7 +1203,11 @@ impl Debugger {
         for (tid, t) in &mut self.threads {
             if t.state == ThreadState::Running && !t.exiting {
                 if !t.sent_interrupt {
-                    unsafe {ptrace(PTRACE_INTERRUPT, *tid, 0, 0)?};
+                    match unsafe {ptrace(PTRACE_INTERRUPT, *tid, 0, 0)} {
+                        Ok(_) => (),
+                        Err(e) if e.is_io_esrch() => (),
+                        Err(e) => return Err(e),
+                    }
                     t.sent_interrupt = true;
                 }
                 n += 1;
@@ -1846,7 +1862,11 @@ impl Debugger {
         }
         let op = if thread.single_stepping {PTRACE_SINGLESTEP} else {PTRACE_CONT};
         let sig = thread.pending_signal.take().unwrap_or(0);
-        unsafe {ptrace(op, tid, 0, sig as u64)?};
+        match unsafe {ptrace(op, tid, 0, sig as u64)} {
+            Ok(_) => (),
+            Err(e) if e.is_io_esrch() => (),
+            Err(e) => return Err(e),
+        }
         thread.state = ThreadState::Running;
         thread.stop_reasons.clear();
         thread.is_after_user_debug_trap_instruction = false;
@@ -2481,9 +2501,18 @@ impl Debugger {
             let byte_idx = location.addr % 8;
             let bit_idx = byte_idx * 8;
             // Other threads may be running, but it's fine.
-            let word = self.memory.read_u64(location.addr - byte_idx)?;
-            let word = word & !(0xff << bit_idx) | ((location.original_byte as u64) << bit_idx);
-            unsafe { ptrace(PTRACE_POKETEXT, any_suspended_tid, (location.addr - byte_idx) as u64, word)?; }
+            match self.memory.read_u64(location.addr - byte_idx) {
+                Ok(word) => {
+                    let word = word & !(0xff << bit_idx) | ((location.original_byte as u64) << bit_idx);
+                    match unsafe { ptrace(PTRACE_POKETEXT, any_suspended_tid, (location.addr - byte_idx) as u64, word) } {
+                        Ok(_) => (),
+                        Err(e) if e.is_io_esrch() => (),
+                        Err(e) => return Err(e),
+                    }
+                }
+                Err(e) if e.is_io_esrch() => (),
+                Err(e) => return Err(e),
+            }
         }
         location.active = false;
         Ok(())
@@ -2626,6 +2655,13 @@ impl Debugger {
     }
 
     fn set_debug_registers_for_thread(&mut self, tid: pid_t) -> Result<()> {
+        match self.set_debug_registers_for_thread_impl(tid) {
+            Err(e) if e.is_io_esrch() => Ok(()),
+            r => r,
+        }
+    }
+
+    fn set_debug_registers_for_thread_impl(&mut self, tid: pid_t) -> Result<()> {
         // TODO: Remember last assigned values if dr0-3 and dr7 to avoid doing these syscalls again if nothing changed.
         //       Then also clear dr6 when changing hw breakpoints, to not report incorrect hits based on stale bp indices.
 

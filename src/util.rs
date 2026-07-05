@@ -2,6 +2,12 @@ use crate::{*, error::*, log::*, os::*};
 use libc::{pid_t, c_char, c_void};
 use std::{io, io::{Read, BufReader, BufRead, Write}, str::FromStr, ptr, mem, mem::{ManuallyDrop, MaybeUninit}, fmt, fmt::Write as fmtWrite, os::fd::{RawFd, AsRawFd}, ffi::{CStr, OsString, CString}, os::unix::ffi::{OsStringExt, OsStrExt}, arch::asm, cell::UnsafeCell, sync::atomic::{AtomicBool, Ordering}, ops::{Deref, DerefMut, FnOnce}, fs::File, collections::{BinaryHeap, hash_map::DefaultHasher}, hash::{Hash, Hasher}, cmp::Ord, cmp, path::{Path, PathBuf}, slice};
 
+// (Note: `man ptrace` says: "the tracer must be prepared to handle an ESRCH error on any ptrace operation".
+//  ESRCH error can happen if the thread was killed a moment ago, before we got a corresponding WIFEXITED/WIFSIGNALED event.
+//  We assume that such error implies that the whole process is exiting imminently, i.e. WIFEXITED/WIFSIGNALED will be delivered for all threads soon.
+//  So no elaborate error handling is needed, we just need to not crash.
+//  This condition is extremely rare; many call sites weren't checking for ESRCH for years, and no one reported any
+//  debugger crashes caused by that; I'm only fixing this out of some misguided abundance of diligence.)
 pub unsafe fn ptrace(request: i32, pid: pid_t, addr: u64, data: u64) -> Result<i64> {
     (*libc::__errno_location()) = 0;
     let r = profile_syscall!(libc::ptrace(request as _, pid, addr, data));
