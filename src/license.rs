@@ -444,7 +444,7 @@ Used by:
 ======================== Apache License 2.0 ========================
 
 Used by:
- * nnd 0.79.0
+ * nnd 0.80.0
    https://github.com/al13n321/nnd
  * ureq 3.3.0
    https://github.com/algesten/ureq

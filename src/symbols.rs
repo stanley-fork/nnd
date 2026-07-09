@@ -309,16 +309,17 @@ impl FunctionInfo {
 
     pub fn demangle_name(&self) -> String {
         let name = self.mangled_name();
-        match self.language {
-            LanguageFamily::Rust => if let Ok(s) = str::from_utf8(name) {
+        // (Can't rely only on self.language because the name may come from .symtab with no language info.)
+        if name.starts_with(b"_R") || self.language == LanguageFamily::Rust {
+            if let Ok(s) = str::from_utf8(name) {
                 return rustc_demangle::demangle(s).to_string();
             }
-            _ => if name.starts_with(b"_Z") {
-                if let Ok(symbol) = cpp_demangle::BorrowedSymbol::new_with_options(name, &cpp_demangle::ParseOptions::default().recursion_limit(1000)) {
-                    let options = cpp_demangle::DemangleOptions::new().recursion_limit(1000).no_return_type().no_params().hide_expression_literal_types();
-                    if let Ok(r) = symbol.demangle_with_options(&options) {
-                        return r;
-                    }
+        }
+        if name.starts_with(b"_Z") {
+            if let Ok(symbol) = cpp_demangle::BorrowedSymbol::new_with_options(name, &cpp_demangle::ParseOptions::default().recursion_limit(1000)) {
+                let options = cpp_demangle::DemangleOptions::new().recursion_limit(1000).no_return_type().no_params().hide_expression_literal_types();
+                if let Ok(r) = symbol.demangle_with_options(&options) {
+                    return r;
                 }
             }
         }
